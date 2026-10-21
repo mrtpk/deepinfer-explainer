@@ -1,0 +1,157 @@
+---
+title: Mixture of Experts (MoE)
+nav_title: Mixture of Experts (MoE)
+level: Beginner
+prerequisites: learn/transformer, learn/gpus-kernels, learn/parallelism
+related: concepts/moe-routing, concepts/mega-moe, concepts/eplb, concepts/expert-parallelism, learn/number-formats, code/v4-mlp
+summary: An MoE layer has many small feed-forward networks (experts). A router sends each token to only a few of them. DeepInfer's model uses MoE in every layer, with a top-k gate, shared experts and expert parallelism.
+---
+<x-sentence>A Mixture of Experts layer holds many experts but uses only a few of them for each token. So the model is large, but each token is cheap.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>From one FFN to many experts</h3>
+<p>Each transformer layer has {{term attention}} and then a feed-forward network ({{term ffn}}). The FFN works on each token alone. A common FFN is {{term swiglu}}, with three weight matrices:</p>
+<pre><code class="language-none">h      = hidden size,  m = FFN width
+W1, W3 : [h → m]      W2 : [m → h]
+FFN(x) = W2 · ( SiLU(W1·x) ⊙ (W3·x) )
+FLOPs per token = 2 · 3 · h · m          (three matrix-vector products)</code></pre>
+<p>An {{term moe}} layer replaces the one FFN with many smaller FFNs, the {{term expert | experts}}. A small {{term router}} gives each token a score for each expert. With {{term top-k-routing}}, the token goes only to the <em>k</em> experts with the best scores. Their outputs are added with weights that come from the scores.</p>
+<p>Many MoE models also have a {{term shared-expert}}. Every token uses it, in addition to its top-k experts. It learns what all tokens need, so the routed experts can specialize.</p>
+
+<h3>Why MoE is cheap per token</h3>
+<p>The weights that a token really uses are its {{term active-parameters}}. In an MoE layer, they are the top-k experts, the shared experts and the router. All other experts stay unused for that token.</p>
+<p><strong>A worked example (illustrative numbers).</strong> Take <em>h</em> = 4,096, expert width <em>m</em> = 2,048, 64 routed experts, top-6 and 1 shared expert.</p>
+<ol>
+  <li>One expert: 3 × 4,096 × 2,048 = 25.2 M weights.</li>
+  <li>Stored in one layer: (64 + 1) × 25.2 M = 1.64 G weights.</li>
+  <li>Used by one token: (6 + 1) × 25.2 M = 176 M weights, which is 10.8 % of the stored weights.</li>
+  <li>FLOPs per token: 2 × 176 M = 352 M. A dense FFN with all 1.64 G weights would need 3.3 G FLOPs.</li>
+</ol>
+<p>So the model can store much more knowledge without more compute per token. The cost moves to memory: all experts must be in device memory, and the router must send tokens to the right experts.</p>
+
+<h3>Load balance and capacity</h3>
+<p>A router can send many tokens to the same few experts. Then those experts do most of the work, and the others wait. During training, MoE models use a balance rule. Two common rules:</p>
+<ul>
+  <li>An extra loss that punishes uneven use of the experts.</li>
+  <li>A bias per expert that is added to the scores only to choose the top-k (the "auxiliary-loss-free" rule of DeepSeek-V3). The bias goes up for under-used experts and down for over-used ones.</li>
+</ul>
+<p>Some systems also set an {{term expert-capacity}}: a maximum number of tokens per expert in one step. Extra tokens are dropped or sent to another expert. This keeps buffers small, but it changes the output.</p>
+<p>In inference, {{term load-balance}} matters even more with {{term expert-parallelism}}. Each rank holds some experts. The rank with the most tokens takes the longest, and all other ranks wait for it in the collective step.</p>
+
+<h3>Why MoE decode is memory-bound</h3>
+<p>In a dense layer, all tokens of the batch share the same weights. In an MoE layer, each expert sees only its own tokens. With <em>T</em> tokens, top-<em>k</em> and <em>E</em> experts, an expert gets <em>T</em> × <em>k</em> / <em>E</em> tokens on average.</p>
+<p>Example: 1,536 decode tokens, top-6, 64 experts: 1,536 × 6 / 64 = 144 tokens per expert. A BF16 GEMM with 144 rows is still memory-bound on a device with a ridge point of about 281 (see {{link learn/gpus-kernels}}). With 256 tokens, an expert gets only 24. This is why MoE engines want very large decode batches, and why they spread the experts over many ranks.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a large hospital. A triage nurse (the router) sees each patient and sends the patient to two specialists out of many (top-2). Every patient also sees the family doctor (the shared expert). The hospital employs many specialists, but each patient costs only three short visits.</p>
+<p>The comparison stops here: a specialist in a hospital is an expert in a human topic, but an MoE expert has no clear topic. Training decides what each expert does. And the router decides again for every token, in every layer.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2_moe" alt="Panel 1: a token goes to the router, which scores 8 experts; experts 2 and 5 have the highest scores (0.82 and 0.74) and are chosen. Their weights are 0.53 and 0.47. The output is shared(x) plus 0.53 times E2(x) plus 0.47 times E5(x). Panel 2: the layer stores 9 expert FFNs, but one token uses 3 (33 percent). Panel 3: four EP ranks with two experts each; rank 2 holds a hot expert with 120 tokens and has 135 tokens in total, against a mean of 72.5, so the other ranks wait." caption="Figure: panel 1 shows top-2 routing with a shared expert. Panel 2 shows stored versus used weights. Panel 3 shows how one hot expert slows all EP ranks. Click the diagram to zoom." />
+<p>Read panel 1 from left to right: token, router, chosen experts, weighted sum. The weights 0.53 and 0.47 are the two best scores divided by their sum. Panel 3 is the problem that {{link concepts/eplb}} solves.</p>
+
+<h2>In DeepInfer</h2>
+<p>This is a basics page, so this part only gives pointers. The concept pages explain the full code.</p>
+<ol>
+  <li><strong>Every decoder layer is an MoE layer.</strong> The layer builder accepts only <code>MoeDecoderBlockHC</code> and always makes a <code>DeepseekMoE</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:38-42}}). The number of experts, top-k, the shared experts and the expert width come from the checkpoint config ({{cite deepinfer/hugging_face/config.py:164-174}}).</li>
+  <li><strong>The gate.</strong> <code>TopKGate</code> has a BF16 projection <code>Wgate</code> and two FP32 bias vectors, one for text tokens and one for image tokens. It accepts only the scoring function <code>sqrtsoftplus</code>, the top-k method <code>noaux_tc</code> and normalized top-k weights:</li>
+</ol>
+<x-code file="deepinfer/model_executor/models/v4_modules/moe.py" lines="40-67" highlight="55,58-60,62,64,67" caption="The docstring says: <code>sqrtsoftplus</code> scoring, and <code>noaux_tc</code> top-k selection with a load-correction bias. The kernels that compute the scores are vendor code ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:397-400}}). See {{link concepts/moe-routing}}." />
+<ol start="3">
+  <li><strong>Two ways to run the experts.</strong> When all EP ranks are in one fast-link domain, DeepInfer uses one fused "mega MoE" kernel. Otherwise it uses DeepEP dispatch, grouped GEMMs and DeepEP combine ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:184-188}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:565-616}}). On Ascend the domain check always passes ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:131-134}}). See {{link concepts/mega-moe}} and {{link concepts/expert-parallelism}}.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="One expert, with shapes and FLOPs">
+<p>DeepInfer stores the gate and up projections (<code>W1</code> and <code>W3</code>) of an expert as one matrix <code>linear1</code> with <code>2 × m</code> outputs. <code>linear2</code> is <code>W2</code> ({{cite deepinfer/model_executor/models/v4_modules/moe.py:97-108}}). When it loads the checkpoint, it joins <code>w1</code> and <code>w3</code> of each expert ({{cite deepinfer/hugging_face/weights.py:285}}).</p>
+<table>
+  <thead><tr><th>Step</th><th>Shape for <em>T</em> tokens of one expert</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>input</td><td><code>[T, h]</code>, FP8 with scales, or BF16</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:406-415}}</td></tr>
+    <tr><td><code>linear1</code> (grouped GEMM)</td><td><code>[T, 2m]</code> BF16</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:417-430}}</td></tr>
+    <tr><td>SwiGLU with clamp and cast (the kernel also gets <code>topk_weights</code>)</td><td><code>[T, m]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:436-442}}</td></tr>
+    <tr><td><code>linear2</code> (grouped GEMM)</td><td><code>[T, h]</code> BF16</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:444-457}}</td></tr>
+  </tbody>
+</table>
+<p>The clamp value is <code>swiglu_limit</code> from the checkpoint config ({{cite deepinfer/hugging_face/config.py:282}}). The SwiGLU kernel also receives the top-k weights ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:440}}). A weight before <code>linear2</code> gives the same result as a weight after it, because <code>linear2</code> is linear.</p>
+<p><strong>Shared experts.</strong> With <code>n_shared_experts</code> = <em>s</em>, DeepInfer makes one FFN of width <code>m × s</code>, not <em>s</em> separate FFNs ({{cite deepinfer/model_executor/models/v4_modules/moe.py:24-37}}). The result is the same, because the outputs of shared experts are simply added.</p>
+<p><strong>FLOPs.</strong> DeepInfer's FLOPs estimator counts, per token and MoE layer ({{cite csrc/engine/flops_estimator.hpp:82-99}}):</p>
+<pre><code class="language-none">FFN:    coef · 3 · h · m · (top_k + n_shared)      coef = 2 (FP8) or 4 (BF16)
+router: 4 · h · n_routed_experts                   (BF16 gate GEMM over all logical experts)</code></pre>
+<p>The coefficients count FP8-equivalent operations: a BF16 multiply-add counts 4, an FP8 multiply-add counts 2 ({{cite csrc/engine/flops_estimator.hpp:13-20}}). Use the illustrative numbers of "The idea" in FP8. The FFN counts 2 × 3 × 4,096 × 2,048 × 7 = 352 M. The router adds 4 × 4,096 × 64 = 1.0 M. The router is cheap.</p>
+</x-deepdive>
+
+<x-deepdive title="The gate, line by line">
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="359-401" highlight="367-371,374-377,381-396,397-400" />
+<ol>
+  <li>Lines 367-371: a profiling knob. If <code>DEEPINFER_FORCE_IMBALANCE_RATIO</code> &gt; 0 and EP &gt; 1, random selections replace the real routing. They send more tokens to the experts of the first rank. Only the memory profile run uses it: it sets the value to 1.8 and then back to 0.0 ({{cite deepinfer/worker/model_runner.py:509-512}}).</li>
+  <li>Lines 374-377: <code>gate_force_random</code> is a per-token flag in the input metadata. A true flag replaces the gate logits of that token with random values, to balance the MoE load ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:48-50}}). The C++ input builder sets it from a <code>force_load_balance</code> argument ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:82-85}}).</li>
+  <li>Lines 381-396: the arguments. <code>bias</code> is the correction bias; <code>image_bias</code> and <code>image_token_mask</code> select the second bias for image tokens. <code>mask</code> is <code>valid_token_mask</code>, which marks the padding tokens. <code>to_physical_map</code> and <code>logical_count</code> come from {{link concepts/eplb | EPLB}}: they map the chosen logical expert to a physical copy.</li>
+  <li>Lines 397-400: on NVIDIA, <code>deep_gemm.bf16_mega_gate</code> does the gate GEMM and the selection in one kernel. Otherwise the BF16 gate GEMM gives FP32 logits ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:222-227}}), and <code>tile_kernels.moe.moe_topk_gate</code> selects.</li>
+</ol>
+<p>The result is <code>topk_idx</code> and <code>topk_weights</code>, both <code>[num_tokens, top_k]</code>. The profiling path shows the same pair from <code>torch.topk</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:335-345}}).</p>
+<p><strong>What <code>noaux_tc</code> means.</strong> The name comes from DeepSeek-V3: "no auxiliary loss", with a bias per expert. In that design the bias changes only <em>which</em> experts win. The output weights use the scores without the bias, normalized over the chosen experts and multiplied by <code>routed_scaling_factor</code>. DeepInfer passes the bias, the scaling factor and <code>norm_topk_prob</code> to the kernel. The exact kernel math is vendor code, which this site does not explain.</p>
+</x-deepdive>
+
+<x-deepdive title="Logical experts, physical experts and EP ranks">
+<p>The module docstring defines four counts ({{cite deepinfer/model_executor/models/v4_modules/moe.py:3-7}}):</p>
+<ul>
+  <li><strong>logical</strong> = <code>n_routed_experts</code>: what the gate chooses from;</li>
+  <li><strong>extra</strong> = <code>n_redundant_experts</code>: extra copies of busy experts;</li>
+  <li><strong>physical</strong> = logical + extra, a multiple of <code>ep_size</code>;</li>
+  <li><strong>local</strong> = physical / <code>ep_size</code>: the experts on one rank.</li>
+</ul>
+<p>The extra count is at least <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code> (default 0, {{cite deepinfer/environ.py:114}}). DeepInfer rounds it up until physical is a multiple of <code>ep_size</code>, and logs a warning when it rounds ({{cite deepinfer/model_executor/eplb/__init__.py:21-28}}, {{cite deepinfer/model_executor/model_loader.py:93-100}}). The example scripts set a default of 32 when <code>set_override_experts</code> is on ({{cite examples/_config.py:77-79}}).</p>
+<p><strong>Worked example (illustrative expert count).</strong> 256 logical experts, extra at least 32, EP = 64.</p>
+<ol>
+  <li>256 + 32 = 288. 288 mod 64 = 32, so the padding is 64 − 32 = 32.</li>
+  <li>extra = 32 + 32 = 64; physical = 320; local = 320 / 64 = 5 experts per rank.</li>
+  <li>With EP = 8 instead: 288 mod 8 = 0, so extra stays 32, and each rank holds 36 experts.</li>
+</ol>
+<p><strong>Memory per rank.</strong> The expert weights on one rank are <code>local × (2m·h + m·h)</code> values. With FP4 experts, a value takes half a byte plus a small scale (see {{link learn/number-formats}}). The routed experts in DeepInfer are FP4 ({{cite deepinfer/hugging_face/config.py:256}}, {{cite deepinfer/hugging_face/weights.py:283}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Dispatch, grouped GEMM and combine">
+<p>Without mega MoE, <code>DeepseekMoE.forward</code> does five steps ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:565-616}}):</p>
+<ol>
+  <li><strong>Gate</strong>: <code>topk_idx</code>, <code>topk_weights</code> (line 574).</li>
+  <li><strong>Dispatch</strong> (DeepEP): each token goes to the ranks that hold its chosen experts. The receiver gets its tokens in one tensor, grouped by local expert, and <code>psum_num_recv_tokens_per_expert</code>, the running sum of tokens per expert (lines 578-585).</li>
+  <li><strong>Routed experts</strong>: two grouped GEMMs over the sorted tokens, with SwiGLU between them (lines 593-598).</li>
+  <li><strong>Shared expert</strong>: runs on the local tokens of this rank, before DeepInfer launches the combine. <code>limit_num_sms</code> makes it leave <code>DEEPINFER_USERBUFFER_COMM_SMS</code> SMs free for DeepEP (lines 601-603).</li>
+  <li><strong>Combine</strong> (DeepEP): each result goes back to the rank of its token. DeepInfer passes the shared-expert output as the <code>bias</code> argument (lines 604-610, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:505}}).</li>
+</ol>
+<p><strong>Grouped GEMM.</strong> All tokens of all local experts are in one tensor. <code>psum</code> marks where each expert's tokens start, as <code>cu_seqlens</code> does for sequences (see {{link learn/batching}}). One kernel multiplies each group with the weights of its expert ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:109-137}}).</p>
+<p>Example: a rank has 4 local experts and receives 10, 0, 7 and 3 tokens. Without padding, the packed tensor has 20 rows and the running sums are 10, 10, 17, 20. Expert 1 has an empty group. DeepInfer also sets an alignment for the groups that the GEMM kernel needs ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:250-252}}).</p>
+<p><strong>No capacity per expert.</strong> The dispatch gets a maximum number of tokens <em>per rank</em> (the prefill or decode token limit), not per expert ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:476}}). DeepInfer's code sets no capacity per expert.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A checkpoint with another router.</strong> DeepInfer asserts <code>sqrtsoftplus</code>, <code>noaux_tc</code> and <code>norm_topk_prob</code>. Another value stops the model build ({{cite deepinfer/model_executor/models/v4_modules/moe.py:58-60}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:164-170}}).</li>
+  <li><strong>An unsupported precision mix.</strong> Only FP8 × FP4, FP8 × FP8 and BF16 × BF16 are allowed for activations × expert weights ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:177-182}}). An FP4 path also needs a checkpoint that was trained for FP4 ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:60}}).</li>
+  <li><strong>Experts that do not divide by EP.</strong> Physical experts must be a multiple of <code>ep_size</code> ({{cite deepinfer/model_executor/models/v4_modules/moe.py:94-95}}). The loader pads the extra count, so the assert only fails if you bypass the loader.</li>
+  <li><strong>Uneven load.</strong> A hot expert makes its rank slow, and all EP ranks wait. EPLB moves and copies experts to fix this; see {{link concepts/eplb}}.</li>
+  <li><strong>A profiling knob that does nothing.</strong> <code>DEEPINFER_FORCE_IMBALANCE_RATIO</code> replaces real routing with random choices ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:367-371}}). But the memory profile run sets it to 1.8 and then to 0.0 ({{cite deepinfer/worker/model_runner.py:509-512}}). So a value that you set in the environment never takes effect in normal steps.</li>
+</ul>
+<p><strong>Why it matters.</strong> MoE decides the shape of a DeepInfer deployment. The experts need memory on many ranks, the tokens need an all-to-all, and the batch per expert decides if the experts are memory-bound. Expert parallelism, EPLB and mega MoE all exist because of MoE.</p>
+
+<x-quiz>
+  <x-q level="easy">An MoE layer has 32 routed experts, top-4 and 2 shared experts. How many experts does one token use? What fraction of the expert weights is that?
+    <x-a><p>4 + 2 = 6 experts, out of 32 + 2 = 34 stored: 6 / 34 ≈ 18 % (if all experts have the same size).</p></x-a>
+  </x-q>
+  <x-q level="medium">A router gives the top-2 experts the scores 0.6 and 0.2. What are the normalized weights? Why does this matter for the output?
+    <x-a><p>0.6 / 0.8 = 0.75 and 0.2 / 0.8 = 0.25. They sum to 1, so the size of the MoE output does not depend on how high the scores are. DeepInfer asserts <code>norm_topk_prob</code> ({{cite deepinfer/model_executor/models/v4_modules/moe.py:56-60}}); the vendor kernel then also applies <code>routed_scaling_factor</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">Where does DeepInfer get the number of experts and top-k? Are they fixed in the code?
+    <x-a><p>No. They come from the checkpoint config: <code>n_routed_experts</code>, <code>n_shared_experts</code>, <code>num_experts_per_tok</code> and <code>moe_intermediate_size</code> ({{cite deepinfer/hugging_face/config.py:164-174}}). The gate reads <code>num_experts_per_tok</code> as its top-k ({{cite deepinfer/model_executor/models/v4_modules/moe.py:52-53}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A model has 128 logical experts. You run EP = 48 and set <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS=16</code>. How many physical experts are there, and how many on each rank?
+    <x-a><p>128 + 16 = 144. 144 mod 48 = 0, so the padding is 0 ({{cite deepinfer/model_executor/eplb/__init__.py:27-28}}). Physical = 144, local = 144 / 48 = 3 experts per rank.</p></x-a>
+  </x-q>
+  <x-q level="hard">A decode step has 512 tokens, top-8 and 256 experts. On average, how many tokens does one expert get, and is its GEMM memory-bound (ridge point about 281)?
+    <x-a><p>512 × 8 / 256 = 16 tokens per expert. The intensity of a BF16 GEMM is about the number of rows, so about 16, far below 281: strongly memory-bound. Larger batches or fewer experts per rank help; see the deep dive "What the deployment notes say" on {{link learn/parallelism}}.</p></x-a>
+  </x-q>
+</x-quiz>

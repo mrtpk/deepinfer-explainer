@@ -16,7 +16,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | Batch | Writer | Fact check | Committed |
 |---|---|---|---|
 | B1 Basics I | done | done (23 defects fixed) | yes |
-| B2 Basics II | done | running | — |
+| B2 Basics II | done | done (16 defects fixed) | yes |
 | B3a Engine + scheduler | done | running | — |
 | B3b API + cache | running | — | — |
 | B4a Inputs + graphs | running | — | — |

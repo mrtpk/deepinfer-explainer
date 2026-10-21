@@ -1,0 +1,169 @@
+---
+title: Parallelism basics
+level: Beginner
+prerequisites: learn/batching, learn/gpus-kernels
+related: concepts/dp-step-votes, concepts/context-parallelism, concepts/expert-parallelism, concepts/eplb, concepts/engram, concepts/hardware-platforms, code/parallel-state
+summary: Large models run on many devices. The work can be split by requests (DP), by matrices (TP), by layers (PP), by tokens (CP) or by experts (EP). DeepInfer uses DP for attention, CP for long prefills and EP for the MoE experts. It has no TP and no PP group.
+---
+<x-sentence>Parallelism splits the work of one model over many devices; the devices then exchange data with collective operations.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Why use more than one device?</h3>
+<p>There are two reasons. First, a large model does not fit in the memory of one device. Second, one device is too slow for the number of requests. So the engine runs on many devices. Each device is driven by one process, the {{term rank}}.</p>
+<p>The ranks must then split the work and exchange data. There are five common ways to split the work. Each way splits a different thing, and each way needs a different kind of communication.</p>
+
+<h3>Five ways to split the work</h3>
+<table>
+  <thead><tr><th>Name</th><th>What each rank holds</th><th>What the ranks exchange</th><th>In DeepInfer</th></tr></thead>
+  <tbody>
+    <tr><td>{{term data-parallelism | Data parallel}} (DP)</td><td>a full copy of the model part; its own requests</td><td>nothing in the forward pass</td><td>yes, for attention</td></tr>
+    <tr><td>{{term tensor-parallelism | Tensor parallel}} (TP)</td><td>a slice of every weight matrix</td><td>an {{term all-reduce}} (or {{term all-gather}}) in every layer</td><td>no</td></tr>
+    <tr><td>{{term pipeline-parallelism | Pipeline parallel}} (PP)</td><td>some of the layers (a stage)</td><td>activations, from one stage to the next</td><td>no</td></tr>
+    <tr><td>{{term context-parallelism | Context parallel}} (CP)</td><td>a part of the tokens of one long prompt</td><td>keys and values (all-gather)</td><td>yes, for prefill</td></tr>
+    <tr><td>{{term expert-parallelism | Expert parallel}} (EP)</td><td>some of the experts of each {{term moe}} layer</td><td>tokens to experts and back ({{term all-to-all}})</td><td>yes, for the experts</td></tr>
+  </tbody>
+</table>
+<p>Real systems combine them. A common plan for an MoE model is "attention DP, MoE EP". Every rank keeps the full attention weights and its own requests, but holds only some of the experts. This is the plan of DeepInfer ({{cite README.md:12}}).</p>
+
+<h3>Collectives, with small numbers</h3>
+<p>A {{term collective}} is a communication step in which all ranks of a {{term process-group | group}} take part. Every rank calls the same function, and every rank gets a result. Here are the four that this site uses, with three ranks:</p>
+<table>
+  <thead><tr><th>Collective</th><th>Rank 0 gives</th><th>Rank 1 gives</th><th>Rank 2 gives</th><th>Each rank gets</th></tr></thead>
+  <tbody>
+    <tr><td>{{term all-reduce}} (sum)</td><td>[1, 2]</td><td>[3, 4]</td><td>[5, 6]</td><td>[9, 12]</td></tr>
+    <tr><td>{{term all-gather}}</td><td>[1, 2]</td><td>[3, 4]</td><td>[5, 6]</td><td>[1, 2, 3, 4, 5, 6]</td></tr>
+    <tr><td>{{term all-to-all}}</td><td>[1, 2, 3]</td><td>[4, 5, 6]</td><td>[7, 8, 9]</td><td>rank 0: [1, 4, 7]; rank 1: [2, 5, 8]; rank 2: [3, 6, 9]</td></tr>
+    <tr><td>{{term broadcast}} from rank 0</td><td>[1, 2]</td><td>(anything)</td><td>(anything)</td><td>[1, 2]</td></tr>
+  </tbody>
+</table>
+<p>In an all-to-all, rank <em>j</em> gets part <em>j</em> of every rank. That is a transpose of the data over the ranks. MoE uses it: each rank sends each token to the rank that holds its expert.</p>
+<p>All-reduce has more than one use. With "sum" it adds partial results, as in TP. With "max" or "min" it works as a vote: all ranks learn the same answer to a yes/no question.</p>
+
+<h3>The cost of communication</h3>
+<p>Communication takes time, and it also uses SMs and memory bandwidth on the device. Links inside one machine or rack ({{term nvlink}} on NVIDIA) are much faster than the network between machines. So the plan tries to keep heavy traffic on fast links. A simple cost rule for a ring all-reduce of <em>S</em> bytes over <em>n</em> ranks: each rank sends and receives 2 × (<em>n</em> − 1) / <em>n</em> × <em>S</em> bytes.</p>
+<p>Example: an all-reduce of 16 MiB over 8 ranks. Each rank sends 2 × 7/8 × 16 = 28 MiB. TP does this in every layer, for every step. This is one reason why an MoE engine can prefer DP for attention: DP needs no communication in the attention layers.</p>
+<x-simplified><p>Libraries such as {{term nccl}} also use tree and other algorithms. The ring formula is a good first estimate, not an exact cost.</p></x-simplified>
+
+<h3>An everyday comparison</h3>
+<p>Think of a restaurant group with eight kitchens. With DP, each kitchen cooks the full menu for its own guests. With TP, every dish is half-cooked in two kitchens, and the halves are joined before the next step. With PP, each kitchen does one stage of every dish, like an assembly line. With EP, each kitchen has specialist cooks for some dishes, and orders go to the kitchen with the right specialist. With CP, very large orders are shared between kitchens.</p>
+<p>The comparison stops here: kitchens can work alone for hours, but ranks must exchange data many times in every step. And in a collective, all ranks wait for the slowest one. So one slow rank slows down the whole group.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2_parallel_kinds" alt="Panel 1: three cards for data parallel, tensor parallel and pipeline parallel with two devices each. DP keeps all four layers on each device with different requests; TP splits the columns of every layer and needs an all-reduce per layer; PP puts layers 1-2 on one device and 3-4 on the other. DP is used by DeepInfer; TP and PP are not. Panel 2: context parallel splits the tokens of one prompt in mirror order and all-gathers keys and values; expert parallel puts experts 0-3 on one device and 4-7 on the other with all-to-all dispatch and combine; both are used. A summary card lists attention DP, CP, EP, Engram rows, and no TP or PP group." caption="Figure: the five ways to split the work. Green cards are used by DeepInfer; dashed pink cards are not. Click the diagram to zoom." />
+<p>Read each card from top to bottom: what each device holds, then the communication on the last line. The summary card on the right says how DeepInfer combines the three that it uses.</p>
+<x-diagram name="b2_collectives_groups" alt="Panel 1: all-reduce, all-gather and all-to-all on three ranks with the same numbers as the table on this page. Panel 2: eight ranks with dp_size 4 and cp_size 2. CP groups are the pairs 0-1, 2-3, 4-5, 6-7. DP groups are ranks 0, 2, 4, 6 and ranks 1, 3, 5, 7. The EP group and the Engram group contain all eight ranks." caption="Figure: panel 1 shows the result of each collective. Panel 2 shows which ranks form each DeepInfer group for 8 ranks. Click the diagram to zoom." />
+<p>In panel 2, a rank number is <code>engine_rank × cp_size + cp_rank</code>. So the two ranks of one CP group are neighbours, and a DP group takes every second rank.</p>
+
+<h2>In DeepInfer</h2>
+<p>This is a basics page, so this part only gives pointers. The concept pages explain each kind of parallelism in DeepInfer.</p>
+<ol>
+  <li><strong>The groups.</strong> <code>ParallelProcessGroup</code> holds the device groups <code>dp</code>, <code>cp</code>, <code>ep</code>, <code>ep_in_dp</code>, <code>enp</code> (Engram), <code>world</code> and <code>local</code>, and CPU (gloo) copies of the DP, CP and EP-in-DP groups:</li>
+</ol>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="51-65" caption="There is no tensor-parallel and no pipeline-parallel group. <code>init_parallel_groups</code> fills these fields ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:196-212}})." />
+<ol start="2">
+  <li><strong>No tensor parallelism.</strong> The linear layers use <code>ReplicatedLinear</code>: every rank holds the full weight ({{cite deepinfer/model_executor/layers/linear.py:36-45}}). The only other linear class, <code>ParallelRoutedLinear</code>, holds the full weights of the local experts of one EP rank. It splits by expert, not inside a matrix ({{cite deepinfer/model_executor/models/v4_modules/linear.py:23-34}}). Even <code>VocabParallelEmbedding</code> keeps the whole table on each rank ({{cite deepinfer/model_executor/layers/vocab_parallel_embedding.py:19-24}}). The "model parallel size" is the CP size ({{cite deepinfer/config.py:171}}). The deployment notes say that attention uses data parallelism, with #DP = #EP ({{cite doc/inference_deployment_qa.md:33}}).</li>
+  <li><strong>Where to read more.</strong> DP ranks vote on the kind of each step: {{link concepts/dp-step-votes}}. CP ranks share one long prefill: {{link concepts/context-parallelism}}. EP ranks exchange tokens with DeepEP: {{link concepts/expert-parallelism}} and {{link concepts/eplb}}.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Sizes, ranks and group layouts, with a worked example">
+<p><strong>Sizes.</strong> <code>ParallelConfig</code> gets four sizes ({{cite deepinfer/config.py:150-182}}):</p>
+<x-code file="deepinfer/config.py" lines="161-182" highlight="162,171-173,178" />
+<ol>
+  <li>Line 162: if <code>data_parallel_size</code> is 0 (the <code>EngineArgs</code> default, {{cite deepinfer/engine/arg_utils.py:28-31}}), it becomes <code>max(1, ep // cp)</code>.</li>
+  <li>Line 171: <code>model_parallel_size</code> = <code>context_parallel_size</code>.</li>
+  <li>Lines 172-173: the Engram size defaults to <code>cp × dp</code>. The world size is <code>max(cp × dp, enp)</code>.</li>
+  <li>Lines 177-182: EP must divide <code>cp × dp</code>, and the world size must be a multiple of <code>cp × dp</code> and of <code>enp</code>.</li>
+</ol>
+<p><strong>Rank numbers.</strong> A rank is <code>engine_rank × cp_size + cp_rank</code> ({{cite deepinfer/worker/base.py:329}}). <code>engine_rank</code> is the DP index of the engine. The CP ranks of one engine are neighbours.</p>
+<p><strong>Layouts.</strong> <code>create_process_groups</code> uses <code>einops.rearrange</code> on <code>torch.arange(world)</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:80-118}}):</p>
+<table>
+  <thead><tr><th>Group</th><th>Rearrange pattern</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td>DP</td><td><code>(replica dp cp) -&gt; (replica cp) dp</code></td><td>92</td></tr>
+    <tr><td>CP</td><td><code>(dp cp) -&gt; dp cp</code></td><td>97</td></tr>
+    <tr><td>EP</td><td>the world group if <code>ep_size</code> = world size, else <code>(edp ep) -&gt; edp ep</code></td><td>102-106</td></tr>
+    <tr><td>Engram</td><td><code>(replica enp) -&gt; replica enp</code></td><td>109</td></tr>
+    <tr><td>EP-in-DP</td><td><code>(edp ep_in_dp) -&gt; edp ep_in_dp</code>; the local group if <code>ep_size</code> = 1</td><td>113-117</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example.</strong> Run with <code>--ep 8 --cp 2</code> and no DP size. Then dp = max(1, 8 // 2) = 4, enp = 2 × 4 = 8, world = 8. The ranks are 0..7, and rank <em>r</em> has <code>engine_rank</code> = <em>r</em> // 2 and <code>cp_rank</code> = <em>r</em> % 2.</p>
+<ul>
+  <li>CP groups: [0, 1], [2, 3], [4, 5], [6, 7]. Each pair runs one engine.</li>
+  <li>DP groups: [0, 2, 4, 6] and [1, 3, 5, 7]. Each group has one rank of each engine with the same <code>cp_rank</code>.</li>
+  <li>EP group: [0..7], the world group. Engram group: [0..7].</li>
+  <li>With <code>--ep 4</code> instead: EP groups [0, 1, 2, 3] and [4, 5, 6, 7]. Each rank holds 1/4 of the experts.</li>
+</ul>
+<p><strong>One group object per layout.</strong> <code>_split_group_cached</code> makes a group for <em>every</em> row of the layout on every rank, because <code>torch.distributed.new_group</code> must be called by all ranks. It keeps only the row that contains this rank, and caches the result ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:26-48}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Backends and lazy start-up of the device groups">
+<p>The default process group uses <code>gloo</code>, a CPU backend ({{cite deepinfer/worker/base.py:334-340}}). The device groups use the backend of the platform: <code>nccl</code> or <code>hccl</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:82-83}}). See {{link concepts/hardware-platforms}}.</p>
+<p>With a CPU default group, the device groups start lazily. So DeepInfer runs one small all-reduce on each device group at start-up:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="173-187" highlight="187">
+<x-tr line="174">After the default process group changed to the CPU (gloo) backend, the NCCL/HCCL subgroups lost eager/split start-up. They are all lazy: a collective must run once before the communicator really exists.</x-tr>
+<x-tr line="176">Single-rank groups must not be skipped either: Engram's deep_ep reuses the communicator made here through backend._comm_ptr(), and a null pointer gives a segmentation fault at once.</x-tr>
+</x-code>
+<p>The CPU copies of the groups are for small control messages. For example, with {{term zos}} the scheduler votes over the CPU DP group ({{cite deepinfer/engine/llm_engine.py:313}}). The CPU CP group carries the shared-memory message queue that sends method calls from the driver to the other CP ranks ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:122-124}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Every collective that DeepInfer calls, and why">
+<table>
+  <thead><tr><th>Collective</th><th>Group</th><th>Purpose</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>all-reduce MIN</td><td>DP (CPU with ZOS)</td><td>vote: prefill step or decode step</td><td>{{cite csrc/engine/scheduler.hpp:170-182}}, {{cite csrc/engine/scheduler.hpp:316-318}}</td></tr>
+    <tr><td>all-reduce MAX</td><td>DP</td><td>does any rank still have unfinished requests?</td><td>{{cite deepinfer/engine/llm_engine.py:675-678}}</td></tr>
+    <tr><td>all-reduce SUM</td><td>world</td><td>average number of KV blocks</td><td>{{cite deepinfer/worker/base.py:264-266}}</td></tr>
+    <tr><td>broadcast</td><td>CP</td><td>the driver sends the step inputs to the other CP ranks</td><td>{{cite deepinfer/model_executor/parallel_utils/communication_op.py:28-43}}</td></tr>
+    <tr><td>all-gather</td><td>CP</td><td>keys and values of all CP ranks in a prefill</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:450}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:943}}</td></tr>
+    <tr><td>all-gather</td><td>CP</td><td>the final hidden states of a CP prefill</td><td>{{cite deepinfer/model_executor/models/deepseek.py:241-244}}</td></tr>
+    <tr><td>dispatch / combine (all-to-all pattern)</td><td>EP</td><td>send tokens to their experts and bring the results back</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:461-511}}</td></tr>
+    <tr><td>all-gather</td><td>EP</td><td>MoE load statistics</td><td>{{cite deepinfer/model_executor/eplb/__init__.py:188}}</td></tr>
+    <tr><td>all-reduce SUM</td><td>EP</td><td>token count per expert, for rebalancing</td><td>{{cite deepinfer/model_executor/eplb/__init__.py:254}}</td></tr>
+    <tr><td>all-gather</td><td>Engram</td><td>scale factors of the split Engram tables</td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:96-101}}</td></tr>
+  </tbody>
+</table>
+<p>The CP all-gathers go through DeepInfer's own buffer (<code>userbuffer.cp</code>), and the EP exchange goes through {{term deepep}}. This site does not explain the insides of DeepEP.</p>
+<p><strong>Worked example: the size of an MoE dispatch.</strong> The numbers are illustrative, not from the repo. One rank has 1,536 tokens, top-8 routing, hidden size 4,096 and FP8 tokens (1 byte per value). Each token goes to up to 8 experts. So the rank sends at most 1,536 × 8 × 4,096 B = 48 MiB in the dispatch, plus the small scale factors. The combine brings the same number of BF16 results back, 96 MiB at most. Tokens whose expert is on the same rank do not leave the rank. In a real model, top-k and the hidden size come from the checkpoint config.</p>
+</x-deepdive>
+
+<x-deepdive title="What the deployment notes say about TP, CP and EP sizes">
+<p>The Q&amp;A document describes the production service of DeepSeek V4.1 Flash. It is about the service, not only about this repo:</p>
+<ul>
+  <li>Prefill uses EP2-8 / DP2-8, the smallest size that HBM allows. Decode uses EP64-128 / DP64-128 ("Wide-EP") ({{cite doc/inference_deployment_qa.md:47-49}}).</li>
+  <li>"TP and CP are not used for now" ({{cite doc/inference_deployment_qa.md:53}}). The code supports CP, and the examples show <code>--cp 8</code> ({{cite examples/README.md:8}}).</li>
+  <li>Wide EP reduces the memory traffic per step in the expert part ({{cite doc/inference_deployment_qa.md:57}}).</li>
+</ul>
+<p><strong>Why wide EP helps decode, with numbers.</strong> Take 256 experts (illustrative) and 64 ranks: each rank holds 4 experts. With 8 ranks, each rank holds 32 experts. A decode step must read the weights of every expert that gets at least one token. With fewer experts per rank, each rank reads fewer weight bytes per step. Also, each expert gets the tokens of more ranks, so the batch per expert is larger. A larger batch per expert gives the expert GEMMs a higher arithmetic intensity. See {{link learn/gpus-kernels}} and {{link learn/moe}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Sizes that do not fit.</strong> <code>ParallelConfig</code> asserts that EP divides <code>cp × dp</code>, and that the world size fits CP, DP and Engram ({{cite deepinfer/config.py:176-182}}). A wrong combination stops start-up.</li>
+  <li><strong>Experts that do not divide by EP.</strong> The number of physical experts must be a multiple of <code>ep_size</code>. DeepInfer rounds the number of extra (redundant) experts up and logs a warning ({{cite deepinfer/model_executor/model_loader.py:93-100}}, {{cite deepinfer/model_executor/eplb/__init__.py:21-28}}).</li>
+  <li><strong>A hang in a collective.</strong> All ranks of a group must call the same collectives in the same order. The scheduler keeps <code>decode_step</code> equal on all ranks for this reason. Translated: <em>"decode_step is the same on all ranks. So the number and meaning of the votes match, and the group does not hang in the allreduce."</em> ({{cite csrc/engine/scheduler.hpp:307}}).</li>
+  <li><strong>A slow rank.</strong> In a collective, every rank waits for the slowest one. One rank with too much MoE load slows all EP ranks. This is the job of {{link concepts/eplb}}.</li>
+  <li><strong>A long start-up wait.</strong> The CPU group waits up to <code>DEEPINFER_GLOO_TIMEOUT</code> seconds, default 14,400 ({{cite deepinfer/environ.py:110}}, {{cite deepinfer/worker/base.py:334-340}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The parallel plan decides how much memory each rank needs, how much it communicates, and which ranks wait for which. When a DeepInfer page says "the DP group" or "the EP group", it means one of the groups on this page.</p>
+
+<x-quiz>
+  <x-q level="easy">Three ranks hold [2, 0], [1, 1] and [0, 3]. What does each rank get from an all-reduce (sum)? And from an all-gather?
+    <x-a><p>All-reduce: every rank gets [3, 4]. All-gather: every rank gets [2, 0, 1, 1, 0, 3], in rank order.</p></x-a>
+  </x-q>
+  <x-q level="medium">Does DeepInfer split the attention weights over ranks with tensor parallelism? Give evidence from the code.
+    <x-a><p>No. <code>ParallelProcessGroup</code> has no TP group ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:51-65}}). The attention layers use <code>ReplicatedLinear</code>, which keeps the full weight ({{cite deepinfer/model_executor/layers/linear.py:36-45}}). Only the expert weights are split, by expert (EP). Attention uses DP ({{cite doc/inference_deployment_qa.md:33}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In an all-to-all over 4 ranks, rank 2 holds [a, b, c, d]. Which rank gets <em>c</em>?
+    <x-a><p>Rank <em>j</em> gets part <em>j</em> of every rank. <em>c</em> is part 2 of rank 2, so rank 2 keeps it. <em>a</em> goes to rank 0, <em>b</em> to rank 1 and <em>d</em> to rank 3.</p></x-a>
+  </x-q>
+  <x-q level="hard">You start DeepInfer with <code>--ep 8 --cp 4</code> and no DP size. What are dp, the world size, the CP groups and the DP groups?
+    <x-a><p>dp = max(1, 8 // 4) = 2 ({{cite deepinfer/config.py:161-162}}). enp = 4 × 2 = 8, world = 8. CP groups <code>(dp cp) -&gt; dp cp</code>: [0, 1, 2, 3] and [4, 5, 6, 7]. DP groups <code>(replica dp cp) -&gt; (replica cp) dp</code>: [0, 4], [1, 5], [2, 6], [3, 7] ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:92-98}}). The EP group is all 8 ranks.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>init_device_groups</code> run an all-reduce on a zero tensor for every NCCL or HCCL group, also for groups with one rank?
+    <x-a><p>The default group uses gloo, so the device groups start lazily. A collective must run once to make the communicator. Single-rank groups are included because Engram's DeepEP code reuses that communicator, and a null pointer would crash ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:173-187}}).</p></x-a>
+  </x-q>
+</x-quiz>

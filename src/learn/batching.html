@@ -1,0 +1,209 @@
+---
+title: Batching
+level: Beginner
+prerequisites: learn/prefill-decode, learn/kv-cache
+related: concepts/scheduler, concepts/input-metadata, concepts/dp-step-votes, concepts/cuda-graphs, concepts/speculative-decoding, learn/gpus-kernels, code/scheduler-hpp
+summary: Batching runs the tokens of many sequences in one step, so the model reads its weights once for all of them. DeepInfer makes a new packed batch in every step: a prefill batch or a decode batch.
+---
+<x-sentence>Batching runs the tokens of many sequences through the model in one step, so that one read of the weights serves all of them.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Why run many sequences together?</h3>
+<p>In each {{term engine-step | step}}, the model reads all its weights from device memory. For one {{term sequence}}, a {{term decode}} step computes very little: one new {{term token}} (or a few). So the device spends most of the step on memory reads, and its math units wait.</p>
+<p>A {{term batch}} puts the tokens of many sequences into the same step. The weights come from memory once and serve every token in the batch. Up to a limit, 64 tokens take about the same time as 1 token. The page {{link learn/gpus-kernels}} gives the numbers.</p>
+<p>An engine must answer three questions in every step:</p>
+<ol>
+  <li><strong>Which sequences run?</strong> This is the job of the {{term scheduler}}.</li>
+  <li><strong>How are their tokens stored?</strong> With {{term padding}}, or packed end to end.</li>
+  <li><strong>How many tokens fit?</strong> A {{term token-budget}} limits the size of one step. A long prompt must then be split.</li>
+</ol>
+
+<h3>Static and continuous batching</h3>
+<p>With {{term static-batching}}, the engine takes a group of requests and runs them until the <em>last</em> one ends. A sequence that ends early keeps its place in the batch, but it does no work. New requests wait for the next group.</p>
+<p>With {{term continuous-batching}}, the engine makes a new batch in every step. A finished sequence leaves at once. A waiting request can join at the next step. This is also called iteration-level batching.</p>
+<p><strong>A worked example.</strong> The batch has 3 slots. Five requests want 3, 7, 4, 5 and 2 output tokens (A to E). One step makes one token per sequence.</p>
+<table>
+  <thead><tr><th></th><th>Static batching</th><th>Continuous batching</th></tr></thead>
+  <tbody>
+    <tr><td>Batch 1</td><td>A, B, C run steps 1-7 (B is the longest)</td><td>A, B, C start at step 1</td></tr>
+    <tr><td>D starts</td><td>step 8</td><td>step 4 (A ended at step 3)</td></tr>
+    <tr><td>E starts</td><td>step 8</td><td>step 5 (C ended at step 4)</td></tr>
+    <tr><td>Last token</td><td>step 12</td><td>step 8</td></tr>
+    <tr><td>Slot-steps used</td><td>21 of 3 × 12 = 36 (58 %)</td><td>21 of 3 × 8 = 24 (88 %)</td></tr>
+  </tbody>
+</table>
+<p>The useful work is the same: 3 + 7 + 4 + 5 + 2 = 21 tokens. Continuous batching finishes in 8 steps instead of 12, and D and E get their tokens much earlier.</p>
+<x-simplified><p>The example leaves out the {{term prefill}} of each new request. A real engine must read the prompt of D before D can decode. The deep dive "Static and continuous batching: the general formula" adds it.</p></x-simplified>
+
+<h3>An everyday comparison</h3>
+<p>Think of a tour bus and a city tram. The tour bus leaves with a full group and comes back only when the last person is ready. Empty seats stay empty for the whole tour. The tram stops at every station. People get off, and new people get on at once. Continuous batching is the tram.</p>
+<p>The comparison stops here: a tram seat costs the same for every person, but a batch slot does not. A new sequence must first read its whole prompt (prefill). That step costs much more than one decode token.</p>
+
+<h3>Padded and packed batches</h3>
+<p>The sequences of a batch have different lengths. A simple {{term tensor}} has rectangular rows, so the engine has two choices:</p>
+<ul>
+  <li><strong>Padded.</strong> Make a tensor <code>[batch, max_len]</code>. Fill the short rows with pad tokens. The device computes the pad tokens too, and then drops the results.</li>
+  <li><strong>Packed (varlen).</strong> Put all tokens end to end in one tensor <code>[total_tokens]</code>. A second tensor, {{term cu-seqlens}}, marks where each sequence starts. This is a {{term packed-batch}}.</li>
+</ul>
+<p><strong>A worked example.</strong> Three prompts have 5, 2 and 3 tokens.</p>
+<pre><code class="language-none">padded:  [3, 5] = 15 slots, 5 of them padding (33 % waste)
+packed:  [10]   = 10 slots, no padding
+         cu_seqlens = [0, 5, 7, 10]
+         sequence 0 = tokens 0..4, sequence 1 = tokens 5..6, sequence 2 = tokens 7..9</code></pre>
+<p>Matrix multiplies do not care about sequence boundaries: each token row is independent. Only attention needs the boundaries, because a token must look only at tokens of its own sequence. Varlen attention {{term kernel | kernels}} read <code>cu_seqlens</code> to find them.</p>
+
+<h3>Chunked prefill</h3>
+<p>One step has a token budget. A prompt can be longer than the budget. With {{term chunked-prefill}}, the engine splits the prompt into chunks and runs one chunk per step. The KV cache keeps the chunks that are done, so the next chunk can attend to them.</p>
+<p>Example: the budget is 4,096 tokens and a prompt has 10,000 tokens. The chunks are 4,096, 4,096 and 1,808 tokens, in three prefill steps.</p>
+<p>Chunking also keeps each step short. Without chunks, one very long prompt makes one very long step, and all decoding sequences wait for it.</p>
+
+<h3>Why decode is memory-bound</h3>
+<p>A prefill step has many tokens per sequence. A decode step has only one token per sequence (or a few, with {{term speculative-decoding}}). So in decode, the batch size is the number of running sequences.</p>
+<p>Take one weight matrix of 4,096 × 4,096 BF16 values: 32 MiB. The table uses illustrative device numbers: 8 TB/s memory bandwidth and 2,250 TFLOP/s of BF16 math.</p>
+<table>
+  <thead><tr><th>Tokens in the batch</th><th>Bytes read (about)</th><th>Time for the bytes</th><th>FLOPs</th><th>Time for the math</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>33.6 MB</td><td>4.2 µs</td><td>33.6 M</td><td>0.015 µs</td></tr>
+    <tr><td>64</td><td>34.6 MB</td><td>4.3 µs</td><td>2.1 G</td><td>0.95 µs</td></tr>
+    <tr><td>512</td><td>42.0 MB</td><td>5.2 µs</td><td>17.2 G</td><td>7.6 µs</td></tr>
+  </tbody>
+</table>
+<p>The step takes about as long as the larger of the two times. With 1 or 64 tokens, the memory read sets the time: the multiply is {{term memory-bound}}. So 64 tokens cost almost the same as 1 token. With 512 tokens, the math sets the time. This is why decode needs large batches. It is also why the {{term kv-cache}} size matters so much: the cache limits how many sequences can run at the same time.</p>
+<x-simplified><p>The numbers count only one matrix and leave out attention, which reads the KV cache of each sequence. That read grows with the batch, so attention stays memory-bound in decode. {{link learn/gpus-kernels}} explains the roofline model behind this table.</p></x-simplified>
+
+<h3>Mixed steps or separate steps</h3>
+<p>Many engines mix prefill chunks and decode tokens in one step. Others keep the two kinds apart: a step is a prefill step or a decode step. With separate kinds, every decode step has the same simple form, one or a few tokens per sequence. The cost is that a waiting prompt must wait for a prefill step, and the decoding sequences pause during that step.</p>
+<p>DeepInfer keeps the two kinds apart. It also has engine types that do only one kind: a PROMPT engine does only prefill, and a COMPLETION engine does only decode ({{cite csrc/engine/scheduler.hpp:37-43}}). The deployment notes describe separate prefill and decode machines in production ({{cite doc/inference_deployment_qa.md:31}}).</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2_batching" alt="Panel 1: two grids of 3 slots over engine steps. Static batching runs A, B, C for 7 steps and then D, E, 12 steps and 58 percent slot use. Continuous batching starts D at step 4 and E at step 5, 8 steps and 88 percent use. Panel 2: three prompts of 5, 2 and 3 tokens as a padded 3 by 5 tensor with 5 padding cells, and as a packed tensor of 10 tokens with cu_seqlens 0, 5, 7, 10. Panel 3: a DeepInfer prefill step with prompts of 1,000 and 2,000 tokens and a chunk of 1,096 tokens in a 4,096 budget, and a decode step with 4 sequences of 6 tokens each." caption="Figure: panel 1 shows that continuous batching leaves fewer idle slots. Panel 2 shows that a packed batch has no padding. Panel 3 shows the two step kinds of DeepInfer. Click the diagram to zoom." />
+<p>Read panel 1 from left to right: each column is one step. A dashed cell is a slot with no work. Panel 2 shows the same three prompts in the two layouts. Panel 3 shows what one DeepInfer step holds; the budget of 4,096 tokens is only an example.</p>
+
+<h2>In DeepInfer</h2>
+<p>This is a basics page, so this part only gives pointers. The pages {{link concepts/scheduler}} and {{link concepts/input-metadata}} explain the full code.</p>
+<ol>
+  <li><strong>The C++ scheduler makes one batch per step, and the batch has one kind.</strong> In a NORMAL engine, <code>_schedule()</code> returns a prefill batch or a decode batch, never a mix ({{cite csrc/engine/scheduler.hpp:288-341}}). All {{term data-parallelism | data-parallel}} ranks vote, so all of them do the same kind of step. See {{link concepts/dp-step-votes}}.</li>
+  <li><strong>Prefill fills a token budget, decode takes all running sequences.</strong> A prefill step takes waiting prompts in order until <code>max_num_batched_tokens</code> is full. It cuts the last prompt to the rest of the budget ({{cite csrc/engine/scheduler.hpp:467-475}}). A decode step takes every running sequence, up to <code>max_num_seqs</code> ({{cite csrc/engine/scheduler.hpp:622-643}}).</li>
+  <li><strong>The batch is packed.</strong> The model gets the tokens end to end, with <code>cu_seqlens_q</code> and <code>cu_seqlens_k</code> of shape <code>[num_seqs + 1]</code>:</li>
+</ol>
+<x-code file="deepinfer/model_executor/input_metadata/input_metadata.py" lines="261-264" caption="<code>cu_seqlens_q</code> marks the new tokens of each sequence in the packed batch. <code>cu_seqlens_k</code> also counts the tokens that are already in the KV cache." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Static and continuous batching: the general formula">
+<p>Let a batch have <em>S</em> slots, and let request <em>i</em> need <em>n<sub>i</sub></em> decode steps.</p>
+<ul>
+  <li><strong>Static.</strong> A group of <em>S</em> requests takes max(<em>n<sub>i</sub></em>) steps. The useful slot-steps are Σ <em>n<sub>i</sub></em>. Use = Σ <em>n<sub>i</sub></em> / (<em>S</em> × max <em>n<sub>i</sub></em>). Use is low when the lengths differ much. Output lengths of a chat model differ very much.</li>
+  <li><strong>Continuous.</strong> A slot is idle only when no request waits. With a long queue, use is near 100 % for decode. The cost moves to prefill: each joining request needs one or more prefill steps.</li>
+</ul>
+<p><strong>Worked example with prefill.</strong> Use the five requests of "The idea" (3 slots; A to E want 3, 7, 4, 5 and 2 tokens). Now a request first needs a prefill step, and the prefill step makes its first output token. So request <em>i</em> needs 1 prefill and <em>n<sub>i</sub></em> − 1 decode steps. A new request joins as soon as a slot is free.</p>
+<table>
+  <thead><tr><th>Engine</th><th>Steps</th><th>Total</th></tr></thead>
+  <tbody>
+    <tr><td>Static</td><td>prefill A, B, C · 6 decode steps (until B has 7) · prefill D, E · 4 decode steps (until D has 5)</td><td>12</td></tr>
+    <tr><td>Continuous, separate step kinds (like DeepInfer)</td><td>1: prefill A, B, C · 2-3: decode · 4: prefill D (B, C pause) · 5: decode (C ends) · 6: prefill E · 7-9: decode (E ends at 7, B and D at 9)</td><td>9</td></tr>
+    <tr><td>Continuous, mixed steps</td><td>1: prefill A, B, C · 2-3: decode · 4: prefill D + decode B, C · 5: prefill E + decode B, D · 6-8: decode (E ends at 6, B at 7, D at 8)</td><td>8</td></tr>
+  </tbody>
+</table>
+<p>The step count is not the full story: a prefill step with long prompts takes much longer than a decode step. In the separate-kind engine, the running sequences pause during each prefill step. So DeepInfer does not try a prefill step at every step. It tries only at fixed decode-step intervals (deep dive "When does DeepInfer do a prefill step?").</p>
+</x-deepdive>
+
+<x-deepdive title="Packed batches: the tensors, with shapes">
+<p>A packed batch in DeepInfer is an <code>InputMetadata</code> object. These fields describe the token layout ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:32-38}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:261-264}}):</p>
+<table>
+  <thead><tr><th>Field</th><th>Shape</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>is_prompt</code></td><td>bool</td><td>True for a prefill step, False for a decode step.</td></tr>
+    <tr><td><code>input_ids</code></td><td><code>[total_q]</code></td><td>The token ids of all new tokens, end to end.</td></tr>
+    <tr><td><code>positions</code></td><td><code>[total_q]</code></td><td>The position of each token in its own sequence.</td></tr>
+    <tr><td><code>cu_seqlens_q</code></td><td><code>[num_seqs + 1]</code></td><td><code>cumsum(seqlen_q)</code>, with a leading 0.</td></tr>
+    <tr><td><code>cu_seqlens_k</code></td><td><code>[num_seqs + 1]</code></td><td><code>cumsum(seqlen_k)</code>: cached tokens plus new tokens.</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example: a prefill step with a cached prefix.</strong> Sequence 0 is a new prompt of 5 tokens. Sequence 1 has 100 tokens in the cache and sends a chunk of 2 tokens. Sequence 2 is a new prompt of 3 tokens.</p>
+<pre><code class="language-none">seqlen_q     = [5, 2, 3]            total_q = 10
+seqlen_k     = [5, 102, 3]
+cu_seqlens_q = [0, 5, 7, 10]
+cu_seqlens_k = [0, 5, 107, 110]
+positions    = [0 1 2 3 4 | 100 101 | 0 1 2]</code></pre>
+<p>The two new tokens of sequence 1 have positions 100 and 101. They attend to 102 keys: 100 from the cache and 2 new ones. Rule: <code>seqlen_k = cached tokens + in-flight tokens + seqlen_q</code> ({{cite csrc/engine/scheduler.hpp:697}}).</p>
+<p><strong>Padding still exists in one place.</strong> A decode step that replays a {{term cuda-graph}} must match a captured size. The model runner pads the list of sequences with placeholder entries up to the next captured size ({{cite deepinfer/worker/model_runner.py:182-191}}). The padding is at the end of the packed tensor, not inside each row. The field <code>valid_token_mask</code> marks the padding tokens ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:44-46}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The prefill step in DeepInfer, step by step">
+<p><code>_schedule_prefill</code> takes sequences from the front of the <code>waiting</code> queue, in order (first in, first out). For each sequence it checks these rules. The first rule that fails stops the loop or skips the sequence ({{cite csrc/engine/scheduler.hpp:351-546}}):</p>
+<ol>
+  <li>A sequence that is already finished (aborted, or a failed image or grammar) goes to <code>ignored_seqs</code> (lines 363-368).</li>
+  <li>A sequence that is not yet <code>schedulable</code> stops the loop (lines 369-371). For example, the multimodal worker has not finished it.</li>
+  <li>A prompt longer than <code>prompt_limit</code> is ignored with a warning (lines 377-384). <code>prompt_limit</code> is <code>max_model_len</code> with chunked prefill, else <code>min(max_model_len, max_num_batched_tokens)</code> ({{cite csrc/engine/scheduler.hpp:112}}).</li>
+  <li>The KV blocks and a state slot must be free, else the loop stops (<code>LATER</code>) or the prompt is ignored (<code>NEVER</code>) (lines 386-397).</li>
+  <li>The number of running sequences must stay at or below <code>max_num_seqs</code> (lines 440-442).</li>
+  <li>The sum of the sequence lengths (<code>seqlen_k</code>) must stay at or below <code>prefill_max_sum_seqlen_k</code> (lines 444-449). The default is 2<sup>30</sup>, so this limit is normally off ({{cite deepinfer/environ.py:9}}).</li>
+  <li>If the prompt does not fit the rest of the budget, cut it to the rest (lines 470-475). With context parallelism, the rest is rounded down to a multiple of <code>cp_align</code> = 2 × <code>cp_size</code> ({{cite csrc/engine/scheduler.hpp:90}}).</li>
+  <li>A cut prompt needs <code>chunked_prefill</code>; without it the loop stops (lines 504-507).</li>
+  <li>The scheduler commits: it adds the tokens to <code>num_batched_tokens</code> and allocates the blocks (lines 515-520).</li>
+  <li>In a NORMAL engine, a chunked prompt is the last one in the step (lines 543-545).</li>
+</ol>
+<p><strong>The budget.</strong> If you do not set <code>max_num_batched_tokens</code>, the default is <code>max(max_model_len, 4096, max_num_seqs × (1 + nextn))</code>. If you set it, it must be at least <code>max_num_seqs × (1 + nextn)</code>, the largest decode batch ({{cite deepinfer/config.py:219-228}}).</p>
+<x-code file="deepinfer/config.py" lines="219-228" />
+<p><strong>Worked example.</strong> <code>max_model_len</code> = 65,536, <code>max_num_seqs</code> = 256, nextn = 5 (the default, {{cite deepinfer/environ.py:129}}). The default budget is max(65,536, 4,096, 1,536) = 65,536 tokens. Prompts of 30,000, 20,000 and 40,000 tokens wait. Step 1 takes 30,000 + 20,000 + the first 15,536 tokens of the third prompt. The third prompt then waits for the next prefill step with 24,464 tokens left. This needs <code>chunked_prefill=True</code>. The <code>EngineArgs</code> default is False ({{cite deepinfer/engine/arg_utils.py:42}}); the example scripts set True ({{cite examples/_config.py:120}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The decode step in DeepInfer, step by step">
+<p><code>_schedule_decode</code> builds the decode batch ({{cite csrc/engine/scheduler.hpp:559-660}}):</p>
+<ol>
+  <li>Free the finished sequences, and clean finished entries out of <code>waiting</code> (lines 562-577).</li>
+  <li>Move sequences from the <code>prompted</code> queue (prefill done) into <code>running</code>, up to <code>max_num_seqs</code> (lines 595-620). This is the moment when a new sequence joins the decode batch.</li>
+  <li>Sort <code>running</code> by output length and give each sequence a block if it needs one. If no block is free, preempt (lines 622-643). The page {{link learn/kv-cache}} explains this part.</li>
+  <li>Sort the scheduled sequences by total length, longest first (lines 648-649).</li>
+  <li>Get <code>seqlen_q</code> for each sequence and add them up (lines 651-657).</li>
+</ol>
+<p>Without the variable-length draft feature, <code>seqlen_q</code> is 1 + the number of draft tokens ({{cite csrc/engine/mtp_varlen.hpp:153-157}}). After a prefill the draft list has 5 entries, so each sequence sends 6 tokens: the last real token and 5 drafts. See {{link concepts/speculative-decoding}}.</p>
+<p><strong>Sizes.</strong> With <code>max_num_seqs</code> = 256 (the default, {{cite deepinfer/engine/arg_utils.py:36}}) and nextn = 5, one decode step has at most 256 × 6 = 1,536 tokens. The CUDA graph runner captures graphs up to the same size ({{cite deepinfer/worker/model_runner.py:76-79}}). So for the matrix multiplies, the decode batch has up to 1,536 rows, not 256. Draft tokens make decode less memory-bound.</p>
+<p><strong>Check.</strong> <code>schedule()</code> stops with an error if a batch has more than <code>max_num_batched_tokens</code> tokens ({{cite csrc/engine/scheduler.hpp:671-673}}).</p>
+</x-deepdive>
+
+<x-deepdive title="When does DeepInfer do a prefill step?">
+<p>In a NORMAL engine, the scheduler counts decode steps in <code>decode_step</code>. A prefill step sets it back to 0 ({{cite csrc/engine/scheduler.hpp:676-680}}). The scheduler tries a prefill step only at two kinds of points:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="308-322">
+<x-tr line="316">ANY: one rank that wants a prefill is enough.</x-tr>
+<x-tr line="318">ALL: all ranks must want a prefill.</x-tr>
+</x-code>
+<ul>
+  <li><strong>ALL points</strong>: every <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> decode steps, default 70. All data-parallel ranks must have prefill work.</li>
+  <li><strong>ANY points</strong>: every <code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code> decode steps, default 100. One rank with work is enough ({{cite deepinfer/environ.py:174-178}}).</li>
+  <li>A rank wants a prefill only if cache usage is 90 % or less and the first waiting sequence is schedulable (line 313).</li>
+</ul>
+<p>Step 0 is an ALL point. So right after a prefill step, the next step is a prefill step again if all ranks still have prompts. The comment of the variable gives the reason for the interval. Translated: <em>"Each rank collects pending prompts before a collective prefill."</em> ({{cite deepinfer/environ.py:175-176}}).</p>
+<p><strong>Worked example (one rank).</strong> A new request arrives while 200 sequences decode, at <code>decode_step</code> = 12. The next ALL point is 70. So the request waits 58 decode steps before its prefill. If each decode step takes 20 ms (an illustrative number), it waits about 1.2 s before its first token.</p>
+<p>The vote, the second vote and the empty "follower" prefill step are on {{link concepts/dp-step-votes}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A prompt that is too long.</strong> Without chunked prefill, a prompt longer than <code>max_num_batched_tokens</code> is ignored, with the warning <em>"Input prompt ... is too long"</em> ({{cite csrc/engine/scheduler.hpp:377-384}}). Turn on <code>chunked_prefill</code>, or increase the budget.</li>
+  <li><strong>A budget that is too small.</strong> If you set <code>max_num_batched_tokens</code> below <code>max_num_seqs × (1 + DEEPINFER_USE_NEXTN_DECODE)</code>, start-up fails on an assert ({{cite deepinfer/config.py:224-226}}). It must also be at least one block (128 tokens) ({{cite csrc/engine/scheduler.hpp:116}}).</li>
+  <li><strong>Slow first token while many sequences decode.</strong> A new prompt can wait up to 70 decode steps for a prefill point ({{cite csrc/engine/scheduler.hpp:308-312}}). With more than one DP rank, the ALL vote can fail; then the prompt waits for the next ANY point, up to 100 decode steps. Lower <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> for a lower first-token latency, at some cost in decode speed.</li>
+  <li><strong>A full cache blocks new prompts.</strong> Above 90 % cache usage, a rank does not want a prefill ({{cite csrc/engine/scheduler.hpp:313}}). The running sequences must finish first.</li>
+</ul>
+<p><strong>Why it matters.</strong> Batch size is the main control of the speed of an inference engine. Large decode batches make the device do useful math instead of waiting for memory. Packed batches avoid wasted work. The scheduler decides which tokens go into each step, so most speed settings are batching settings.</p>
+
+<x-quiz>
+  <x-q level="easy">Why does a decode step for 64 sequences take about the same time as a decode step for 1 sequence?
+    <x-a><p>Both steps must read all weights from device memory once. With few tokens, this read takes much longer than the math. So the read sets the time, and the extra 63 tokens add almost nothing. The operation is memory-bound.</p></x-a>
+  </x-q>
+  <x-q level="easy">Three prompts have 6, 1 and 4 tokens. Give <code>cu_seqlens</code> for the packed batch, and the number of padding slots in a padded batch.
+    <x-a><p>Packed: <code>cu_seqlens = [0, 6, 7, 11]</code>, 11 tokens, no padding. Padded: a <code>[3, 6]</code> tensor = 18 slots, so 18 − 11 = 7 padding slots.</p></x-a>
+  </x-q>
+  <x-q level="medium">A DeepInfer NORMAL engine has 50 running sequences and 3 waiting prompts. Can one step hold 50 decode tokens and one prompt chunk?
+    <x-a><p>No. In a NORMAL engine each step is a prefill step or a decode step. <code>_schedule()</code> returns the result of <code>_schedule_prefill</code> or of <code>_schedule_decode</code>, never both ({{cite csrc/engine/scheduler.hpp:295-341}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You do not set <code>max_num_batched_tokens</code>. <code>max_model_len</code> is 8,192, <code>max_num_seqs</code> is 1,024, and nextn is 5. What is the token budget, and why?
+    <x-a><p>The default is <code>max(max_model_len, 4096, max_num_seqs × (1 + nextn))</code> = max(8,192, 4,096, 6,144) = 8,192 ({{cite deepinfer/config.py:224-228}}). The third term makes sure that the largest decode batch (1,024 sequences × 6 tokens) always fits in one step.</p></x-a>
+  </x-q>
+  <x-q level="hard">With one rank and default settings, a new request arrives at <code>decode_step</code> = 71. At which decode step does DeepInfer next try a prefill step?
+    <x-a><p>ALL points are at multiples of 70, ANY points at multiples of 100 ({{cite csrc/engine/scheduler.hpp:308-309}}, {{cite deepinfer/environ.py:174-177}}). After 71, the next multiple of 70 is 140, and the next multiple of 100 is 100. So the scheduler tries at <code>decode_step</code> = 100 (an ANY point). With one rank, ANY and ALL give the same result.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,183 @@
+---
+title: GPUs, kernels, and speed
+nav_title: GPUs, kernels, and speed
+level: Beginner
+prerequisites: learn/transformer, learn/batching
+related: concepts/hardware-platforms, concepts/tilelang-kernels, concepts/cuda-graphs, concepts/zero-overhead-scheduling, learn/number-formats, code/cuda-graph-runner, code/tilelang-ops
+summary: A GPU runs small programs (kernels) on many compute units at the same time. Speed depends on memory traffic, math and launch cost. DeepInfer uses TileLang kernels for NVIDIA and Ascend, and CUDA graphs for decode.
+---
+<x-sentence>A GPU runs kernels on many compute units at the same time. A kernel is fast only when it does not wait for memory or for the CPU.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>What is inside a GPU?</h3>
+<p>A {{term gpu}} is a chip with many small compute units. NVIDIA calls one unit a <em>Streaming Multiprocessor</em> ({{term sm}}). A data-center GPU has more than 100 SMs. Each SM runs many threads at the same time, and has {{term tensor-core | Tensor Cores}} that multiply small matrix tiles in one instruction.</p>
+<p>The memory has levels. Far memory is large and slow. Near memory is small and fast:</p>
+<table>
+  <thead><tr><th>Level</th><th>Where</th><th>Size (rounded)</th><th>Who uses it</th></tr></thead>
+  <tbody>
+    <tr><td>{{term hbm | HBM}} (device memory)</td><td>next to the chip</td><td>80-192 GB, 3-8 TB/s</td><td>everything: weights, KV cache, activations</td></tr>
+    <tr><td>L2 cache</td><td>on the chip</td><td>tens of MB</td><td>all SMs (shared)</td></tr>
+    <tr><td>{{term smem | shared memory}} (SMEM)</td><td>in each SM</td><td>up to about 228 KiB</td><td>the threads of one thread block</td></tr>
+    <tr><td>{{term register | registers}}</td><td>in each SM</td><td>256 KiB per SM</td><td>one thread each</td></tr>
+  </tbody>
+</table>
+<x-simplified><p>The numbers are rounded values for recent NVIDIA data-center GPUs. For example, an H100 has 132 SMs, 80 GB of HBM and a 50 MB L2 cache. Each GPU model has its own exact values. This site does not depend on them.</p></x-simplified>
+
+<h3>Kernels and launches</h3>
+<p>A {{term kernel}} is one program that runs on the device. The CPU starts it with a {{term kernel-launch}}. The launch gives a <em>grid</em> of <em>thread blocks</em>. Each block runs on one SM, and all its threads run the same code on different data.</p>
+<p>A typical kernel has three phases:</p>
+<ol>
+  <li>Load a tile of data from HBM into shared memory or registers.</li>
+  <li>Compute on the tile.</li>
+  <li>Write the result back to HBM.</li>
+</ol>
+<p>A model forward pass is a long list of kernels: matrix multiplies ({{term gemm | GEMMs}}), attention, norms, activations and communication. One launch costs a few microseconds of CPU time.</p>
+
+<h3>Memory-bound and compute-bound</h3>
+<p>A kernel waits for one of two things: bytes from memory, or math. The {{term arithmetic-intensity}} of a kernel tells which one:</p>
+<pre><code class="language-none">arithmetic intensity = FLOPs / bytes moved        (FLOP per byte)
+attainable FLOP/s    = min(peak FLOP/s, bandwidth × intensity)
+ridge point          = peak FLOP/s / bandwidth</code></pre>
+<p>This is the {{term roofline}} model. A kernel with an intensity below the ridge point is {{term memory-bound}}. A kernel above it is {{term compute-bound}}.</p>
+<p><strong>A worked example.</strong> Take a BF16 peak of 2,250 TFLOP/s. DeepInfer uses this value for NVIDIA SM100 on x86 (see "In DeepInfer"). Take an illustrative HBM bandwidth of 8 TB/s. The ridge point is 2,250 / 8 ≈ 281 FLOP per byte.</p>
+<ul>
+  <li><strong>Element-wise add of two BF16 vectors.</strong> 1 FLOP per element; 6 bytes per element (read 2 + 2, write 2). Intensity 1/6. Always memory-bound.</li>
+  <li><strong>Decode GEMM, 1 token.</strong> Weight [4,096, 4,096] BF16. About 2 FLOPs per weight, 2 bytes per weight. Intensity about 1. Memory-bound: 4.2 µs to read 33.6 MB, but only 0.015 µs of math.</li>
+  <li><strong>Prefill GEMM, 4,096 tokens.</strong> Same weight. Intensity about 4,096 / 3 ≈ 1,365. Compute-bound.</li>
+</ul>
+<p>For a GEMM with a small batch, the intensity is about the batch size (deep dive "The roofline, with formulas"). So a memory-bound GEMM gets more tokens almost for free. The page {{link learn/batching}} uses this result.</p>
+
+<h3>Streams and events</h3>
+<p>The CPU does not wait for each kernel. It puts kernels into a {{term cuda-stream | stream}}, a queue that the device runs in order. Kernels in two different streams can run at the same time. For example, a communication kernel can run next to a compute kernel.</p>
+<p>An {{term cuda-event | event}} is a marker in a stream. The CPU can record an event and later wait for it. Another stream can also wait for it. Events let the CPU continue with useful work and stop only at the point where it needs a result.</p>
+
+<h3>CUDA graphs: why launch overhead matters</h3>
+<p>A decode step has small kernels. Many of them finish in a few microseconds, which is about the time that the CPU needs to launch one kernel. Then the device waits for the CPU between kernels.</p>
+<p>A {{term cuda-graph}} solves this. The engine runs the forward pass once in <em>capture</em> mode: the driver records every launch and does not run it. Later, one <code>replay()</code> call starts the whole list. The CPU cost is one call instead of hundreds.</p>
+<p>A graph records fixed addresses and fixed shapes. So the engine captures one graph per batch size, and pads a batch up to the next captured size.</p>
+<p><strong>A worked example (illustrative).</strong> A decode step has 800 kernels. Each launch takes 4 µs of CPU time, and the kernels take 6 ms of device time in total. Eager launches need 800 × 4 µs = 3.2 ms of CPU time. That is about half of the device time, and any CPU delay adds to the step. With a graph, the CPU needs one call, and the kernels start one after the other with no gaps.</p>
+
+<h3>NPUs in brief</h3>
+<p>An {{term npu}} is Huawei's Ascend AI chip. The same ideas apply: device memory (HBM), compute units, kernels, streams, events and graphs. The compute unit is the <em>AI Core</em>, with a Cube unit for matrix math and a Vector unit for other math. The software stack is {{term cann}}, and PyTorch reaches it through {{term torch-npu}}.</p>
+<x-simplified><p>This is only an outline of the Ascend design. The page {{link concepts/hardware-platforms}} explains what DeepInfer changes on Ascend.</p></x-simplified>
+
+<h3>An everyday comparison</h3>
+<p>Think of a large kitchen. The storeroom (HBM) holds all food, but it is far away. Each cook (SM) has a small worktop (shared memory) and two hands (registers). A cook carries food to the worktop, cooks it, and carries the dish back. If a dish needs little cooking, the cooks spend most of their time walking: the kitchen is memory-bound. The head chef (CPU) gives orders one at a time. A CUDA graph is a printed list of all orders for the evening.</p>
+<p>The comparison stops here: real cooks do different tasks, but all threads of a GPU block do the <em>same</em> instruction on different data. And the device does not get tired: speed depends only on bytes, FLOPs and launches.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2_gpu_roofline" alt="Panel 1: HBM with 80 to 192 GB at 3 to 8 TB/s feeds an L2 cache of tens of MB, which feeds each SM; an SM has up to about 228 KiB of shared memory, 256 KiB of registers and Tensor Cores. Panel 2: a roofline chart on log axes; the memory line rises with 8 TB/s times intensity until the ridge at about 281 FLOP per byte, then the roof is flat at 2,250 TFLOP/s. Decode GEMMs with 1 and 64 tokens sit on the memory line; GEMMs with 512 and 4,096 tokens sit on the roof. Panel 3: eager mode needs one CPU launch per kernel, with GPU gaps; a CUDA graph needs one replay call and the kernels run back to back." caption="Figure: panel 1 shows the memory levels. Panel 2 shows that decode GEMMs sit on the memory slope. Panel 3 shows why a graph removes the gaps between small kernels. Click the diagram to zoom." />
+<p>Read panel 2 from left to right. A kernel moves right when it does more math per byte, for example with a larger batch. Below the ridge, the kernel goes as fast as memory allows. Above the ridge, it goes as fast as the math units allow.</p>
+
+<h2>In DeepInfer</h2>
+<p>This is a basics page, so this part only gives pointers. The concept pages go further.</p>
+<ol>
+  <li><strong>One kernel folder per platform.</strong> DeepInfer writes its own kernels in {{term tilelang}}. The dispatcher <code>ops.py</code> imports the folder <code>cuda</code> or <code>asc</code>, from the {{term platform}} object. It then re-exports every factory whose name ends in <code>_tl</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/ops.py:13-22}}). See {{link concepts/tilelang-kernels}}.</li>
+  <li><strong>CUDA graphs for decode.</strong> The model runner replays a captured graph only in decode steps. Prefill steps run eagerly ({{cite deepinfer/worker/model_runner.py:182}}). See {{link concepts/cuda-graphs}}.</li>
+  <li><strong>Two kinds of device.</strong> The README lists NVIDIA SM100 GPUs and Huawei Ascend 950 NPUs ({{cite README.md:33-36}}). For the peak BF16 rate, DeepInfer uses 2,250 TFLOP/s (SM100, x86), 2,500 (SM100, ARM) or 432 (Ascend):</li>
+</ol>
+<x-code file="deep_cluster/hardware/device.py" lines="151-164" highlight="153,155,164" caption="The stats logger uses twice this value as the FP8 peak ({{cite deepinfer/engine/llm_engine.py:304}}). An NVIDIA GPU that is not SM 10.x raises <code>unknown GPU type</code>. See {{link concepts/hardware-platforms}}." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The roofline, with formulas and worked numbers">
+<p><strong>GEMM.</strong> For <code>C[M, N] = A[M, K] × B[K, N]</code>, with <em>b</em> bytes per value:</p>
+<pre><code class="language-none">FLOPs = 2·M·N·K                         (one multiply and one add per term)
+bytes = b·(M·K + K·N + M·N)             (read A, read B, write C, once each)
+intensity = 2·M·N·K / (b·(M·K + K·N + M·N))</code></pre>
+<p>In decode, <em>M</em> (tokens) is small and <em>N</em>, <em>K</em> (weight size) are large. Then <code>K·N</code> dominates the bytes, and intensity ≈ <code>2·M / b</code>. For BF16 (<em>b</em> = 2) that is about <em>M</em>. For FP8 weights (<em>b</em> = 1 for the weight) it is about <code>2·M</code>: smaller weights also make a GEMM less memory-bound. See {{link learn/number-formats}}.</p>
+<p><strong>Worked numbers.</strong> <em>N</em> = <em>K</em> = 4,096, BF16, peak 2,250 TFLOP/s, bandwidth 8 TB/s. Time = max(bytes / bandwidth, FLOPs / peak).</p>
+<table>
+  <thead><tr><th>M</th><th>FLOPs</th><th>Bytes</th><th>Intensity</th><th>Memory time</th><th>Math time</th><th>Bound by</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>33.6 M</td><td>33.6 MB</td><td>1.0</td><td>4.2 µs</td><td>0.015 µs</td><td>memory</td></tr>
+    <tr><td>64</td><td>2.15 G</td><td>34.6 MB</td><td>62</td><td>4.3 µs</td><td>0.95 µs</td><td>memory</td></tr>
+    <tr><td>281</td><td>9.4 G</td><td>38.2 MB</td><td>247</td><td>4.8 µs</td><td>4.2 µs</td><td>memory (close)</td></tr>
+    <tr><td>512</td><td>17.2 G</td><td>42.0 MB</td><td>409</td><td>5.2 µs</td><td>7.6 µs</td><td>math</td></tr>
+    <tr><td>4,096</td><td>137 G</td><td>101 MB</td><td>1,365</td><td>12.6 µs</td><td>61 µs</td><td>math</td></tr>
+  </tbody>
+</table>
+<p>From <em>M</em> = 1 to <em>M</em> = 64, the work grows 64 times, but the time grows only from 4.2 µs to 4.3 µs.</p>
+<p><strong>Attention in decode.</strong> Attention reads the KV cache of each sequence once per step. Its intensity does not grow with the batch, because each sequence has its own cache. With classic multi-head attention, it does only a few FLOPs per byte, so decode attention stays memory-bound. In DeepInfer, all query heads share one KV head, and a decode step sends 6 tokens per sequence. Both give more FLOPs per cache byte, but the intensity still does not grow with the batch. In DeepInfer, one main cache entry (one token, or one compressed group of tokens) is 528 bytes (FP8) or 288 bytes (FP4) per layer ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-128}}). Smaller entries mean less to read; see {{link learn/kv-cache}}.</p>
+<x-simplified><p>Real kernels do not reach the full peak, caches can serve some reads, and many kernels overlap. The roofline gives an upper limit and the right intuition, not an exact time.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Grids, blocks and threads: one DeepInfer kernel">
+<p>The <code>gather</code> kernel copies rows of a table: <code>y[i] = x[index[i]]</code>. The embedding layer uses it to look up token vectors ({{cite deepinfer/model_executor/layers/vocab_parallel_embedding.py:22-24}}). It is short, so it shows the parts of a kernel well:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/cuda/gather.py" lines="14-67" highlight="19,33-41,49,52-53,67" />
+<ol>
+  <li>Lines 14-20: <code>gather_tl</code> is a {{term kernel-factory}}. Its arguments are compile-time values: row width <code>D</code> in bytes, dtypes, stride, and 256 threads per block. TileLang compiles one kernel per set of values.</li>
+  <li>Lines 24-41: the factory picks a tile. <code>BD</code> bytes of a row and <code>BM</code> rows go to one block. <code>nbd × nbm</code> is the number of blocks.</li>
+  <li>Line 49: <code>T.Kernel(nbd * nbm, threads=threads)</code> is the launch grid: one dimension of blocks, 256 threads each.</li>
+  <li>Lines 52-53: <code>T.alloc_fragment</code> makes buffers in registers, spread over the threads of the block.</li>
+  <li>Lines 58-67: each block loads its index values and reads the rows from HBM into registers. An index out of range gives zeros. Then the block copies the rows to the output in HBM.</li>
+</ol>
+<p><strong>Worked example.</strong> The interface views every tensor as int8 bytes ({{cite deepinfer/model_executor/layers/tilelang_ops/gather.py:56-59}}). A BF16 row of 4,096 values is 8,192 bytes, so <code>D</code> = 8,192. Take 1,536 tokens.</p>
+<ol>
+  <li><code>D</code> &gt; 128, so <code>C</code> = 16,384 and <code>reg_buf_size</code> = 4,096 (lines 30-34).</li>
+  <li><code>BD</code> = min(next power of 2 of 8,192, 16,384) = 8,192. <code>BM</code> = 16,384 / 8,192 = 2 rows per block.</li>
+  <li><code>buf_n</code> = 4,096 bytes; <code>buf_m</code> = min(2, 4,096 / 4,096) = 1. One pass moves 4,096 bytes with 256 threads: 16 bytes per thread, one vector load. The comment on line 31 gives this aim.</li>
+  <li><code>nbd</code> = 1 and <code>nbm</code> = ceil(1,536 / 2) = 768. The grid has 768 blocks of 256 threads.</li>
+</ol>
+<p>The kernel does no math at all: it reads 12.6 MB and writes 12.6 MB. It is fully memory-bound, so its only aim is wide, aligned memory access.</p>
+</x-deepdive>
+
+<x-deepdive title="Streams, events and SMs for communication in DeepInfer">
+<p><strong>Events mark the end of a step.</strong> After the sampler is launched, the worker records <code>sample_end_evt</code> ({{cite deepinfer/worker/worker.py:167-168}}). The CPU waits on it in the post-processing of that step ({{cite deepinfer/worker/worker.py:262-263}}). With {{term zos}}, the worker post-processes a decode step one step later, so in between the CPU prepares the next step. A prefill step, or a run without ZOS, is post-processed at once ({{cite deepinfer/worker/worker.py:182-187}}). See {{link concepts/zero-overhead-scheduling}}.</p>
+<p><strong>No hidden synchronization.</strong> The forward launch runs inside <code>forbid_cuda_sync()</code> ({{cite deepinfer/worker/model_runner.py:321-329}}). The guard raises on any blocking copy or stream synchronize in that scope. Event waits are not covered, so planned sync points still work ({{cite deepinfer/utils.py:119-132}}).</p>
+<p><strong>A side stream for capture.</strong> The CUDA graph runner warms up and captures on its own <code>graph_stream</code>. It first waits for the current stream, and at the end the current stream waits for it ({{cite deepinfer/worker/cuda_graph_runner.py:113-115}}, {{cite deepinfer/worker/cuda_graph_runner.py:137}}).</p>
+<p><strong>Communication takes SMs.</strong> A communication kernel runs on SMs too. DeepInfer limits the SMs that each library may use:</p>
+<ul>
+  <li>NCCL groups get <code>max_ctas = min_ctas = DEEPINFER_NCCL_NUM_SMS</code>, default 32 ({{cite deepinfer/platform.py:75-83}}, {{cite deepinfer/environ.py:108}}).</li>
+  <li>For the MoE buffer, if <code>DEEPINFER_USERBUFFER_COMM_SMS</code> is 0 (the default), DeepInfer asks DeepEP for the SMs it needs. It always keeps <code>min(32, SMs / 4)</code> SMs for compute ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:86-90}}).</li>
+  <li>While the shared expert runs, <code>limit_num_sms</code> tells the GEMM libraries to leave <code>DEEPINFER_USERBUFFER_COMM_SMS</code> SMs free for the MoE communication ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:40-51}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:602-603}}).</li>
+</ul>
+<p><strong>Worked example.</strong> A device has 148 SMs, and DeepEP asks for 64. Compute keeps min(32, 148 // 4) = 32 SMs. Communication gets min(64, 148 − 32) = 64 SMs. While the shared expert runs, the GEMM libraries use 148 − 64 = 84 SMs.</p>
+</x-deepdive>
+
+<x-deepdive title="CUDA graphs in DeepInfer: sizes, capture and replay">
+<p><strong>Which sizes.</strong> The runner captures graphs up to <code>max_num_seqs × (1 + nextn)</code> tokens ({{cite deepinfer/worker/model_runner.py:76-79}}). The size list has powers of two below the interval, then steps of the interval ({{cite deepinfer/worker/cuda_graph_runner.py:41-51}}):</p>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="41-51" />
+<p>Worked example with the defaults: 256 × 6 = 1,536 and interval 8 (<code>DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL</code>, {{cite deepinfer/environ.py:155}}). The list is [1, 2, 4, 8, 16, 24, …, 1,528, 1,536]: 3 + 191 + 1 = 195 graphs.</p>
+<p><strong>Capture</strong> ({{cite deepinfer/worker/cuda_graph_runner.py:82-141}}):</p>
+<ol>
+  <li>Build input metadata for the largest size, with placeholder sequences, and copy it to the device (lines 93-96).</li>
+  <li>Go from the largest size to the smallest (line 102). Each size uses slices of the same buffers (lines 104-110).</li>
+  <li>Run the model once to warm up (lines 112-115). Then capture it into a <code>torch.cuda.CUDAGraph</code> (lines 124-128).</li>
+  <li>All graphs share one memory pool: the first graph makes it, the others reuse it (lines 139-140). The first graph is the largest one.</li>
+</ol>
+<p><strong>Replay.</strong> For a decode batch of <code>total_q</code> tokens, <code>select()</code> takes the smallest captured size that is not smaller ({{cite deepinfer/worker/cuda_graph_runner.py:143-148}}). The runner fills the static input buffers and pads with placeholder entries ({{cite deepinfer/worker/model_runner.py:184-191}}). Then <code>replay()</code> calls <code>graph.replay()</code> once ({{cite deepinfer/worker/cuda_graph_runner.py:150-154}}).</p>
+<p>Example: 37 sequences × 6 tokens = 222 tokens. The graph of size 224 runs, with 2 padding tokens (0.9 % waste). With 3 tokens, the graph of size 4 runs.</p>
+<p><strong>Ascend.</strong> On NPU the same class works through <code>torch.cuda</code>, which <code>torch_npu</code> maps to <code>torch.npu</code> ({{cite deepinfer/platform.py:120-123}}). NPU graphs have no <code>keep_graph</code> argument and need no <code>instantiate()</code> ({{cite deepinfer/worker/cuda_graph_runner.py:121-132}}).</p>
+<p><strong>Switches.</strong> <code>DEEPINFER_ENFORCE_EAGER</code> turns graphs off, and a PROMPT engine never uses them ({{cite deepinfer/worker/model_runner.py:73}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A batch larger than the largest graph.</strong> <code>select()</code> raises <code>ValueError("No captured graph for total_q=...")</code> ({{cite deepinfer/worker/cuda_graph_runner.py:144-146}}). The scheduler normally prevents this, because a decode batch has at most <code>max_num_seqs × (1 + nextn)</code> tokens.</li>
+  <li><strong>A sync inside the forward pass.</strong> A <code>.item()</code> or <code>.cpu()</code> in model code raises under <code>forbid_cuda_sync()</code>. For debugging only, <code>DEEPINFER_DISABLE_SYNC_GUARD=1</code> turns the guard off ({{cite deepinfer/utils.py:127-131}}).</li>
+  <li><strong>A kernel that one platform does not have.</strong> If the selected backend has no factory with that name, <code>ops</code> raises <code>KernelUnavailableError</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/ops.py:25-32}}).</li>
+  <li><strong>An unsupported NVIDIA GPU.</strong> <code>get_bf16_tflops_limit()</code> raises <code>RuntimeError("unknown GPU type")</code> for an NVIDIA GPU that is not SM 10.x ({{cite deep_cluster/hardware/device.py:151-156}}). The engine calls it at start-up ({{cite deepinfer/engine/llm_engine.py:304}}).</li>
+  <li><strong>Eager mode is slow.</strong> With <code>DEEPINFER_ENFORCE_EAGER=1</code>, every decode kernel needs its own launch, so small batches become CPU-bound.</li>
+</ul>
+<p><strong>Why it matters.</strong> Most inference speed work does one of three things. It moves fewer bytes (smaller formats, fused kernels). It does more math per byte (larger batches). Or it removes CPU gaps (graphs, overlap). When you read a DeepInfer optimization, ask which of the three it does.</p>
+
+<x-quiz>
+  <x-q level="easy">A kernel adds two vectors element by element. Is it memory-bound or compute-bound? Why?
+    <x-a><p>Memory-bound. It does 1 FLOP for every 6 bytes it moves (two BF16 reads, one BF16 write). Its intensity, 1/6 FLOP per byte, is far below any ridge point.</p></x-a>
+  </x-q>
+  <x-q level="medium">The peak is 2,250 TFLOP/s and the bandwidth is 8 TB/s. A BF16 GEMM has a 4,096 × 4,096 weight. About how many tokens must it have before math sets its time?
+    <x-a><p>The ridge point is 2,250 / 8 ≈ 281 FLOP per byte. For a small batch, the intensity is about the batch size <em>M</em>. So <em>M</em> must be about 281 or more. The deep dive table gives 4.8 µs for memory and 4.2 µs for math at <em>M</em> = 281. At 512, math wins.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does DeepInfer capture many CUDA graphs and not only one?
+    <x-a><p>A graph records fixed shapes and addresses, so it fits only one batch size. The runner captures one graph per size in a list (195 sizes with the defaults) and pads a batch up to the next size ({{cite deepinfer/worker/cuda_graph_runner.py:41-51}}, {{cite deepinfer/worker/cuda_graph_runner.py:143-148}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A decode step has 50 sequences, each with 6 tokens, and the defaults are in use. Which graph size runs, and how many padding tokens does it have?
+    <x-a><p>50 × 6 = 300 tokens. The sizes above 8 are multiples of 8, so <code>bisect_left</code> selects 304 ({{cite deepinfer/worker/cuda_graph_runner.py:143-148}}). Padding: 304 − 300 = 4 tokens.</p></x-a>
+  </x-q>
+  <x-q level="hard">A device has 132 SMs. DeepEP asks for 128 SMs and <code>DEEPINFER_USERBUFFER_COMM_SMS</code> is not set. How many SMs does DeepInfer give to MoE communication?
+    <x-a><p>Compute keeps min(32, 132 // 4) = 32 SMs. Communication gets min(128, 132 − 32) = 100 SMs ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:86-90}}).</p></x-a>
+  </x-q>
+</x-quiz>
