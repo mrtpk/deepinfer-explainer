@@ -1,0 +1,170 @@
+---
+title: CUDA graphs
+nav_title: CUDA graphs
+level: Intermediate
+prerequisites: learn/gpus-kernels, learn/prefill-decode, concepts/input-metadata
+related: code/cuda-graph-runner, code/model-runner, code/input-metadata, concepts/zero-overhead-scheduling, concepts/dspark, code/dflash, tours/life-of-a-request
+summary: At start-up DeepInfer records the decode forward pass once for each of a list of batch sizes. Each decode step then pads its rows to the next recorded size and replays the recording with one call.
+---
+<x-sentence>DeepInfer records the decode forward pass once per batch size at start-up, then replays the recording in each decode step to save CPU launch time.</x-sentence>
+
+<h2>The idea</h2>
+<p>One forward pass of the model starts many {{term kernel | kernels}} on the device. For each one, the CPU does a {{term kernel-launch}}, which costs CPU time. In a prefill step, each kernel works on thousands of tokens, so the launch cost is small next to the device work. In a decode step, each kernel works on only a few rows (1 + 5 per sequence). Then the CPU can need more time to launch the kernels than the device needs to run them.</p>
+<p>A {{term cuda-graph}} removes most of this cost. The CPU records all launches of one forward pass once. Later, one call replays the whole recording. The recording keeps the kernel arguments, also the memory addresses of the input and output tensors. So a replay must use the same buffers and the same number of rows.</p>
+<p>DeepInfer therefore does three things:</p>
+<ol>
+  <li><strong>Capture at start-up.</strong> It records one graph for each size in a list, for example 1, 2, 4, 8, 16 and 24 rows ({{term graph-capture}}).</li>
+  <li><strong>Pad.</strong> A decode step with 12 rows uses the graph of size 16. It adds 4 {{term graph-padding | padding rows}}.</li>
+  <li><strong>Replay.</strong> The step writes its {{term input-metadata}} into the fixed input buffers of that graph, and replays it.</li>
+</ol>
+<p>Prefill steps do not use graphs. They run in {{term eager-mode}}.</p>
+<p><strong>An everyday comparison.</strong> Think of a coffee machine with programmed buttons. The first time, you program the button "medium": the amount of water, the grind, the time. After that, one press makes a medium coffee. You cannot program a button for every possible amount, so the machine has a few sizes, and you take the next larger cup. The comparison stops at one point: DeepInfer fills the extra space in the cup with padding rows, and it throws their results away.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4a_graph_lifecycle" alt="Three panels. Panel 1, start-up: full input buffers for 24 placeholder rows go through a capture loop for sizes 24, 16, 8, 4, 2, 1 (cut views, warm-up, clear derived fields, record, keep the pool of the first graph) into a dict of graphs. Panel 2, each decode step: select(12) gives 16, the buffers get 12 real and 4 padding rows, replay runs all kernels with one call; a note says that too many rows raise ValueError. Panel 3: four cases that run without a graph: prefill, DEEPINFER_ENFORCE_EAGER=1, a PROMPT engine, and before the capture." caption="Figure: capture once at start-up (panel 1), then select, fill and replay in each decode step (panel 2). Panel 3 lists the eager cases. Click to zoom." />
+<p>Read the panels from top to bottom. Panel 1 runs once, inside <code>warm_up_model</code>. Panel 2 runs in every decode step. All graphs share one set of input buffers: each graph uses the first rows of the size-24 buffers.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: decide if graphs are on</h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="72-91" highlight="73,77,80-85" />
+<ol>
+  <li>Line 73: graphs are on unless <code>DEEPINFER_ENFORCE_EAGER</code> is set or the engine is a PROMPT engine. A PROMPT engine does only prefill, so it has no decode step to speed up.</li>
+  <li>Line 77: the largest graph has <code>max_num_seqs × (1 + nextn)</code> rows: every sequence sends its last token plus <code>nextn</code> draft tokens.</li>
+  <li>Line 78: with {{term zos}} on, the input buffers are on the device (<code>input_on_device</code>).</li>
+  <li>Lines 80-91: the {{term dflash}} draft model gets its own graph runner, with its own sizes.</li>
+</ol>
+
+<h3>Step 2: the list of sizes</h3>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="41-51" />
+<p>Below the interval, the sizes are powers of two. From the interval on, they grow in steps of the interval. The last size is the maximum. The interval is <code>DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL</code>, default 8 ({{cite deepinfer/environ.py:155}}).</p>
+<ul>
+  <li><code>examples/offline_inference.py</code> sets <code>max_num_seqs=4</code> ({{cite examples/offline_inference.py:54}}): 24 rows, sizes <code>[1, 2, 4, 8, 16, 24]</code>.</li>
+  <li>The default <code>max_num_seqs</code> is 256 ({{cite deepinfer/engine/arg_utils.py:36}}): 1536 rows, 195 sizes from <code>[1, 2, 4, 8, 16, …]</code> to <code>[…, 1520, 1528, 1536]</code>.</li>
+</ul>
+
+<h3>Step 3: capture at start-up</h3>
+<p>The engine calls <code>warm_up_model</code> on all ranks after it makes the KV cache ({{cite deepinfer/engine/llm_engine.py:457}}). That function captures the main graphs, then the DFlash graphs ({{cite deepinfer/worker/base.py:274-285}}). The capture itself:</p>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="93-141" highlight="93-96,102,108-110,113-115,117-119,125-127,139-141" />
+<ol>
+  <li>Lines 93-96: one input object for the maximum size, built from placeholder sequences of one row each, and one output buffer.</li>
+  <li>Line 102: the loop starts with the largest size.</li>
+  <li>Lines 108-110: each size gets views of the first <code>bs</code> rows. The views share memory with the full buffers.</li>
+  <li>Lines 113-115: a warm-up run outside the recording.</li>
+  <li>Lines 117-119: the fields that the forward pass computes from the inputs are set to <code>None</code>. So the recording contains the kernels that compute them (deep dive).</li>
+  <li>Lines 125-127: the recording. The output copy into the shared output buffer is also recorded.</li>
+  <li>Lines 139-141: the first graph sets the {{term graph-memory-pool}}; all smaller graphs reuse it.</li>
+</ol>
+
+<h3>Step 4: select, pad and fill in each decode step</h3>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="143-154" />
+<p><code>bisect_left</code> finds the smallest size that is not less than <code>total_q</code>. The model runner then adds padding sequences and lets the input builder write straight into the graph's buffers:</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="182-191" highlight="182,185,187-188" />
+<p>Line 182 is the rule for graph use: a decode step, graphs on, and graphs already captured. The page {{link concepts/input-metadata}} shows the 16 rows of this example.</p>
+
+<h3>Step 5: replay</h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="321-329" highlight="326-329" />
+<p>The replay runs inside <code>forbid_cuda_sync()</code>, a {{term sync-guard}}. The call returns at once; the device works in the background. The output object has <code>graph_size</code> rows. The sampler reads only the real rows ({{link code/prepare-sample-cpp}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="What the recording contains, step by step">
+<p><code>_run_model</code> is the function that runs both in the warm-up and in the recording:</p>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="54-66" highlight="62-63,64-65" />
+<ol>
+  <li><strong>Input copy (ZOS off only).</strong> With <code>copy_inputs = not input_on_device</code>, line 63 on CP rank 0 copies every tensor of the pinned CPU object into the device object. Because the copy is inside the recording, each replay repeats it. So C++ can write new values into the pinned buffers before each replay.</li>
+  <li><strong>CP broadcast.</strong> With context parallelism, line 65 broadcasts the device tensors from rank 0 to the other ranks. This collective is also recorded.</li>
+  <li><strong>The forward pass.</strong> Line 66. Each attention layer calls <code>compute_attn_info</code>, which expands the short index descriptions (offset pairs) into full index tables ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:371-389}}).</li>
+  <li><strong>The output copy.</strong> <code>output.copy_(model_output)</code> writes into the shared output buffer ({{cite deepinfer/worker/cuda_graph_runner.py:127}}).</li>
+</ol>
+<p><strong>Why the clean list.</strong> After the warm-up, the derived fields already exist. Then <code>compute_attn_info</code> would skip them, and the recording would not contain the kernels that compute them. So the runner sets them to <code>None</code> first: <code>kv_ca_index_len</code>, <code>kv_swa_index</code>, <code>kv_ca_index</code>, <code>mlp_relu_schedule_metadata</code> and <code>flash_mla_sched_meta_dict</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:326-334}}). The docstring says: "Fields to clear (set to None) when reusing a cudagraph; they are recomputed in forward" ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:73}}).</p>
+<p><strong>With ZOS on.</strong> The input builder makes device tensors (<code>device="cuda"</code>, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:113-117}}). Then <code>.cuda()</code> on line 95 returns the same tensors, so the "source" and "device" objects share memory. The docstring of <code>CudaGraphData</code> says this: "Source tensors are on CPU, or share device tensor storage under ZOS" ({{cite deepinfer/worker/cuda_graph_runner.py:28-32}}). No copy is recorded; a device kernel fills the buffers before the replay.</p>
+</x-deepdive>
+
+<x-deepdive title="Memory: one pool, one set of buffers">
+<ul>
+  <li><strong>Input buffers.</strong> One object for the maximum size. A smaller graph uses <code>x[:bs]</code> views ({{cite deepinfer/worker/cuda_graph_runner.py:104-109}}). A comment in <code>profile_decode_perf</code> says, translated: <em>"each batch size shares slice views of the largest buffer; fill once for all graphs"</em> ({{cite deepinfer/worker/model_runner.py:581}}).</li>
+  <li><strong>Output buffer.</strong> <code>model.allocate_output(max_batch_size)</code>, with <code>narrow(batch_size)</code> views ({{cite deepinfer/worker/cuda_graph_runner.py:96}}, {{cite deepinfer/worker/cuda_graph_runner.py:110}}).</li>
+  <li><strong>Temporary tensors.</strong> All graphs use one memory pool. The largest graph is captured first, so its pool is large enough for all others ({{cite deepinfer/worker/cuda_graph_runner.py:125}}, {{cite deepinfer/worker/cuda_graph_runner.py:139-140}}).</li>
+  <li><strong>One side stream.</strong> Warm-up and recording run on <code>graph_stream</code>. The default stream waits for it after each capture ({{cite deepinfer/worker/cuda_graph_runner.py:100}}, {{cite deepinfer/worker/cuda_graph_runner.py:137}}).</li>
+</ul>
+<p>The DFlash graphs reuse the same pool and stream ({{cite deepinfer/worker/model_runner.py:543-549}}). The model runner logs the extra memory of the DFlash graphs, measured with <code>torch.cuda.mem_get_info</code> ({{cite deepinfer/worker/model_runner.py:552-559}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The DFlash graph runner">
+<p>The draft model of {{term speculative-decoding}} has its own runner, <code>DFlashCudaGraphRunner</code>. It differs from the main runner in four points:</p>
+<ol>
+  <li><strong>Sizes count sequences, not rows.</strong> The maximum is <code>max_num_seqs</code>, with the interval <code>DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL</code> (default 8) ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:32-37}}, {{cite deepinfer/environ.py:157}}). With <code>max_num_seqs=4</code>: <code>[1, 2, 4]</code>.</li>
+  <li><strong>It needs the main graphs.</strong> The capture uses the input metadata of the largest main graph, and it asserts that the main graphs exist ({{cite deepinfer/worker/model_runner.py:538-549}}).</li>
+  <li><strong>Inputs are copied in.</strong> <code>replay</code> copies the per-request decode input into the graph's buffers with a kernel, then replays, then cuts the padding from the output ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:84-91}}).</li>
+  <li><strong>Only the driver keeps an output.</strong> <code>do_sample</code> is <code>is_driver_worker</code>. Only with <code>do_sample</code> does the runner make an output buffer, record the copy into it, and return the draft output ({{cite deepinfer/worker/model_runner.py:88-91}}, {{cite deepinfer/worker/dflash_cuda_graph_runner.py:54}}, {{cite deepinfer/worker/dflash_cuda_graph_runner.py:67-71}}, {{cite deepinfer/worker/dflash_cuda_graph_runner.py:90-91}}).</li>
+</ol>
+<p>DFlash graphs are on when the main graphs are on, <code>DEEPINFER_DFLASH_ENFORCE_EAGER</code> is off, <code>nextn &gt; 0</code>, and the model config has <code>dflash_cfg</code> ({{cite deepinfer/worker/model_runner.py:80-85}}). The draft model replays the graph when it has one, else it runs eager ({{cite deepinfer/model_executor/models/mtp/dflash.py:385-387}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Timing inside a graph: the graph timer">
+<p>A normal CUDA {{term cuda-event}} pair cannot measure one layer inside a replay, because the whole graph is one launch. The {{term graph-timer}} records events <em>inside</em> the graph instead.</p>
+<ol>
+  <li>During capture, <code>cuda_graph_timer.record(name)</code> records a start and an end event with the "external" flag. The recording then contains two event-record nodes ({{cite deepinfer/timer.py:100-126}}, {{cite csrc/graph_timer/graph_timer_cuda.cpp:19-22}}).</li>
+  <li>After capture, <code>register_graph</code> finds these nodes in the graph and makes a second set of events ({{cite deepinfer/timer.py:128-167}}).</li>
+  <li>Before each replay, <code>flip_event_buffer</code> points the nodes at the other set of events (ping-pong). So the CPU can read the times of the previous replay while the next one runs ({{cite deepinfer/timer.py:169-187}}, {{cite deepinfer/worker/cuda_graph_runner.py:150-154}}).</li>
+  <li>The worker reads the finished times after the sample event of a step ({{cite deepinfer/worker/worker.py:262-266}}).</li>
+</ol>
+<p>The model uses it for the decode core attention: it times one layer and multiplies by the number of layers with the same shape ({{cite deepinfer/model_executor/models/v4_modules/attn.py:655-658}}). The timer works only on NVIDIA ({{cite deepinfer/timer.py:94-98}}). On Ascend, each event and node function of the C++ timer raises "NPU graph timer primitives are not implemented yet". Only the <code>GraphHandle</code> constructor does not raise ({{cite csrc/graph_timer/graph_timer_asc.cpp:7-43}}). The capture asks for <code>keep_graph=True</code> on NVIDIA only, because the NPU graph does not support it ({{cite deepinfer/worker/cuda_graph_runner.py:121-124}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Graphs and DSpark: the decode performance curve">
+<p>With <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code> ({{term dspark}}), the scheduler needs to know how long a decode step takes for each graph size. So after the capture, <code>profile_decode_perf</code> replays every graph and measures it ({{cite deepinfer/worker/base.py:280-281}}):</p>
+<ol>
+  <li>It fills <code>valid_token_mask</code> and <code>gate_force_random</code> with <code>True</code> once, in the shared buffers ({{cite deepinfer/worker/model_runner.py:582-584}}).</li>
+  <li>For each size: 1 warm-up replay, then 5 timed replays with CUDA events ({{cite deepinfer/worker/model_runner.py:586-608}}).</li>
+  <li>It drops the fastest and the slowest time and takes the mean of the other 3. Then it takes the mean over the expert-parallel group ({{cite deepinfer/worker/model_runner.py:616-623}}).</li>
+  <li>It stores the curve in a cache file, and later runs load it from there ({{cite deepinfer/worker/model_runner.py:576-579}}, {{cite deepinfer/worker/model_runner.py:630}}).</li>
+</ol>
+<p>The engine gives the curve to the C++ scheduler ({{cite deepinfer/engine/llm_engine.py:268}}). See {{link concepts/dspark}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and settings">
+<table>
+  <thead><tr><th>Variable or setting</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_ENFORCE_EAGER</code></td><td>off ({{cite deepinfer/environ.py:154}})</td><td>{{cite deepinfer/worker/model_runner.py:73}}</td><td>No graphs at all: decode runs eager.</td></tr>
+    <tr><td><code>DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL</code></td><td>8 ({{cite deepinfer/environ.py:155}})</td><td>{{cite deepinfer/worker/cuda_graph_runner.py:74}}</td><td>Step between graph sizes. A larger value means fewer graphs and more padding.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_ENFORCE_EAGER</code></td><td>off ({{cite deepinfer/environ.py:156}})</td><td>{{cite deepinfer/worker/model_runner.py:82}}</td><td>No DFlash graphs.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL</code></td><td>8 ({{cite deepinfer/environ.py:157}})</td><td>{{cite deepinfer/worker/dflash_cuda_graph_runner.py:36}}</td><td>Step between DFlash sizes.</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>see {{link concepts/zero-overhead-scheduling}}</td><td>{{cite deepinfer/worker/model_runner.py:78}}</td><td>Buffers on the device; no input copy in the graph.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/worker/model_runner.py:67}}</td><td>Rows per sequence: the largest graph is <code>max_num_seqs × (1 + nextn)</code>.</td></tr>
+    <tr><td><code>max_num_seqs</code></td><td>256 ({{cite deepinfer/engine/arg_utils.py:36}})</td><td>{{cite deepinfer/worker/model_runner.py:77}}</td><td>Size of the largest graph.</td></tr>
+    <tr><td><code>capture_max_graph_only</code></td><td>False</td><td>{{cite deepinfer/worker/base.py:277-278}}</td><td>Captures only the largest graph. <code>examples/benchmark.py</code> uses it ({{cite examples/benchmark.py:237}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Too many rows.</strong> If a decode step has more rows than the largest graph, <code>select</code> raises <code>ValueError("No captured graph for total_q=...")</code> ({{cite deepinfer/worker/cuda_graph_runner.py:144-146}}). There is no eager fallback. A decode sequence sends at most <code>1 + nextn</code> rows ({{cite csrc/engine/prepare_sample.cpp:212}}), and the decode scheduler takes at most <code>max_num_seqs</code> sequences ({{cite csrc/engine/scheduler.hpp:595}}). So this error points at a changed setting or a bug.</li>
+  <li><strong>A CPU wait inside the forward pass.</strong> A sync in recorded code breaks the capture. At run time, the {{term sync-guard}} raises an error on any sync inside the forward and sample launch ({{cite deepinfer/utils.py:119-132}}). <code>DEEPINFER_DISABLE_SYNC_GUARD=1</code> turns the guard off for debugging ({{cite deepinfer/environ.py:198}}).</li>
+  <li><strong>New tensors in the forward pass.</strong> A graph replays fixed addresses. Code that makes a new input tensor each step would not reach the graph. So all decode inputs go through the fixed buffers (<code>out_dict</code>).</li>
+  <li><strong>Hang at shutdown.</strong> NCCL calls inside graphs hold extra resources. The worker destroys the graphs before it destroys the process groups; the code says this avoids a hang ({{cite deepinfer/worker/base.py:142-146}}, {{cite deepinfer/worker/model_runner.py:633-644}}).</li>
+  <li><strong>Start-up time and memory.</strong> With the defaults (<code>max_num_seqs=256</code>, nextn 5, interval 8), the main runner captures 195 graphs. A model with DFlash adds 35 DFlash graphs (sizes up to 256 sequences, {{cite deepinfer/worker/dflash_cuda_graph_runner.py:36}}). The log line "All graph capturing finished in ...s" shows the time ({{cite deepinfer/worker/model_runner.py:528-529}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Graphs make decode steps faster, but they fix the shapes and the memory addresses. When you change the model or the input metadata, keep the decode inputs in the captured buffers, and do not add a CPU wait. Else the replay uses old values, or the step stops with an error.</p>
+
+<x-quiz>
+  <x-q level="easy">Which steps use CUDA graphs in DeepInfer: prefill, decode, or both?
+    <x-a><p>Only decode steps. <code>run_cuda_graph</code> needs <code>not is_prompt</code> ({{cite deepinfer/worker/model_runner.py:182}}). Prefill steps call <code>self.model(...)</code> directly ({{cite deepinfer/worker/model_runner.py:328-329}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">With <code>max_num_seqs=4</code> and the default settings, which graph sizes does DeepInfer capture?
+    <x-a><p><code>[1, 2, 4, 8, 16, 24]</code>. The maximum is <code>4 × (1 + 5) = 24</code> ({{cite deepinfer/worker/model_runner.py:77}}); the interval is 8, so powers of two below 8, then 8 and 16, then 24 ({{cite deepinfer/worker/cuda_graph_runner.py:41-51}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A decode step has 3 sequences with 6 rows each. Which graph does it use, and how many padding rows does it add?
+    <x-a><p><code>total_q = 18</code>. <code>bisect_left</code> over <code>[1, 2, 4, 8, 16, 24]</code> gives 24, so it adds 6 padding sequences of one row each ({{cite deepinfer/worker/cuda_graph_runner.py:143-148}}, {{cite deepinfer/worker/model_runner.py:186-188}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does the capture set fields such as <code>kv_swa_index</code> to <code>None</code> between the warm-up and the recording?
+    <x-a><p>The warm-up run fills them. <code>compute_attn_info</code> computes a field only when it is <code>None</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:371-376}}). Without the reset, the recording would not contain the kernels that compute them, and every replay would reuse the values of the warm-up. The list is <code>get_clean_list()</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:326-334}}). This is in the deep dive "What the recording contains".</p></x-a>
+  </x-q>
+  <x-q level="hard">With ZOS off, C++ writes the decode inputs into pinned CPU buffers. How do the new values reach the device in a replay?
+    <x-a><p>The copy is part of the recording. <code>_run_model</code> calls <code>input_metadata_device.recursive_copy_(input_metadata_source)</code> when <code>copy_inputs</code> is true, which is <code>not input_on_device</code>, and this runs inside <code>torch.cuda.graph(...)</code> ({{cite deepinfer/worker/cuda_graph_runner.py:62-63}}, {{cite deepinfer/worker/cuda_graph_runner.py:125-126}}). So each replay first copies the current CPU values.</p></x-a>
+  </x-q>
+</x-quiz>

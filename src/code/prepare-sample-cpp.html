@@ -1,0 +1,169 @@
+---
+title: engine/prepare_sample.cpp: the sampler inputs
+nav_title: prepare_sample.cpp
+level: Advanced
+prerequisites: concepts/sampler, concepts/input-metadata
+related: code/sampler, code/model-runner, code/engine-pyi, code/sequence-hpp, concepts/speculative-decoding, concepts/dspark, concepts/yoco-swa-replay
+summary: prepare_sampler_inputs reads the scheduled sequences once and builds the arrays that the sampler needs: which model-output rows to sample, per-sequence temperature, top-p, top-k and seed, and the draft-token bookkeeping of speculative decoding.
+---
+<h2>Purpose</h2>
+<p>This file has one public function, <code>prepare_sampler_inputs</code>. It makes the {{term sampler-inputs}} of one step: the rows of the model output that the sampler reads, and the values that each sequence brings.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>csrc/engine/prepare_sample.cpp</code>, 284 lines of C++, and <code>csrc/engine/prepare_sample.hpp</code>, 66 lines (the result structs).</td></tr>
+    <tr><th>Main function</th><td><code>prepare_sampler_inputs</code> ({{cite csrc/engine/prepare_sample.cpp:40-284}}).</td></tr>
+    <tr><th>Runs in</th><td>The driver worker process, on the CPU. It releases the Python GIL for the whole call ({{cite csrc/engine/prepare_sample.cpp:42}}).</td></tr>
+    <tr><th>Called by</th><td><code>ModelRunner.prepare_sampler_inputs</code>, inside <code>execute_sample</code> ({{cite deepinfer/worker/model_runner.py:244-249}}).</td></tr>
+    <tr><th>Calls</th><td><code>torch::empty</code> with pinned memory, and <code>Tensor.to(device, non_blocking=true)</code>. No kernels.</td></tr>
+    <tr><th>Not in this file</th><td>The sampling math (<code>layers/sampler.py</code> and its kernels), the input metadata of the model ({{link code/prepare-tensor-input-v4}}), and the update of the sequences after sampling (<code>process_output.hpp</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4a_sampler_rows" alt="Panel 1, prefill: a strip of 260 output rows, A rows 0-59 and B rows 60-259; the sampled rows 59 and 259 are marked; selected_token_indices [59, 259], sample_positions [260, 200], one temperature per sequence; with YOCO compact and 140 kept tokens the indices are [59, 60]. Panel 2, decode: 16 rows, 6 for C, 6 for D, 4 padding; selected_token_indices 0 to 11, mtp_first_token_positions [0, 6], mtp_seqlens_q [6, 6], sample_positions [301, 129], mtp_info_read_rows, stop_token_ids." caption="Figure: which model-output rows the sampler reads, for the prefill and decode examples of {{link concepts/input-metadata}}. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>ModelRunner.prepare_sampler_inputs</code> on the driver. It passes the sequence list without graph padding, <code>nextn</code>, and the YOCO mode (prefill) or <code>OFF</code> (decode) ({{cite deepinfer/worker/model_runner.py:238-249}}).</li>
+  <li>The binding with default arguments: <code>yoco_prefill_truncation_mode=OFF</code>, <code>yoco_prefill_keep_tokens=0</code> ({{cite csrc/engine/pybind_output.cpp:133-135}}).</li>
+</ul>
+
+<h3>Who reads the result</h3>
+<ul>
+  <li>The sampler gathers the selected hidden-state rows first: <code>gather(hidden_states, selected_token_indices)</code> ({{cite deepinfer/model_executor/layers/sampler.py:125}}, {{cite deepinfer/model_executor/layers/sampler.py:141}}). So it computes logits only for these rows.</li>
+  <li>The prefill EOS rows ({{cite deepinfer/model_executor/layers/sampler.py:184}}), the speculative rows ({{cite deepinfer/model_executor/layers/sampler.py:456}}) and the golden tokens ({{cite deepinfer/model_executor/layers/sampler.py:665-671}}).</li>
+  <li>With context parallelism, the followers get only the row indices by broadcast ({{cite deepinfer/worker/model_runner.py:250-259}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it holds or does</th></tr></thead>
+  <tbody>
+    <tr><td><code>LogitsTransformInputs</code></td><td>{{cite csrc/engine/prepare_sample.hpp:13}}</td><td><code>temperatures</code>, <code>top_ps</code>, <code>top_ks</code>.</td></tr>
+    <tr><td><code>SamplingKernelInputs</code></td><td>{{cite csrc/engine/prepare_sample.hpp:19}}</td><td>The above plus <code>seq_seeds</code> and <code>sample_positions</code>.</td></tr>
+    <tr><td><code>PromptLogprobInputs</code>, <code>PrefillSamplingInputs</code></td><td>{{cite csrc/engine/prepare_sample.hpp:25}}, {{cite csrc/engine/prepare_sample.hpp:32}}</td><td>Prompt log-probability targets; EOS suppression rows.</td></tr>
+    <tr><td><code>SpeculativeSamplingInputs</code></td><td>{{cite csrc/engine/prepare_sample.hpp:38}}</td><td>Draft rows, MTP write slots, stop tokens.</td></tr>
+    <tr><td><code>DecodeSamplingInputs</code></td><td>{{cite csrc/engine/prepare_sample.hpp:45}}</td><td>First row and row count of each sequence.</td></tr>
+    <tr><td><code>DriverSamplingInputs</code>, <code>SamplerInputs</code></td><td>{{cite csrc/engine/prepare_sample.hpp:50}}, {{cite csrc/engine/prepare_sample.hpp:58}}</td><td>The driver part (absent on CP followers) and the top object.</td></tr>
+    <tr><td><code>num_prompt_logprobs</code></td><td>{{cite csrc/engine/prepare_sample.cpp:12}}</td><td><code>seqlen_q</code>, minus 1 on the last prompt chunk; 0 when not asked.</td></tr>
+    <tr><td><code>suppresses_eos</code></td><td>{{cite csrc/engine/prepare_sample.cpp:20}}</td><td>True on the last chunk when <code>first_n_token_no_eos == 1</code>.</td></tr>
+    <tr><td><code>prepare_sampler_inputs</code></td><td>{{cite csrc/engine/prepare_sample.cpp:40}}</td><td>Fills everything and starts the copies to the device.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>Checks and sizes</h3>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="40-78" highlight="42,48-49,61,72-77" />
+<ol>
+  <li>Line 42: the function runs without the GIL, so other Python threads can run.</li>
+  <li>Lines 48-49: a prefill step has no draft tokens to verify, so <code>nextn_token_cnt</code> is 0 there.</li>
+  <li>Line 61: all sequences must be prefill or all decode.</li>
+  <li>Lines 72-77: prefill samples one row per sequence; decode samples every row (<code>seqlen_q</code> rows per sequence).</li>
+</ol>
+
+<h3>Allocation</h3>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="80-88" highlight="82,84-88" />
+<p>Line 82: the number of parameter entries is the number of sequences in both cases. So <code>temperatures</code>, <code>top_ps</code>, <code>top_ks</code>, <code>seq_seeds</code> and <code>sample_positions</code> have one entry per sequence, not per row. All arrays are pinned CPU tensors.</p>
+
+<h3>The prefill branch</h3>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="163-199" highlight="168-180,192-195,197-199">
+  <x-tr line="168">Rows of this request in the model output: keep_len when compaction is on (compact layout), else seqlen_q (full layout).</x-tr>
+  <x-tr line="173-174">The upper bound seqlen_q - 1 means keep_len &gt;= 1: every prefill chunk sends its last token through sampling (the result of a non-final chunk is dropped later), so a chunk that is fully cut still keeps 1 placeholder token, and selected_token_indices always points at a valid model-output row.</x-tr>
+  <x-tr line="182-183">In the full layout model_output_offset equals query_token_offset - seqlen_q; under compaction prompt_logprobs is already turned off by the assert above.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 168-180: with YOCO compact, the model output has only the kept rows. The same <code>clip_prefix</code> formula as in the input builder gives their count.</li>
+  <li>Lines 181-189: prompt log-probabilities. Row <em>j</em> of the chunk predicts prompt token <code>q_start + j + 1</code>.</li>
+  <li>Lines 192-195: on the last chunk with <code>first_n_token_no_eos == 1</code>, the sampler must not pick EOS.</li>
+  <li>Lines 197-199: the sampled row is the last row of the chunk; <code>sample_positions</code> is <code>seqlen_k</code>, the position of the next token.</li>
+</ol>
+
+<h3>The decode branch and the speculative fields</h3>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="200-226" highlight="203-205,206,210-212,221-225" />
+<ol>
+  <li>Lines 203-205: every row of the sequence is sampled. Row <em>j</em> (0 to 4) gives the distribution that checks draft <em>j</em> + 1. The last row samples a new token after the last draft (see lines 221-225).</li>
+  <li>Line 206: <code>sample_positions</code> is the position after the last real token.</li>
+  <li>Lines 210-212: every decode sequence must have exactly <code>nextn</code> draft tokens, and at most <code>1 + nextn</code> rows.</li>
+  <li>Lines 221-225: rows 0 to <code>seqlen_q − 2</code> read the draft information of the sequence's MTP slot. The last row reads slot 0, the padding slot.</li>
+</ol>
+<p>The first loop also writes <code>mtp_first_token_positions</code> and <code>mtp_seqlens_q</code> for every decode sequence ({{cite csrc/engine/prepare_sample.cpp:151-154}}). With ZOS, the Worker first corrects <code>seqlen_q</code> on the CPU metadata from the device values, so these arrays match the real step ({{cite deepinfer/worker/worker.py:147-152}}).</p>
+
+<h3>Golden tokens and the copies</h3>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="229-283" highlight="229-231,234,250-255,257-264" />
+<p>Golden tokens force the sampled result for testing ("golden teacher forcing", {{cite deepinfer/model_executor/layers/sampler.py:92}}). <code>-1</code> means "sample normally". At the end, every array starts a non-blocking copy to the default device. The CPU does not wait for these copies.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="All arrays: shapes and dtypes">
+<p><code>S</code> = number of sequences. <code>R</code> = <code>total_batch_size</code>: <code>S</code> in prefill, the sum of <code>seqlen_q</code> in decode. <code>P</code> = prompt log-probability rows.</p>
+<table>
+  <thead><tr><th>Array</th><th>Shape, dtype</th><th>When</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>selected_token_indices</code></td><td><code>[R]</code> int32</td><td>always</td><td>{{cite csrc/engine/prepare_sample.cpp:83}}</td></tr>
+    <tr><td><code>temperatures</code>, <code>top_ps</code></td><td><code>[S]</code> float32</td><td>always</td><td>{{cite csrc/engine/prepare_sample.cpp:84-85}}</td></tr>
+    <tr><td><code>top_ks</code>, <code>sample_positions</code></td><td><code>[S]</code> int32</td><td>always</td><td>{{cite csrc/engine/prepare_sample.cpp:86}}, {{cite csrc/engine/prepare_sample.cpp:88}}</td></tr>
+    <tr><td><code>seq_seeds</code></td><td><code>[S]</code> uint64</td><td>always</td><td>{{cite csrc/engine/prepare_sample.cpp:87}}</td></tr>
+    <tr><td><code>selected_prompt_indices</code>, <code>prompt_tokens</code></td><td><code>[P]</code> int32</td><td>prefill, when a sequence asks for prompt log-probabilities</td><td>{{cite csrc/engine/prepare_sample.cpp:94-100}}</td></tr>
+    <tr><td><code>eos_suppression_rows</code>, <code>eos_token_ids</code></td><td>C++ vectors</td><td>prefill</td><td>{{cite csrc/engine/prepare_sample.cpp:104-105}}</td></tr>
+    <tr><td><code>mtp_first_token_positions</code>, <code>mtp_seqlens_q</code></td><td><code>[S]</code> int32</td><td>decode</td><td>{{cite csrc/engine/prepare_sample.cpp:109-110}}</td></tr>
+    <tr><td><code>mtp_info_read_rows</code></td><td><code>[R]</code> int32</td><td>decode with <code>nextn &gt; 0</code></td><td>{{cite csrc/engine/prepare_sample.cpp:115}}</td></tr>
+    <tr><td><code>mtp_info_write_slots</code></td><td><code>[S]</code> int32</td><td>same</td><td>{{cite csrc/engine/prepare_sample.cpp:116}}</td></tr>
+    <tr><td><code>stop_token_ids</code></td><td><code>[S, 2]</code> int32</td><td>same</td><td>{{cite csrc/engine/prepare_sample.cpp:117}}</td></tr>
+    <tr><td><code>golden_output</code></td><td><code>[R]</code> int32, -1 = none</td><td>a sequence has golden tokens</td><td>{{cite csrc/engine/prepare_sample.cpp:229-248}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the decode step of the figure">
+<p>Sequences C (<code>seqlen_q = 6</code>, <code>seqlen_k = 306</code>, MTP slot 2) and D (<code>seqlen_q = 6</code>, <code>seqlen_k = 134</code>, MTP slot 1). <code>nextn = 5</code>. The graph has 16 rows, but this function gets only C and D.</p>
+<ol>
+  <li><code>R = 12</code>, <code>S = 2</code>.</li>
+  <li><code>selected_token_indices = [0, 1, …, 11]</code>. Rows 12-15 (padding) are not in it.</li>
+  <li><code>mtp_first_token_positions = [0, 6]</code>, <code>mtp_seqlens_q = [6, 6]</code>.</li>
+  <li><code>sample_positions = [306 − 6 + 1, 134 − 6 + 1] = [301, 129]</code>.</li>
+  <li><code>mtp_info_read_rows</code>: C rows 0-4 read <code>2 × 5 + j = 10 … 14</code>, row 5 reads 0; D rows 6-10 read <code>5 … 9</code>, row 11 reads 0.</li>
+  <li><code>mtp_info_write_slots = [2, 1]</code>. The read slot is the same slot when the sequence has draft information, else 0 ({{cite csrc/engine/sequence.hpp:149-153}}).</li>
+  <li><code>stop_token_ids = [[1, -1], [1, -1]]</code> with the EOS id 1, or <code>-1</code> in the first column when <code>ignore_eos</code> is set.</li>
+</ol>
+<p><strong>The prefill step</strong> of the figure: A (last chunk, <code>q 60</code>, <code>k 260</code>) and B (first chunk, <code>q 200</code>, <code>k 200</code>). <code>selected_token_indices = [59, 259]</code>, <code>sample_positions = [260, 200]</code>. With YOCO compact and 140 kept tokens, B keeps 1 row, so the output has 61 rows and the indices are <code>[59, 60]</code>. B's sampled token is not used, because B is not on its last chunk; the scheduler drops it ({{cite csrc/engine/scheduler.hpp:1011-1020}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths (TORCH_CHECK)">
+<table>
+  <thead><tr><th>Check</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td>At least one sequence; <code>max_mtp_tokens ≥ 0</code></td><td>{{cite csrc/engine/prepare_sample.cpp:44-45}}</td></tr>
+    <tr><td>YOCO compact needs <code>keep_tokens &gt; 0</code></td><td>{{cite csrc/engine/prepare_sample.cpp:52-53}}</td></tr>
+    <tr><td>No mixed prefill and decode batch</td><td>{{cite csrc/engine/prepare_sample.cpp:61}}</td></tr>
+    <tr><td><code>seqlen_q &gt; 0</code> and <code>seqlen_k ≥ seqlen_q</code></td><td>{{cite csrc/engine/prepare_sample.cpp:62-65}}</td></tr>
+    <tr><td>Prompt log-probabilities with YOCO compaction</td><td>{{cite csrc/engine/prepare_sample.cpp:177-178}}</td></tr>
+    <tr><td>Decode draft count equals <code>nextn</code>; rows ≤ <code>nextn + 1</code></td><td>{{cite csrc/engine/prepare_sample.cpp:210-212}}</td></tr>
+    <tr><td>MTP slots not negative</td><td>{{cite csrc/engine/prepare_sample.cpp:214-215}}</td></tr>
+    <tr><td>A token id that does not fit in int32</td><td>{{cite csrc/engine/prepare_sample.cpp:32-36}}</td></tr>
+    <tr><td>Final counters match the sizes</td><td>{{cite csrc/engine/prepare_sample.cpp:250-255}}</td></tr>
+  </tbody>
+</table>
+<p>The engine turns prompt log-probabilities off when YOCO truncation is on, at <code>add_request</code> ({{cite deepinfer/engine/llm_engine.py:529-537}}). So the check at lines 177-178 catches only a bug.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/sampler}} and {{link code/sampler}}: what the sampler does with these arrays.</li>
+  <li>{{link concepts/speculative-decoding}}: drafts, verification and the MTP info pool.</li>
+  <li>{{link concepts/input-metadata}}: the rows of the model output.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">How many temperature values does a decode step with 3 sequences of 6 rows get?
+    <x-a><p>Three, one per sequence. <code>num_sampling_positions</code> is <code>num_seqs</code> in decode ({{cite csrc/engine/prepare_sample.cpp:82}}, {{cite csrc/engine/prepare_sample.cpp:84}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A prefill batch has chunks with <code>seqlen_q</code> 60 and 200. Which output rows does the sampler read?
+    <x-a><p>Rows 59 and 259: the last row of each chunk, <code>model_output_offset + out_len − 1</code> ({{cite csrc/engine/prepare_sample.cpp:197}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In a decode step with <code>nextn = 5</code>, why does the last row of each sequence read MTP slot 0?
+    <x-a><p>The last row has no draft to verify: it samples a fresh token. The comment says "The final row is a fresh sample and reads padding from slot 0" ({{cite csrc/engine/prepare_sample.cpp:224-225}}). Slot 0 is the padding slot that no request uses ({{cite csrc/engine/scheduler.hpp:125-126}}). This is in the deep dive "Worked example".</p></x-a>
+  </x-q>
+</x-quiz>

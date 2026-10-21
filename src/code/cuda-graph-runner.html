@@ -1,0 +1,169 @@
+---
+title: worker/cuda_graph_runner.py: CUDA graph capture and replay
+nav_title: worker/cuda_graph_runner.py
+level: Advanced
+prerequisites: concepts/cuda-graphs, concepts/input-metadata
+related: code/model-runner, code/input-metadata, code/dflash, concepts/dspark, concepts/zero-overhead-scheduling
+summary: CudaGraphRunner records the main model's decode forward once per graph size and replays it; DFlashCudaGraphRunner does the same for the DFlash draft model, per number of sequences.
+---
+<h2>Purpose</h2>
+<p>These two small files hold the {{term cuda-graph}} logic: they build the list of sizes, record one graph per size at start-up, pick the right graph for a step, replay it, and free it at shutdown.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/worker/cuda_graph_runner.py</code>, 168 lines. <code>deepinfer/worker/dflash_cuda_graph_runner.py</code>, 100 lines.</td></tr>
+    <tr><th>Main classes</th><td><code>CudaGraphRunner</code> ({{cite deepinfer/worker/cuda_graph_runner.py:69}}) and <code>DFlashCudaGraphRunner</code> ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:31}}). Data classes <code>CudaGraphData</code> and <code>DFlashCudaGraphData</code>; the function <code>build_graph_batch_sizes</code>.</td></tr>
+    <tr><th>Runs in</th><td>Every worker process (driver and context-parallel followers), on the device of that rank.</td></tr>
+    <tr><th>Called by</th><td><code>ModelRunner</code> (capture, select, replay, destroy); <code>Worker._correct_seqlens_qk</code> (select only); the DFlash model (DFlash replay).</td></tr>
+    <tr><th>Calls</th><td><code>torch.cuda.CUDAGraph</code>, the model's forward, the {{term graph-timer}}, the DFlash <code>run_drafts</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The decision to use a graph (<code>ModelRunner</code>), the values in the input buffers (the input builder), and the padding sequence (<code>ModelRunner._placeholder_seq_metadata</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4a_graph_lifecycle" alt="Three panels: capture at start-up into a dict of graphs that share the size-24 buffers and one memory pool; select, fill and replay in each decode step; the cases that run eager." caption="Figure: what the runner makes at start-up and what it does in each decode step. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>ModelRunner.__init__</code> makes both runners when graphs are on ({{cite deepinfer/worker/model_runner.py:75-91}}).</li>
+  <li><code>ModelRunner.capture_model</code> and <code>capture_dflash_model</code> call <code>capture</code> at start-up ({{cite deepinfer/worker/model_runner.py:521-526}}, {{cite deepinfer/worker/model_runner.py:543-549}}).</li>
+  <li><code>ModelRunner._prepare_input_driver</code> and <code>_prepare_input_follower</code> call <code>select</code>; <code>execute_main_model</code> calls <code>replay</code> ({{cite deepinfer/worker/model_runner.py:185}}, {{cite deepinfer/worker/model_runner.py:224}}, {{cite deepinfer/worker/model_runner.py:327}}).</li>
+  <li><code>Worker._correct_seqlens_qk</code> calls <code>select</code> to count the padding sequences for ZOS ({{cite deepinfer/worker/worker.py:203-205}}).</li>
+  <li><code>DFlash.decode_forward</code> calls the DFlash <code>replay</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:385-386}}).</li>
+  <li><code>ModelRunner.destroy_cuda_graphs</code> calls <code>destroy</code> ({{cite deepinfer/worker/model_runner.py:641-644}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li>The model: <code>model(kv_caches=..., input_metadata=...)</code> and <code>model.allocate_output</code> ({{cite deepinfer/worker/cuda_graph_runner.py:66}}, {{cite deepinfer/worker/cuda_graph_runner.py:96}}).</li>
+  <li>The input builder that the caller passes as <code>prepare_input_fn</code> ({{cite deepinfer/worker/cuda_graph_runner.py:94}}).</li>
+  <li>The graph timer: <code>register_graph</code>, <code>flip_event_buffer</code>, <code>unbind_graphs</code> ({{cite deepinfer/worker/cuda_graph_runner.py:134-136}}, {{cite deepinfer/worker/cuda_graph_runner.py:152}}, {{cite deepinfer/worker/cuda_graph_runner.py:157}}).</li>
+  <li>DFlash: <code>run_drafts</code>, <code>MTPDecodeInput.build_padding</code>, the copy kernel <code>copy_dflash_decode_input</code> ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:12-13}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>CudaGraphData</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:27}}</td><td>One graph: the graph, its timer handle, its output view, its source and device input objects.</td></tr>
+    <tr><td><code>build_graph_batch_sizes</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:41}}</td><td>The list of {{term graph-size | graph sizes}}.</td></tr>
+    <tr><td><code>_run_model</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:54}}</td><td>Copy inputs (ZOS off), CP broadcast, forward.</td></tr>
+    <tr><td><code>CudaGraphRunner.capture</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:82}}</td><td>Records all sizes, largest first.</td></tr>
+    <tr><td><code>CudaGraphRunner.select</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:143}}</td><td>Smallest size not less than <code>total_q</code>.</td></tr>
+    <tr><td><code>CudaGraphRunner.replay</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:150}}</td><td>Flips the timer events, replays, returns the output view.</td></tr>
+    <tr><td><code>CudaGraphRunner.destroy</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:156}}</td><td>Drops all graphs, buffers, the pool and the stream.</td></tr>
+    <tr><td><code>DFlashCudaGraphRunner</code></td><td>{{cite deepinfer/worker/dflash_cuda_graph_runner.py:31}}</td><td>Same idea for the draft model; sizes count sequences.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>build_graph_batch_sizes</code></h3>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="41-51" />
+<ol>
+  <li>Line 43: the interval cannot be larger than the maximum.</li>
+  <li>Lines 46-48: powers of two below the interval.</li>
+  <li>Line 49: multiples of the interval below the maximum.</li>
+  <li>Line 50: the maximum itself, always last.</li>
+</ol>
+<p>Examples with interval 8: maximum 24 gives <code>[1, 2, 4, 8, 16, 24]</code>; maximum 6 gives <code>[1, 2, 4, 6]</code>; maximum 1536 gives 195 sizes.</p>
+
+<h3><code>_run_model</code></h3>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="54-66" />
+<p>This function runs in the warm-up and inside the recording. With ZOS off (<code>copy_inputs</code> true), rank 0 copies the pinned CPU inputs to the device first, so the copy is part of the graph. With CP above 1, <code>broadcast()</code> sends the device tensors from rank 0 to the other ranks, also inside the graph ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:120-167}}).</p>
+
+<h3><code>capture</code></h3>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="82-141" highlight="89,93-96,102,104-110,113-119,124-127,130-137,139-141">
+  <x-tr line="121-123">keep_graph=True keeps the raw cudaGraph_t, so the graph timer can find its event-record nodes for the ping-pong buffer. The NPU has only an instantiated graph and does not support keep_graph.</x-tr>
+</x-code>
+<ol>
+  <li>Line 89: a new capture first destroys the old graphs.</li>
+  <li>Lines 93-96: <code>max_batch_size</code> placeholder sequences give one input object; <code>.cuda(non_blocking=True)</code> gives the device object. With ZOS the input builder already makes device tensors, so both objects share memory.</li>
+  <li>Line 102: largest size first.</li>
+  <li>Lines 104-110: <code>_cut</code> takes the first <code>bs</code> rows of every tensor. The assert makes sure that every tensor has <code>max_batch_size</code> rows. This is true for decode metadata, where every field is per row.</li>
+  <li>Lines 113-115: the warm-up on the side stream.</li>
+  <li>Lines 117-119: fields from <code>get_clean_list()</code> go back to <code>None</code>, on both objects, so the recording computes them.</li>
+  <li>Lines 124-127: the recording, with the shared pool and the side stream. <code>capture_error_mode="thread_local"</code> limits capture errors to this thread.</li>
+  <li>Lines 130-137: instantiate (NVIDIA), register with the timer, and let the default stream wait for the side stream.</li>
+  <li>Lines 139-141: keep the pool of the first graph; store the graph.</li>
+</ol>
+
+<h3><code>select</code>, <code>replay</code> and <code>destroy</code></h3>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="143-168" />
+<p><code>select</code> raises <code>ValueError</code> when <code>total_q</code> is larger than the largest size. <code>replay</code> returns the stored output object: its tensors have <code>graph_size</code> rows and are the same memory in every replay of this graph. So the caller must read the result before the next replay of a graph that shares this memory. <code>destroy</code> also unbinds the timer.</p>
+
+<h3>The DFlash runner</h3>
+<x-code file="deepinfer/worker/dflash_cuda_graph_runner.py" lines="42-91" highlight="52-54,58-59,62-65,67-71,77-82,84-91" />
+<ol>
+  <li>Lines 52-54: two padding inputs: one for the graph, one kept as the fill value for unused rows.</li>
+  <li>Lines 58-59: sizes are numbers of sequences; each graph cuts its views with <code>cut(num_seqs)</code>.</li>
+  <li>Lines 62-71: warm-up and recording of <code>run_drafts</code>, with the pool and stream of the main runner. Only the driver (<code>do_sample</code>) copies a sampled output.</li>
+  <li>Lines 84-91: <code>replay</code> selects by the request count, copies the real decode input into the graph's buffers (<code>copy_dflash_decode_input</code>, which uses the padding for the rest), replays, and cuts the output to the real count.</li>
+</ol>
+<p><code>run_drafts</code> reads <code>main_input_metadata</code>: the device object of the <em>largest</em> main graph ({{cite deepinfer/worker/model_runner.py:546}}). This works for every step because the input fields of all main graphs are views of the same buffers: a smaller graph writes the first rows of the same memory. (The derived fields, such as <code>kv_swa_index</code>, are not shared: each graph computes its own.)</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: what each graph holds">
+<table>
+  <thead><tr><th>Field of CudaGraphData</th><th>Type</th><th>Shape (size bs)</th><th>Shared with</th></tr></thead>
+  <tbody>
+    <tr><td><code>graph</code></td><td><code>torch.cuda.CUDAGraph</code></td><td>—</td><td>memory pool of the largest graph</td></tr>
+    <tr><td><code>graph_handle</code></td><td><code>graph_timer.GraphHandle</code> or <code>None</code></td><td>—</td><td>NVIDIA only</td></tr>
+    <tr><td><code>output</code></td><td><code>CausalLMForwardOutput</code></td><td><code>[bs, …]</code></td><td>views of <code>output_full</code> ({{cite deepinfer/worker/cuda_graph_runner.py:110}})</td></tr>
+    <tr><td><code>input_metadata_source</code></td><td><code>InputMetadataV4</code></td><td>every field <code>[bs, …]</code></td><td>views of the size-max object; pinned CPU (ZOS off) or device (ZOS on)</td></tr>
+    <tr><td><code>input_metadata_device</code></td><td><code>InputMetadataV4</code></td><td>every field <code>[bs, …]</code></td><td>views of the device object; the model reads these</td></tr>
+  </tbody>
+</table>
+<p>The docstring explains why the two metadata objects stay separate: "Metadata objects stay separate because forward populates derived fields" ({{cite deepinfer/worker/cuda_graph_runner.py:31}}). The forward pass writes fields such as <code>kv_swa_index</code> into the device object only.</p>
+<p><strong>Example sizes.</strong> With <code>max_num_seqs=4</code> and <code>nextn=5</code>: <code>max_batch_size = 24</code>, sizes <code>[1, 2, 4, 8, 16, 24]</code>; the decode block tables of all graphs are views of one <code>int32 [24, 320]</code> tensor (<code>max_num_blocks = 320</code> for <code>runtime_max_model_len = 32784</code>). DFlash sizes: <code>[1, 2, 4]</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="The graph timer in the runner">
+<p>On NVIDIA the capture keeps the raw graph (<code>keep_graph=True</code>) and wraps it in a C++ <code>GraphHandle</code>. The handle reads the raw graph and the executable graph from <code>raw_cuda_graph()</code> and <code>raw_cuda_graph_exec()</code> ({{cite csrc/graph_timer/graph_timer_cuda.cpp:62-65}}). <code>get_event_record_nodes</code> walks the graph nodes and keeps the event-record nodes ({{cite csrc/graph_timer/graph_timer_cuda.cpp:67-85}}). Before each replay, <code>flip_event_buffer</code> swaps the events of these nodes with <code>cudaGraphExecEventRecordNodeSetEvent</code> ({{cite csrc/graph_timer/graph_timer_cuda.cpp:57-60}}, {{cite deepinfer/timer.py:169-187}}). The page {{link concepts/cuda-graphs}} explains why two sets of events are necessary.</p>
+<p>On Ascend, <code>cuda_graph_timer.supported()</code> is false ({{cite deepinfer/timer.py:94-98}}), so the runner makes no handle. The capture logs "cuda_graph_timer probes not supported on this platform." ({{cite deepinfer/worker/cuda_graph_runner.py:90-91}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>total_q</code> above the largest size</td><td><code>ValueError("No captured graph for total_q=...")</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:144-146}}</td></tr>
+    <tr><td>DFlash request count above <code>max_num_seqs</code></td><td><code>ValueError("No DFlash CUDA graph for ...")</code></td><td>{{cite deepinfer/worker/dflash_cuda_graph_runner.py:77-82}}</td></tr>
+    <tr><td>An input tensor without <code>max_batch_size</code> rows</td><td><code>AssertionError</code> in <code>_cut</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:104-106}}</td></tr>
+    <tr><td>Graph timer probe without a start or end node</td><td><code>AssertionError</code> in <code>register_graph</code></td><td>{{cite deepinfer/timer.py:153-154}}</td></tr>
+    <tr><td>A sync or an unsupported call inside the recording</td><td>the capture fails (PyTorch error)</td><td>{{cite deepinfer/worker/cuda_graph_runner.py:125}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL</code></td><td>8 ({{cite deepinfer/environ.py:155}})</td><td>{{cite deepinfer/worker/cuda_graph_runner.py:74}}</td><td>Step between main graph sizes.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL</code></td><td>8 ({{cite deepinfer/environ.py:157}})</td><td>{{cite deepinfer/worker/dflash_cuda_graph_runner.py:36}}</td><td>Step between DFlash sizes.</td></tr>
+  </tbody>
+</table>
+<p>The switches that turn graphs off are read in <code>ModelRunner</code> (see {{link code/model-runner}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/cuda-graphs}}: the idea, with the eager cases and DSpark timing.</li>
+  <li>{{link concepts/input-metadata}}: the buffers that a graph reads.</li>
+  <li>{{link code/dflash}}: the draft model that the DFlash runner records.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">In which order does <code>capture</code> record the graph sizes, and why?
+    <x-a><p>Largest first (<code>reversed(self.batch_sizes)</code>, {{cite deepinfer/worker/cuda_graph_runner.py:102}}). The first graph sets the memory pool, and the smaller graphs reuse it ({{cite deepinfer/worker/cuda_graph_runner.py:139-140}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What does <code>select(9)</code> return when the sizes are <code>[1, 2, 4, 8, 16, 24]</code>?
+    <x-a><p>Size 16 and its <code>CudaGraphData</code>. <code>bisect_left</code> gives the index of the first size that is not less than 9 ({{cite deepinfer/worker/cuda_graph_runner.py:143-148}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The DFlash graphs read the input metadata of the largest main graph. Why is that correct in a step that replays the size-8 main graph?
+    <x-a><p>All main graphs use views of the same size-max buffers (<code>_cut</code>, {{cite deepinfer/worker/cuda_graph_runner.py:104-109}}). The size-8 step writes rows 0-7 of the same memory that the largest object sees, and the comment in <code>profile_decode_perf</code> says the buffers are shared ({{cite deepinfer/worker/model_runner.py:581}}). This is in the deep dive "Data flow".</p></x-a>
+  </x-q>
+</x-quiz>

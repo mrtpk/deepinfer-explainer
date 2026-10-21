@@ -19,7 +19,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B2 Basics II | done | done (16 defects fixed) | yes |
 | B3a Engine + scheduler | done | done (26 defects fixed) | yes |
 | B3b API + cache | done | done (16 defects fixed) | yes |
-| B4a Inputs + graphs | done | running | — |
+| B4a Inputs + graphs | done | done (26 defects fixed) | yes |
 | B4b Worker + ZOS | done | done (26 defects fixed) | yes |
 | B5a Attention I | done | done (43 defects fixed) | yes |
 | B5b Attention II | done | running | — |

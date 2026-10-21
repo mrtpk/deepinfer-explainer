@@ -1,0 +1,227 @@
+---
+title: Input metadata (varlen batching)
+nav_title: Input metadata
+level: Intermediate
+prerequisites: learn/batching, learn/kv-cache, concepts/paged-kv-cache
+related: code/input-metadata, code/prepare-tensor-input-v4, code/model-runner, code/prepare-sample-cpp, concepts/cuda-graphs, concepts/zero-overhead-scheduling, concepts/sliding-window-attention, concepts/yoco-swa-replay, concepts/context-parallelism, tours/life-of-a-request
+summary: Before each forward pass, DeepInfer packs the tokens of all scheduled sequences into one flat list and computes index tensors that tell each kernel where every token is, where to write its cache entry and which keys to read.
+---
+<x-sentence>DeepInfer packs the new tokens of all sequences into one flat list and computes index tensors that tell the kernels where each token goes.</x-sentence>
+
+<h2>The idea</h2>
+<p>The scheduler gives the worker a list of sequences. The sequences have different lengths. A prefill chunk can have thousands of new tokens, and a decode sequence has 1 + 5 tokens. The kernels on the device cannot read C++ sequence objects. They need flat {{term tensor | tensors}} of numbers.</p>
+<p>So DeepInfer puts the new tokens of all sequences end to end, with no gaps. This is a {{term packed-batch | packed (varlen) batch}}. Each new token is one <em>row</em>. Then DeepInfer computes small index tensors for these rows. Together they are the {{term input-metadata}}:</p>
+<ul>
+  <li><strong>Where each sequence starts.</strong> Offset arrays such as {{term cu-seqlens}}.</li>
+  <li><strong>Where each token is in its sequence.</strong> The position of each row.</li>
+  <li><strong>Where to write.</strong> A {{term slot-mapping}} gives the cache row for each new cache entry.</li>
+  <li><strong>What to read.</strong> {{term block-table | Block tables}}, window descriptions and key ranges tell attention which earlier entries each row sees.</li>
+</ul>
+<p>In a prefill step, C++ code computes these tensors on the CPU. In a decode step with {{term zos}} (the default), C++ packs only per-sequence values and a device kernel computes the per-row tensors (deep dive). Python wraps the tensors in one object of the class <code>InputMetadataV4</code>, or of its subclass <code>InputMetadataV4VL</code> for a vision model ({{cite deepinfer/model_executor/model_metadata_utils.py:142-144}}). Every layer of the model reads this object.</p>
+<p><strong>An everyday comparison.</strong> Think of a delivery truck. The parcels of many customers go into the truck end to end, with no gaps. A packing list says where the parcels of each customer start. It also gives, for each parcel, the shelf in the warehouse where it goes. The kernels are the warehouse workers: they read only the list, not the customer files.</p>
+<p>The comparison stops at two points. First, in a decode step with a {{term cuda-graph}}, the truck has a fixed size, so DeepInfer adds empty parcels ({{term graph-padding | padding rows}}). Second, some list entries are short descriptions that the device expands later into full index tables.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4a_varlen_prefill" alt="Three panels. Panel 1: a strip of 260 rows; rows 0-59 belong to sequence A (positions 200-259), rows 60-259 to sequence B (positions 0-199); cu_seqlens_q is [0, 60, 260], cu_seqlens_k is [0, 260, 460], state_block_idx is [2, 1]. Panel 2: slot_mapping_store_swa: A rows go to ring slots 334-393, B rows 60-125 are -1, B rows 126-259 go to 200-267 and 134-199; slot_mapping_store_ca for ratio 2: A entries go to 164-191 and 576-577, B entries to 192-291. Panel 3: the gathered SWA buffer of 516 rows: A history 0-127, B history zero-filled 128-255, new rows 256-515; load_segments_swa and four example pivot rows." caption="Figure: the input metadata of one prefill step with two chunks. Read panel 1 for the packing, panel 2 for the cache writes, panel 3 for the sliding-window reads. All values follow the C++ rules; the sequences are illustrative. Click to zoom." />
+<p>Sequence A is the last chunk of a 260-token prompt: its first 200 tokens are already in the cache. Sequence B is a new 400-token prompt. The scheduler cut it at 200 tokens, so it is last in the batch. Every value in the figure comes from the rules in the next section. The deep dive repeats the example with all fields.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the scheduler gives one SequenceMetadata per sequence</h3>
+<p>The C++ scheduler makes one {{term sequence-metadata}} object for each scheduled sequence. It has two lengths: <code>seqlen_q</code> (the new tokens of this step) and <code>seqlen_k</code> (all tokens that the step can see) ({{cite csrc/engine/scheduler.hpp:696-697}}). A step is a prefill step or a decode step, never both. The sampler preparation checks this: "Mixed prefill and decode batches are unsupported" ({{cite csrc/engine/prepare_sample.cpp:61}}).</p>
+<x-note title="Why the cut chunk is last">
+<p>In a NORMAL engine, the scheduler stops the prefill batch right after it cuts a prompt ({{cite csrc/engine/scheduler.hpp:543-545}}). So a batch has at most one cut chunk, at the end. A continued chunk (like A) can come earlier.</p>
+</x-note>
+
+<h3>Step 2: the model runner calls the C++ builder</h3>
+<p><code>ModelRunner._prepare_input_tensors</code> is the entry point. It asks the model's <code>ModelMetadata</code> for a dict of tensors, then builds the object:</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="120-146" highlight="131-139,142-146" caption="With <code>out_dict</code>, the builder writes into existing buffers and the function returns <code>None</code>. This is the CUDA graph path (Step 6)." />
+<p><code>prepare_inputmetadata_dict</code> fills one <code>PrepareArgs</code> struct and picks the function:</p>
+<x-code file="deepinfer/model_executor/model_metadata_utils.py" lines="142-144" caption="Prefill: <code>prepare_prompt_v4</code>. Decode: <code>prepare_decode_v4</code>, or the Python function <code>prepare_decode_v4_zos</code> when {{term zos}} is on." />
+<x-code file="deepinfer/model_executor/model_metadata_utils.py" lines="156-181" highlight="168,170-172,181" />
+<p>Line 172 passes <code>out_dict</code> only in decode steps. Prefill steps always make new tensors. All tensors that C++ makes are in {{term pinned-memory}} on the CPU ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:8}}).</p>
+
+<h3>Step 3: positions and token ids for every row</h3>
+<p>The first loop is the same for prefill and decode. Row <em>j</em> of a sequence gets the position <code>seqlen_k − seqlen_q + j</code>:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_base.cpp" lines="88-122" highlight="93-94,112,116-118">
+  <x-tr line="88">Position id of each query token.</x-tr>
+</x-code>
+<p>In a prefill step, line 112 copies the <code>seqlen_q</code> prompt ids. In a decode step, it copies one id, the last real token. Lines 116-118 then add the {{term draft-token | draft tokens}}. So a decode sequence sends 1 + 5 rows with the default settings.</p>
+
+<h3>Step 4: where the new cache entries go</h3>
+<p>DeepInfer has two kinds of cache for attention. The compressed cache is paged in blocks of 128 tokens. The {{term sliding-window-attention}} (SWA) cache is a ring per sequence in a {{term state-slot}} ({{link concepts/paged-kv-cache}}). <code>update_common_v4</code> writes one slot map for each:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="98-109" highlight="103-104" caption="SWA: <code>state_id × swa_block_size + position % swa_block_size</code>. Only the last <code>swa_block_size</code> rows of a chunk write; older rows get <code>-1</code>." />
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="56-61" highlight="59-60" caption="Prefill, compressed cache with ratio <em>n</em>: one entry per <em>n</em> tokens. Entry <em>j</em> goes to <code>block_table[j / (128/n)] × (128/n) + j % (128/n)</code>." />
+<p>The dict <code>slot_mapping_store_ca</code> has one tensor per compress ratio, with keys such as <code>"1"</code> and <code>"2"</code>. The model accepts only ratios 0, 1 and 2 ({{cite deepinfer/model_executor/model_metadata_utils.py:52-53}}). The SWA ring has <code>swa_block_size</code> rows: the window plus the backtracking tokens ({{cite deepinfer/worker/cache_engine.py:88-93}}, {{cite deepinfer/environ.py:132}}). The window size comes from the checkpoint config. The docs give 128 + 6 = 134 for V4.1 ({{cite doc/inference_deployment_qa.md:191}}), and this page uses these example values.</p>
+
+<h3>Step 5: what each row reads</h3>
+<p>Prefill and decode read the cache in different ways.</p>
+<ul>
+  <li><strong>Prefill</strong> gathers the history of all sequences into one flat buffer first. A {{term load-plan}} (<code>load_segments_swa</code>, <code>load_segments_ca</code>) says which cache rows to copy ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:461-476}}). Then each row gets a short description of its window in that buffer: <code>kv_swa_full_index_pivots</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:478-527}}).</li>
+  <li><strong>Decode</strong> reads the paged cache in place. Each row gets a copy of its sequence's block table (<code>block_tables</code>), its visible length (<code>context_lens</code>) and an <code>[offset, length]</code> pair for its window ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:585-652}}).</li>
+</ul>
+<p>The device expands the short descriptions into full index tables at the start of the forward pass. Each attention layer calls <code>compute_attn_info</code>, and the first call does the work ({{cite deepinfer/model_executor/models/v4_modules/attn.py:765}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:343-389}}).</p>
+
+<h3>Step 6: decode with a CUDA graph</h3>
+<p>A decode step usually replays a captured CUDA graph ({{link concepts/cuda-graphs}}). The graph has fixed input buffers. So the model runner adds padding sequences up to the graph size, and C++ writes straight into the graph's buffers:</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="182-198" highlight="185,187-188,198" caption="Line 198 is the eager path: it copies the new tensors to the device without a wait." />
+<p>The second figure shows a decode step of two sequences with 6 rows each, padded to 16 rows.</p>
+<x-diagram name="b4a_varlen_decode" alt="Three panels. Panel 1: a row of 16 cells: rows 0-5 for sequence C (positions 300-305), rows 6-11 for sequence D (positions 128-133), rows 12-15 padding (position 0); valid_token_mask True for 12 rows and False for 4; query_indices 0, 1 and a large sentinel; context_lens; state_block_idx 3, 4, 0. Panel 2: slot_mapping_store_swa, slot_mapping_store_ca for ratios 2 and 1, block tables per row, and kv_swa_index_offset_len. Panel 3: C++ writes into the size-16 views of the graph buffers, the graph copies them to the device and runs the model, the sampler reads rows 0-11." caption="Figure: the input metadata of a decode step with graph padding. Padding rows have <code>valid_token_mask = False</code> and write only to state slot 0 and block 0, which no real sequence uses. Click to zoom." />
+
+<h3>Step 7: views for special features</h3>
+<p>Three features change the metadata during the forward pass. The deep dive explains each one.</p>
+<ul>
+  <li><strong>Context parallelism.</strong> With CP above 1, the model reorders the prefill rows for each rank: <code>prepare_for_mirror_cp</code> ({{cite deepinfer/model_executor/models/deepseek.py:168-170}}).</li>
+  <li><strong>YOCO prefill truncation.</strong> At the first consumer layer, the model switches to a different view of the metadata: fewer rows in compact mode, narrower windows in mask mode ({{cite deepinfer/model_executor/models/deepseek.py:190-207}}).</li>
+  <li><strong>DFlash drafts.</strong> The draft model gets its own fixed-stride view: <code>build_dflash_input</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:367-372}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Field reference: shapes, dtypes and who writes them">
+<p>All index tensors are int32 unless the table says otherwise. <code>total_q</code> is the number of rows, <code>n_seq</code> the number of sequences. A dict field has one tensor per compress ratio <em>N</em>, with the key <code>"N"</code>. Sources: the field docstrings in {{cite deepinfer/model_executor/input_metadata/input_metadata.py:32-69}} and {{cite deepinfer/model_executor/input_metadata/input_metadata.py:225-322}}.</p>
+<table>
+  <thead><tr><th>Field</th><th>Prefill shape</th><th>Decode shape</th><th>Meaning</th><th>Written at</th></tr></thead>
+  <tbody>
+    <tr><td><code>input_ids</code></td><td><code>[total_q]</code></td><td><code>[total_q]</code></td><td>Token id of each row.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:98-122}}</td></tr>
+    <tr><td><code>positions</code></td><td><code>[total_q]</code></td><td><code>[total_q]</code></td><td>Absolute position of each row.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:88-96}}</td></tr>
+    <tr><td><code>gate_force_random</code></td><td><code>[total_q]</code> bool</td><td><code>[total_q]</code> bool</td><td>True: the MoE gate uses random values (load test). Value of <code>DEEPINFER_FORCE_LOAD_BALANCE</code>.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:82-86}}</td></tr>
+    <tr><td><code>ngram_token_ids</code></td><td><code>[total_q, max_ngram]</code></td><td>same</td><td>Engram only: compressed ids of the last tokens.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:124-137}}</td></tr>
+    <tr><td><code>valid_token_mask</code></td><td><code>None</code> (CP 1)</td><td><code>[total_q]</code> bool</td><td>False for padding rows.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:173-182}}</td></tr>
+    <tr><td><code>total_q</code>, <code>cp_mirror_len</code></td><td>int</td><td>—</td><td>Row count; row count of one rank after the CP reorder.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:142-158}}</td></tr>
+    <tr><td><code>cu_seqlens_q</code>, <code>cu_seqlens_k</code></td><td><code>[n_seq + 1]</code></td><td>—</td><td>Running sums of <code>seqlen_q</code> and <code>seqlen_k</code>, from 0.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:407-418}}</td></tr>
+    <tr><td><code>cu_compressed_seqlens_q</code></td><td>dict of <code>[n_seq + 1]</code></td><td>—</td><td>Running sum of new compressed entries per sequence (at least 1).</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:420-432}}</td></tr>
+    <tr><td><code>positions_c</code></td><td>dict of <code>[n_cq]</code></td><td>dict of <code>[total_q]</code></td><td>Position of each new compressed entry. Decode: 0 where no entry ends.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:39-96}}</td></tr>
+    <tr><td><code>slot_mapping_store_ca</code></td><td>dict of <code>[n_cq]</code></td><td>dict of <code>[total_q]</code></td><td>Paged cache row for each new compressed entry, or -1.</td><td>same</td></tr>
+    <tr><td><code>slot_mapping_store_swa</code></td><td><code>[total_q]</code></td><td><code>[total_q]</code></td><td>SWA ring row of each token, or -1.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:98-109}}</td></tr>
+    <tr><td><code>state_block_idx</code></td><td><code>[n_seq]</code></td><td><code>[total_q]</code></td><td>State slot of each sequence (prefill) or row (decode).</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:111-126}}</td></tr>
+    <tr><td><code>ks</code>, <code>ke</code></td><td>dict of <code>[total_q]</code></td><td>—</td><td>Sparse layers: start and end of each row's keys in the gathered compressed buffer.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:434-459}}</td></tr>
+    <tr><td><code>load_segments_swa</code>, <code>total_k_swa</code></td><td><code>[segments, 4]</code>, int</td><td>—</td><td>Load plan of the SWA history; <code>total_k_swa = n_seq × window</code>.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:362-389}}</td></tr>
+    <tr><td><code>load_segments_ca</code>, <code>total_k_compressed</code></td><td>dict of <code>[segments, 4]</code>, dict of int</td><td>—</td><td>Load plan of the compressed history.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:51-63}}</td></tr>
+    <tr><td><code>kv_swa_full_index_pivots</code></td><td><code>[total_q, 4]</code></td><td>—</td><td>Window of each row in the gathered SWA buffer.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:487-527}}</td></tr>
+    <tr><td><code>kv_ca_index_offset_len</code></td><td>dict of <code>[total_q, 2]</code></td><td>dict of <code>[total_q, 2]</code></td><td>Dense layers: <code>[start, count]</code> of each row's compressed keys.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:540-557}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:612-629}}</td></tr>
+    <tr><td><code>block_tables</code></td><td>—</td><td><code>[total_q, max_num_blocks]</code></td><td>Copy of the block table for every row.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:207-229}}</td></tr>
+    <tr><td><code>context_lens</code></td><td>—</td><td><code>[total_q]</code></td><td>Visible tokens of each row, itself included.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:188-205}}</td></tr>
+    <tr><td><code>query_indices</code></td><td>—</td><td><code>[total_q]</code></td><td>Sequence index of each row; 998244353 for padding.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:231-251}}</td></tr>
+    <tr><td><code>klen</code></td><td>—</td><td>dict of <code>[total_q]</code></td><td>Sparse layers: compressed keys that each row needs.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:588-602}}</td></tr>
+    <tr><td><code>kv_swa_index_offset_len</code></td><td>—</td><td><code>[total_q, 2]</code></td><td>First ring row of the window and its length.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:631-652}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Fields that the device computes.</strong> <code>kv_swa_full_index</code>, <code>kv_ca_index</code>, <code>kv_ca_index_len</code>, <code>compressed_batch_mapping</code>, <code>kv_swa_index</code> and the scheduling metadata of the attention libraries start as <code>None</code>. <code>compute_attn_info</code> fills them in the first attention layer ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:343-389}}). The width of <code>kv_ca_index</code> is <code>max_model_len / N</code>, rounded up to a multiple of 128: the comment says that the sparse-attention kernel needs this ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:362}}).</p>
+<p><strong>The size of a decode block table.</strong> <code>max_num_blocks</code> is the block count of <code>runtime_max_model_len</code>, rounded up to a multiple of 64 ({{cite deepinfer/worker/model_runner.py:114-115}}). With <code>runtime_max_model_len = 32784</code> (<code>max_model_len</code> 32768 plus 16 extra positions with nextn 5 and ZOS on, {{cite deepinfer/config.py:11-16}}): 257 blocks, rounded up to 320. So 16 rows of block tables take <code>16 × 320 × 4 = 20,480</code> bytes. C++ copies only the blocks that the row needs; the rest of the row is not written ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:207}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the prefill step of the figure, field by field">
+<p>Settings: block size 128, window 128, ring 134, ratio 2 (64 compressed entries per block). Sequence A: <code>seqlen_q = 60</code>, <code>seqlen_k = 260</code>, block table <code>[7, 2, 9]</code>, state slot 2. Sequence B: <code>seqlen_q = 200</code>, <code>seqlen_k = 200</code>, block table <code>[3, 4, 5, 6]</code>, state slot 1. B has four blocks because the scheduler gives a new sequence the blocks of its whole prompt ({{cite csrc/engine/block_manager.hpp:207-209}}, {{cite csrc/engine/sequence.hpp:291-293}}).</p>
+<ol>
+  <li><code>total_q = 60 + 200 = 260</code>. <code>cp_mirror_len = 2 × (⌈60/2⌉ + ⌈200/2⌉) = 260</code> for CP 1.</li>
+  <li><code>positions</code>: rows 0-59 = 200 … 259; rows 60-259 = 0 … 199.</li>
+  <li><code>cu_seqlens_q = [0, 60, 260]</code>, <code>cu_seqlens_k = [0, 260, 460]</code>.</li>
+  <li>New compressed entries: A: <code>260/2 − 200/2 = 30</code> (entries 100-129). B: <code>100</code> (entries 0-99). <code>n_cq = 130</code>, <code>cu_compressed_seqlens_q["2"] = [0, 30, 130]</code>.</li>
+  <li><code>positions_c["2"]</code> = <code>2 × j</code>: 200, 202, …, 258, then 0, 2, …, 198.</li>
+  <li><code>slot_mapping_store_ca["2"]</code>: A entry 100 is in logical block 1 (block 2): <code>2 × 64 + 36 = 164</code>, up to 191 for entry 127. Entries 128-129 are in block 9: 576, 577. B: 192-255 (block 3), then 256-291 (block 4).</li>
+  <li><code>slot_mapping_store_swa</code>: A rows: <code>2 × 134 + (200 … 259) % 134</code> = 334 … 393. B rows 60-125 (positions 0-65): -1, because only the last 134 rows of a chunk go to the ring. Positions 66-133: 200-267. Positions 134-199 wrap: 134-199.</li>
+  <li><code>state_block_idx = [2, 1]</code>.</li>
+  <li><code>ks["2"]</code> and <code>ke["2"]</code> (if the ratio-2 layers are sparse): A rows: <code>ks = 0</code>, <code>ke = (pos + 1) / 2</code> = 100 … 130. B rows: <code>ks = 130</code>, <code>ke = 130 + (pos + 1)/2</code> = 130 … 230.</li>
+  <li><code>load_segments_ca["2"]</code>: <code>[7,0,64,0]</code>, <code>[2,0,64,64]</code>, <code>[9,0,2,128]</code>, <code>[3,0,64,130]</code>, <code>[4,0,36,194]</code>. So <code>total_k_compressed["2"] = 230</code>. The plan covers all <code>seqlen_k / 2</code> entries of each sequence.</li>
+  <li><code>load_segments_swa</code>: A's history is positions 72-199. They are ring rows 72-133, then 0-65: <code>[2,72,134,0]</code>, <code>[2,0,66,62]</code>. B has no history: <code>[-1,0,128,128]</code> fills zeros. <code>total_k_swa = 256</code>.</li>
+  <li>Pivots of B row 259 (position 199) are <code>[256, 0, 388, 128]</code>. B has no history. The row reads 128 new rows from buffer row 388, which is <code>316 + 72</code>: position 72 of B.</li>
+</ol>
+<p>The C++ comment gives the rule for the pivots ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:478-486}}). <code>X[0:P1] = P0 + arange(P1)</code>, then <code>X[P1:P1+P3] = P2 + arange(P3)</code>, and the rest is −1. The window always has <code>window_size</code> slots: history count plus new count is at most 128.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the decode step of the second figure">
+<p>Settings: <code>max_num_seqs = 4</code>, <code>nextn = 5</code>, so the graph sizes are <code>[1, 2, 4, 8, 16, 24]</code> ({{cite deepinfer/worker/cuda_graph_runner.py:41-51}}). ZOS is off, so <code>prepare_decode_v4</code> in C++ writes every row. Sequence C: 301 tokens, <code>seqlen_k = 306</code>, block table <code>[5, 6, 8]</code>, state slot 3. Sequence D: 129 tokens, <code>seqlen_k = 134</code>, block table <code>[10, 11]</code>, state slot 4. The scheduler sorts decode sequences by length, longest first ({{cite csrc/engine/scheduler.hpp:648-649}}).</p>
+<ol>
+  <li><code>total_q = 12</code>. <code>select(12)</code> returns 16, so 4 placeholder sequences follow ({{cite deepinfer/worker/model_runner.py:185-188}}).</li>
+  <li>A placeholder has <code>seqlen_q = 1</code>, <code>seqlen_k = 1</code> and block table <code>[0]</code> ({{cite deepinfer/worker/model_runner.py:386-403}}). It does not set <code>state_id</code>, so it gets the default state slot 0 ({{cite csrc/engine/pybind_sequence.cpp:152}}). C++ marks it with <code>is_placeholder</code> because its request id is <code>"placeholder"</code> ({{cite csrc/engine/sequence.hpp:398}}).</li>
+  <li><code>positions</code>: 300-305, 128-133, 0, 0, 0, 0. <code>context_lens</code>: 301-306, 129-134, 1, 1, 1, 1.</li>
+  <li><code>slot_mapping_store_swa</code>: <code>3 × 134 + 300 % 134 = 434</code> … 439; <code>4 × 134 + 128 = 664</code> … 669; padding 0.</li>
+  <li><code>slot_mapping_store_ca["2"]</code>: an entry ends only when <code>(position + 1) % 2 == 0</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:82}}). Position 301 ends entry 150: block <code>[5,6,8][150 / 64] = 8</code>, slot <code>8 × 64 + 22 = 534</code>. The row values are <code>-1, 534, -1, 535, -1, 536</code>.</li>
+  <li><code>block_tables</code> use the smallest ratio of the model ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:566}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:586}}). With ratio 1: C needs <code>⌈306/128⌉ = 3</code> blocks, D needs 2.</li>
+  <li><code>kv_swa_index_offset_len</code> for C row 0: the window has 128 positions and starts at <code>300 − 127 = 173</code>. That is ring row <code>173 % 134 = 39</code>, so the pair is <code>[3 × 134 + 39, 128] = [441, 128]</code>.</li>
+  <li><code>kv_ca_index_offset_len["1"]</code> for row <em>i</em>, with <code>max_num_blocks = 320</code> (see the field reference): <code>[i × 320 × 128, (pos + 1)]</code>. The offset points at row <em>i</em> of the flat <code>block_tables</code>; the device turns it into cache rows ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:606-611}}).</li>
+</ol>
+<p><strong>Why padding is safe.</strong> Block 0 and state slot 0 are never given to a real sequence: the free list starts at 1 ({{cite csrc/engine/block_manager.hpp:27-30}}). So padding rows write only to these two places. The MoE gate gets <code>valid_token_mask</code> as its mask ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:387}}), and the sampler does not read them (see {{link code/prepare-sample-cpp}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Decode with ZOS: half on the CPU, half on the device">
+<p>{{term zos | Zero-overhead scheduling}} is on by default. Then the CPU does not know the real <code>seqlen_k</code> of a sequence: the previous step is still on the device. So the decode path splits the work ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:307-382}}):</p>
+<ol>
+  <li>C++ <code>prepare_decode_zos_inputs</code> packs only per-sequence values: lengths, state ids, a flat block table with offsets, and the token ids of fresh sequences ({{cite csrc/engine/zos.cpp:198-277}}).</li>
+  <li>The worker corrects <code>seqlens_k</code> on the device from the accepted-token counts of the previous step. With {{term dspark}} (<code>DEEPINFER_ENABLE_MTP_VARLEN</code>), it also sets <code>seqlens_q</code> from the confidence rates ({{cite deepinfer/worker/worker.py:191-245}}).</li>
+  <li>The kernel <code>prepare_v4_decode_metadata</code> computes all per-row fields on the device: positions, masks, slot maps, block tables, offset pairs ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367}}).</li>
+  <li><code>gather_input_ids_zos</code> takes the token ids of continuing sequences from the previous step's device tensors, so no copy to the CPU is necessary ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:235-244}}).</li>
+</ol>
+<p>With ZOS, the output buffers are device tensors (<code>get_or_create</code> uses <code>device="cuda"</code>, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:113-117}}). The kernel writes several ratio buckets in one launch, through equally spaced row views of one allocation (<code>get_or_create_stacked</code>, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:120-159}}).</p>
+</x-deepdive>
+
+<x-deepdive title="YOCO prefill truncation: the consumer view">
+<p>A {{term yoco}} model has consumer layers after layer <code>n_prefill_layer</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:87-88}}). With {{term swa-bounded-replay | YOCO prefill truncation}}, the prefill step needs the consumer layers only for the last <code>KEEP_TOKENS</code> tokens of the prompt. C++ computes the extra fields when the mode is not <code>off</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:349-360}}):</p>
+<ul>
+  <li><strong>mask</strong>: only <code>yoco_mask_swa_index_pivots</code>. The layout stays full; the windows of rows before the kept range are empty ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:155}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:285-289}}).</li>
+  <li><strong>compact</strong>: <code>yoco_consumer_*</code> fields in a smaller layout: <code>query_indices</code> (which full rows stay), <code>cu_seqlens_q</code>, <code>total_q</code>, <code>positions</code>, pivots, <code>ks</code>/<code>ke</code>, offset pairs and the SWA slot map ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:334-342}}).</li>
+</ul>
+<p>The rows to drop: <code>clip_prefix = clamp(data_len − keep_tokens − q_start, 0, q_len − 1)</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:225}}). The upper limit <code>q_len − 1</code> keeps at least one row, because the sampler always reads the last row of a chunk. Example with <code>KEEP_TOKENS = 140</code>: A (<code>data_len 260</code>, <code>q_start 200</code>) keeps all 60 rows. B (<code>data_len 400</code>, <code>q_start 0</code>) has <code>clip_prefix = 199</code> and keeps 1 row. The compact batch has <code>cu = [0, 60, 61]</code>.</p>
+<p>At the first consumer layer, <code>DeepseekModel.forward</code> calls <code>get_consumer_view()</code> (compact) or <code>get_mask_view()</code> (mask) ({{cite deepinfer/model_executor/models/deepseek.py:191-207}}). Each view is a shallow copy. It sets the derived fields to <code>None</code>, so that <code>compute_attn_info</code> expands them again for the new pivots or layout ({{cite deepinfer/model_executor/input_metadata/yoco.py:86-128}}). The page {{link concepts/yoco-swa-replay}} explains the model side.</p>
+</x-deepdive>
+
+<x-deepdive title="Context parallelism: the mirror layout and the broadcast">
+<p>With CP above 1, only the driver rank builds the metadata. For an eager step it sends all fields with <code>broadcast_tensor_dict</code>. Dict fields are flattened to keys such as <code>"slot_mapping_store_ca.2"</code>, because the broadcast handles one level only ({{cite deepinfer/worker/model_runner.py:200-212}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:391-413}}).</p>
+<p>In a prefill step, each rank then works on its own part of the rows: the {{term cp-mirror}}. <code>prepare_for_mirror_cp</code> computes <code>mirror_cp_index</code> and new <code>ks</code>/<code>ke</code> on the device. It reorders <code>positions</code> and <code>ngram_token_ids</code>. <code>gate_force_random</code> keeps the full layout; a reordered copy goes to <code>gate_force_random_cp</code>. It sets <code>valid_token_mask</code> to <code>mirror_cp_index != -1</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:170-208}}). <code>input_ids</code> keeps the full layout, because the embedding runs before the reorder ({{cite deepinfer/model_executor/models/deepseek.py:161-170}}).</p>
+<p>The length per rank is <code>cp_mirror_len = 2 × Σ ⌈seqlen_q / (2 × cp)⌉</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:147-155}}). Example: our prefill batch with <code>cp = 2</code>: <code>2 × (⌈60/4⌉ + ⌈200/4⌉) = 2 × (15 + 50) = 130</code> rows per rank.</p>
+</x-deepdive>
+
+<x-deepdive title="DFlash: a second, fixed-stride view">
+<p>The DFlash draft model runs after the main model in a decode step. Its attention needs one block of draft rows per request, not the varlen rows of the main model. <code>build_dflash_input</code> makes a shallow copy and replaces six fields with one fused kernel: <code>dflash_newx_slot_mapping_store</code>, <code>positions</code>, <code>input_ids</code>, <code>valid_token_mask</code>, <code>gate_force_random</code> and <code>dflash_kv_index</code> ({{cite deepinfer/model_executor/input_metadata/dflash.py:36-84}}).</p>
+<ul>
+  <li><code>dflash_newx_slot_mapping_store</code>: <code>[real_cnt × dflash_block_size]</code>, SWA slots for the draft-token KV.</li>
+  <li><code>dflash_kv_index</code>: <code>[real_cnt × dflash_block_size, pad64(window_size + dflash_block_size)]</code>, the SWA slots that each draft row reads ({{cite deepinfer/model_executor/input_metadata/dflash.py:30-34}}).</li>
+</ul>
+<p>The module docstring says, translated: the C++ prepare does not make these fields. With the DFlash CUDA graph, the graph captures and replays them ({{cite deepinfer/model_executor/input_metadata/dflash.py:1-8}}). See {{link code/dflash}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that change the metadata">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>0; <code>EngineArgs</code> sets 1 for NORMAL ({{cite deepinfer/environ.py:179}})</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:143}}</td><td>Decode metadata built on the device.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:311}}</td><td>Rows per decode sequence: 1 + nextn.</td></tr>
+    <tr><td><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td>at least nextn + 1 = 6 ({{cite deepinfer/environ.py:132}})</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:178}}</td><td>Extra ring rows: <code>swa_block_size = window + this</code>.</td></tr>
+    <tr><td><code>DEEPINFER_FORCE_LOAD_BALANCE</code></td><td>off ({{cite deepinfer/environ.py:120}})</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:166}}</td><td>Value of every <code>gate_force_random</code> entry.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code></td><td><code>off</code> ({{cite deepinfer/environ.py:188}})</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:175}}</td><td>Adds the mask or compact YOCO fields.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code></td><td>0 ({{cite deepinfer/environ.py:191}})</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:176}}</td><td>Kept tokens. Must be at least window + backtracking.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code>, <code>..._SIZE</code></td><td>off, 128 ({{cite deepinfer/environ.py:163-164}})</td><td>{{cite deepinfer/worker/cache_engine.py:108-110}}</td><td>Makes the ring larger than 134 rows.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<p>The C++ builder checks its inputs with <code>TORCH_CHECK</code>. A failed check raises a Python <code>RuntimeError</code> and stops the step.</p>
+<ul>
+  <li><strong>YOCO keep length too small.</strong> <code>KEEP_TOKENS</code> must be at least <code>window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS</code> (134 with the defaults). The model runner checks this at load time with an <code>assert</code> ({{cite deepinfer/worker/model_runner.py:107-113}}), and C++ checks it again in each prefill ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:355-357}}).</li>
+  <li><strong>Block table too short.</strong> In a decode step, a row needs more blocks than <code>max_num_blocks</code> or than the sequence has ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:223}}).</li>
+  <li><strong>Index overflow.</strong> The decode offset <code>total_q × max_num_blocks × (128/N)</code> must fit in int32 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:615-616}}).</li>
+  <li><strong>Wrong buffer size.</strong> On the graph path, each existing buffer must have exactly the expected shape and dtype ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:41-43}}).</li>
+  <li><strong>Unsupported compression.</strong> Ratios other than 0 (no compression), 1 and 2 stop the model load with <code>ValueError</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:52-53}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every attention kernel trusts these numbers. A wrong slot writes a token into the cache of another sequence, and no error appears. The checks above catch only shape errors. So when you change the scheduler or the cache layout, test the slot maps with a small example like the one on this page.</p>
+
+<x-quiz>
+  <x-q level="easy">A prefill batch has two chunks with <code>seqlen_q</code> 60 and 200 and <code>seqlen_k</code> 260 and 200. What are <code>cu_seqlens_q</code> and <code>cu_seqlens_k</code>?
+    <x-a><p><code>cu_seqlens_q = [0, 60, 260]</code> and <code>cu_seqlens_k = [0, 260, 460]</code>. Both are running sums that start at 0, with <code>n_seq + 1</code> values ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:407-418}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which function turns the list of <code>SequenceMetadata</code> into an <code>InputMetadataV4</code> object, and where do the tensors live after it returns on the eager path?
+    <x-a><p><code>ModelRunner._prepare_input_tensors</code> ({{cite deepinfer/worker/model_runner.py:120-146}}). In a prefill step, C++ makes the tensors in pinned CPU memory (also in a decode step without ZOS). <code>_prepare_input_driver</code> then copies them to the device with <code>.cuda(non_blocking=True)</code> ({{cite deepinfer/worker/model_runner.py:198}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A prefill chunk has 200 rows, state slot 1, and the ring has 134 rows. Which rows get <code>-1</code> in <code>slot_mapping_store_swa</code>, and why?
+    <x-a><p>Rows 0-65. Only rows with <code>seqlen_q − j ≤ swa_block_size</code> write, so only the last 134 rows ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:103-106}}). Older rows would be overwritten in the ring by later rows of the same chunk.</p></x-a>
+  </x-q>
+  <x-q level="medium">In a decode step, a padding row has <code>positions = 0</code>, <code>state_block_idx = 0</code> and <code>slot_mapping_store_swa = 0</code>. Why does its write not damage a real sequence?
+    <x-a><p>Slot 0 and block 0 are never given to a sequence: the block lists start at 1 ({{cite csrc/engine/block_manager.hpp:27-30}}). The placeholder uses block table <code>[0]</code> ({{cite deepinfer/worker/model_runner.py:386-403}}) and the default state slot 0 ({{cite csrc/engine/pybind_sequence.cpp:152}}). <code>valid_token_mask</code> is False for it, and the sampler skips it. This is in the deep dive "Worked example: the decode step".</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code> and <code>KEEP_TOKENS=140</code>, a new 400-token prompt is cut into a first chunk of 200 tokens. How many rows does this chunk have in the consumer layers, and why not zero?
+    <x-a><p>One row. <code>clip_prefix = clamp(400 − 140 − 0, 0, 200 − 1) = 199</code>, so <code>keep_len = 1</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:225-229}}). The upper limit <code>q_len − 1</code> keeps one row because every prefill chunk sends its last row through the sampler ({{cite csrc/engine/prepare_sample.cpp:173-180}}). This is in the deep dive "YOCO prefill truncation".</p></x-a>
+  </x-q>
+</x-quiz>

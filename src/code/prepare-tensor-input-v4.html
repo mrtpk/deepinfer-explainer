@@ -1,0 +1,223 @@
+---
+title: prepare_tensor_input_v4.cpp: the C++ input builder
+nav_title: prepare_tensor_input_v4.cpp
+level: Advanced
+prerequisites: concepts/input-metadata, concepts/paged-kv-cache
+related: code/input-metadata, code/model-runner, code/engine-pyi, code/sequence-hpp, code/zos-cpp, concepts/sliding-window-attention, concepts/yoco-swa-replay
+summary: prepare_prompt_v4 and prepare_decode_v4 turn the scheduled SequenceMetadata list into a dict of pinned int32 tensors: positions, offsets, cache slot maps, load plans and window descriptions for the V4 attention layers.
+---
+<h2>Purpose</h2>
+<p>This C++ file computes the V4 part of the {{term input-metadata}}: for each row of the packed batch, where its cache entries go and which cache entries it reads.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp</code>, 655 lines of C++. It builds on <code>prepare_tensor_input_base.cpp</code> (251 lines), <code>prepare_tensor_input.hpp</code> (73 lines) and <code>block_load_plan.cpp</code> (60 lines) in the same folder.</td></tr>
+    <tr><th>Main functions</th><td><code>prepare_prompt_v4</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:391}}) and <code>prepare_decode_v4</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:562}}).</td></tr>
+    <tr><th>Runs in</th><td>The driver worker process, on the CPU, with the GIL held (it writes Python dicts). Part of the extension <code>deepinfer._C.engine</code>.</td></tr>
+    <tr><th>Called by</th><td><code>ModelMetadata.prepare_inputmetadata_dict</code> through the bindings ({{cite csrc/engine/pybind_output.cpp:73-74}}).</td></tr>
+    <tr><th>Calls</th><td>The base functions in <code>prepare_tensor_input_base.cpp</code>, <code>BlockLoadPlanBuilder</code>, and <code>torch::empty</code> for pinned tensors.</td></tr>
+    <tr><th>Not in this file</th><td>The ZOS decode path (Python and a device kernel, see {{link code/input-metadata}}), the sampler inputs ({{link code/prepare-sample-cpp}}), and the image fields (<code>deepinfer/ve/prepare_tensor_input_vl.py</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4a_varlen_prefill" alt="Worked example of the output of prepare_prompt_v4 for two chunks: packing and offsets, the SWA and compressed slot maps, and the gathered SWA buffer with its load plan and pivots." caption="Figure: what <code>prepare_prompt_v4</code> returns for a batch of two prefill chunks. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>ModelMetadata.prepare_inputmetadata_dict</code> fills a <code>PrepareArgs</code> and calls <code>prepare_prompt_v4</code> or <code>prepare_decode_v4</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:156-181}}).</li>
+  <li>With ZOS on (the default), decode steps call the Python <code>prepare_decode_v4_zos</code> instead ({{cite deepinfer/model_executor/model_metadata_utils.py:143}}). So in a default run, this file builds only prefill metadata.</li>
+  <li>The bindings: <code>PrepareArgs</code> and the two functions ({{cite csrc/engine/pybind_output.cpp:53-74}}). The build compiles the three <code>.cpp</code> files of the folder ({{cite setup.py:29-31}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>prepare_prompt_base</code> and <code>prepare_decode_base</code>: positions, token ids, the load-balance flag, Engram n-grams, the padding mask ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:65-186}}).</li>
+  <li><code>fill_decode_context_lens</code>, <code>fill_decode_block_tables</code>, <code>fill_decode_query_indices</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:188-251}}).</li>
+  <li><code>BlockLoadPlanBuilder</code> for the {{term load-plan | load plans}} ({{cite csrc/engine/input_metadata/block_load_plan.hpp:19-34}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>PrepareArgs</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input.hpp:20}}</td><td>All inputs in one struct: sequences, sizes, ratios, YOCO mode, optional <code>out</code> dict.</td></tr>
+    <tr><td><code>get_or_create_tensor</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:37}}</td><td>With <code>out</code>: take the existing buffer and check its shape. Else: a new pinned tensor.</td></tr>
+    <tr><td><code>check_compress_ratios</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:3}}</td><td>Each ratio is positive and divides the block size.</td></tr>
+    <tr><td><code>update_common_v4</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:26}}</td><td>Slot maps and state slots, prefill and decode.</td></tr>
+    <tr><td><code>yoco_swa_visibility</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:149}}</td><td>Visible window of one row under YOCO truncation.</td></tr>
+    <tr><td><code>fill_yoco_consumer_cp_scalars</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:173}}</td><td>CP lengths of the compact YOCO layout.</td></tr>
+    <tr><td><code>fill_yoco_truncation_metadata</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:203}}</td><td>The <code>yoco_*</code> fields (mask or compact).</td></tr>
+    <tr><td><code>update_yoco_prompt_v4</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:349}}</td><td>Entry for YOCO; checks the keep length.</td></tr>
+    <tr><td><code>make_swa_block_load_plan</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:362}}</td><td>Load plan of the SWA history: <code>window</code> rows per sequence.</td></tr>
+    <tr><td><code>prepare_prompt_v4</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:391}}</td><td>All prefill fields.</td></tr>
+    <tr><td><code>prepare_decode_v4</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:562}}</td><td>All decode fields (ZOS off).</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The two modes of every field</h3>
+<p>Every function can make its tensors or fill existing ones. The comment at the top of <code>update_common_v4</code> says, translated: <em>"1. args.out has a value: the tensors are already allocated in result; only fill them. 2. Else: build the tensors from zero and write them into result."</em> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:20-25}}).</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_base.cpp" lines="37-49" highlight="41-43,45-46" caption="Mode 2 makes pinned CPU tensors. Mode 1 checks the shape and dtype of the CUDA graph buffer." />
+
+<h3><code>update_common_v4</code>: where new entries go</h3>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="41-96" highlight="47-49,58-61,63-67,80-91">
+  <x-tr line="62">Pad to at least 1 element for each sequence.</x-tr>
+  <x-tr line="71">Decode: shape [total_q]; only query tokens that make a new compressed token have a value, the others are padding.</x-tr>
+  <x-tr line="83">Makes a new compressed token.</x-tr>
+  <x-tr line="88">Padding: no new compressed token.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 47-49 (prefill): the new compressed entries of a sequence are <code>seqlen_k/n − (seqlen_k − seqlen_q)/n</code>, at least 1.</li>
+  <li>Lines 58-61: entry <em>j</em> has position <code>j × n</code> and slot <code>block_table[j / cbs] × cbs + j % cbs</code>, with <code>cbs = 128 / n</code>.</li>
+  <li>Lines 63-67: a sequence with no new entry gets one dummy entry with slot <code>-1</code>, so every sequence has at least one row in the compressor.</li>
+  <li>Lines 80-91 (decode): one value per row. Only a row at position <code>p</code> with <code>(p + 1) % n == 0</code> ends an entry.</li>
+</ol>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="98-126" highlight="103-106,111-115,117-123" />
+<p>Lines 103-106: the SWA slot. Only the last <code>swa_block_size</code> rows of a sequence write to the ring; older rows of a long chunk would be overwritten anyway. Lines 111-123: <code>state_block_idx</code> has one value per sequence in prefill and one per row in decode.</p>
+
+<h3><code>prepare_prompt_v4</code>: the prefill fields</h3>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="391-418" highlight="392-393,395-396,407-418">
+  <x-tr line="406">For the compressor.</x-tr>
+</x-code>
+<p>Then the function adds, in this order:</p>
+<ol>
+  <li><code>cu_compressed_seqlens_q</code> per ratio, with at least 1 per sequence ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:420-432}}).</li>
+  <li><code>ks</code> and <code>ke</code> per sparse ratio. A row at position <code>j</code> sees <code>(j + 1) / r</code> compressed keys from the start of its sequence in the gathered buffer ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:434-459}}).</li>
+  <li>The SWA load plan and the compressed load plans ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:461-476}}).</li>
+  <li><code>kv_swa_full_index_pivots</code> (next section).</li>
+  <li>The YOCO fields, when the mode is not <code>off</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:532}}).</li>
+  <li><code>kv_ca_index_offset_len</code> per dense ratio ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:534-557}}).</li>
+</ol>
+
+<h3>The SWA history and the pivots</h3>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="362-389" highlight="378-383,387" />
+<p>Each sequence gets exactly <code>window_size</code> history rows. Rows before position 0, or before <code>swa_valid_start</code>, are zero-filled (<code>src_block_id = -1</code>). The rest comes from the sequence's ring, in at most two pieces because the ring wraps.</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="478-527" highlight="493-494,507-509,512-517,520-523">
+  <x-tr line="478-486">Index of each query token in the gathered SWA buffer, new tokens included. With X = kv_swa_full_index[i_q], P = kv_swa_full_index_pivots[i_q], W = window_size, the device computes: X[0 : P[1]] = P[0] + arange(P[1]); X[P[1] : P[1] + P[3]] = P[2] + arange(P[3]); X[P[1] + P[3] : W] = -1.</x-tr>
+  <x-tr line="499-500">Zero-state recompute: the SWA state in [0, valid_start) is cleared, so the left edge of the visible window is clamped to valid_start. With valid_start = 0 (the normal path) this is the same as the old formula.</x-tr>
+  <x-tr line="502">The code below assumes valid_start &lt;= q_start. At present the visible range is always larger than the input range.</x-tr>
+  <x-tr line="506">Lower bound of the visible keys: the larger of the window bound and the valid start, at least 0.</x-tr>
+  <x-tr line="511">Section 1 (history, from the state buffer): visible range [min(abs_lo, q_start), q_start).</x-tr>
+  <x-tr line="519">Section 2 (new in this chunk): visible range [max(abs_lo, q_start), pos].</x-tr>
+</x-code>
+<ol>
+  <li>Lines 493-494: the gathered buffer has all histories first (<code>window_size</code> rows each), then all new rows.</li>
+  <li>Lines 507-509: the oldest visible position is <code>pos − window + 1</code>, but not before <code>swa_valid_start</code> or 0.</li>
+  <li>Lines 512-517: section 1 is a range of the sequence's history block.</li>
+  <li>Lines 520-523: section 2 is a range of the sequence's new rows, up to the row itself (causal).</li>
+</ol>
+
+<h3><code>prepare_decode_v4</code>: the decode fields</h3>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="562-604" highlight="566,568-569,585-586,597-599">
+  <x-tr line="568">The base already checks that seq_metadata_list is not empty.</x-tr>
+  <x-tr line="588">klen: the number of compressed keys that each query token needs, per sparse ratio (mixed ratios are supported).</x-tr>
+</x-code>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="606-652" highlight="615-616,624-625,646-649">
+  <x-tr line="606-611">Offset and length of each query token's KV index, per dense ratio. Layers without index attention still call the sparse-attention kernel, so the full index set is made in advance. Only offset and length are computed here, to keep the CPU cost low. The device then computes pos = offset + arange(len), kv_ca_index[i, :len] = block_tables[pos // tpb] * tpb + pos % tpb, and -1 after len.</x-tr>
+  <x-tr line="631-638">The KV of the current 1 or 2 tokens is already written to the SWA state through slot_mapping_store_swa; here it is read back from the SWA cache with the other tokens. Only offset and length are computed, to keep the CPU cost low.</x-tr>
+  <x-tr line="645">The length is window_size, but not more than the available tokens.</x-tr>
+</x-code>
+<p>The decode block table of a row uses the smallest ratio of the model (line 566, line 586). The offset of row <em>i</em> is <code>i × max_num_blocks × tpb</code>: it points at row <em>i</em> of the flat <code>block_tables</code> tensor in "compressed token" units.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Output dict: keys, shapes and the mode that makes them">
+<table>
+  <thead><tr><th>Key</th><th>Prefill</th><th>Decode (ZOS off)</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>positions</code>, <code>input_ids</code>, <code>gate_force_random</code></td><td><code>[total_q]</code></td><td><code>[total_q]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:65-140}}</td></tr>
+    <tr><td><code>total_q</code>, <code>cp_mirror_len</code></td><td>int</td><td>—</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:142-158}}</td></tr>
+    <tr><td><code>valid_token_mask</code></td><td>—</td><td><code>[total_q]</code> bool</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:160-186}}</td></tr>
+    <tr><td><code>positions_c</code>, <code>slot_mapping_store_ca</code></td><td>dict <code>[n_cq]</code></td><td>dict <code>[total_q]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:39-96}}</td></tr>
+    <tr><td><code>slot_mapping_store_swa</code></td><td><code>[total_q]</code></td><td><code>[total_q]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:98-109}}</td></tr>
+    <tr><td><code>state_block_idx</code></td><td><code>[n_seq]</code></td><td><code>[total_q]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:111-126}}</td></tr>
+    <tr><td><code>cu_seqlens_q/k</code>, <code>cu_compressed_seqlens_q</code></td><td><code>[n_seq + 1]</code></td><td>—</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:407-432}}</td></tr>
+    <tr><td><code>ks</code>, <code>ke</code></td><td>dict <code>[total_q]</code></td><td>—</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:434-459}}</td></tr>
+    <tr><td><code>load_segments_swa</code>, <code>total_k_swa</code></td><td><code>[S, 4]</code>, int</td><td>—</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:461-463}}</td></tr>
+    <tr><td><code>load_segments_ca</code>, <code>total_k_compressed</code></td><td>dict <code>[S, 4]</code>, dict int</td><td>—</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:467-476}}</td></tr>
+    <tr><td><code>kv_swa_full_index_pivots</code></td><td><code>[total_q, 4]</code></td><td>—</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:487-527}}</td></tr>
+    <tr><td><code>kv_ca_index_offset_len</code></td><td>dict <code>[total_q, 2]</code></td><td>dict <code>[total_q, 2]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:540-557}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:612-629}}</td></tr>
+    <tr><td><code>context_lens</code>, <code>query_indices</code></td><td>—</td><td><code>[total_q]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:188-205}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:231-251}}</td></tr>
+    <tr><td><code>block_tables</code></td><td>—</td><td><code>[total_q, max_num_blocks]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:207-229}}</td></tr>
+    <tr><td><code>klen</code></td><td>—</td><td>dict <code>[total_q]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:588-602}}</td></tr>
+    <tr><td><code>kv_swa_index_offset_len</code></td><td>—</td><td><code>[total_q, 2]</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:639-652}}</td></tr>
+    <tr><td><code>yoco_*</code></td><td>see {{link concepts/input-metadata}}</td><td>—</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:203-346}}</td></tr>
+  </tbody>
+</table>
+<p>All tensors are int32 except the bool masks. A dict key is the ratio as a string, for example <code>"2"</code>. The page {{link concepts/input-metadata}} computes every field for a two-chunk prefill and a padded decode step.</p>
+</x-deepdive>
+
+<x-deepdive title="The load plan builder, line by line">
+<x-code file="csrc/engine/input_metadata/block_load_plan.cpp" lines="9-35" />
+<ol>
+  <li>Lines 9-12: a segment records its destination offset, which is the running total <code>total_k_</code>.</li>
+  <li>Lines 14-21: a zero fill is cut into pieces of at most one source block.</li>
+  <li>Lines 23-35: a paged range walks the block table. Each segment stays inside one block.</li>
+</ol>
+<p><code>append_ring_range</code> does the same for a ring: the source block id stays the state slot, and the position wraps with <code>% source_block_size</code> ({{cite csrc/engine/input_metadata/block_load_plan.cpp:37-46}}). The compressed plan of a sequence covers entries <code>0</code> to <code>seqlen_k / n</code>; a sequence with 0 entries gets a one-entry zero fill, "on par with" the <code>max(1, …)</code> in <code>ks</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:51-63}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:451-452}}).</p>
+<p><strong>Example</strong> (sequence A of the figure, ratio 2, block table <code>[7, 2, 9]</code>, <code>seqlen_k = 260</code>): 130 entries, 64 per block: <code>[7,0,64,0]</code>, <code>[2,0,64,64]</code>, <code>[9,0,2,128]</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="YOCO: the visibility rule and the compact layout">
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="149-168">
+  <x-tr line="151-152">Combined lower bound (position in the sequence): the max of the window bound, the rectangle bound and the state valid bound, clamped to [0, pos + 1]; abs_lo == pos + 1 means an empty visible range (the token is fully outside the rectangle).</x-tr>
+  <x-tr line="157">The right edge of section 1 is q_start.</x-tr>
+  <x-tr line="158">q_start - window_size: the sequence position of the start of the original SWA range.</x-tr>
+  <x-tr line="163-164">The left edge of section 2 is q_start; j is the offset of the token in section 2, k_lo the offset of the start.</x-tr>
+</x-code>
+<p>The "rectangle" is the kept range <code>[data_len − keep_tokens, data_len)</code>. Rows outside it see nothing in mask mode. In compact mode they are dropped, but a chunk always keeps at least its last row as a placeholder ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:222-225}}). In compact mode, a kept row writes to the ring only if it is in the rectangle and among the last <code>swa_block_size</code> rows of the chunk ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:266-271}}).</p>
+<p>With CP above 1, <code>fill_yoco_consumer_cp_scalars</code> computes two lengths for the device: the compact mirror length <code>Σ 2 × ⌈keep_len / (2·cp)⌉</code> and the largest number of kept rows on one rank ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:173-201}}). Rank <code>r</code> holds parts <code>r</code> and <code>2·cp − 1 − r</code> of each sequence (line 187), the {{term cp-mirror}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths (TORCH_CHECK)">
+<table>
+  <thead><tr><th>Check</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td>Each ratio is positive and divides the block size</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:3-9}}</td></tr>
+    <tr><td>Decode needs at least one ratio</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:564}}</td></tr>
+    <tr><td>Row counters match <code>total_q</code> / <code>n_cq</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:69}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:109}}</td></tr>
+    <tr><td>YOCO keep tokens &gt; 0 and ≥ window + backtracking</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:353-357}}</td></tr>
+    <tr><td><code>swa_block_size ≥ window_size</code>; <code>total_k_swa = n_seq × window</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:369}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:387}}</td></tr>
+    <tr><td><code>swa_valid_start ≤ q_start</code>; window start slot in range; section 2 not empty</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:503-521}}</td></tr>
+    <tr><td>Decode KV offset fits in int32</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:615-616}}</td></tr>
+    <tr><td>Decode block count ≤ <code>max_num_blocks</code> and ≤ the table length</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:223}}</td></tr>
+    <tr><td>Decode: <code>token_ids.size() − 1 + seqlen_q == seqlen_k</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:109}}</td></tr>
+    <tr><td>Graph buffer shape and dtype</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:42-43}}</td></tr>
+  </tbody>
+</table>
+<p>A failed check raises a Python <code>RuntimeError</code> with the message of the check.</p>
+</x-deepdive>
+
+<x-deepdive title="Settings that reach this file">
+<p>All values come through <code>PrepareArgs</code>, set in {{cite deepinfer/model_executor/model_metadata_utils.py:160-180}}:</p>
+<ul>
+  <li><code>block_size</code>: 128 for this model ({{cite deepinfer/model_executor/model_metadata_utils.py:133-135}}).</li>
+  <li><code>window_size</code> and <code>swa_block_size</code>: from the model config, <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> and, when it is on, <code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code> ({{cite deepinfer/worker/model_runner.py:101-102}}, {{cite deepinfer/worker/cache_engine.py:88-110}}).</li>
+  <li><code>yoco_prefill_truncation_mode</code>, <code>yoco_prefill_keep_tokens</code>, <code>max_backtracking_tokens</code>: environment variables ({{cite deepinfer/model_executor/model_metadata_utils.py:175-178}}).</li>
+  <li><code>force_load_balance</code>: <code>DEEPINFER_FORCE_LOAD_BALANCE</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:166}}).</li>
+  <li><code>dense_compress_ratios</code>, <code>sparse_compress_ratios</code>: from the attention configs; sparse means <code>index_topk &gt; 0</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:29-34}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/input-metadata}}: the fields with worked examples.</li>
+  <li>{{link concepts/paged-kv-cache}}: blocks, state slots and the SWA ring.</li>
+  <li>{{link concepts/sliding-window-attention}} and {{link concepts/yoco-swa-replay}}: what the windows are for.</li>
+  <li>{{link code/zos-cpp}}: the C++ part of the ZOS decode path.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">With ZOS on (the default), does <code>prepare_decode_v4</code> run in a decode step?
+    <x-a><p>No. <code>ModelMetadata</code> picks <code>prepare_decode_v4_zos</code> when <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> is on ({{cite deepinfer/model_executor/model_metadata_utils.py:143}}). Then a device kernel computes the decode fields.</p></x-a>
+  </x-q>
+  <x-q level="medium">A decode row is at position 305 and the model has ratio-2 layers. Does it end a compressed entry, and which entry?
+    <x-a><p>Yes: <code>(305 + 1) % 2 == 0</code>. The entry is <code>305 / 2 = 152</code>, with <code>positions_c = 304</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:80-86}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A prefill chunk has <code>q_start = 200</code> and a window of 128. What are the pivots of its first row (position 200), if it is the first sequence of a batch of two?
+    <x-a><p><code>abs_lo = 73</code>, so section 1 starts at slot <code>73 − (200 − 128) = 1</code> with 127 rows, and section 2 has 1 row at <code>2 × 128 + 0 = 256</code>. Pivots: <code>[1, 127, 256, 1]</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:493-523}}). This matches the deep dive of {{link concepts/input-metadata}}.</p></x-a>
+  </x-q>
+</x-quiz>

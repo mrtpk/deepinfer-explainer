@@ -1,0 +1,255 @@
+---
+title: worker/model_runner.py: the ModelRunner class
+nav_title: worker/model_runner.py
+level: Advanced
+prerequisites: concepts/input-metadata, concepts/cuda-graphs
+related: code/worker, code/worker-base, code/input-metadata, code/cuda-graph-runner, code/prepare-tensor-input-v4, code/prepare-sample-cpp, code/sampler, code/deepseek, concepts/zero-overhead-scheduling, concepts/context-parallelism, tours/life-of-a-request
+summary: ModelRunner owns the model object on one rank. It builds the input metadata, runs the forward pass (eager or as a CUDA graph replay), prepares the sampler inputs, runs the memory profile and captures the graphs.
+---
+<h2>Purpose</h2>
+<p><code>ModelRunner</code> is the layer between the Worker and the model: for each step it turns the scheduled sequences into device inputs, starts the forward pass and the sampler, and it does the start-up work for memory profiling and {{term cuda-graph}} capture.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/worker/model_runner.py</code>, 644 lines of Python. The header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/worker/model_runner.py:2}})</td></tr>
+    <tr><th>Main class</th><td><code>ModelRunner</code> ({{cite deepinfer/worker/model_runner.py:53}}). Also the result type <code>MainModelOutput</code> ({{cite deepinfer/worker/model_runner.py:46-50}}).</td></tr>
+    <tr><th>Runs in</th><td>Every worker process: the {{term driver-worker}} (in the engine process) and each context-parallel follower. Only the driver has the sequence list.</td></tr>
+    <tr><th>Called by</th><td><code>Worker.execute_model_step</code> each step, and <code>WorkerBase</code> at start-up and shutdown.</td></tr>
+    <tr><th>Calls</th><td>The model (<code>DeepseekForCausalLM</code>), <code>ModelMetadata.prepare_inputmetadata_dict</code>, C++ <code>prepare_sampler_inputs</code>, <code>CudaGraphRunner</code>, <code>DFlashCudaGraphRunner</code>, <code>CacheEngine</code> (profile only).</td></tr>
+    <tr><th>Not in this file</th><td>No scheduling, no kernels, no cache allocation for serving. The C++ code computes the index tensors; the model and the sampler do the math.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4a_runner_flow" alt="Panel 1: two lanes, the driver rank and a CP follower rank. The driver either selects a graph, adds padding and lets C++ fill out_dict, or builds pinned tensors and copies them to the device; with CP above 1 it broadcasts a small dict. The follower receives it and selects the same graph or rebuilds the object. Both ranks then replay the graph or call the model inside forbid_cuda_sync. Panel 2: the driver calls the C++ prepare_sampler_inputs and broadcasts row indices; the follower builds SamplerInputs without the driver part." caption="Figure: one step inside ModelRunner on the driver rank and on a context-parallel follower. Click to zoom." />
+<p>Blue is the driver rank. Pink is a follower rank, which exists only with context parallelism. Amber is the eager path, and violet marks the broadcasts.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>WorkerBase.__init__</code></strong> makes the runner with the block size of the cache ({{cite deepinfer/worker/base.py:90-96}}).</li>
+  <li><strong>Start-up:</strong> <code>load_model</code> ({{cite deepinfer/worker/base.py:207}}), <code>profile_run</code> inside <code>profile_num_available_blocks</code> ({{cite deepinfer/worker/base.py:222-225}}), then <code>capture_model</code>, <code>profile_decode_perf</code> and <code>capture_dflash_model</code> inside <code>warm_up_model</code> ({{cite deepinfer/worker/base.py:274-285}}).</li>
+  <li><strong>Each step:</strong> <code>Worker.execute_model_step</code> calls <code>execute_main_model</code> and <code>execute_sample</code> ({{cite deepinfer/worker/worker.py:121-159}}), and later <code>post_process</code> ({{cite deepinfer/worker/worker.py:268}}). For a {{term placeholder-step}} it first asks for <code>_placeholder_seq_metadata</code> ({{cite deepinfer/worker/worker.py:126-127}}).</li>
+  <li><strong>Shutdown:</strong> <code>WorkerBase.stop</code> calls <code>destroy_cuda_graphs</code> ({{cite deepinfer/worker/base.py:142-146}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>The input builder.</strong> <code>self.model.model_metadata.prepare_inputmetadata_dict</code> ({{cite deepinfer/worker/model_runner.py:131-139}}), which calls the C++ functions of {{link code/prepare-tensor-input-v4}}.</li>
+  <li><strong>The sampler input builder.</strong> C++ <code>prepare_sampler_inputs</code> ({{cite deepinfer/worker/model_runner.py:15}}, {{cite deepinfer/worker/model_runner.py:244-249}}); see {{link code/prepare-sample-cpp}}.</li>
+  <li><strong>The model.</strong> <code>self.model(...)</code> for the forward pass and <code>self.model.sample(...)</code> for sampling ({{cite deepinfer/worker/model_runner.py:329}}, {{cite deepinfer/worker/model_runner.py:361-365}}).</li>
+  <li><strong>The graph runners.</strong> {{link code/cuda-graph-runner}} ({{cite deepinfer/worker/model_runner.py:34-36}}).</li>
+  <li><strong>Collectives.</strong> <code>broadcast_tensor_dict</code> to the context-parallel group ({{cite deepinfer/worker/model_runner.py:212}}, {{cite deepinfer/worker/model_runner.py:259}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>MainModelOutput</code></td><td>{{cite deepinfer/worker/model_runner.py:46}}</td><td>Result of the forward: model output, input metadata, graph size (0 = eager).</td></tr>
+    <tr><td><code>__init__</code></td><td>{{cite deepinfer/worker/model_runner.py:54}}</td><td>Decides if graphs are on; makes the graph runners.</td></tr>
+    <tr><td><code>load_model</code></td><td>{{cite deepinfer/worker/model_runner.py:96}}</td><td>Loads the model; window and ring sizes; YOCO check; <code>max_num_blocks</code>.</td></tr>
+    <tr><td><code>_prepare_input_tensors</code></td><td>{{cite deepinfer/worker/model_runner.py:120}}</td><td>Builds the {{term input-metadata}} on the CPU (or device with ZOS), or fills given buffers.</td></tr>
+    <tr><td><code>_prepare_input</code></td><td>{{cite deepinfer/worker/model_runner.py:149}}</td><td>Driver or follower path.</td></tr>
+    <tr><td><code>_graph_input_metadata</code></td><td>{{cite deepinfer/worker/model_runner.py:164}}</td><td>Takes the device object of a graph and sets the real request count.</td></tr>
+    <tr><td><code>_prepare_input_driver</code></td><td>{{cite deepinfer/worker/model_runner.py:171}}</td><td>Graph or eager input; broadcast to CP followers.</td></tr>
+    <tr><td><code>_prepare_input_follower</code></td><td>{{cite deepinfer/worker/model_runner.py:216}}</td><td>Receives the input from the driver.</td></tr>
+    <tr><td><code>prepare_sampler_inputs</code></td><td>{{cite deepinfer/worker/model_runner.py:233}}</td><td>C++ sampler inputs on the driver; broadcast of row indices.</td></tr>
+    <tr><td><code>execute_model_profile_run</code></td><td>{{cite deepinfer/worker/model_runner.py:280}}</td><td>One full step with a sync, for the memory profile.</td></tr>
+    <tr><td><code>execute_main_model</code></td><td>{{cite deepinfer/worker/model_runner.py:308}}</td><td>Input, then replay or eager forward. No sync.</td></tr>
+    <tr><td><code>execute_sample</code></td><td>{{cite deepinfer/worker/model_runner.py:337}}</td><td>Sampler inputs, then <code>model.sample</code>. No sync.</td></tr>
+    <tr><td><code>post_process</code></td><td>{{cite deepinfer/worker/model_runner.py:370}}</td><td>Runs the sampler's deferred functions; prompt log-probabilities.</td></tr>
+    <tr><td><code>_placeholder_seq_metadata</code></td><td>{{cite deepinfer/worker/model_runner.py:386}}</td><td>A one-token dummy sequence on block 0 and state slot 0.</td></tr>
+    <tr><td><code>_build_prompt_profile_seq_lens</code></td><td>{{cite deepinfer/worker/model_runner.py:405}}</td><td>Lengths of the profile batch.</td></tr>
+    <tr><td><code>profile_run</code></td><td>{{cite deepinfer/worker/model_runner.py:444}}</td><td>Runs the largest batch once on a small real cache, to measure peak memory.</td></tr>
+    <tr><td><code>capture_model</code>, <code>capture_dflash_model</code></td><td>{{cite deepinfer/worker/model_runner.py:515}}, {{cite deepinfer/worker/model_runner.py:532}}</td><td>Graph capture of the main model and of DFlash.</td></tr>
+    <tr><td><code>profile_decode_perf</code></td><td>{{cite deepinfer/worker/model_runner.py:562}}</td><td>Time of each graph size (DSpark only).</td></tr>
+    <tr><td><code>destroy_cuda_graphs</code></td><td>{{cite deepinfer/worker/model_runner.py:633}}</td><td>Frees the graphs before the process groups end.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>: graphs on or off</h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="72-93" highlight="73,77-78,80-85" />
+<ol>
+  <li>Line 73: graphs are on unless <code>DEEPINFER_ENFORCE_EAGER</code> is set or the engine is a PROMPT engine.</li>
+  <li>Line 77: the largest graph has <code>max_num_seqs × (1 + nextn)</code> rows.</li>
+  <li>Line 78: with {{term zos}}, the graph inputs live on the device.</li>
+  <li>Lines 80-85: DFlash graphs need main graphs, <code>nextn &gt; 0</code>, a <code>dflash_cfg</code> and no <code>DEEPINFER_DFLASH_ENFORCE_EAGER</code>.</li>
+</ol>
+
+<h3><code>load_model</code>: sizes and the YOCO keep guard</h3>
+<x-warning title="YOCO keep tokens must cover the window and the backtracking">
+<p>With YOCO truncation on, start-up stops with <code>AssertionError</code> unless <code>window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS ≤ DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code>. With a window of 128 and 6 backtracking tokens, the minimum is 134. The README value is 140 ({{cite README.md:25}}).</p>
+</x-warning>
+<x-code file="deepinfer/worker/model_runner.py" lines="95-115" highlight="101-102,107-113,115">
+  <x-tr line="101">Models without a window size can have (-1, -1) here.</x-tr>
+  <x-tr line="104-105">Keep the three-state mode; later code checks separately if truncation is on and if the compact layout is used. ModelMetadata already makes sure that the model has YoCo consumer layers when truncation is on.</x-tr>
+  <x-tr line="108">The truncation length must be at least window_size + backtracking, so that after a rollback the decoder still has a full window of SWA.</x-tr>
+  <x-tr line="114">The 64 here is an alignment requirement. self.block_size is the token count before compression.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 98-99: only the driver of a non-PROMPT engine makes the {{term mtp-info-pool}} of the draft model.</li>
+  <li>Lines 101-102: the window size comes from the model config. The ring size is <code>window + DEEPINFER_MAX_BACKTRACKING_TOKENS</code>, plus extra rows when <code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code> is on ({{cite deepinfer/worker/cache_engine.py:88-110}}).</li>
+  <li>Lines 107-113: the YOCO guard. C++ checks the same rule again in each prefill ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:355-357}}).</li>
+  <li>Line 115: the width of a decode block table. With <code>runtime_max_model_len = 32784</code>: <code>⌈32784 / 128⌉ = 257</code>, rounded up to 320.</li>
+</ol>
+
+<h3><code>_prepare_input_tensors</code></h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="120-146" highlight="131-139,140-141,142-146" />
+<p>The dict from C++ becomes the keyword arguments of the metadata class: <code>InputMetadataV4</code>, or <code>InputMetadataV4VL</code> for a vision model ({{cite deepinfer/model_executor/model_metadata_utils.py:142-144}}). <code>num_reqs</code> is the number of sequences, with padding when the caller added it. On the graph path the caller passes <code>out_dict</code>, and the function returns <code>None</code>.</p>
+
+<h3><code>_prepare_input_driver</code>: graph or eager</h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="171-214" highlight="182,185-191,194-198,200-212" />
+<p>The helper <code>_graph_input_metadata</code> sets the real request count. Its comment says, translated: <em>"The real request count, without padding. It must match the sampler inputs, which have no padding. It is in input_metadata because with CP only the driver has the sampling inputs."</em> ({{cite deepinfer/worker/model_runner.py:164-169}}).</p>
+<ol>
+  <li>Line 180: <code>total_q</code> is the sum of <code>seqlen_q</code>, unless the Worker passes it. For a decode step the driver Worker passes <code>scheduler_outputs.num_batched_tokens</code> ({{cite deepinfer/worker/worker.py:117}}).</li>
+  <li>Line 182: a graph runs for a decode step when graphs are on and captured.</li>
+  <li>Lines 185-191: select the graph, add <code>graph_size − total_q</code> padding sequences, and let the builder write into the graph's source buffers. Then set the real request count on the device object.</li>
+  <li>Lines 194-198: the eager path builds a new object and copies every tensor to the device without a wait.</li>
+  <li>Lines 200-212: with CP above 1, broadcast a small dict. Only an eager step also sends all tensor fields, flattened to one dict level.</li>
+</ol>
+
+<h3><code>_prepare_input_follower</code></h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="216-230" highlight="217,223-225,227">
+  <x-tr line="218">Pop only the keys that are not InputMetadata fields; is_prompt, total_q and num_reqs are fields themselves and stay for from_flatten_dict.</x-tr>
+</x-code>
+<p>A follower selects the same graph from <code>total_q</code>. The tensor values reach its graph buffers inside the replay: the recorded <code>InputMetadata.broadcast()</code> copies them from rank 0 ({{cite deepinfer/worker/cuda_graph_runner.py:64-65}}).</p>
+
+<h3><code>execute_main_model</code></h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="307-335" highlight="319,324,326-329" />
+<ol>
+  <li>Line 319: build the input (driver) or receive it (follower).</li>
+  <li>Lines 321-325: two timers and the {{term sync-guard}}. The CPU timer name contains the request count and the row count, for example <code>launch_forward_N2_B12</code>.</li>
+  <li>Lines 326-329: replay or eager call. Both return at once; the device works in the background.</li>
+</ol>
+
+<h3><code>prepare_sampler_inputs</code> and <code>execute_sample</code></h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="238-259" highlight="241-243,244-249,250-259">
+  <x-tr line="239-240">Compact mode computes the prefill sample positions from the truncated output size; mask and off keep the full layout. The sampler runs after CP, so CP is invisible to it. Decode always uses the full layout, so it passes off.</x-tr>
+</x-code>
+<p>The driver passes the real sequence list, without graph padding. So the sampler reads only real rows. With CP, the followers get the row indices and build a <code>SamplerInputs</code> without the driver part ({{cite deepinfer/worker/model_runner.py:260-275}}). <code>execute_sample</code> then calls <code>self.model.sample(...)</code> inside the sync guard. It passes <code>kv_caches</code> only when <code>nextn &gt; 0</code>, because the draft model needs the cache ({{cite deepinfer/worker/model_runner.py:348-365}}).</p>
+
+<h3><code>post_process</code></h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="369-384" />
+<p>The sampler leaves work that needs finished device results in <code>post_funcs</code>. The Worker calls <code>post_process</code> after it waits for the sample event ({{cite deepinfer/worker/worker.py:262-268}}). For a prefill step, the driver converts the prompt log-probabilities in C++ (<code>update_prompt_logprobs</code>).</p>
+
+<h3><code>profile_run</code>: the memory profile</h3>
+<x-code file="deepinfer/worker/model_runner.py" lines="443-512" highlight="448,452,476,493,505-507,510-512">
+  <x-tr line="469">Engram's compressed tokenizer cannot handle meaningless tokens; the valid range is [0, len(tokenizer)).</x-tr>
+  <x-tr line="498-503">Run the profile on a small real KV cache, to count the memory of the cache read and write kernels. The allocation uses cuMemAlloc, which torch does not count, and it is freed when the function returns, so it does not change the block count of profile_num_available_blocks. It is zeroed because the full gather of chunked prefill reads cache areas that nobody wrote; zeros make sure the values read are finite. allocate_gpu_cache also writes bytes_per_block, num_state_seqs and bytes_of_state_per_seqs into cache_config, with the same values as the real allocation (only num_gpu_blocks is different).</x-tr>
+</x-code>
+<ol>
+  <li>Line 448: a NORMAL engine profiles a prefill batch; only a COMPLETION engine profiles a decode batch.</li>
+  <li>Line 452: the lengths come from <code>_build_prompt_profile_seq_lens</code> (deep dive).</li>
+  <li>Line 476: each sequence gets its own blocks, in order, so the profile cache has exactly the blocks it needs.</li>
+  <li>Lines 505-507: a temporary <code>CacheEngine</code> with these blocks, filled with zeros.</li>
+  <li>Lines 510-512: the run uses a forced MoE imbalance of 1.8, so the profile sees a bad expert load. Then the value goes back to 0.0.</li>
+</ol>
+
+<h3>Capture and destroy</h3>
+<p><code>capture_model</code> passes <code>_prepare_input_tensors</code> and a decode placeholder to the graph runner ({{cite deepinfer/worker/model_runner.py:514-529}}). <code>capture_dflash_model</code> needs the main graphs and reuses their pool and stream ({{cite deepinfer/worker/model_runner.py:538-549}}). <code>destroy_cuda_graphs</code> frees both runners; its docstring explains that NCCL inside graphs holds extra resources that block the destruction of the process group ({{cite deepinfer/worker/model_runner.py:633-644}}). The page {{link code/cuda-graph-runner}} reads the runners line by line.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow of one step: objects, types and shapes">
+<p><code>n</code> is the number of real sequences, <code>total_q</code> the number of real rows, <code>G</code> the graph size (0 when eager).</p>
+<table>
+  <thead><tr><th>Object</th><th>Type, shape</th><th>Made by</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>seq_metadata_list</code></td><td><code>list[SequenceMetadata]</code>, length <code>n</code></td><td>C++ scheduler</td><td>Driver only. Followers get <code>None</code>.</td></tr>
+    <tr><td><code>metadata_zos</code></td><td><code>MetadataZOS</code> or <code>None</code></td><td><code>Worker._correct_seqlens_qk</code></td><td>Device copies of corrected <code>seqlens_q/k</code> ({{cite deepinfer/worker/worker.py:236-245}}).</td></tr>
+    <tr><td>padding list</td><td><code>G − total_q</code> placeholders</td><td>graph runner</td><td>One row each ({{cite deepinfer/worker/cuda_graph_runner.py:93}}).</td></tr>
+    <tr><td><code>input_metadata</code></td><td><code>InputMetadataV4</code>, tensors <code>[total_q, …]</code> or <code>[G, …]</code></td><td><code>_prepare_input</code></td><td>Device tensors; <code>num_reqs = n</code>.</td></tr>
+    <tr><td><code>model_output</code></td><td><code>CausalLMForwardOutput</code>, rows <code>total_q</code> or <code>G</code></td><td>model / graph</td><td>Hidden states, not logits. Wrapped in <code>Movable</code> by the Worker ({{cite deepinfer/worker/worker.py:140}}).</td></tr>
+    <tr><td><code>sampler_inputs</code></td><td><code>SamplerInputs</code></td><td>C++ <code>prepare_sampler_inputs</code></td><td>Index arrays of real rows only.</td></tr>
+    <tr><td><code>SamplerOutput</code></td><td>tokens, accepted counts, <code>post_funcs</code></td><td><code>model.sample</code></td><td>Read after <code>sample_end_evt</code>.</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example</strong> (the decode step of {{link concepts/input-metadata}}): <code>n = 2</code>, <code>total_q = 12</code>, <code>G = 16</code>. The CPU timer record is <code>launch_forward_N2_B12</code>. <code>input_metadata.num_reqs = 2</code> although the buffers have 16 rows. <code>MainModelOutput.graph_size = 16</code>; the Worker passes it to DSpark statistics ({{cite deepinfer/worker/worker.py:129-137}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The profile batch: lengths with numbers">
+<x-code file="deepinfer/worker/model_runner.py" lines="405-441" highlight="407-409,414,419-422,431-438">
+  <x-tr line="406">If DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K is set, run the profile with sum seqlen_k as close as possible to it.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 407-409: split <code>max_num_batched_tokens</code> evenly over <code>max_num_seqs</code> sequences for <code>seqlen_q</code>.</li>
+  <li>Line 414: the first sequence gets the longest possible <code>seqlen_k</code>, <code>runtime_max_model_len</code>.</li>
+  <li>Lines 417-439: with <code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code> set, the other sequences grow until the sum of <code>seqlen_k</code> hits the limit (clamped between the minimum and <code>max_num_seqs × runtime_max_model_len</code>).</li>
+</ol>
+<p><strong>Example A</strong>, the settings of <code>examples/offline_inference.py</code> (<code>max_num_seqs=4</code>, <code>max_num_batched_tokens=32768</code>, {{cite examples/offline_inference.py:52-54}}) and <code>runtime_max_model_len = 32784</code>: <code>seqlen_q = [8192, 8192, 8192, 8192]</code>, <code>seqlen_k = [32784, 8192, 8192, 8192]</code>. Blocks: <code>⌈32784/128⌉ + 3 × 64 = 257 + 192 = 449</code>.</p>
+<p><strong>Example B</strong>, the same with <code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K=65536</code>: the minimum sum is 57360, so 8176 tokens remain. The loop adds 2726, 2725 and 2725: <code>seqlen_k = [32784, 10918, 10917, 10917]</code>, sum 65536.</p>
+<p>The prefill sequences use <code>top_p=0.99</code> and <code>top_logprobs=20</code> ({{cite deepinfer/worker/model_runner.py:484}}), so the profile also counts the memory of the log-probability path. Each sequence gets its own MTP write slot <code>seq_id + 1</code>, unlike padding, which uses slot 0 ({{cite deepinfer/worker/model_runner.py:491-492}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, ranks and broadcasts">
+<table>
+  <thead><tr><th>Rank</th><th>Has</th><th>Gets from the driver</th></tr></thead>
+  <tbody>
+    <tr><td>Driver (cp_rank 0)</td><td><code>seq_metadata_list</code>, <code>scheduler_outputs</code>, sampler driver part</td><td>—</td></tr>
+    <tr><td>CP follower</td><td><code>is_prompt</code>, <code>is_placeholder</code></td><td>Eager: all input fields by <code>broadcast_tensor_dict</code>. Graph: a small dict, then the tensors inside the replay. Sampler: row indices ({{cite deepinfer/worker/model_runner.py:250-259}}).</td></tr>
+  </tbody>
+</table>
+<p>Only the driver makes the MTP info pool and samples DFlash drafts ({{cite deepinfer/worker/model_runner.py:98-99}}, {{cite deepinfer/worker/model_runner.py:90}}). Every rank runs the same model kernels, because the model math is split over the CP group. The page {{link concepts/context-parallelism}} explains the split.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>YOCO on, but keep tokens below window + backtracking</td><td><code>AssertionError</code> at load</td><td>{{cite deepinfer/worker/model_runner.py:110-113}}</td></tr>
+    <tr><td>YOCO on, model without a window</td><td><code>AssertionError</code> at load</td><td>{{cite deepinfer/worker/model_runner.py:109}}</td></tr>
+    <tr><td>Empty sequence list on the driver</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/model_runner.py:178}}</td></tr>
+    <tr><td>More rows than the largest graph</td><td><code>ValueError</code> in <code>select</code></td><td>{{cite deepinfer/worker/cuda_graph_runner.py:144-146}}</td></tr>
+    <tr><td>A CPU-device sync inside forward or sample launch</td><td>error from the sync guard</td><td>{{cite deepinfer/worker/model_runner.py:324}}, {{cite deepinfer/worker/model_runner.py:359}}</td></tr>
+    <tr><td>Follower and driver disagree on <code>is_prompt</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/model_runner.py:262}}</td></tr>
+    <tr><td>Profile lengths over <code>runtime_max_model_len</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/model_runner.py:412}}</td></tr>
+    <tr><td>DFlash capture before the main capture</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/model_runner.py:539}}</td></tr>
+    <tr><td>Prefill sum-K limit outside the possible range</td><td>warning "Clamped prefill profile sum-K", then the clamped value</td><td>{{cite deepinfer/worker/model_runner.py:423-428}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that this file reads">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/worker/model_runner.py:67}}</td><td>Graph size, DFlash, sampler width.</td></tr>
+    <tr><td><code>DEEPINFER_ENFORCE_EAGER</code></td><td>off ({{cite deepinfer/environ.py:154}})</td><td>{{cite deepinfer/worker/model_runner.py:73}}</td><td>No graphs.</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>0; <code>EngineArgs</code> sets 1 for NORMAL ({{cite deepinfer/environ.py:179}})</td><td>{{cite deepinfer/worker/model_runner.py:78}}, {{cite deepinfer/worker/model_runner.py:384}}</td><td>Graph inputs on the device; non-blocking timer flush.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_ENFORCE_EAGER</code></td><td>off ({{cite deepinfer/environ.py:156}})</td><td>{{cite deepinfer/worker/model_runner.py:82}}</td><td>No DFlash graphs.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code></td><td><code>off</code> ({{cite deepinfer/environ.py:188}})</td><td>{{cite deepinfer/worker/model_runner.py:106}}</td><td>YOCO guard; sampler layout.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code></td><td>0 ({{cite deepinfer/environ.py:191}})</td><td>{{cite deepinfer/worker/model_runner.py:110}}, {{cite deepinfer/worker/model_runner.py:248}}</td><td>Kept tokens.</td></tr>
+    <tr><td><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td>at least nextn + 1 ({{cite deepinfer/environ.py:132}})</td><td>{{cite deepinfer/worker/model_runner.py:110}}</td><td>Part of the YOCO minimum.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code></td><td>unset ({{cite deepinfer/environ.py:124}})</td><td>{{cite deepinfer/worker/model_runner.py:417}}</td><td>Profile batch sum-K.</td></tr>
+    <tr><td><code>DEEPINFER_FORCE_IMBALANCE_RATIO</code></td><td>set to 1.8, then 0.0, by this file</td><td>{{cite deepinfer/worker/model_runner.py:510-512}}</td><td>The profile overwrites any value from the environment.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/input-metadata}}: what <code>_prepare_input_tensors</code> builds, with worked examples.</li>
+  <li>{{link concepts/cuda-graphs}}: capture, padding and replay.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why the forward and sample launches must not wait for the device.</li>
+  <li>{{link concepts/context-parallelism}}: the followers and the broadcasts.</li>
+  <li>{{link concepts/sampler}}: what <code>model.sample</code> does with the inputs.</li>
+  <li>{{link tours/life-of-a-request}}: stops 6 and 8 pass through this file.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method of <code>ModelRunner</code> does the Worker call to start the forward pass, and does it wait for the device?
+    <x-a><p><code>execute_main_model</code> ({{cite deepinfer/worker/worker.py:122}}). It does not wait: the docstring says it "must NOT contain any cuda synchronize", and the launch runs inside <code>forbid_cuda_sync()</code> ({{cite deepinfer/worker/model_runner.py:315-324}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code> and <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS=128</code>, with a window of 128 and the default backtracking. What happens?
+    <x-a><p>Start-up stops in <code>load_model</code> with <code>AssertionError</code>: <code>128 + 6 = 134 &gt; 128</code> ({{cite deepinfer/worker/model_runner.py:107-113}}). The default backtracking is at least <code>nextn + 1 = 6</code> ({{cite deepinfer/environ.py:132}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">On the graph path, the device buffers have 16 rows but only 2 real sequences. Where does the model find the real count, and why is it stored in the input metadata?
+    <x-a><p><code>_graph_input_metadata</code> sets <code>input_metadata.num_reqs</code> to the real count ({{cite deepinfer/worker/model_runner.py:164-169}}). The comment says that with CP only the driver has the sampling inputs, so the count must travel in the metadata.</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>max_num_seqs=4</code>, <code>max_num_batched_tokens=32768</code>, <code>runtime_max_model_len=32784</code> and <code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K=65536</code>, what <code>seqlen_k</code> values does the profile batch use, and how many KV blocks does the temporary cache get?
+    <x-a><p><code>[32784, 10918, 10917, 10917]</code> (deep dive "The profile batch"; {{cite deepinfer/worker/model_runner.py:405-441}}). Blocks: <code>⌈32784/128⌉ + ⌈10918/128⌉ + 2 × ⌈10917/128⌉ = 257 + 86 + 86 + 86 = 515</code> ({{cite deepinfer/worker/model_runner.py:476}}).</p></x-a>
+  </x-q>
+</x-quiz>

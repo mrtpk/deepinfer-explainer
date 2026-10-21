@@ -1,0 +1,190 @@
+---
+title: model_executor/input_metadata/: the InputMetadata classes
+nav_title: input_metadata/
+level: Advanced
+prerequisites: concepts/input-metadata, concepts/cuda-graphs
+related: code/prepare-tensor-input-v4, code/model-runner, code/cuda-graph-runner, code/v4-attn, code/deepseek, code/dflash, concepts/zero-overhead-scheduling, concepts/context-parallelism, concepts/yoco-swa-replay
+summary: The Python side of the input metadata. InputMetadataV4 holds the per-step index tensors, expands them on the device, broadcasts them to CP ranks and makes the YOCO and DFlash views; prepare_tensor_input_zos.py builds the decode metadata on the device when ZOS is on.
+---
+<h2>Purpose</h2>
+<p>This folder defines the object that every layer of the model reads in a step, the {{term input-metadata}}, and the device-side builder of the decode metadata for {{term zos}}.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>input_metadata.py</code> (490 lines): the classes. <code>yoco.py</code> (182 lines) and <code>dflash.py</code> (84 lines): two mixins. <code>prepare_tensor_input_zos.py</code> (382 lines): the ZOS decode builder. <code>__init__.py</code> (13 lines): exports four classes ({{cite deepinfer/model_executor/input_metadata/__init__.py:1-13}}).</td></tr>
+    <tr><th>Main class</th><td><code>InputMetadataV4</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:218}}), with the base <code>InputMetadata</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:27}}) and the vision classes <code>InputMetadataVL</code> and <code>InputMetadataV4VL</code>.</td></tr>
+    <tr><th>Runs in</th><td>Every worker process. The object is built on the driver; its tensors live on the device during the forward pass.</td></tr>
+    <tr><th>Called by</th><td><code>ModelRunner</code> (construction), <code>ModelMetadata</code> (the ZOS builder), the model (<code>compute_attn_info</code>, the views), <code>CudaGraphRunner</code> (<code>recursive_fn</code>, <code>broadcast</code>).</td></tr>
+    <tr><th>Calls</th><td>TileLang kernels for gathers and index expansion (<code>get_kv_index</code>, <code>swa_index</code>, <code>prepare_cp_mirror</code>, <code>prepare_v4_decode_metadata</code>, …), CP collectives, C++ <code>prepare_decode_zos_inputs</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The CPU computation of prefill fields and of non-ZOS decode fields (C++, {{link code/prepare-tensor-input-v4}}). The image fields come from <code>deepinfer/ve/prepare_tensor_input_vl.py</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4a_varlen_decode" alt="Worked example of a decode step: 16 rows (6 for sequence C, 6 for D, 4 padding) with positions, masks, query indices, context lengths, state slots, slot maps, block tables and SWA offsets, written into the graph buffers." caption="Figure: the fields of an <code>InputMetadataV4</code> in a decode step padded to a graph of size 16. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>ModelRunner._prepare_input_tensors</code> builds the object from the dict of the builder ({{cite deepinfer/worker/model_runner.py:142-146}}).</li>
+  <li><code>ModelMetadata</code> selects the class and the ZOS builder ({{cite deepinfer/model_executor/model_metadata_utils.py:142-144}}).</li>
+  <li>Each attention layer calls <code>compute_attn_info</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:765}}).</li>
+  <li><code>DeepseekModel.forward</code> calls <code>prepare_for_mirror_cp</code>, <code>get_consumer_view</code> and <code>get_mask_view</code> ({{cite deepinfer/model_executor/models/deepseek.py:168-207}}).</li>
+  <li>The DFlash model calls <code>build_dflash_input</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:367-372}}).</li>
+  <li><code>CudaGraphRunner</code> calls <code>recursive_fn</code>, <code>get_clean_list</code>, <code>recursive_copy_</code> and <code>broadcast</code> ({{cite deepinfer/worker/cuda_graph_runner.py:62-65}}, {{cite deepinfer/worker/cuda_graph_runner.py:95}}, {{cite deepinfer/worker/cuda_graph_runner.py:117-119}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li>Index kernels: <code>get_kv_ca_index_prefill</code>, <code>get_kv_ca_index_decode</code>, <code>get_kv_swa_index_decode</code>, <code>expand_swa_index</code>, <code>gather</code>, <code>prepare_cp_mirror</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:13-20}}).</li>
+  <li>CP collectives: <code>cp_broadcast_object</code> and <code>cp_broadcast_multi_tensor</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:21-22}}).</li>
+  <li>ZOS: C++ <code>prepare_decode_zos_inputs</code> and the kernels <code>gather_input_ids_zos</code>, <code>gather_engram_tokens_zos</code>, <code>prepare_v4_decode_metadata</code> ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:7-10}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>InputMetadata</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:27}}</td><td>Base dataclass: token ids, positions, masks, CP mirror fields; helpers.</td></tr>
+    <tr><td><code>recursive_fn</code>, <code>recursive_copy_</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:86}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:100}}</td><td>Apply a function to every tensor (also inside dicts); copy every tensor in place.</td></tr>
+    <tr><td><code>broadcast</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:120}}</td><td>Send all fields from CP rank 0 to the others, in place.</td></tr>
+    <tr><td><code>prepare_for_mirror_cp</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:170}}</td><td>Reorder prefill rows into the {{term cp-mirror}}.</td></tr>
+    <tr><td><code>InputMetadataV4</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:218}}</td><td>All V4 fields; inherits the YOCO and DFlash mixins.</td></tr>
+    <tr><td><code>get_clean_list</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:327}}</td><td>Derived fields to reset before a graph capture.</td></tr>
+    <tr><td><code>compute_attn_info</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:343}}</td><td>Expand compact descriptions into full index tables, once.</td></tr>
+    <tr><td><code>to_flatten_dict</code>, <code>from_flatten_dict</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:391}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:404}}</td><td>Flatten dict fields to <code>"field.ratio"</code> keys for a broadcast, and back.</td></tr>
+    <tr><td><code>InputMetadataVL</code>, <code>InputMetadataV4VL</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:417}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:472}}</td><td>Image fields for the vision model.</td></tr>
+    <tr><td><code>YocoMetadataMixin</code></td><td>{{cite deepinfer/model_executor/input_metadata/yoco.py:32}}</td><td>YOCO fields; <code>get_mask_view</code>, <code>get_consumer_view</code>.</td></tr>
+    <tr><td><code>DFlashMetadataMixin</code></td><td>{{cite deepinfer/model_executor/input_metadata/dflash.py:27}}</td><td>DFlash fields; <code>build_dflash_input</code>.</td></tr>
+    <tr><td><code>prepare_decode_v4_zos</code></td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:307}}</td><td>ZOS decode builder: C++ packs, a kernel fills.</td></tr>
+    <tr><td><code>get_or_create</code>, <code>get_or_create_stacked</code></td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:113}}, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:120}}</td><td>Reuse a graph buffer or make a device tensor.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The dataclass and its field layout</h3>
+<x-code file="deepinfer/model_executor/input_metadata/input_metadata.py" lines="217-240" highlight="218,225,232,235,238">
+  <x-tr line="221">The YoCo truncation fields and views, and the DFlash fields and construction, are in the mixins of yoco.py and dflash.py.</x-tr>
+</x-code>
+<p>Every field has a docstring with its shape. The fields fall in three groups: prefill and decode (lines 225-252), prefill only (lines 256-298), decode only (lines 300-322). The page {{link concepts/input-metadata}} has the full table. The class docstring says "Zero-length tensors are padded to length 1": this is the <code>max(1, …)</code> rule of the C++ builder.</p>
+
+<h3><code>compute_attn_info</code>: expansion on the device</h3>
+<x-code file="deepinfer/model_executor/input_metadata/input_metadata.py" lines="343-389" highlight="345-352,353-357,358-363,371-376,377-383">
+  <x-tr line="354-356">Expand the SWA visible range of the current object (the original metadata or a consumer view). On the original metadata the pivots are the full sliding window; on a consumer view get_consumer_view has replaced them with compact YOCO pivots. The expansion is the same.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 345-352 (prefill): <code>compressed_batch_mapping</code> gives the sequence index of each new compressed entry, from <code>cu_compressed_seqlens_q</code>. A <code>scatter_add_</code> marks the sequence ends and a <code>cumsum_</code> counts them.</li>
+  <li>Lines 353-357: <code>kv_swa_full_index</code> from the pivots (<code>[total_q, window_size]</code>).</li>
+  <li>Lines 358-363: <code>kv_ca_index</code> from the offset pairs. The width is <code>max_model_len / N</code> rounded up to 128.</li>
+  <li>Lines 371-376 (decode): <code>kv_swa_index</code> from the offset pairs, with the ring size.</li>
+  <li>Lines 377-383: <code>kv_ca_index</code> through the block tables, but only when the layer passes <code>block_size</code>. The indexer of a sparse layer makes its own top-k indices.</li>
+</ol>
+<p>Each step is guarded by <code>is None</code>. So the first attention layer does the work, and later layers reuse it. This is also why <code>get_clean_list</code> exists: a graph capture must see these fields as <code>None</code>.</p>
+
+<h3><code>broadcast</code>: one call for the whole object</h3>
+<x-code file="deepinfer/model_executor/input_metadata/input_metadata.py" lines="120-167" highlight="126-149,151-164,166-167" />
+<ol>
+  <li>Lines 126-149: walk the object. Tensors go into a list, also the tensors inside dict fields such as <code>slot_mapping_store_ca["2"]</code>. Other values go into a dict by path, for example <code>"num_reqs"</code>. All tensors must be on the device.</li>
+  <li>Lines 151-164: rank 0 sends the dict with <code>cp_broadcast_object</code>; the other ranks write the values back by path.</li>
+  <li>Lines 166-167: one multi-tensor broadcast fills all tensors in place. Because the addresses do not change, this call works inside a CUDA graph.</li>
+</ol>
+
+<h3><code>prepare_for_mirror_cp</code></h3>
+<x-code file="deepinfer/model_executor/input_metadata/input_metadata.py" lines="169-208" highlight="178-179,185-193,196-208">
+  <x-tr line="183">Dense-only models have an empty ks dict; the kernel needs at least one ratio to compute the mirror index, so it falls back to 1.</x-tr>
+</x-code>
+<p>The kernel <code>prepare_cp_mirror</code> returns the mirror index, its inverse, and new <code>ks</code>/<code>ke</code> for the reordered rows. The function then reorders <code>positions</code> and <code>ngram_token_ids</code> with <code>gather</code>, and writes a reordered copy of <code>gate_force_random</code> to <code>gate_force_random_cp</code>. <code>input_ids</code> and <code>gate_force_random</code> keep the full layout. The docstring explains why rebinding the fields is safe: "prefill runs without cudagraph" ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:171-177}}).</p>
+
+<h3>The YOCO views</h3>
+<x-code file="deepinfer/model_executor/input_metadata/yoco.py" lines="86-128" highlight="88-92,101-118,121,124-128">
+  <x-tr line="87">YOCO decoder truncation (mask mode) changes only the mask; it does not cut rows.</x-tr>
+  <x-tr line="95-99">Make a compact shallow copy of the metadata for the first YoCo consumer layer: switch the query-aligned fields and the SWA visible range to the compact layout, and clear the attention expansions so that they are made again. With CP &gt; 1, also redo the zigzag split and make the redistribution index at the layer boundary. Fields that are not rewritten share tensors with the original metadata; do not change them in place.</x-tr>
+  <x-tr line="111-112">Switch the SWA visible range to the compact YOCO pivots; consumer layers read kv_swa_full_index(_pivots) as usual and get the truncated meaning.</x-tr>
+  <x-tr line="114">Set the fields expanded in forward to None; compute_attn_info expands them again from the compact metadata.</x-tr>
+  <x-tr line="119-120">input_ids is used only by the embedding before the layer loop, so it keeps the original varlen tensor. gate_force_random is gathered from the full layout to the compact layout.</x-tr>
+</x-code>
+<p>The two properties <code>yoco_compaction_enabled</code> and <code>yoco_mask_enabled</code> test which fields C++ made; the two modes never exist together ({{cite deepinfer/model_executor/input_metadata/yoco.py:66-84}}). With CP above 1, <code>get_consumer_view</code> also runs <code>prepare_cp_mirror</code> on the compact lengths and builds the redistribution index for the layer boundary ({{cite deepinfer/model_executor/input_metadata/yoco.py:130-182}}).</p>
+
+<h3>The ZOS decode builder</h3>
+<x-code file="deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py" lines="307-335" highlight="311,314-317,322-334" />
+<ol>
+  <li>Line 317: <code>prepare_common_decode_buffers_zos</code> calls C++ <code>prepare_decode_zos_inputs</code> for per-sequence values, copies them to the device, and gets or makes the per-row buffers ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:162-178}}).</li>
+  <li>Lines 322-334: one stacked buffer per dict field, so one kernel launch fills all ratios.</li>
+</ol>
+<x-code file="deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py" lines="336-382" highlight="337-338,358-366,369" />
+<p>The kernel reads the corrected <code>seqlens_q</code> and <code>seqlens_k</code> from <code>metadata_zos</code>, which the Worker made on the device ({{cite deepinfer/worker/worker.py:236-245}}). <code>finalize_decode_outputs_zos</code> then fills <code>input_ids</code>: a copy from the CPU for fresh sequences, and a device gather from the previous step's sampled and draft tokens for continuing ones ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:181-244}}). With a graph, it returns the graph's <code>out</code> dict ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:286-287}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="get_or_create_stacked: one kernel output, several dict entries">
+<p>The kernel <code>prepare_v4_decode_metadata</code> writes, for example, <code>positions_c</code> for all ratios in one launch. It needs one 2-D buffer <code>[len(keys), q_stride]</code>. The dict of the metadata needs one 1-D tensor per ratio. <code>get_or_create_stacked</code> gives both ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:120-159}}):</p>
+<ol>
+  <li>No keys: a dummy one-row buffer that the kernel does not write, and an empty dict.</li>
+  <li>Eager (no buffer yet): a new <code>[n, total_q, …]</code> tensor; the dict values are its rows.</li>
+  <li>Graph: the existing per-ratio buffers are row views of one allocation from the capture. The function checks that they are equally spaced views of one storage, then rebuilds the 2-D view with <code>as_strided</code>. The row stride can be larger than <code>total_q</code>, because a small graph uses the first rows of the size-max buffer.</li>
+</ol>
+<p>Translated assert message: <em>"the existing buffers of {outer} are not equally spaced row views (was the capture flow changed?)"</em>. So a change to the capture flow that breaks this zero-copy rule fails at once.</p>
+<p><strong>Example.</strong> Sizes <code>[1, …, 24]</code>, ratios <code>"1"</code> and <code>"2"</code>, a step with 16 rows. The capture made <code>positions_c</code> as one <code>[2, 24]</code> tensor with rows <code>["1"]</code> and <code>["2"]</code>; the size-16 graph has views <code>[:16]</code> of each row. <code>stride_elems = 24</code>, <code>q_stride = 24</code>, and the kernel output is a <code>[2, 24]</code> view; the kernel writes the first 16 values of each row.</p>
+</x-deepdive>
+
+<x-deepdive title="Engram token ids under ZOS">
+<p>With Engram, each row needs the compressed ids of its last <code>max_ngram_size</code> tokens. Under ZOS some of them are still on the device. The docstring of <code>prepare_token_ids_zos</code> defines a virtual sequence: the compressed sequence data, then the in-flight draft tokens of the previous step, then the current tokens ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:186-209}}). The window has <code>nextn + max_ngram_size − 1</code> tokens. For lookback <code>r</code> of row <code>j</code>: if <code>j ≥ r</code>, the id is a current token; else it comes from the window, shifted by the number of rejected drafts, which the kernel computes.</p>
+</x-deepdive>
+
+<x-deepdive title="CP broadcast: two paths">
+<table>
+  <thead><tr><th>Path</th><th>What travels</th><th>How</th></tr></thead>
+  <tbody>
+    <tr><td>Eager step</td><td>All fields, flattened</td><td><code>broadcast_tensor_dict</code> in <code>ModelRunner</code>; the follower calls <code>from_flatten_dict</code> ({{cite deepinfer/worker/model_runner.py:209-212}}, {{cite deepinfer/worker/model_runner.py:227}})</td></tr>
+    <tr><td>Graph step</td><td>Tensor values into fixed buffers</td><td><code>InputMetadata.broadcast</code> inside the recorded graph ({{cite deepinfer/worker/cuda_graph_runner.py:64-65}})</td></tr>
+  </tbody>
+</table>
+<p><code>to_flatten_dict</code> handles one level of nesting only. The base class comment says why: the builders nest at most one dict level (the ratio buckets) ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:81-84}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A CPU tensor in <code>broadcast</code></td><td><code>AssertionError</code> "Currently we only support broadcasting tensors on cuda."</td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:137}}</td></tr>
+    <tr><td><code>prepare_for_mirror_cp</code> on a decode step</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:178}}</td></tr>
+    <tr><td>A YOCO view without the YOCO fields</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/input_metadata/yoco.py:88}}, {{cite deepinfer/model_executor/input_metadata/yoco.py:101}}</td></tr>
+    <tr><td>CP consumer view before <code>prepare_for_mirror_cp</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/input_metadata/yoco.py:133}}</td></tr>
+    <tr><td><code>build_dflash_input</code> on a prefill step</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/input_metadata/dflash.py:53-54}}</td></tr>
+    <tr><td>ZOS: no compress ratio at all</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:315}}</td></tr>
+    <tr><td>Graph buffers not equally spaced views</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:146-156}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:311}}</td><td><code>max_seqlen_q = nextn + 1</code> for the ZOS kernels.</td></tr>
+    <tr><td><code>DEEPINFER_ENABLE_MTP_VARLEN</code></td><td>off ({{cite deepinfer/environ.py:131}})</td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:93-95}}</td><td><code>cu_seqlens_q</code> from the corrected device <code>seqlens_q</code>.</td></tr>
+    <tr><td><code>DEEPINFER_FORCE_LOAD_BALANCE</code></td><td>off ({{cite deepinfer/environ.py:120}})</td><td>{{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:366}}</td><td>Fills <code>gate_force_random</code>.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/input-metadata}}: every field with worked examples.</li>
+  <li>{{link concepts/cuda-graphs}}: why the derived fields are cleaned before a capture.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why decode metadata is built on the device.</li>
+  <li>{{link concepts/context-parallelism}} and {{link concepts/yoco-swa-replay}}: the two views.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method turns the offset pairs of a decode step into the full index table <code>kv_swa_index</code>, and when does it run?
+    <x-a><p><code>InputMetadataV4.compute_attn_info</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:371-376}}). Each attention layer calls it at the start of its forward ({{cite deepinfer/model_executor/models/v4_modules/attn.py:765}}); only the first call does the work.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>get_consumer_view</code> set <code>kv_swa_full_index</code> and <code>kv_ca_index</code> to <code>None</code>?
+    <x-a><p>The view has a new, compact row layout. With <code>None</code>, the next <code>compute_attn_info</code> call expands them again from the compact pivots and offsets ({{cite deepinfer/model_executor/input_metadata/yoco.py:113-118}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Under ZOS with a graph of size 16 and two compress ratios, how can one kernel launch write both <code>positions_c["1"]</code> and <code>positions_c["2"]</code> without a copy?
+    <x-a><p>The capture made both as rows of one <code>[2, 24]</code> tensor. <code>get_or_create_stacked</code> checks that the two size-16 views are equally spaced in one storage and builds a strided <code>[2, 24]</code> view for the kernel ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:141-159}}). This is in the deep dive "get_or_create_stacked".</p></x-a>
+  </x-q>
+</x-quiz>
