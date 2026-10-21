@@ -195,3 +195,37 @@ Rules for unattended work:
 | 1b | Three sample sets in parallel: (i) home page + clickable system map + code-map tree + module page `llm_engine.py`; (ii) basics page "The KV cache" + interactive block allocator + glossary; (iii) Tour 1 "Life of a request" + env-var reference | 3 subagents |
 | 1c | Fact check of all sample pages against the code, build check, browser screenshots | 1 subagent + supervisor |
 | 1d | Stop. Show the user the sample pages. | supervisor |
+
+## 13. Full build (approved by the user 2026-10-21: "build for all, fact check it as well")
+
+Change from section 8: no separate research phase. Phase 1 showed that a writer who reads the code
+for its own cluster gives good pages. A SEPARATE fact checker then checks each batch (Phase 1 fact
+checks found ~5–10 % defective claims, mostly citations, so this step is required).
+Shared facts: `notes/facts.md`. Git: commit locally after each stage (user request); never push.
+
+Pipeline per batch: writer subagent → build 0 errors → fact-check subagent (fixes in place) → commit.
+At most ~7 subagents at the same time.
+
+| Batch | Pages | Interactive visual |
+|---|---|---|
+| B1 Basics I | learn: what-an-llm-does, tokens, transformer, attention, prefill-decode, sampling | attention toy |
+| B2 Basics II | learn: batching, gpus-kernels, parallelism, moe, number-formats | — |
+| B3a Engine + scheduler | concepts: engine-step-loop, request-lifecycle, scheduler · code: scheduler-hpp, sequence-hpp, sequence | scheduler simulator |
+| B3b API + cache | concepts: paged-kv-cache · code: entrypoints-llm, sampling-params, engine-pyi, block-manager-hpp, outputs-hpp | — |
+| B4a Inputs + graphs | concepts: input-metadata, cuda-graphs · code: input-metadata, prepare-tensor-input-v4, prepare-sample-cpp, cuda-graph-runner, model-runner | — |
+| B4b Worker + ZOS | concepts: zero-overhead-scheduling · code: worker-base, worker, cache-engine, zos-cpp · tour: engine-step | ZOS timeline |
+| B5a Attention I | concepts: model-map, mla-attention, sparse-attention-indexer · code: deepseek, v4-attn, v4-mla-attn, v4-index-attn | — |
+| B5b Attention II | concepts: sliding-window-attention, kv-compression, cross-layer-kv-sharing, yoco-swa-replay · code: v4-compress, v4-cross-layer | — |
+| B6a Layer + mHC | concepts: mhc-residual · code: v4-hc, decoder-layer · tour: decoder-layer | — |
+| B6b Engram + VL | concepts: engram, vision-encoder · code: v4-engram, deepseek-vl, vit, ve | — |
+| B7 MoE + EP | concepts: moe-routing, mega-moe, expert-parallelism, eplb · code: v4-mlp, eplb, userbuffer | MoE router + EPLB |
+| B8 Scale | concepts: dp-step-votes, context-parallelism, hardware-discovery · code: parallel-state, shm-broadcast, shared-memory, deep-cluster · tour: multi-gpu-step | — |
+| B9 Decoding | concepts: sampler, speculative-decoding, dspark · code: sampler, dflash · tour: spec-decode-round | spec-decode accept/reject |
+| B10a SO + precision | concepts: structured-outputs, determinism, low-precision-formats · code: structure-output, linear | — |
+| B10b Kernels + loading | concepts: tilelang-kernels, python-cpp-boundary, weight-loading · code: tilelang-ops, model-loader, hf-weights, platform, npu-ops | — |
+| B11 Start-up + reference | tour: startup · code: config, environ, stats-logger · reference: config-classes, cpp-engine-api, faq · Tour 1 stepper visual | request stepper |
+| D Diagrams | convert the 12 Phase 1 diagrams to the 1100 canvas | — |
+| F Final | link and glossary consistency, home map live, strict build, screenshots of every page, final fact spot-check | — |
+
+Waves: 1 = B1, B2, B3a, B5a, B7, B9, D · 2 = B3b, B4a, B4b, B5b, B6a, B6b · 3 = B8, B10a, B10b, B11 · then F.
+Fact checks start as soon as each batch finishes.

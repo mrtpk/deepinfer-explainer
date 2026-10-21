@@ -1,19 +1,15 @@
 # DeepInfer Explainer — Progress
 
 Last update: 2026-10-21
-Current phase: **1 — Foundation (step 1c running: fact check + restyle)**
+Current phase: **Full build — wave 1** (plan section 13)
 
 ## Phase status
 
 | Phase | Status | Notes |
 |---|---|---|
 | 0 Plan approval | done | Approved 2026-10-21 with answers (plan section 11) |
-| 1 Foundation | running | Steps 1a–1d in plan section 12. Stop after 1d for user review. |
-| 2 Research fact sheets | not started | |
-| 3 Write pages | not started | |
-| 4 Interactive visuals | not started | |
-| 5 Verification | not started | |
-| 6 Polish | not started | |
+| 1 Foundation | done | User reviewed and approved: "I like it. build for all. fact check it as well." |
+| Full build (plan §13) | running | Batches B1–B11, D, F. Writer → fact check → commit per batch. |
 
 ## Done
 
@@ -33,9 +29,12 @@ Current phase: **1 — Foundation (step 1c running: fact check + restyle)**
 
 - TODO (supervisor, before user review): diagram text is still ~7-8px at 1280 (1500 canvas shown at ~950px). Plan: one subagent converts all site diagrams so they display near 1:1 (narrower canvas ~1000-1100 or larger fonts), after fact checkers finish.
 
+- 2026-10-21: Phase 1 fact checks done (A: 30 defects fixed, B: 36). Step-71 claim reworded to "earliest possible". Commits 966f05e, 92608af (local git, user asked; no push).
+- 2026-10-21: User approved Phase 1 and asked for the full build with fact checks, and local git commits per stage.
+
 ## Next step
 
-Wait for 2 fact checkers (they also do page style cleanup + code-version section). Then diagram readability pass. Then supervisor: tooling TODOs, final build, screenshots check. Then 1d: ping the user for review.
+Wave 1 writers running. Start fact checks as batches finish. Then wave 2. Then supervisor: tooling TODOs, final build, screenshots check. Then 1d: ping the user for review.
 
 ## Questions for the user
 
