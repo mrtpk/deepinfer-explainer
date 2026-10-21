@@ -44,7 +44,7 @@ Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
 
-- FINAL-PASS TODO: other pages may say split groups / DP votes use the 14400 s Gloo time-out — only the default group does (facts.md B8). Check reference/env-vars and any page that mentions GLOO_TIMEOUT.
+- FINAL-PASS TODO: other pages may say split groups / DP votes use the 14400 s Gloo time-out — only the default group does (facts.md B8). Pages that mention it: code/worker-base, learn/parallelism, tours/startup, reference/env-vars.
 
 - USER INSTRUCTION 2026-10-22 (usage at 77%): normal plan, but first let the 4 running subagents finish (B8/B10a/B11 fact checks, B10b writer), then build, commit and PUSH, then PAUSE for user approval. UPDATE: the user wants the B10b fact check BEFORE the build/commit/push. Then a NORMAL build (not strict; user decision 2026-10-22, because links to the deferred TileLang pages give expected warnings), commit, push, and pause. Final pass (consistency, site check) and README + final commit wait for user approval.
 
