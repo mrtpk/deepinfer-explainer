@@ -1,0 +1,185 @@
+---
+title: csrc/engine/zos.cpp: the C++ helpers of zero-overhead scheduling
+nav_title: zos.cpp
+level: Advanced
+prerequisites: concepts/zero-overhead-scheduling, code/worker
+related: concepts/zero-overhead-scheduling, code/worker, tours/engine-step, code/sequence-hpp, code/scheduler-hpp, concepts/paged-kv-cache, concepts/input-metadata
+summary: zos.cpp has three functions for ZOS decode steps - match the batch with the previous step (remap), pack the decode inputs into pinned arrays, and refresh the CPU metadata before sampling. The device kernels do the rest.
+---
+<h2>Purpose</h2>
+<p><code>zos.cpp</code> does the CPU part of a ZOS decode step: it matches the sequences of two steps, packs pinned input arrays for the device kernels, and corrects the CPU metadata before the sampler.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>csrc/<wbr>engine/<wbr>zos.<wbr>cpp</code>, 307 lines of C++, and the header <code>csrc/<wbr>engine/<wbr>zos.<wbr>hpp</code>, 30 lines. Built into the extension <code>deepinfer._C</code> ({{cite setup.py:28}}).</td></tr>
+    <tr><th>Main functions</th><td><code>prepare_<wbr>zos_<wbr>inputs</code> ({{cite csrc/engine/zos.cpp:142}}), <code>prepare_<wbr>decode_<wbr>zos_<wbr>inputs</code> ({{cite csrc/engine/zos.cpp:198}}), <code>update_<wbr>metadata_<wbr>for_<wbr>sampling_<wbr>zos</code> ({{cite csrc/engine/zos.cpp:279}}). Helpers in an anonymous namespace: <code>compress_token</code> and <code>prepare_<wbr>token_<wbr>inputs</code>.</td></tr>
+    <tr><th>Runs in</th><td>The driver worker thread, on the CPU. The two <code>prepare_*</code> functions release the Python {{term gil}}.</td></tr>
+    <tr><th>Called by</th><td><code>Worker.<wbr>_<wbr>correct_<wbr>seqlens_<wbr>qk</code>, <code>Worker.<wbr>execute_<wbr>model_<wbr>step</code> and <code>prepare_<wbr>decode_<wbr>inputs_<wbr>zos</code> (Python).</td></tr>
+    <tr><th>Calls</th><td>Torch tensor allocation in {{term pinned-memory}}, the engram helpers (lookup table, <code>fill_engram_row</code>) and <code>SequenceMetadata::refresh_for_sampling</code>. No device work.</td></tr>
+    <tr><th>Not in this file</th><td>The length kernel, the token gather and the slot mapping run on the device, in TileLang kernels ({{cite deepinfer/model_executor/layers/tilelang_ops/compute_seqlens_k_zos.py:10-32}}, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:235-244}}, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367}}).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4b_zos_remap" alt="Panel 1: the previous step ran B, A, C; the next step runs A, B, C plus 6 padding rows; prepare_zos_inputs returns remap [1, 0, 2, -1, -1, -1, -1, -1, -1] and has_overlap True. Panel 2: a table of CPU seqlen_k, the value sent (seqlen_k minus seqlen_q), the accepted count and the device value after the kernel: A 112, 106, 2, 109; B 108, 102, 5, 108; C 47, 41, 0, 42; padding 1. Panel 3: the CPU fills only fresh rows of fresh_input_ids; the device gathers matched rows from the previous outputs; before sampling the CPU sets seqlen_k = seqlen_q + cache length." caption="Figure: the three functions of zos.cpp on one batch. Panel 1 is prepare_zos_inputs, panel 3 box 1 is prepare_token_inputs, panel 3 box 3 is update_metadata_for_sampling_zos." />
+<h3>Who calls it</h3>
+<ul>
+  <li><code>prepare_zos_inputs</code>: <code>Worker._correct_seqlens_qk</code>, at the start of each step that has a kept step ({{cite deepinfer/worker/worker.py:209-211}}).</li>
+  <li><code>prepare_decode_zos_inputs</code>: <code>prepare_decode_inputs_zos</code> in the ZOS input path of the model runner ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:49-69}}).</li>
+  <li><code>update_metadata_for_sampling_zos</code>: a method of <code>SchedulerOutputs</code>, called by <code>Worker.execute_model_step</code> before the sampler ({{cite deepinfer/worker/worker.py:150-152}}).</li>
+</ul>
+<p>The Python bindings and stubs:</p>
+<x-code file="csrc/engine/pybind_sequence.cpp" lines="51-55" />
+<x-code file="csrc/engine/pybind_scheduler.cpp" lines="51-53" caption="This binding keeps the GIL, because <code>refresh_for_sampling</code> assigns a Python object (the grammar matcher)." />
+<p>The stubs are in <code>deepinfer/_C/engine.pyi</code> ({{cite deepinfer/_C/engine.pyi:374}}, {{cite deepinfer/_C/engine.pyi:721}}, {{cite deepinfer/_C/engine.pyi:727}}).</p>
+<h3>What it calls</h3>
+<ul>
+  <li><code>pinned(dtype)</code>: tensor options with <code>pinned_memory(true)</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:8}}).</li>
+  <li><code>get_engram_lookup_table()</code> and <code>fill_engram_row</code>, for models with engram n-gram inputs ({{cite csrc/engine/input_metadata/prepare_tensor_input.hpp:59-63}}).</li>
+  <li><code>SequenceMetadata::refresh_for_sampling</code> ({{cite csrc/engine/sequence.hpp:408-418}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>PreparedDecodeZOSInputs</code></td><td>{{cite csrc/engine/zos.hpp:16-18}}</td><td>The 13-element tuple type that <code>prepare_decode_zos_inputs</code> returns.</td></tr>
+    <tr><td><code>PreparedTokenInputs</code></td><td>{{cite csrc/engine/zos.cpp:14-20}}</td><td>Five optional token arrays.</td></tr>
+    <tr><td><code>compress_token</code></td><td>{{cite csrc/engine/zos.cpp:22-29}}</td><td>Maps a token id through the engram lookup table; no table means no change.</td></tr>
+    <tr><td><code>prepare_token_inputs</code></td><td>{{cite csrc/engine/zos.cpp:31-138}}</td><td>Input tokens: all on the CPU without overlap, only new rows with overlap.</td></tr>
+    <tr><td><code>prepare_zos_inputs</code></td><td>{{cite csrc/engine/zos.cpp:142-196}}</td><td>Builds the {{term zos-remap}} and the CPU lengths for the {{term seqlen-correction}}.</td></tr>
+    <tr><td><code>prepare_decode_zos_inputs</code></td><td>{{cite csrc/engine/zos.cpp:198-277}}</td><td>Packs block tables, state ids and offsets for the device metadata kernel.</td></tr>
+    <tr><td><code>update_metadata_for_sampling_zos</code></td><td>{{cite csrc/engine/zos.cpp:279-305}}</td><td>Sets the corrected lengths in the CPU metadata before the sampler.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>prepare_zos_inputs</code>: match two batches</h3>
+<x-code file="csrc/engine/zos.cpp" lines="142-196" highlight="148-157,159-173,174-176,186-188,190-194" />
+<ol>
+  <li>Lines 148-157: fast path. If both lists have the same length and the same <code>seq_id</code> at each index, <code>remap[i] = i</code>. A placeholder in the previous list stops the fast path.</li>
+  <li>Lines 159-173: else, a hash map from <code>seq_id</code> to the previous index. Placeholders are not in the map, so they never match.</li>
+  <li>Lines 174-176: no common sequence: return three empty optionals and <code>false</code>. The worker then does no correction.</li>
+  <li>Lines 178-189: three pinned int32 arrays of length <code>n_seq_with_padding</code>. Line 188 sends <code>seqlen_k − seqlen_q</code>; the kernel adds the (maybe new) <code>seqlen_q</code> back. With <code>nextn = 0</code>, it sends <code>seqlen_k</code> unchanged.</li>
+  <li>Lines 190-194: CUDA graph padding rows get <code>remap = -1</code> and lengths 1.</li>
+</ol>
+<p>The sort in the scheduler orders the decode batch by length every step ({{cite csrc/engine/scheduler.hpp:648-649}}). So the hash path is normal when the lengths change their order.</p>
+
+<h3><code>prepare_decode_zos_inputs</code>: pack the decode inputs</h3>
+<x-code file="csrc/engine/zos.cpp" lines="210-226" highlight="219-225" />
+<p>The block count of each sequence uses the largest possible length, <code>seqlen_k − seqlen_q + max_seqlen_q</code>. The English comment at lines 220-221 gives the reason. With DSpark, the device can give a sequence more query tokens than the CPU planned. Example: <code>seqlen_k = 112</code>, <code>seqlen_q = 6</code>, <code>max_seqlen_q = 6</code>, smallest compress ratio 1, 128 tokens per block: <code>ceil(112 / 128) = 1</code> block. A placeholder gets 1 block.</p>
+<x-code file="csrc/engine/zos.cpp" lines="236-277" highlight="238-241,245-246,258-271,272-273" />
+<ol>
+  <li>Lines 238-241: default lengths only when there is no correction (<code>need_default_seqlens</code>, which Python sets to <code>metadata_zos is None</code>).</li>
+  <li>Lines 242-246: cumulative query lengths, state ids, placeholder flags, and the block tables in CSR form: <code>block_table_offsets [n+1]</code> and one flat <code>block_tables [total_blocks]</code>.</li>
+  <li>Lines 258-271: one loop fills them. Each sequence copies only its first <code>num_blocks[i]</code> table entries.</li>
+  <li>Lines 272-273: the token arrays come from <code>prepare_token_inputs</code>.</li>
+</ol>
+
+<h3><code>prepare_token_inputs</code>: which tokens the CPU still writes</h3>
+<x-code file="csrc/engine/zos.cpp" lines="49-60" title="Without overlap" highlight="49-51" />
+<x-code file="csrc/engine/zos.cpp" lines="84-113" title="With overlap" highlight="84-85,94,105-113" />
+<ol>
+  <li>Without overlap (no kept step, or no common sequence), the CPU writes the final packed <code>input_ids [total_q]</code>: the last real token, then <code>seqlen_q − 1</code> drafts. Python copies it to the device as it is ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:215-223}}).</li>
+  <li>With overlap, the CPU writes <code>fresh_input_ids [n_seq, max_seqlen_q]</code>. Line 94 fills it with 0. Lines 106-113 fill only the rows with <code>remap = -1</code>. The device kernel takes the other rows from the outputs of the previous step.</li>
+  <li>Lines 115-135: for engram models, the CPU also writes the window of compressed history tokens (<code>win_compressed</code>). The device kernel <code>gather_engram_tokens_zos</code> adds the new tokens of the previous step ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:246-274}}).</li>
+</ol>
+
+<h3><code>update_metadata_for_sampling_zos</code>: catch up before sampling</h3>
+<x-code file="csrc/engine/zos.cpp" lines="279-305" highlight="282-288,297,299,300-302,303">
+<x-tr line="298">The extra forward after EOS may not have appended the golden token to the Sequence; the sampling side uses the cached length.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 282-288: checks. The metadata list and the scheduled sequences must have the same length; the arrays must be CPU int32 and contiguous.</li>
+  <li>Line 297: <code>seqlen_q</code> from the pinned array. Without DSpark it does not change. With DSpark, the worker copied the device values back into this array first ({{cite deepinfer/worker/worker.py:230-234}}).</li>
+  <li>Line 299: <code>seqlen_k = seqlen_q + cache.num_tokens</code>. At this point the previous step is post-processed, so the cache count is exact.</li>
+  <li>Lines 300-302: a matched sequence refreshes its last token, its draft slots, its grammar state and its golden tokens ({{cite csrc/engine/sequence.hpp:408-418}}).</li>
+  <li>Line 303: the scheduler outputs get the same <code>seqlen_q</code>, for the post-process of this step.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: every array, its shape and its user">
+<table>
+  <thead><tr><th>Array</th><th>Shape, dtype</th><th>Made by</th><th>Used by</th></tr></thead>
+  <tbody>
+    <tr><td><code>remap</code></td><td><code>[P]</code> int32 pinned</td><td><code>prepare_zos_inputs</code></td><td>H2D copy; length kernel; token gather; <code>prepare_token_inputs</code> (as <code>remap_cpu</code>); <code>update_metadata_for_sampling_zos</code></td></tr>
+    <tr><td><code>seqlens_q</code>, <code>seqlens_k</code></td><td><code>[P]</code> int32 pinned</td><td><code>prepare_zos_inputs</code>, or line 238-241 without correction</td><td>H2D copy; device metadata kernel</td></tr>
+    <tr><td><code>cu_seqlens_q</code></td><td><code>[n]</code> int32 pinned, inclusive sum</td><td><code>prepare_decode_zos_inputs</code></td><td>device kernels; recomputed on the device with DSpark ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:93-95}})</td></tr>
+    <tr><td><code>state_ids</code>, <code>is_placeholder</code></td><td><code>[n]</code> int32, bool</td><td>same</td><td>SWA slot mapping on the device</td></tr>
+    <tr><td><code>block_table_offsets</code>, <code>block_tables</code></td><td><code>[n+1]</code>, <code>[total_blocks]</code> int32</td><td>same</td><td><code>prepare_v4_decode_metadata</code></td></tr>
+    <tr><td><code>input_ids</code></td><td><code>[total_q]</code> int32</td><td><code>prepare_token_inputs</code>, no overlap</td><td>direct H2D copy</td></tr>
+    <tr><td><code>fresh_input_ids</code></td><td><code>[n, nextn+1]</code> int32</td><td><code>prepare_token_inputs</code>, overlap</td><td><code>gather_input_ids_zos</code></td></tr>
+    <tr><td><code>ngram_token_ids</code> / <code>win_compressed</code>, <code>curr_fresh</code></td><td><code>[total_q, max_ngram]</code> / <code>[n, nextn + max_ngram − 1]</code>, <code>[n, nextn+1]</code></td><td>same (engram models only)</td><td>H2D copy / <code>gather_engram_tokens_zos</code></td></tr>
+  </tbody>
+</table>
+<p><code>P = n + graph_size − total_q</code> with CUDA graphs, else <code>n</code> ({{cite deepinfer/worker/worker.py:203-207}}). <code>n</code> here is the number of sequences; in the decode path the input list already contains the graph padding sequences ({{cite deepinfer/worker/model_runner.py:186-190}}).</p>
+</x-deepdive>
+
+<x-deepdive title="A worked example of the block count and the CSR tables">
+<p>Two decode sequences and one padding sequence, <code>nextn = 5</code>, block size 128, smallest compress ratio 1 (so <code>tokens_per_block = 128</code>).</p>
+<table>
+  <thead><tr><th>i</th><th>sequence</th><th>CPU <code>seqlen_k</code>, <code>seqlen_q</code></th><th><code>max_k</code></th><th>blocks</th><th>block table (first entries)</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>A</td><td>300, 6</td><td><code>300 − 6 + 6 = 300</code></td><td><code>ceil(300 / 128) = 3</code></td><td>[17, 4, 9, 22]</td></tr>
+    <tr><td>1</td><td>C</td><td>47, 6</td><td>47</td><td>1</td><td>[31]</td></tr>
+    <tr><td>2</td><td>padding</td><td>1, 1</td><td>—</td><td>1</td><td>[0]</td></tr>
+  </tbody>
+</table>
+<pre><code class="language-python">cu_seqlens_q        = [6, 12, 13]
+block_table_offsets = [0, 3, 4, 5]
+block_tables        = [17, 4, 9, 31, 0]      # A's 4th entry is not copied
+state_ids           = [stateA, stateC, 0]
+is_placeholder      = [False, False, True]</code></pre>
+<p>The block ids are illustrative. A sequence can hold more table entries than <code>max_k</code> needs, because the scheduler reserves blocks for in-flight and draft tokens ({{cite csrc/engine/sequence.hpp:291-293}}). Line 228 of the source checks that the table has at least <code>n_blocks</code> entries ({{cite csrc/engine/zos.cpp:227-229}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Threads, the GIL and object lifetimes">
+<ul>
+  <li><code>prepare_zos_inputs</code> and <code>prepare_decode_zos_inputs</code> run with <code>py::gil_scoped_release</code> ({{cite csrc/engine/pybind_sequence.cpp:51-55}}). They only read C++ objects and write new tensors.</li>
+  <li><code>update_metadata_for_sampling_zos</code> keeps the GIL, because <code>refresh_for_sampling</code> assigns the Python grammar matcher ({{cite csrc/engine/pybind_scheduler.cpp:51}}, {{cite csrc/engine/sequence.hpp:416}}).</li>
+  <li>The previous metadata list must stay valid until the post-process of the previous step. <code>WorkerStepState</code> holds it. The engine post-process gives it to <code>DeferredRelease</code>, which returns it to the pool in the <code>pre_sampler_sync</code> of the same call ({{cite deepinfer/worker/zos_status.py:11}}, {{cite deepinfer/engine/llm_engine.py:1013}}, {{cite deepinfer/engine/llm_engine.py:830-831}}).</li>
+  <li>A refreshed sequence keeps its old write slot for the draft pool if ZOS already released the request. Comment: "Keep the slot captured for an in-flight sample after ZOS releases the request" ({{cite csrc/engine/sequence.hpp:411-414}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Check</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>n_seq_with_padding</code> smaller than the list</td><td>{{cite csrc/engine/zos.cpp:145}}</td></tr>
+    <tr><td><code>seqlen_q</code> outside <code>[1, max_seqlen_q]</code> (no overlap path)</td><td>{{cite csrc/engine/zos.cpp:60-61}}</td></tr>
+    <tr><td>token start outside the sequence, too few drafts</td><td>{{cite csrc/engine/zos.cpp:63-66}}, {{cite csrc/engine/zos.cpp:104}}, {{cite csrc/engine/zos.cpp:109-110}}</td></tr>
+    <tr><td>a token id outside the engram table</td><td>{{cite csrc/engine/zos.cpp:26-27}}</td></tr>
+    <tr><td>bad block size or compress ratio; too many blocks for the table or <code>max_num_blocks</code></td><td>{{cite csrc/engine/zos.cpp:203-208}}, {{cite csrc/engine/zos.cpp:227-229}}</td></tr>
+    <tr><td>metadata and scheduled sequences differ in length or <code>seq_id</code></td><td>{{cite csrc/engine/zos.cpp:282}}, {{cite csrc/engine/zos.cpp:296}}</td></tr>
+  </tbody>
+</table>
+<p>All checks are <code>TORCH_CHECK</code> macros. In Python they appear as <code>RuntimeError</code>. None of them only logs.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/zero-overhead-scheduling}}: why the CPU is one step behind.</li>
+  <li>{{link code/worker}}: the Python code that calls these functions.</li>
+  <li>{{link tours/engine-step}}: the functions in the order of one step.</li>
+  <li>{{link concepts/paged-kv-cache}}: the block tables that the CSR arrays hold.</li>
+  <li>{{link concepts/dspark}}: why the device can change <code>seqlen_q</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What does <code>remap[i] = -1</code> mean?
+    <x-a><p>Sequence <code>i</code> of the current step was not in the previous step, or row <code>i</code> is CUDA graph padding ({{cite csrc/engine/zos.cpp:168-171}}, {{cite csrc/engine/zos.cpp:190-194}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>prepare_zos_inputs</code> send <code>seqlen_k − seqlen_q</code> and not <code>seqlen_k</code>?
+    <x-a><p>The kernel adds <code>seqlens_q</code> back, and with DSpark that value can be a new device value ({{cite csrc/engine/zos.cpp:188}}, {{cite deepinfer/model_executor/layers/tilelang_ops/compute_seqlens_k_zos.py:22-23}}, {{cite deepinfer/worker/worker.py:218-219}}). So the result is always "old length + the real query length − rejected drafts".</p></x-a>
+  </x-q>
+  <x-q level="medium">With overlap, which rows of <code>fresh_input_ids</code> does the CPU fill?
+    <x-a><p>Only the rows with <code>remap &lt; 0</code>, which are not placeholders. All other entries stay 0; the device gathers those rows from the previous step ({{cite csrc/engine/zos.cpp:94}}, {{cite csrc/engine/zos.cpp:101-113}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A sequence has CPU <code>seqlen_k = 300</code> and <code>seqlen_q = 3</code> (DSpark gave it 2 drafts). <code>max_seqlen_q = 6</code>. How many 128-token blocks go into the CSR table, and why not fewer?
+    <x-a><p><code>max_k = 300 − 3 + 6 = 303</code>, so <code>ceil(303 / 128) = 3</code> blocks ({{cite csrc/engine/zos.cpp:222-225}}). The device can raise <code>seqlen_q</code> up to 6 with the newest confidences, so the table must cover the longest case (comment at lines 220-221). See the deep dive "A worked example of the block count".</p></x-a>
+  </x-q>
+</x-quiz>

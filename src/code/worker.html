@@ -1,0 +1,200 @@
+---
+title: worker/worker.py: the per-step Worker
+nav_title: worker/worker.py
+level: Advanced
+prerequisites: code/llm-engine, concepts/zero-overhead-scheduling
+related: code/worker-base, code/zos-cpp, code/model-runner, code/llm-engine, concepts/zero-overhead-scheduling, tours/engine-step, concepts/dspark, concepts/engine-step-loop
+summary: Worker.execute_model_step runs every engine step on one rank in a fixed order - forward N, post-process N-1, sample N - and keeps a ZOS decode step for the next call. zos_status.py holds the two records that it keeps.
+---
+<h2>Purpose</h2>
+<p><code>Worker</code> runs the device work of one engine step on one rank, in the order forward, post-process of the previous step, sample. With ZOS it keeps a decode step for the next call.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/worker/worker.py</code>, 283 lines, and <code>deepinfer/worker/zos_status.py</code>, 40 lines. The header of <code>worker.py</code> says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/worker/worker.py:2}})</td></tr>
+    <tr><th>Main class</th><td><code>Worker(WorkerBase)</code> ({{cite deepinfer/worker/worker.py:51}}). Also <code>EngineCallbacks</code> ({{cite deepinfer/worker/worker.py:43-48}}), <code>_SeqlensCorrection</code> ({{cite deepinfer/worker/worker.py:34-40}}), and in <code>zos_status.py</code> the dataclasses <code>WorkerStepState</code> and <code>MetadataZOS</code>.</td></tr>
+    <tr><th>Runs in</th><td>The driver worker runs in the engine process, in the main thread. Context-parallel followers run the same methods in their own processes.</td></tr>
+    <tr><th>Called by</th><td><code>LLMEngine</code> through <code>run_workers</code>: <code>execute_model_step</code> every step, <code>flush_inflight_reqs</code> at the end ({{cite deepinfer/engine/llm_engine.py:965-973}}, {{cite deepinfer/engine/llm_engine.py:979}}).</td></tr>
+    <tr><th>Calls</th><td><code>ModelRunner</code> (forward, sample, post-process), the C++ functions <code>prepare_zos_inputs</code> and <code>SchedulerOutputs.update_metadata_for_sampling_zos</code>, two TileLang kernels, and the two engine callbacks.</td></tr>
+    <tr><th>Not in this file</th><td>Start-up, the model load and the KV cache: they are in the base class ({{link code/worker-base}}). Input tensors and the model call: {{link code/model-runner}}.</td></tr>
+  </tbody>
+</table>
+<p>The class docstring gives the rule: "Every step runs the Forward-Post_process-Sample round in execute_model_step; under ZOS the post-process of a decode step is deferred to overlap with the next forward" ({{cite deepinfer/worker/worker.py:52-55}}).</p>
+
+<h2>Where it sits</h2>
+<p>The figure on {{link tours/engine-step}} shows the phases of one call in code order. This section lists the neighbours.</p>
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>LLMEngine._init_workers</code></strong> makes the driver <code>Worker</code> with <code>is_driver_worker=True</code> and an <code>EngineCallbacks</code> object that holds <code>post_process</code> and <code>pre_sampler_sync</code> ({{cite deepinfer/engine/llm_engine.py:398-413}}).</li>
+  <li><strong><code>_spawn_worker</code></strong> makes a follower <code>Worker</code> in each context-parallel process ({{cite deepinfer/engine/llm_engine.py:122-127}}). Its constructor never returns: it ends in the call loop of the base class ({{cite deepinfer/worker/base.py:120-123}}).</li>
+  <li><strong><code>LLMEngine._execute_model_async_step</code></strong> calls <code>execute_model_step</code> every step ({{cite deepinfer/engine/llm_engine.py:961-975}}).</li>
+  <li><strong><code>LLMEngine.flush_inflight_reqs</code></strong> calls <code>flush_inflight_reqs</code> ({{cite deepinfer/engine/llm_engine.py:977-982}}).</li>
+</ul>
+<h3>What it calls</h3>
+<ul>
+  <li><code>ModelRunner.execute_main_model</code>, <code>execute_sample</code>, <code>post_process</code> and <code>_placeholder_seq_metadata</code> ({{cite deepinfer/worker/worker.py:122-127}}, {{cite deepinfer/worker/worker.py:154-159}}, {{cite deepinfer/worker/worker.py:268}}).</li>
+  <li>C++: <code>prepare_zos_inputs</code> ({{cite deepinfer/worker/worker.py:209-211}}) and <code>update_metadata_for_sampling_zos</code> ({{cite deepinfer/worker/worker.py:150-152}}). See {{link code/zos-cpp}}.</li>
+  <li>Kernels: <code>compute_seqlens_q_by_confidence_rates</code> (DSpark only) and <code>compute_seqlens_k_zos</code> ({{cite deepinfer/worker/worker.py:218-227}}).</li>
+  <li>Engine callbacks on the driver only: <code>pre_sampler_sync_fn</code> and <code>post_process_fn</code> ({{cite deepinfer/worker/worker.py:163-164}}, {{cite deepinfer/worker/worker.py:270-271}}).</li>
+  <li>Timers: <code>cpu_timer</code>, <code>cuda_timer</code> and <code>cuda_graph_timer</code> from <code>deepinfer/timer.py</code>.</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_SeqlensCorrection</code></td><td>{{cite deepinfer/worker/worker.py:34}}</td><td>Result of the length correction: <code>MetadataZOS</code>, the pinned CPU <code>seqlens_q</code>, and an optional copy event.</td></tr>
+    <tr><td><code>EngineCallbacks</code></td><td>{{cite deepinfer/worker/worker.py:43}}</td><td>The two {{term engine-callbacks}}. Used on the driver only.</td></tr>
+    <tr><td><code>Worker.__init__</code></td><td>{{cite deepinfer/worker/worker.py:57}}</td><td>Sets <code>prev_step_state = None</code> and <code>nextn</code> <em>before</em> the base constructor, because a follower enters its loop inside that constructor (comment at line 70).</td></tr>
+    <tr><td><code>execute_model_step</code></td><td>{{cite deepinfer/worker/worker.py:89}}</td><td>One step: forward N, post-process N−1, sample N, post-process N now or keep it.</td></tr>
+    <tr><td><code>_correct_seqlens_qk</code></td><td>{{cite deepinfer/worker/worker.py:191}}</td><td>The {{term seqlen-correction}}: matches the batch with the kept step and fixes the lengths on the device.</td></tr>
+    <tr><td><code>_post_process_step</code></td><td>{{cite deepinfer/worker/worker.py:248}}</td><td>Waits for the end event of a step, runs the sampler's post functions, calls the engine callback.</td></tr>
+    <tr><td><code>flush_inflight_reqs</code></td><td>{{cite deepinfer/worker/worker.py:274}}</td><td>Post-processes the kept step and clears it.</td></tr>
+    <tr><td><code>WorkerStepState</code></td><td>{{cite deepinfer/worker/zos_status.py:9}}</td><td>The {{term worker-step-state}}: everything the post-process of a step needs.</td></tr>
+    <tr><td><code>MetadataZOS</code></td><td>{{cite deepinfer/worker/zos_status.py:24}}</td><td>The corrected lengths, the {{term zos-remap}} and the device outputs of the previous step.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>execute_model_step</code>, part 1: correct and forward</h3>
+<x-code file="deepinfer/worker/worker.py" lines="113-141" highlight="116-118,121-127,130-138" />
+<ol>
+  <li>Lines 116-118: only the driver, and only for a real batch, computes <code>total_q</code> and the correction. A prefill sums <code>seqlen_q</code>; a decode step reads <code>num_batched_tokens</code> from the scheduler.</li>
+  <li>Lines 121-124: launch the forward pass of step N. <code>execute_main_model</code> must not sync (its docstring, {{cite deepinfer/worker/model_runner.py:315-318}}).</li>
+  <li>Lines 125-127: an empty batch still runs the model on one placeholder sequence (a {{term placeholder-step}}). The code gives no reason. This site infers that every rank must join the collective calls of the model.</li>
+  <li>Lines 130-138: with DSpark, the driver keeps the timing events of the forward pass for the cost model of a decode step.</li>
+  <li>Line 140: <code>Movable</code> wraps the model output, so that the sampler can take it and free it early.</li>
+</ol>
+
+<h3><code>execute_model_step</code>, part 2: post-process N−1, sample N, keep N</h3>
+<x-code file="deepinfer/worker/worker.py" lines="143-189" highlight="144,147-152,154,164,167-168,183-187">
+<x-tr line="146">3. Sample the current step (first correct the CPU metadata with the seqlens_q copied back from the device).</x-tr>
+<x-tr line="182">4. A prompt step, or a non-ZOS configuration: post-process at once. A ZOS decode step: keep it for the next step (to overlap with forward).</x-tr>
+</x-code>
+<ol>
+  <li>Line 144: post-process the kept step. With no kept step, this returns an empty array.</li>
+  <li>Lines 147-152: with a correction, wait for the copy event if there is one (DSpark only), then update the CPU metadata of step N.</li>
+  <li>Line 154: launch the sampler of step N.</li>
+  <li>Lines 162-165: the <code>pre_sampler_sync</code> callback (driver only) and the garbage collector run while the device samples.</li>
+  <li>Lines 167-168: record <code>sample_end_evt</code>. It marks the end of all work queued so far in the stream.</li>
+  <li>Lines 183-187: a prefill step, or any step with ZOS off, is post-processed at once and its outputs are added. A ZOS decode step is kept in <code>prev_step_state</code>.</li>
+</ol>
+<x-note title="A placeholder step is kept too">
+<p>With ZOS, an empty decode step is also kept. Its post-process passes no sampler output to the engine ({{cite deepinfer/engine/llm_engine.py:987}}), and the next correction skips it ({{cite deepinfer/worker/worker.py:199-200}}).</p>
+</x-note>
+
+<h3><code>_correct_seqlens_qk</code></h3>
+<x-code file="deepinfer/worker/worker.py" lines="191-245" highlight="199-200,203-207,209-213,218-219,220-227,230-234,236-244">
+<x-tr line="197">With ZOS, the CPU seqlens_q/k are one step behind: if the batch overlaps the previous batch, correct them on the GPU with the sampling results of the previous step.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 199-200: no kept step, or a kept placeholder: return <code>None</code>.</li>
+  <li>Lines 203-207: the arrays need one row per CUDA graph padding row. Example: 3 sequences with 6 tokens each use the graph of 24, so <code>n_seq_with_padding = 3 + 24 − 18 = 9</code>.</li>
+  <li>Lines 209-213: C++ builds the remap and the CPU lengths. No overlap: return <code>None</code>.</li>
+  <li>Lines 214-216: non-blocking copies to the device. The source is {{term pinned-memory}}.</li>
+  <li>Lines 218-219: DSpark only. A kernel splits the verification budget with the newest confidences of the kept step (see {{link concepts/dspark}}).</li>
+  <li>Lines 220-227: the length kernel. It needs drafts, so it runs only with <code>nextn &gt; 0</code>.</li>
+  <li>Lines 230-234: DSpark only. Copy the new <code>seqlens_q</code> back into the same pinned array and record <code>d2h_evt</code>.</li>
+  <li>Lines 236-244: the result for the input preparation of the model runner.</li>
+</ol>
+
+<h3><code>_post_process_step</code> and <code>flush_inflight_reqs</code></h3>
+<x-code file="deepinfer/worker/worker.py" lines="247-283" highlight="263,266,268,270-271,281-282" />
+<ol>
+  <li>Line 263: the wait for the end of the sampler of that step. With ZOS this is the event of step N−1.</li>
+  <li>Line 266: the CUDA graph timer reads the times of finished graphs. The comment says that this does not touch the running graph.</li>
+  <li>Line 268: <code>ModelRunner.post_process</code> runs the sampler's <code>post_funcs</code> and, for a prefill, the prompt log-probabilities ({{cite deepinfer/worker/model_runner.py:370-384}}).</li>
+  <li>Lines 270-271: only the driver calls the engine. A follower returns an empty array.</li>
+  <li>Lines 281-282: the flush post-processes the kept step and clears it. The docstring warns: "It may cause CPU-GPU synchronization" ({{cite deepinfer/worker/worker.py:276}}).</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: what each phase reads and writes">
+<p><code>n</code> is the number of sequences, <code>total_q</code> the number of query tokens, <code>G</code> the CUDA graph size, <code>P = n + G − total_q</code> the number of rows with padding.</p>
+<table>
+  <thead><tr><th>Phase</th><th>Reads</th><th>Writes</th><th>Step</th></tr></thead>
+  <tbody>
+    <tr><td>correction</td><td><code>seq_metadata_list</code> of N and N−1; <code>num_accepted_tokens_gpu [n_prev]</code></td><td><code>MetadataZOS</code>: <code>remap</code>, <code>seqlens_q</code>, <code>seqlens_k</code> int32 <code>[P]</code></td><td>N, from N−1</td></tr>
+    <tr><td>forward</td><td><code>MetadataZOS</code>, block tables, <code>prev_sampled_token_ids [n_prev]</code>, <code>prev_predict_token_ids [n_prev, nextn]</code></td><td>graph outputs (hidden states <code>[G, hidden]</code>), KV cache</td><td>N</td></tr>
+    <tr><td>post-process</td><td>CPU copies of the sampler output of N−1</td><td>C++ sequences, <code>RequestOutput</code> handles <code>uint64 [k]</code></td><td>N−1</td></tr>
+    <tr><td>metadata update</td><td>pinned <code>seqlens_q [P]</code>, <code>remap_cpu [P]</code>, cache lengths</td><td><code>SequenceMetadata.seqlen_q/seqlen_k</code>, <code>scheduler_outputs.seqlens_q</code></td><td>N</td></tr>
+    <tr><td>sample</td><td>hidden states, sampler inputs</td><td><code>SamplerOutput</code>: CPU copies (queued) and device tensors <code>sampled_token_ids_gpu [n]</code>, <code>predict_token_ids_gpu [n, nextn]</code>, <code>num_accepted_tokens_gpu [n]</code>, <code>confidence_rates_gpu [n, nextn]</code> ({{cite deepinfer/sequence.py:259-269}})</td><td>N</td></tr>
+  </tbody>
+</table>
+<p>The fields of <code>WorkerStepState</code> and <code>MetadataZOS</code> are listed in the deep dive "What ZOS keeps between steps" on {{link concepts/zero-overhead-scheduling}}. The source:</p>
+<x-code file="deepinfer/worker/zos_status.py" lines="9-40" />
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<ul>
+  <li>The driver <code>Worker</code> runs in the main thread of the engine process. All engine callbacks run in this thread, inside the worker call.</li>
+  <li>A follower <code>Worker</code> (context parallelism) has <code>is_driver_worker=False</code>. It skips the correction (line 116), gets its input tensors by broadcast inside the model runner ({{cite deepinfer/worker/model_runner.py:216-230}}), and never calls the engine (line 270). It still keeps <code>prev_step_state</code> and waits on its own events.</li>
+  <li>The follower gets only <code>is_prompt</code> and <code>is_placeholder</code> as arguments. <code>seq_metadata_list</code> stays <code>None</code> there ({{cite deepinfer/engine/llm_engine.py:965-973}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="A worked example: three calls with ZOS">
+<p>A prefill step P, then two decode steps D1 and D2, for a batch that does not change.</p>
+<table>
+  <thead><tr><th>Call</th><th><code>prev_step_state</code> at start</th><th>Correction</th><th>Line 144 post-processes</th><th>Line 184 or 187</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>P</td><td>None</td><td>None (line 199)</td><td>nothing</td><td>post-process P now; set None</td><td>tokens of P</td></tr>
+    <tr><td>D1</td><td>None</td><td>None</td><td>nothing</td><td>keep D1</td><td>empty</td></tr>
+    <tr><td>D2</td><td>D1</td><td>yes: same order, remap <code>[0, 1, ...]</code></td><td>D1</td><td>keep D2</td><td>tokens of D1</td></tr>
+    <tr><td>flush</td><td>D2</td><td>—</td><td>D2 (line 281)</td><td>set None</td><td>tokens of D2</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/engine-step-loop}} has the same table for two requests that finish, where the last kept step is a placeholder.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A sync inside the forward or sample launch</td><td>error from the sync guard</td><td>{{cite deepinfer/worker/model_runner.py:321-325}}, {{cite deepinfer/utils.py:119-132}}</td></tr>
+    <tr><td>Batch larger than the largest CUDA graph</td><td><code>ValueError</code> in <code>select</code> (also from the correction)</td><td>{{cite deepinfer/worker/cuda_graph_runner.py:143-148}}, {{cite deepinfer/worker/worker.py:204}}</td></tr>
+    <tr><td>Metadata list and scheduled sequences differ</td><td>C++ <code>TORCH_CHECK</code> error</td><td>{{cite csrc/engine/zos.cpp:282}}, {{cite csrc/engine/zos.cpp:296}}</td></tr>
+    <tr><td><code>engine_callbacks</code> is <code>None</code> on the driver</td><td><code>AttributeError</code> at line 164; the engine always passes it</td><td>{{cite deepinfer/engine/llm_engine.py:398-400}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that this file reads">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td><code>0</code> in <code>environ.py</code>; <code>EngineArgs</code> sets <code>1</code> for NORMAL and COMPLETION ({{cite deepinfer/environ.py:179}}, {{cite deepinfer/engine/arg_utils.py:51-55}})</td><td>{{cite deepinfer/worker/worker.py:183}}</td><td>Keep a decode step for the next call.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/worker/worker.py:74}}</td><td>Number of drafts; with 0 the length kernel does not run.</td></tr>
+    <tr><td><code>DEEPINFER_ENABLE_MTP_VARLEN</code></td><td>off ({{cite deepinfer/environ.py:131}})</td><td>{{cite deepinfer/worker/worker.py:132}}, {{cite deepinfer/worker/worker.py:218}}, {{cite deepinfer/worker/worker.py:230}}</td><td>DSpark: timing events, the confidence kernel, the copy back and the <code>d2h_evt</code> wait.</td></tr>
+    <tr><td><code>DEEPINFER_GC_INTERVAL_STEP</code></td><td><code>1000</code> ({{cite deepinfer/environ.py:185}})</td><td>{{cite deepinfer/worker/base.py:104}}</td><td>Steps between two <code>gc.collect()</code> calls in <code>maybe_gc_collect</code>; ×10 for a COMPLETION engine ({{cite deepinfer/worker/base.py:105-106}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/zero-overhead-scheduling}}: why the worker keeps a step, and what the device corrects.</li>
+  <li>{{link tours/engine-step}}: the same method as a guided tour with a worked batch.</li>
+  <li>{{link code/worker-base}}: the base class with start-up, the KV cache and the follower loop.</li>
+  <li>{{link code/zos-cpp}}: the C++ helpers that the correction calls.</li>
+  <li>{{link concepts/dspark}}: the extra kernel and wait with <code>DEEPINFER_ENABLE_MTP_VARLEN</code>.</li>
+  <li>{{link code/llm-engine}}: the callbacks <code>post_process</code> and <code>pre_sampler_sync</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">In which order does <code>execute_model_step</code> do its three main parts?
+    <x-a><p>Forward of the current step, post-process of the previous step, sample of the current step ({{cite deepinfer/worker/worker.py:96-102}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>Worker.__init__</code> set <code>prev_step_state</code> before it calls <code>super().__init__()</code>?
+    <x-a><p>A follower worker enters <code>start_slave_worker_loop</code> inside the base constructor and never returns ({{cite deepinfer/worker/base.py:120-123}}). The loop calls methods such as <code>execute_model_step</code>, which read <code>prev_step_state</code> and <code>nextn</code>. The comment says so ({{cite deepinfer/worker/worker.py:70-74}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A prefill step runs with ZOS on. Is it kept for the next call?
+    <x-a><p>No. Line 183 post-processes a prompt step at once and sets <code>prev_step_state = None</code> ({{cite deepinfer/worker/worker.py:183-185}}). Only ZOS decode steps are kept.</p></x-a>
+  </x-q>
+  <x-q level="hard">Three sequences with 6 query tokens each run with CUDA graphs of sizes 1, 2, 4, 8, 16, 24. How many rows do <code>remap</code>, <code>seqlens_q</code> and <code>seqlens_k</code> have, and which rows does the length kernel get?
+    <x-a><p><code>total_q = 18</code>, the selected graph has 24 tokens, so <code>n_seq_with_padding = 3 + 24 − 18 = 9</code> ({{cite deepinfer/worker/worker.py:203-205}}). The kernel gets only the first <code>n_seq = 3</code> rows ({{cite deepinfer/worker/worker.py:221-227}}); the 6 padding rows keep length 1 ({{cite csrc/engine/zos.cpp:190-194}}). See the deep dive "Data flow".</p></x-a>
+  </x-q>
+</x-quiz>

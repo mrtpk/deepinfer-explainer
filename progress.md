@@ -19,18 +19,18 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B2 Basics II | done | done (16 defects fixed) | yes |
 | B3a Engine + scheduler | done | done (26 defects fixed) | yes |
 | B3b API + cache | done | done (16 defects fixed) | yes |
-| B4a Inputs + graphs | running | — | — |
-| B4b Worker + ZOS | done | running | — |
+| B4a Inputs + graphs | done | running | — |
+| B4b Worker + ZOS | done | done (26 defects fixed) | yes |
 | B5a Attention I | done | done (43 defects fixed) | yes |
-| B5b Attention II | running | — | — |
-| B6a Layer + mHC | running | — | — |
-| B6b Engram + VL | running | — | — |
+| B5b Attention II | done | running | — |
+| B6a Layer + mHC | done | running | — |
+| B6b Engram + VL | done | running | — |
 | B7 MoE + EP | done | done (40 defects fixed) | yes |
 | B8 Scale | running | — | — |
 | B9 Decoding | done | done (25 defects fixed) | yes |
 | B10a SO + precision | running | — | — |
-| B10b Kernels + loading | running | — | — |
-| B11 Start-up + reference | wave 3 | — | — |
+| B10b Kernels + loading | STOPPED (safety classifier on first page; glossary + 3 diagrams only) — waiting for user | — | — |
+| B11 Start-up + reference | running | — | — |
 | D Diagrams to 1100 | done | n/a | yes |
 | F Final pass | later | — | — |
 
@@ -43,6 +43,8 @@ Resume order after the reset:
 Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
+
+- FINAL-PASS TODO: check every page that describes the DFlash hook position (Tour 1 stop 8/11, model-map, decoder-layer, dflash pages): it runs after the attention mHC pre + norm, before attention, and stores the mean of the trunk streams.
 
 - DECISION 2026-10-21: doc QA ~274 "post-process(N−1) while device runs N" and the code (post-process N in the call that launches N+1) are the same overlap with shifted numbering — not a contradiction. Pages use the code's numbering.
 

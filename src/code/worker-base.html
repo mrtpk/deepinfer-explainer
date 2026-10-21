@@ -1,0 +1,193 @@
+---
+title: worker/base.py: WorkerBase, the resource layer of a worker
+nav_title: worker/base.py
+level: Intermediate
+prerequisites: code/llm-engine, learn/kv-cache
+related: code/worker, code/cache-engine, code/model-runner, code/llm-engine, tours/startup, learn/kv-cache, concepts/paged-kv-cache, concepts/context-parallelism
+summary: WorkerBase sets up one device for one rank - torch settings, NUMA and CPU binding, process groups, the model, the memory profile, the KV cache and the CUDA graphs - and runs the call loop of the context-parallel followers.
+---
+<h2>Purpose</h2>
+<p><code>WorkerBase</code> owns the resources of one worker: the device, the process groups, the model, the KV cache and the CUDA graphs. The per-step code lives in the subclass <code>Worker</code>.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/worker/base.py</code>, 357 lines of Python. The header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/worker/base.py:2}}). The module docstring: "GPU worker resource layer: process/distributed setup, model load, and KV cache." ({{cite deepinfer/worker/base.py:4}})</td></tr>
+    <tr><th>Main class</th><td><code>WorkerBase</code> ({{cite deepinfer/worker/base.py:49}}). Also <code>set_pdeathsig</code> ({{cite deepinfer/worker/base.py:42}}), <code>_init_distributed_environment</code> ({{cite deepinfer/worker/base.py:315}}) and <code>_bind_numa</code> ({{cite deepinfer/worker/base.py:347}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process for the driver worker; one spawned process per extra context-parallel rank.</td></tr>
+    <tr><th>Called by</th><td><code>Worker.__init__</code> (through <code>super()</code>), and <code>LLMEngine</code> through <code>run_workers</code> for start-up methods.</td></tr>
+    <tr><th>Calls</th><td><code>ModelRunner</code>, <code>CacheEngine</code>, <code>parallel_state</code>, <code>runtime_config</code>, <code>torch.distributed</code>, and the C++ functions <code>clone_and_zero_states_and_blocks</code> and <code>set_engram_lookup_table</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The step logic (forward, post-process, sample) is in {{link code/worker}}. The memory layout of the cache is in {{link code/cache-engine}}.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The constructor</strong> runs from <code>Worker.__init__</code> ({{cite deepinfer/worker/worker.py:76-86}}). The engine makes the driver worker in <code>_init_workers</code> ({{cite deepinfer/engine/llm_engine.py:402-413}}); <code>_spawn_worker</code> makes the followers ({{cite deepinfer/engine/llm_engine.py:122-127}}).</li>
+  <li><strong>Start-up calls from the engine</strong>, in this order: <code>load_model</code> ({{cite deepinfer/engine/llm_engine.py:241}}), <code>profile_num_available_blocks</code>, <code>init_cache_engine</code> and <code>warm_up_model</code> ({{cite deepinfer/engine/llm_engine.py:437}}, {{cite deepinfer/engine/llm_engine.py:453}}, {{cite deepinfer/engine/llm_engine.py:457}}).</li>
+  <li><strong>Step calls:</strong> <code>clone_and_zero_states_and_blocks_on_default_stream</code> when the scheduler asks for a clone ({{cite deepinfer/engine/llm_engine.py:898-903}}), and <code>maybe_gc_collect</code> from <code>execute_model_step</code> ({{cite deepinfer/worker/worker.py:165}}).</li>
+  <li><strong><code>stop</code></strong> from <code>LLMEngine.close</code> ({{cite deepinfer/engine/llm_engine.py:350-366}}).</li>
+</ul>
+<h3>What it calls</h3>
+<ul>
+  <li><code>ModelRunner(...)</code> in the constructor ({{cite deepinfer/worker/base.py:90-96}}), then its <code>load_model</code>, <code>profile_run</code>, <code>capture_model</code> and <code>capture_dflash_model</code>.</li>
+  <li><code>CacheEngine(...)</code> in <code>init_cache_engine</code>, and its static <code>get_cache_block_size</code> and <code>get_state_shape</code> in the profile ({{cite deepinfer/worker/base.py:237-242}}).</li>
+  <li><code>configure_worker_environment</code> and <code>configure_worker_kernels</code> ({{cite deepinfer/worker/runtime_config.py:29-69}}).</li>
+  <li><code>dist.init_process_group</code> and <code>init_parallel_groups</code> ({{cite deepinfer/worker/base.py:334-343}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>set_pdeathsig</code></td><td>{{cite deepinfer/worker/base.py:42}}</td><td>Asks Linux to send <code>SIGKILL</code> to this process when its parent dies.</td></tr>
+    <tr><td><code>WorkerBase.__init__</code></td><td>{{cite deepinfer/worker/base.py:58}}</td><td>Stores the configs, makes the <code>ModelRunner</code>, turns off the automatic garbage collector, sets up torch, device and process groups. A follower then enters its loop.</td></tr>
+    <tr><td><code>gpu_id</code></td><td>{{cite deepinfer/worker/base.py:125-127}}</td><td>Physical device id from <code>CUDA_VISIBLE_DEVICES</code>.</td></tr>
+    <tr><td><code>start_slave_worker_loop</code></td><td>{{cite deepinfer/worker/base.py:129}}</td><td>Follower loop: receive <code>(method, kwargs)</code>, call it, forever.</td></tr>
+    <tr><td><code>stop</code></td><td>{{cite deepinfer/worker/base.py:135}}</td><td>Barriers, closes the userbuffer, destroys CUDA graphs and process groups. A follower exits.</td></tr>
+    <tr><td><code>maybe_gc_collect</code></td><td>{{cite deepinfer/worker/base.py:153}}</td><td>Runs <code>gc.collect()</code> every <code>gc_interval_step</code> steps.</td></tr>
+    <tr><td><code>clone_and_zero_states_and_blocks_on_default_stream</code></td><td>{{cite deepinfer/worker/base.py:159-168}}</td><td>Copies or clears state slots and KV blocks on the current stream (C++).</td></tr>
+    <tr><td><code>init_model</code>, <code>init_dist</code></td><td>{{cite deepinfer/worker/base.py:182}}, {{cite deepinfer/worker/base.py:196}}</td><td>Device and CPU binding; process groups.</td></tr>
+    <tr><td><code>load_model</code></td><td>{{cite deepinfer/worker/base.py:203}}</td><td>Engram tokenizer, then the weights.</td></tr>
+    <tr><td><code>profile_num_available_blocks</code></td><td>{{cite deepinfer/worker/base.py:212}}</td><td>The {{term memory-profiling}} pass: how many KV blocks fit.</td></tr>
+    <tr><td><code>init_cache_engine</code></td><td>{{cite deepinfer/worker/base.py:270}}</td><td>Makes the {{term cache-engine}} and keeps its <code>gpu_cache</code>.</td></tr>
+    <tr><td><code>warm_up_model</code></td><td>{{cite deepinfer/worker/base.py:274}}</td><td>Captures the CUDA graphs (main model, then DFlash) and resets the random seed.</td></tr>
+    <tr><td><code>run_workers</code></td><td>{{cite deepinfer/worker/base.py:290}}</td><td>Driver only: send a call to the followers, then run it here.</td></tr>
+    <tr><td><code>init_engram</code></td><td>{{cite deepinfer/worker/base.py:304}}</td><td>Loads the compressed tokenizer and gives its table to C++.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code></h3>
+<x-code file="deepinfer/worker/base.py" lines="90-123" highlight="90-96,102-106,108,114,117,120-123" />
+<ol>
+  <li>Lines 90-96: make the <code>ModelRunner</code>. The model is loaded later, in <code>load_model</code>.</li>
+  <li>Lines 102-106: turn off Python's automatic garbage collector. The worker collects by hand every <code>DEEPINFER_GC_INTERVAL_STEP</code> steps (default 1000), and ten times less often in a COMPLETION engine.</li>
+  <li>Line 108: <code>_init_torch</code> turns off reduced-precision reductions in FP16 and BF16 matrix multiplies, turns on expandable memory segments, and sets 8 CPU threads ({{cite deepinfer/worker/base.py:174-180}}).</li>
+  <li>Line 114: <code>init_model</code> sets environment variables for the kernel libraries, binds the NUMA node, selects the device, binds the CPU cores and sets the seed ({{cite deepinfer/worker/base.py:182-194}}).</li>
+  <li>Line 117: <code>init_dist</code> makes the process groups.</li>
+  <li>Lines 120-123: a follower freezes the current objects for the garbage collector and enters its loop. The constructor never returns.</li>
+</ol>
+
+<h3><code>start_slave_worker_loop</code> and <code>run_workers</code></h3>
+<x-code file="deepinfer/worker/base.py" lines="129-133" />
+<x-code file="deepinfer/worker/base.py" lines="290-302" highlight="298-300,302" />
+<p>The driver puts <code>(method, kwargs)</code> into a shared-memory message queue of the context-parallel group, and each follower reads it ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:17-23}}). The driver then calls the same method with <code>driver_kwargs</code> as well. So the followers run the same sequence of methods as the driver, with fewer arguments. With one context-parallel rank, nothing is sent.</p>
+
+<h3><code>profile_num_available_blocks</code>: the memory profile</h3>
+<x-code file="deepinfer/worker/base.py" lines="217-246" highlight="225,234-235,242-245">
+<x-tr line="241">Subtract the reserved state cache, which has a fixed size.</x-tr>
+<x-tr line="243">State store and copy buffer, so it needs twice the size.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 217-220: empty the PyTorch cache, reset the peak counter, and read free and total device memory.</li>
+  <li>Line 225: <code>profile_run</code> runs one full step on dummy sequences with a small temporary cache (see {{link code/cache-engine}}).</li>
+  <li>Lines 228-234: peak = peak PyTorch memory + device memory that PyTorch does not manage.</li>
+  <li>Line 235: budget = <code>total × gpu_memory_utilization − peak</code>.</li>
+  <li>Lines 237-245: subtract two copies of the state buffer, then divide by the bytes of one block row.</li>
+</ol>
+<x-code file="deepinfer/worker/base.py" lines="264-268" highlight="266" />
+<x-warning title="The docstring says minimum, the code takes the mean">
+<p>Line 266 divides the sum by the world size and rounds down to an even number: the mean, not the minimum. The engine docstring says "minimum" ({{cite deepinfer/engine/llm_engine.py:426-428}}). This site describes the code. A rank that measured fewer blocks than the mean gets the mean anyway.</p>
+</x-warning>
+
+<h3><code>init_cache_engine</code> and <code>warm_up_model</code></h3>
+<x-code file="deepinfer/worker/base.py" lines="270-288" highlight="271-272,279-281,285,288" />
+<ol>
+  <li>Lines 271-272: make the <code>CacheEngine</code> with the agreed block count from <code>cache_config</code>, and keep the per-layer view object <code>gpu_cache</code>.</li>
+  <li>Line 279: capture the CUDA graphs of the main model with the real cache.</li>
+  <li>Lines 280-281: with DSpark, measure the decode time per batch size for the cost model ({{cite deepinfer/worker/model_runner.py:562}}).</li>
+  <li>Line 285: capture the DFlash graphs, if DFlash has graphs.</li>
+  <li>Line 288: reset the seed, so that profiling and capture do not change the random state of the run.</li>
+</ol>
+
+<h3><code>stop</code></h3>
+<x-code file="deepinfer/worker/base.py" lines="135-151" />
+<p>The comment explains the order: the follower ends with <code>os._exit(0)</code>, which skips destructors, so the userbuffer must close between two barriers. CUDA graphs must go before the process groups, because NCCL inside graphs holds extra dependencies (the comment links PyTorch issue 115388).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Process groups: Gloo first, then device groups">
+<x-code file="deepinfer/worker/base.py" lines="322-343" highlight="329,334-340,343" />
+<ul>
+  <li>Line 329: the global rank is <code>engine_rank × cp_size + cp_rank</code>. The same formula sets <code>self.global_rank</code> ({{cite deepinfer/worker/base.py:79}}).</li>
+  <li>Lines 334-340: the default process group uses the CPU backend <code>"gloo"</code>, with the timeout <code>DEEPINFER_GLOO_TIMEOUT</code> (default 14,400 s, {{cite deepinfer/environ.py:110}}).</li>
+  <li>Line 343: <code>init_parallel_groups</code> splits the world into data-parallel, expert-parallel, context-parallel and engram groups. It also makes CPU groups, such as <code>cpu_cp_group</code> for the message queue ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:99}}, {{cite deepinfer/model_executor/parallel_utils/parallel_state.py:124}}), and then the device groups ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:126}}).</li>
+</ul>
+<p>The CPU data-parallel group is the group that the engine uses with ZOS (see {{link concepts/zero-overhead-scheduling}}).</p>
+</x-deepdive>
+
+<x-deepdive title="CPU, NUMA and kernel-library settings">
+<ul>
+  <li><strong>NUMA.</strong> <code>_bind_numa</code> binds the process and its memory to the NUMA node of the device. A failure only logs a warning. Translated: <em>"NUMA binding failed; memory placement falls back to first-touch, which can slow down H2D copies"</em> ({{cite deepinfer/worker/base.py:347-357}}).</li>
+  <li><strong>CPU cores.</strong> <code>bind_cpu</code> gives each device an equal share of the physical cores: device <code>i</code> gets cores <code>i·k</code> to <code>(i+1)·k − 1</code>, with <code>k = physical cores // devices</code> ({{cite deepinfer/utils.py:143-148}}).</li>
+  <li><strong>Environment.</strong> <code>configure_worker_environment</code> sets <code>EP_AVOID_RECORD_STREAM=1</code>, removes <code>NCCL_NVLS_ENABLE</code>, sets NCCL variables on NVIDIA, and sets the JIT cache folders if <code>DEEPINFER_JIT_CACHE_DIR</code> is set ({{cite deepinfer/worker/runtime_config.py:29-51}}).</li>
+  <li><strong>Kernels.</strong> <code>configure_worker_kernels</code> turns on PDL for DeepGEMM and TileKernels on NVIDIA, and deterministic algorithms with <code>DEEPINFER_BATCH_INVARIANT</code> or on Ascend ({{cite deepinfer/worker/runtime_config.py:54-69}}).</li>
+  <li><strong>Seed.</strong> Each rank uses <code>seed + global_rank</code>, so ranks draw different random numbers, for example for simulated MoE imbalance ({{cite deepinfer/worker/base.py:170-172}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="The memory profile with numbers">
+<p>Example values (not measured): 8 ranks, an 80 GiB device, <code>gpu_memory_utilization = 0.85</code> (the value of <code>examples/offline_inference.py</code>), a peak of 50 GiB, a block row of 2 MiB and a state buffer of 0.5 GiB.</p>
+<ol>
+  <li>Budget: <code>80 × 0.85 − 50 = 18</code> GiB = 18,432 MiB.</li>
+  <li>State: <code>2 × 512 MiB = 1,024</code> MiB; left: 17,408 MiB.</li>
+  <li>Blocks on this rank: <code>17,408 // 2 = 8,704</code>.</li>
+  <li>If the 8 ranks measure 8,704, 8,704, 8,704, 8,704, 8,600, 8,600, 8,600 and 8,601 blocks, the sum is 69,217. Each rank uses <code>69,217 // 8 = 8,652</code>, then <code>8,652 // 2 × 2 = 8,652</code>.</li>
+</ol>
+<p>The second state copy is the store buffer <code>copy_state</code> of the KV-saving hooks ({{cite deepinfer/engine/llm_engine.py:787-798}}). In this release <code>copy_state</code> stays <code>None</code> ({{cite deepinfer/engine/llm_engine.py:284}}), but the profile still reserves the memory. The page {{link learn/kv-cache}} has a second worked example in its deep dive "Where the memory comes from".</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>prctl</code> fails</td><td><code>OSError</code></td><td>{{cite deepinfer/worker/base.py:45-46}}</td></tr>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code> not set</td><td><code>KeyError</code> in <code>gpu_id</code> (inside <code>init_model</code>)</td><td>{{cite deepinfer/worker/base.py:125-127}}</td></tr>
+    <tr><td>NUMA binding fails</td><td>warning only</td><td>{{cite deepinfer/worker/base.py:356-357}}</td></tr>
+    <tr><td>Profile leaves no memory</td><td><code>num_gpu_blocks = 0</code>; the engine raises <code>ValueError</code></td><td>{{cite deepinfer/worker/base.py:246}}, {{cite deepinfer/engine/llm_engine.py:441-444}}</td></tr>
+    <tr><td>Batch invariance on Ascend</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/runtime_config.py:61-63}}</td></tr>
+    <tr><td>The parent process dies</td><td>a follower gets <code>SIGKILL</code></td><td>{{cite deepinfer/worker/base.py:130}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that this file reads">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_GC_INTERVAL_STEP</code></td><td><code>1000</code> ({{cite deepinfer/environ.py:185}})</td><td>{{cite deepinfer/worker/base.py:104}}</td><td>Steps between two garbage collections; ×10 for COMPLETION.</td></tr>
+    <tr><td><code>DEEPINFER_PROFILE_TORCH_CUDA_MEMORY</code></td><td>unset ({{cite deepinfer/environ.py:200}})</td><td>{{cite deepinfer/worker/base.py:110-111}}</td><td>Records PyTorch memory history.</td></tr>
+    <tr><td><code>DEEPINFER_ENABLE_MEMORY_TRACING</code></td><td>off ({{cite deepinfer/environ.py:201}})</td><td>{{cite deepinfer/worker/base.py:223-227}}</td><td>Rank 0 writes a memory snapshot of the profile run.</td></tr>
+    <tr><td><code>DEEPINFER_ENABLE_MTP_VARLEN</code></td><td>off ({{cite deepinfer/environ.py:131}})</td><td>{{cite deepinfer/worker/base.py:280}}</td><td>Measures the decode performance curve after capture.</td></tr>
+    <tr><td><code>DEEPINFER_GLOO_TIMEOUT</code></td><td>14,400 s ({{cite deepinfer/environ.py:110}})</td><td>{{cite deepinfer/worker/base.py:339}}</td><td>Timeout of the default process group.</td></tr>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code></td><td>must be set</td><td>{{cite deepinfer/worker/base.py:127}}, {{cite deepinfer/worker/base.py:352}}</td><td>Physical device id and NUMA node.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link code/worker}}: the subclass with the step logic.</li>
+  <li>{{link code/cache-engine}}: what <code>init_cache_engine</code> allocates.</li>
+  <li>{{link learn/kv-cache}} and {{link concepts/paged-kv-cache}}: the blocks that the profile counts.</li>
+  <li>{{link tours/startup}}: the start-up order as a tour.</li>
+  <li>{{link concepts/context-parallelism}}: why followers exist.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which four <code>WorkerBase</code> methods does the engine call at start-up, in order?
+    <x-a><p><code>load_model</code>, <code>profile_num_available_blocks</code>, <code>init_cache_engine</code> and <code>warm_up_model</code> ({{cite deepinfer/engine/llm_engine.py:241}}, {{cite deepinfer/engine/llm_engine.py:437}}, {{cite deepinfer/engine/llm_engine.py:453}}, {{cite deepinfer/engine/llm_engine.py:457}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How does a follower worker learn which method to run?
+    <x-a><p>It waits in <code>start_slave_worker_loop</code> for a <code>(method, kwargs)</code> object from <code>cp_broadcast_object</code> ({{cite deepinfer/worker/base.py:129-133}}). The driver sends it in <code>run_workers</code> before it runs the method itself ({{cite deepinfer/worker/base.py:298-302}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the worker turn off Python's automatic garbage collector?
+    <x-a><p>It calls <code>gc.disable()</code> and collects by hand every <code>DEEPINFER_GC_INTERVAL_STEP</code> steps, next to the <code>pre_sampler_sync</code> callback ({{cite deepinfer/worker/base.py:102-106}}, {{cite deepinfer/worker/base.py:153-157}}, {{cite deepinfer/worker/worker.py:165}}). So a collection runs at a known point, while the device samples, and not at a random point in the step. (The code gives no comment on the reason; this is the effect.)</p></x-a>
+  </x-q>
+  <x-q level="hard">4 ranks measure 1,001, 1,001, 1,000 and 990 blocks. How many blocks does each rank use? Does the docstring of <code>_init_cache</code> give the same answer?
+    <x-a><p>Sum 3,992; <code>3,992 // 4 = 998</code>; <code>998 // 2 × 2 = 998</code> ({{cite deepinfer/worker/base.py:264-266}}). The docstring says the minimum, which would be 990 ({{cite deepinfer/engine/llm_engine.py:426-428}}). So the rank that measured 990 gets 8 blocks more than it measured. See the deep dive "The memory profile with numbers".</p></x-a>
+  </x-q>
+</x-quiz>

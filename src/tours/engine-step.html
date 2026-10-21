@@ -1,0 +1,219 @@
+---
+title: Tour: One engine step
+nav_title: One engine step
+level: Advanced
+prerequisites: tours/life-of-a-request, concepts/engine-step-loop, concepts/zero-overhead-scheduling
+related: concepts/zero-overhead-scheduling, concepts/engine-step-loop, code/worker, code/zos-cpp, code/llm-engine, code/model-runner, concepts/sampler, tours/spec-decode-round, concepts/cuda-graphs
+summary: Follow one decode step of three requests through LLMEngine.step() and Worker.execute_model_step in 11 stops, and see which step's data each phase touches (N or N-1), with ZOS on and off.
+---
+<x-sentence>We follow one decode step of three requests from the scheduler to the outputs, and we mark which step's data each part uses.</x-sentence>
+
+<h2>The idea</h2>
+<p>The tour {{link tours/life-of-a-request}} followed one request through all its steps. This tour stays inside <em>one</em> {{term engine-step}}. It reads every phase of <code>LLMEngine.step()</code> and of <code>Worker.execute_model_step</code> in code order.</p>
+<p>The main point of this tour is time. With {{term zos | zero-overhead scheduling}} (ZOS, the default), one call of <code>step()</code> works on two steps. It schedules, runs and samples step N. It also post-processes step N−1, which the worker kept from the call before. At each stop, a tag tells you which step the data belongs to.</p>
+<p>The example batch has three decode requests, A, B and C. The previous step N−1 ran them in the order B, A, C. The scheduler now sorts them by length and plans step N as A, B, C. The numbers are illustrative; the formulas follow the code:</p>
+<table>
+  <thead><tr><th>Request</th><th>Cache before N−1</th><th>Drafts that N−1 accepts</th><th>Cache after the post-process of N−1</th></tr></thead>
+  <tbody>
+    <tr><td>A</td><td>100</td><td>2 of 5</td><td>103</td></tr>
+    <tr><td>B</td><td>96</td><td>5 of 5</td><td>102</td></tr>
+    <tr><td>C</td><td>35</td><td>0 of 5</td><td>36</td></tr>
+  </tbody>
+</table>
+<p>Other settings: <code>nextn = 5</code>, DSpark off (so each request sends 6 query tokens), CUDA graphs on, <code>max_num_seqs = 4</code>, one data-parallel rank.</p>
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Where</th><th>Data of step</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The loop calls <code>step()</code></td><td><code>LLM._run_engine</code></td><td>—</td></tr>
+    <tr><td>2</td><td>The scheduler plans step N</td><td><code>Scheduler::schedule</code> (C++)</td><td>N</td></tr>
+    <tr><td>3</td><td>The engine calls the worker</td><td><code>_execute_model_async_step</code>, <code>run_workers</code></td><td>N</td></tr>
+    <tr><td>4</td><td>The device corrects the lengths</td><td><code>Worker._correct_seqlens_qk</code>, <code>zos.cpp</code></td><td>N, from N−1</td></tr>
+    <tr><td>5</td><td>Inputs are built and forward N starts</td><td><code>ModelRunner.execute_main_model</code></td><td>N</td></tr>
+    <tr><td>6</td><td>The CPU post-processes step N−1</td><td><code>Worker._post_process_step</code>, <code>LLMEngine.post_process</code></td><td>N−1</td></tr>
+    <tr><td>7</td><td>The CPU metadata catches up</td><td><code>update_metadata_for_sampling_zos</code></td><td>N</td></tr>
+    <tr><td>8</td><td>The sampler of step N starts</td><td><code>ModelRunner.execute_sample</code>, <code>Sampler.forward</code></td><td>N</td></tr>
+    <tr><td>9</td><td>Old buffers go back, the end event is recorded</td><td><code>pre_sampler_sync</code></td><td>older steps</td></tr>
+    <tr><td>10</td><td>The worker keeps step N and returns N−1</td><td><code>execute_model_step</code>, <code>LLM._run_engine</code></td><td>N and N−1</td></tr>
+    <tr><td>11</td><td>The last step: the flush</td><td><code>flush_inflight_reqs</code></td><td>the last step</td></tr>
+  </tbody>
+</table>
+
+<h2>The picture</h2>
+<x-diagram name="b4b_engine_step" alt="Ten CPU phases in a column, each with a tag: 1 loop; 2 schedule step N, tag N; 3 run_workers, tag N; 4 correct lengths with remap and a kernel, tag N from N-1, queues H2D and compute_seqlens_k_zos on the device; 5 prepare inputs and launch forward N, queues metadata, gather ids and forward N; 6 wait for sample_end_evt and post-process, tag N-1, the CPU waits until sample N-1 is done; 7 update metadata for sampling, tag N; 8 launch sample N with DFlash drafts, queues sample, drafts and copies to the CPU; 9 pre_sampler_sync and record the event, tag old; 10 keep N and return the outputs of N-1." caption="Figure: one call of step() with ZOS, in code order. The left column is the CPU; the right column is the work that each phase puts into the device queue." />
+<p>Read the CPU column from top to bottom. The CPU waits for the device only in phase 6. At that moment the device queue already holds forward N, so the device does not stop. Stops 2 to 10 of this tour follow the rows of the figure.</p>
+
+<x-stop n="1" title="The loop calls step()">
+<p>We are in <code>LLM._run_engine</code> in <code>deepinfer/entrypoints/llm.py</code>. The loop asks if work is left, calls <code>step()</code>, and clones every returned output:</p>
+<x-code file="deepinfer/entrypoints/llm.py" lines="176-186" highlight="177-178,181" />
+<p><code>has_unfinished_requests()</code> combines the answers of all data-parallel ranks. With ZOS it uses the CPU (Gloo) group, so the call does not wait for the device ({{cite deepinfer/engine/llm_engine.py:665-679}}). Then <code>step()</code> records its start time ({{cite deepinfer/engine/llm_engine.py:872-879}}).</p>
+<p><strong>State now.</strong> The worker holds the {{term worker-step-state}} of step N−1 in <code>prev_step_state</code>. On the device, sample N−1 may still run. The CPU does not know the tokens of N−1 yet.</p>
+</x-stop>
+
+<x-stop n="2" title="The scheduler plans step N">
+<p>We are in <code>LLMEngine.step()</code>. The C++ scheduler selects the batch and fills one {{term sequence-metadata}} per request:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="881-887" />
+<x-code file="csrc/engine/scheduler.hpp" lines="694-700" highlight="697" />
+<p>The decode branch sorts the running requests by length, longest first ({{cite csrc/engine/scheduler.hpp:648-649}}). So the order can change from step to step. Each request gets <code>seqlen_q = 6</code>. The CPU value of <code>seqlen_k</code> counts the 6 {{term in-flight-tokens}} of step N−1 and the 6 positions of step N. After line 726, each request has 12 in-flight tokens.</p>
+<pre><code class="language-python"># data of step N (CPU view, before the post-process of N-1)
+seq_metadata_list = [A, B, C]           # 3 SequenceMetadata objects from the pool
+seqlen_q          = [6, 6, 6]
+seqlen_k          = [112, 108, 47]      # 100+6+6, 96+6+6, 35+6+6
+scheduler_outputs.num_batched_tokens == 18</code></pre>
+<x-deepdive title="Stop 2 in detail: the rest of step() before the worker">
+<ul>
+  <li><strong>Clone and zero.</strong> If the scheduler asks to copy states or blocks (only for forked sequences), the engine runs a worker call first ({{cite deepinfer/engine/llm_engine.py:889-905}}).</li>
+  <li><strong>Structured output check</strong> at the last prefill chunk; not used in a decode step ({{cite deepinfer/engine/llm_engine.py:910-928}}).</li>
+  <li><strong>Multimodal fetch.</strong> The engine collects the results of the image workers after the schedule ({{cite deepinfer/engine/llm_engine.py:939-945}}).</li>
+  <li><strong>The position limit.</strong> The scheduler checks <code>seqlen_k − seqlen_q + max_seqlen_q + nextn ≤ runtime_max_model_len</code> for a decode step ({{cite csrc/engine/scheduler.hpp:698-705}}). For A: <code>112 − 6 + 6 + 5 = 117</code>.</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="3" title="The engine calls the worker">
+<p>The engine sends the batch to the {{term driver-worker}}:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="961-975" highlight="965-973" />
+<p><code>run_workers</code> first sends the method name to the context-parallel follower ranks, if there are any, and then calls the method in this process ({{cite deepinfer/worker/base.py:290-302}}). Only the driver gets <code>seq_metadata_list</code> and <code>scheduler_outputs</code>. Now we are in <code>Worker.execute_model_step</code> ({{cite deepinfer/worker/worker.py:89-189}}).</p>
+</x-stop>
+
+<x-stop n="4" title="The device corrects the lengths of step N">
+<p>The first phase of the worker compares step N with the kept step N−1:</p>
+<x-code file="deepinfer/worker/worker.py" lines="113-118" highlight="117-118" />
+<x-code file="deepinfer/worker/worker.py" lines="198-227" highlight="199-200,203-205,209-213,221-227" />
+<ol>
+  <li>Lines 199-200: no kept step (after a prefill), or a kept placeholder step: no correction.</li>
+  <li>Lines 203-205: 18 query tokens use the CUDA graph of 24 tokens, so the arrays get <code>3 + 24 − 18 = 9</code> rows.</li>
+  <li>Lines 209-213: C++ matches the requests by <code>seq_id</code> and returns the {{term zos-remap}} <code>[1, 0, 2, -1, ...]</code>.</li>
+  <li>Lines 221-227: the kernel <code>compute_seqlens_k_zos</code> uses the accepted counts of N−1, which are still on the device. It writes the real lengths.</li>
+</ol>
+<x-diagram name="b4b_zos_remap" alt="Panel 1: the previous step ran B, A, C; the next step runs A, B, C plus 6 padding rows; remap is [1, 0, 2, -1, -1, -1, -1, -1, -1]. Panel 2: a table: A 112 sent 106, accepted 2, device 109; B 108 sent 102, accepted 5, device 108; C 47 sent 41, accepted 0, device 42; padding rows stay 1. Panel 3: fresh rows get tokens from the CPU; matched rows gather the sampled token and the drafts of the previous step on the device; after the post-process the CPU sets seqlen_k = 6 + 103 = 109 for A." caption="Figure: the length correction on our batch. The figure names the kept step &quot;N&quot; and the current step &quot;N+1&quot;; in this tour they are N−1 and N." />
+<p>All of this is queued work. The CPU only launches three {{term non-blocking-copy | non-blocking copies}} and one kernel. The page {{link code/zos-cpp}} reads <code>prepare_zos_inputs</code> line by line.</p>
+<pre><code class="language-python"># data of step N, on the device after the kernel
+remap     = [1, 0, 2, -1, -1, -1, -1, -1, -1]   # int32 [9]
+seqlens_q = [6, 6, 6, 1, 1, 1, 1, 1, 1]
+seqlens_k = [109, 108, 42, 1, 1, 1, 1, 1, 1]     # 106+6-3, 102+6-0, 41+6-5</code></pre>
+</x-stop>
+
+<x-stop n="5" title="Inputs are built and forward N starts">
+<p>Now the worker starts the main model:</p>
+<x-code file="deepinfer/worker/worker.py" lines="120-127" highlight="122-124" />
+<x-code file="deepinfer/worker/model_runner.py" lines="182-191" highlight="185-190" caption="A decode step with graphs fills the buffers of the selected graph in place (<code>out_dict</code>)." />
+<p>With ZOS, the decode input function is <code>prepare_decode_v4_zos</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:143}}). It does three things:</p>
+<ol>
+  <li>C++ <code>prepare_decode_zos_inputs</code> packs the block tables, state ids and offsets into pinned arrays ({{cite csrc/engine/zos.cpp:198-277}}). Then <code>prepare_decode_inputs_zos</code> copies them to the device ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:70-77}}).</li>
+  <li>The kernel <code>prepare_v4_decode_metadata</code> computes positions, cache slots and per-token block tables from the corrected lengths ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367}}).</li>
+  <li>The kernel <code>gather_input_ids_zos</code> builds the input tokens. For A, row 0 is the token that N−1 sampled, and rows 1-5 are the drafts that N−1 made ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:235-244}}).</li>
+</ol>
+<p>Then <code>execute_main_model</code> replays the CUDA graph inside the sync guard ({{cite deepinfer/worker/model_runner.py:321-327}}). The call returns at once. The forward pass of N now waits in the device queue behind sample N−1.</p>
+<pre><code class="language-python"># data of step N, on the device
+input_ids  int32 [24] = [rA, eA1..eA5, rB, eB1..eB5, rC, eC1..eC5, pad x 6]
+positions  int32 [24] = [103..108, 102..107, 36..41, ...]   # from seqlens_k - seqlens_q
+hidden_states  [24, hidden_size]   # written later by the graph</code></pre>
+<x-deepdive title="Stop 5 in detail: why the graph does not copy inputs">
+<p>The graph runner gets <code>input_on_device = DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> ({{cite deepinfer/worker/model_runner.py:76-79}}). The graph capture runs <code>_run_model</code>, which copies the inputs from the source buffers only when the inputs are not on the device ({{cite deepinfer/worker/cuda_graph_runner.py:54-66}}, {{cite deepinfer/worker/cuda_graph_runner.py:126}}). So with ZOS the captured graph has no input copy. With ZOS, the kernels of this stop write straight into the buffers that the graph reads. The graph sizes for <code>max_num_seqs = 4</code> are 1, 2, 4, 8, 16 and 24. The largest size is <code>4 × (1 + 5) = 24</code>, and the default interval is 8 ({{cite deepinfer/worker/model_runner.py:77}}, {{cite deepinfer/worker/cuda_graph_runner.py:41-51}}, {{cite deepinfer/environ.py:155}}). The page {{link concepts/cuda-graphs}} explains capture and replay.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="6" title="The CPU post-processes step N−1">
+<p>While the device runs forward N, the CPU handles the kept step:</p>
+<x-code file="deepinfer/worker/worker.py" lines="143-144" />
+<x-code file="deepinfer/worker/worker.py" lines="259-272" highlight="263,268,271" />
+<ol>
+  <li>Line 263: with the default settings, the only planned wait of this call. The CPU waits until sample N−1 and its copies to the CPU are done. Forward N is already queued, so the device keeps working.</li>
+  <li>Line 268: <code>ModelRunner.post_process</code> runs the small functions that the sampler left in <code>post_funcs</code>, for example statistics of the drafts ({{cite deepinfer/worker/model_runner.py:370-384}}).</li>
+  <li>Line 271: the engine callback <code>LLMEngine.post_process</code> calls <code>_process_model_outputs</code>. The C++ code appends the accepted tokens, checks stop conditions and builds the output objects ({{cite deepinfer/engine/llm_engine.py:984-1015}}).</li>
+</ol>
+<pre><code class="language-python"># data of step N-1, after the post-process
+A: cache 100 -> 103, outputs [eA1, eA2, rA]      # 2 drafts + 1 sampled
+B: cache  96 -> 102, outputs [eB1..eB5, rB]      # 5 drafts + 1 sampled
+C: cache  35 ->  36, outputs [rC]
+request_outputs = np.array([...10 handles...], dtype=np.uint64)</code></pre>
+<p>The in-flight count of each request goes from 12 to 6: only step N is in flight now ({{cite csrc/engine/sequence.hpp:249-256}}). The page {{link code/llm-engine}} reads <code>_process_model_outputs</code> line by line.</p>
+</x-stop>
+
+<x-stop n="7" title="The CPU metadata catches up">
+<p>The sampler of step N needs correct CPU metadata, for example <code>seqlen_k</code> for the sample positions ({{cite csrc/engine/prepare_sample.cpp:198-206}}). Now the CPU knows the result of N−1, so it updates each <code>SequenceMetadata</code>:</p>
+<x-code file="deepinfer/worker/worker.py" lines="146-152">
+<x-tr line="146">3. Sample the current step (first correct the CPU metadata with the seqlens_q copied back from the device).</x-tr>
+</x-code>
+<x-code file="csrc/engine/zos.cpp" lines="296-303" highlight="297,299,300-302" />
+<p>For A: <code>seqlen_k = 6 + 103 = 109</code>, the same value as the device value of stop 4. <code>refresh_for_sampling</code> copies the newest last token, draft slot and golden tokens of the sequence into the metadata ({{cite csrc/engine/sequence.hpp:408-418}}).</p>
+<p>With DSpark (<code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>), the device also changed <code>seqlens_q</code> in stop 4. Then line 149 waits for the copy of these lengths to the CPU. With the default settings, <code>d2h_evt</code> is <code>None</code> and there is no wait here ({{cite deepinfer/worker/worker.py:229-234}}).</p>
+</x-stop>
+
+<x-stop n="8" title="The sampler of step N starts">
+<x-code file="deepinfer/worker/worker.py" lines="154-159" />
+<p><code>execute_sample</code> prepares the sampler inputs on the CPU and launches the sampler inside the sync guard ({{cite deepinfer/worker/model_runner.py:337-367}}). In a decode step, the sampler verifies the drafts, samples a new token per request, and runs DFlash for the next drafts ({{cite deepinfer/model_executor/layers/sampler.py:212-251}}). The tour {{link tours/spec-decode-round}} reads this part in full.</p>
+<p>Before it returns, the sampler queues {{term non-blocking-copy | non-blocking copies}} of its results to the CPU. It also keeps device copies for the next step, which stops 4 and 5 of the <em>next</em> call read:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="258-291" highlight="258,261-262,287-290" />
+<pre><code class="language-python"># data of step N, on the device (CPU copies are queued, not done)
+sampled_token_ids_gpu   int32 [3]
+predict_token_ids_gpu   int32 [3, 5]
+num_accepted_tokens_gpu int32 [3]     # last_valid_offset</code></pre>
+</x-stop>
+
+<x-stop n="9" title="Old buffers go back, the end event is recorded">
+<x-code file="deepinfer/worker/worker.py" lines="161-168" highlight="164,167-168" />
+<p><code>pre_sampler_sync</code> runs on the CPU while the device samples ({{cite deepinfer/engine/llm_engine.py:830-846}}). It releases the buffers that <code>DeferredRelease</code> collected ({{cite deepinfer/engine/llm_engine.py:100-107}}). These are the metadata list of step N−1, which stop 6 added ({{cite deepinfer/engine/llm_engine.py:1013}}), and the output handles of the <em>previous</em> call. It also pumps the grammar builder and frees the blocks of finished sequences. Every 1,000 calls (the default of <code>DEEPINFER_GC_INTERVAL_STEP</code>), the worker runs Python garbage collection ({{cite deepinfer/worker/base.py:153-157}}, {{cite deepinfer/environ.py:185}}).</p>
+<p>Lines 167-168 record <code>sample_end_evt</code> in the stream. The event marks the end of all work queued so far: forward N, sample N and its copies. The next call waits on this event in its stop 6.</p>
+</x-stop>
+
+<x-stop n="10" title="The worker keeps step N and returns step N−1">
+<x-code file="deepinfer/worker/worker.py" lines="170-189" highlight="183-187">
+<x-tr line="182">4. A prompt step, or a non-ZOS configuration: post-process at once. A ZOS decode step: keep it for the next step (to overlap with forward).</x-tr>
+</x-code>
+<p>Step N is a decode step and ZOS is on, so the worker keeps it. The call returns the 10 handles of step N−1. The engine puts them into <code>DeferredRelease</code> ({{cite deepinfer/engine/llm_engine.py:974}}). Back in stop 1, <code>LLM</code> clones each handle before the next call.</p>
+<p><strong>Summary of the call.</strong> It scheduled, corrected, ran and sampled step N. It post-processed step N−1. It returned the tokens of N−1. The tokens of N come back in the next call.</p>
+</x-stop>
+
+<x-stop n="11" title="The last step: the flush">
+<p>When no request is left, <code>LLM</code> calls <code>flush_inflight_reqs()</code> instead of <code>step()</code> ({{cite deepinfer/entrypoints/llm.py:178}}):</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="977-982" />
+<x-code file="deepinfer/worker/worker.py" lines="274-283" />
+<p>The flush post-processes the kept step and clears it. In the offline loop, the kept step at that time is usually an empty step, so the flush returns no output. The page {{link concepts/engine-step-loop}} shows why, call by call.</p>
+</x-stop>
+
+<h2 id="zos-off">The same step with ZOS off</h2>
+<p>Set <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING=0</code> before the engine starts (see {{link concepts/zero-overhead-scheduling}}). The same call then works on one step only:</p>
+<table>
+  <thead><tr><th>Stop</th><th>ZOS on</th><th>ZOS off</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>all-reduce on the CPU group</td><td>all-reduce on the device group; <code>.item()</code> waits for the device ({{cite deepinfer/engine/llm_engine.py:667-678}})</td></tr>
+    <tr><td>2</td><td><code>seqlen_k</code> counts the in-flight step N−1</td><td>no step is in flight, so <code>seqlen_k = 103 + 0 + 6 = 109</code> for A</td></tr>
+    <tr><td>4</td><td>remap and length kernel</td><td>no kept step: <code>_correct_seqlens_qk</code> returns <code>None</code> ({{cite deepinfer/worker/worker.py:198-200}})</td></tr>
+    <tr><td>5</td><td>inputs built on the device</td><td><code>prepare_decode_v4</code> builds them on the CPU; the graph copies them ({{cite deepinfer/model_executor/model_metadata_utils.py:143}})</td></tr>
+    <tr><td>6</td><td>post-process N−1</td><td>nothing kept, returns an empty array ({{cite deepinfer/worker/worker.py:259-260}})</td></tr>
+    <tr><td>7</td><td>metadata update</td><td>skipped (<code>correction</code> is <code>None</code>)</td></tr>
+    <tr><td>10</td><td>keep N</td><td>post-process N at once: wait for sample N, then return the tokens of N ({{cite deepinfer/worker/worker.py:183-185}})</td></tr>
+  </tbody>
+</table>
+<p>So without ZOS, the device has no queued work while the CPU post-processes N and schedules N+1. The interactive timeline on {{link concepts/zero-overhead-scheduling#try-it | the ZOS page}} shows the time that this costs.</p>
+
+<h2>What can go wrong</h2>
+<x-warning title="Do not add a sync to the forward or sample launch">
+<p>A <code>.item()</code>, a device-tensor print or a blocking copy in the launch part of <code>execute_main_model</code> or <code>execute_sample</code> raises an error from the {{term sync-guard}} ({{cite deepinfer/utils.py:119-132}}, {{cite deepinfer/worker/model_runner.py:321-325}}, {{cite deepinfer/worker/model_runner.py:356-360}}). Outside the guard, the same sync would stop the overlap without an error.</p>
+</x-warning>
+<ul>
+  <li><strong>A kept handle becomes invalid.</strong> The handles that stop 10 returns go back to the pool at the next <code>pre_sampler_sync</code> (stop 9). Clone them first ({{cite deepinfer/entrypoints/llm.py:179-182}}).</li>
+  <li><strong>A request finishes, but the next step still runs it.</strong> The scheduler of step N+1 runs before the post-process of step N. <code>process_outputs</code> then skips the finished request ({{cite csrc/engine/scheduler.hpp:905-915}}).</li>
+  <li><strong>The metadata list and the scheduled sequences differ.</strong> The C++ checks in <code>update_metadata_for_sampling_zos</code> then fail with an error. They compare the lengths of the two lists and each <code>seq_id</code> ({{cite csrc/engine/zos.cpp:282-288}}, {{cite csrc/engine/zos.cpp:296}}).</li>
+  <li><strong>A slow post-process delays the sampler.</strong> The sampler of N is launched only after the post-process of N−1 (stops 6 and 8). If the post-process takes longer than forward N, the device waits.</li>
+</ul>
+<p><strong>Why it matters.</strong> When you read a profile or a log of DeepInfer, each step mixes two steps. A slow "post-process" in step N is the cost of step N−1. The tokens that step N returns came from the device one call earlier.</p>
+
+<x-quiz>
+  <x-q level="easy">In one call of <code>step()</code> with ZOS, which step's tokens does the CPU post-process?
+    <x-a><p>The tokens of step N−1, the step that the worker kept in <code>prev_step_state</code> ({{cite deepinfer/worker/worker.py:143-144}}, {{cite deepinfer/worker/worker.py:186-187}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">In which phase does the CPU wait for the device with the default settings, and for what?
+    <x-a><p>In the post-process of N−1, at <code>sample_end_evt.synchronize()</code>. It waits until sample N−1 and its copies to the CPU are done ({{cite deepinfer/worker/worker.py:262-263}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Where do the input tokens of request A in step N come from, and why not from the CPU?
+    <x-a><p>From the device outputs of step N−1: the sampled token for row 0 and the 5 new drafts for rows 1-5, gathered by <code>gather_input_ids_zos</code> ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:235-244}}). When step N is prepared, the post-process of N−1 has not run, so the CPU does not know these tokens.</p></x-a>
+  </x-q>
+  <x-q level="hard">Request B accepted all 5 drafts in step N−1. Its CPU <code>seqlen_k</code> for step N is 108. Which value does the kernel write, and which value does the CPU set in stop 7? Explain both.
+    <x-a><p>C++ sends <code>108 − 6 = 102</code> ({{cite csrc/engine/zos.cpp:188}}). The kernel writes <code>102 + 6 − (5 − 5) = 108</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/compute_seqlens_k_zos.py:22-23}}). After the post-process, B's cache holds <code>96 + 6 = 102</code>, so stop 7 sets <code>6 + 102 = 108</code> ({{cite csrc/engine/zos.cpp:299}}). When all drafts are accepted, the CPU guess was already right.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does the event of stop 9 mark the end of the sampler copies, although the copies were launched in stop 8?
+    <x-a><p>All step work goes into the same stream in launch order. The sampler queues its non-blocking copies before it returns ({{cite deepinfer/model_executor/layers/sampler.py:258-275}}), and the worker records <code>sample_end_evt</code> after that ({{cite deepinfer/worker/worker.py:167-168}}). So when the event is complete, the copies are complete too. This is the deep dive "Events, streams and the waits that remain" on {{link concepts/zero-overhead-scheduling}}.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,198 @@
+---
+title: worker/cache_engine.py: CacheEngine and the cache layout
+nav_title: worker/cache_engine.py
+level: Advanced
+prerequisites: learn/kv-cache, concepts/paged-kv-cache, code/worker-base
+related: learn/kv-cache, concepts/paged-kv-cache, code/worker-base, code/block-manager-hpp, concepts/sliding-window-attention, concepts/kv-compression, concepts/cross-layer-kv-sharing, concepts/sparse-attention-indexer
+summary: CacheEngine allocates two raw uint8 device buffers - gpu_blocks for the paged KV cache and gpu_states for the per-sequence state slots - and KVCacheManager cuts them into one KVCache view object per attention layer.
+---
+<h2>Purpose</h2>
+<p><code>CacheEngine</code> allocates the two cache buffers of a rank and gives every attention layer a <code>KVCache</code> object with views into them. The page {{link learn/kv-cache}} explains the layout in simple terms; this page reads the code.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/worker/cache_engine.py</code>, 978 lines of Python. "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/worker/cache_engine.py:2}}). Many comments are in Chinese.</td></tr>
+    <tr><th>Main classes</th><td><code>CacheEngine</code> ({{cite deepinfer/worker/cache_engine.py:851}}), <code>GPUCacheInterface</code> ({{cite deepinfer/worker/cache_engine.py:540}}), <code>KVCacheManager</code> ({{cite deepinfer/worker/cache_engine.py:309}}), <code>StateBlock</code> ({{cite deepinfer/worker/cache_engine.py:221}}) and the dataclass <code>KVCache</code> ({{cite deepinfer/worker/cache_engine.py:205-218}}).</td></tr>
+    <tr><th>Runs in</th><td>Every worker process, at start-up (twice: a temporary cache for the profile run, then the real cache).</td></tr>
+    <tr><th>Called by</th><td><code>WorkerBase.init_cache_engine</code> and <code>profile_num_available_blocks</code>; <code>ModelRunner.profile_run</code>.</td></tr>
+    <tr><th>Calls</th><td><code>cuda_utils.alloc_tensor</code> (C++, <code>cuMemAlloc</code>), <code>ModelMetadata</code>, <code>iter_runtime_attn_modules</code>, and the state kernels <code>select_state_slice</code> and <code>load_state_to_cache</code>.</td></tr>
+    <tr><th>Not in this file</th><td>Which block belongs to which sequence: the C++ {{term block-manager}} ({{link code/block-manager-hpp}}). The slot mappings: the input metadata code. The reads and writes of the cache: the attention kernels.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4b_cache_engine" alt="Panel 1: six boxes. Profile_num_available_blocks on every rank; profile_run with a temporary CacheEngine that is zeroed and freed; the block count from free memory minus two state buffers, as a mean over ranks. Then init_cache_engine makes the CacheEngine; allocate_gpu_cache calls cuMemAlloc for gpu_blocks and gpu_states; GPUCacheInterface runs _kvcache_layout and KVCacheManager.process for each layer. Panel 2: a toy config. One row of gpu_blocks of 64,512 bytes holds the L1 indexer keys (8,704 B), the L1 main cache (36,864 B), the L2 main cache (18,432 B) and padding. One row of gpu_states of 241,296 bytes holds three SWA rings of 70,752 B and an L2 fp32 compression state of 28,672 B." caption="Figure: the start-up order (panel 1) and the bytes that process() gives each layer in a toy 3-layer config (panel 2)." />
+<p>Panel 1 reads left to right, then the second row. The agreed block count goes from the profile into <code>cache_config</code>, and the real <code>CacheEngine</code> reads it there. Panel 2 is the worked example of the deep dive "process() on a toy config".</p>
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>WorkerBase.init_cache_engine</code></strong> makes the real cache ({{cite deepinfer/worker/base.py:270-272}}). The engine calls it on every rank after the profile ({{cite deepinfer/engine/llm_engine.py:453}}).</li>
+  <li><strong><code>WorkerBase.profile_num_available_blocks</code></strong> calls the static methods <code>get_cache_block_size</code> and <code>get_state_shape</code> ({{cite deepinfer/worker/base.py:237-242}}).</li>
+  <li><strong><code>ModelRunner.profile_run</code></strong> makes a temporary <code>CacheEngine</code> with only the blocks of the dummy sequences ({{cite deepinfer/worker/model_runner.py:504-507}}).</li>
+  <li><strong>The model</strong> reads one <code>KVCache</code> per layer: <code>kv_caches[i]</code> ({{cite deepinfer/model_executor/models/deepseek.py:212}}), for example <code>kv_cache.ca_cache</code> and <code>kv_cache.swa_cache</code> in the attention module ({{cite deepinfer/model_executor/models/v4_modules/attn.py:519-520}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:642-644}}).</li>
+  <li><strong>The engine</strong> reads <code>gpu_states</code> and <code>gpu_blocks</code> for clones ({{cite deepinfer/worker/base.py:166-168}}) and the unused state copy ({{cite deepinfer/engine/llm_engine.py:797}}).</li>
+</ul>
+<h3>What it calls</h3>
+<ul>
+  <li><code>cuda_utils.alloc_tensor(size)</code>: "Allocate a 1D byte tensor by calling cuMemAlloc directly, bypassing torch's caching allocator" ({{cite csrc/cuda_utils.cpp:77-89}}, {{cite csrc/cuda_utils.cpp:99-102}}).</li>
+  <li><code>ModelMetadata(cfg)</code> for the alignment and the FP4 flag ({{cite deepinfer/worker/cache_engine.py:320-332}}).</li>
+  <li><code>iter_runtime_attn_modules</code>, which skips the LM-head entry of the attention list ({{cite deepinfer/model_executor/layer_utils.py:6-16}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_state_bytes</code></td><td>{{cite deepinfer/worker/cache_engine.py:41}}</td><td>Bytes of fp32 state <code>[tokens, 2, head_dim]</code>.</td></tr>
+    <tr><td><code>_kv_bytes_per_token</code></td><td>{{cite deepinfer/worker/cache_engine.py:46}}</td><td>528 (MXFP8) or 288 (FP4) bytes per main-cache entry; asserts 512 values.</td></tr>
+    <tr><td><code>_get_qk_topk_bytes</code></td><td>{{cite deepinfer/worker/cache_engine.py:73}}</td><td>FP4 indexer key: <code>index_head_dim / 2 + index_head_dim / 32</code> bytes.</td></tr>
+    <tr><td><code>get_inference_swa_block_size</code></td><td>{{cite deepinfer/worker/cache_engine.py:88}}</td><td>Ring length: window + <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code>.</td></tr>
+    <tr><td><code>get_inference_compress_block_size</code></td><td>{{cite deepinfer/worker/cache_engine.py:131}}</td><td>Compression ring: <code>ratio + max(0, backtracking − 1)</code>.</td></tr>
+    <tr><td><code>get_num_state_slots</code></td><td>{{cite deepinfer/worker/cache_engine.py:201}}</td><td><code>int(max_num_seqs × 1.2) + 1</code> slots.</td></tr>
+    <tr><td><code>KVCache</code></td><td>{{cite deepinfer/worker/cache_engine.py:205}}</td><td>Five optional views of one layer.</td></tr>
+    <tr><td><code>StateBlock</code></td><td>{{cite deepinfer/worker/cache_engine.py:221}}</td><td>Byte layout of one state slot.</td></tr>
+    <tr><td><code>KVCacheManager.process</code></td><td>{{cite deepinfer/worker/cache_engine.py:376}}</td><td>Cuts the views of one layer and moves the offsets.</td></tr>
+    <tr><td><code>KVCacheManager.finalize</code></td><td>{{cite deepinfer/worker/cache_engine.py:479}}</td><td>Pads the block row; checks the state offsets.</td></tr>
+    <tr><td><code>GPUCacheInterface._kvcache_layout</code></td><td>{{cite deepinfer/worker/cache_engine.py:581}}</td><td>Runs <code>process</code> for all layers; returns layout, shapes and views.</td></tr>
+    <tr><td><code>select_state_slice_to_store</code>, <code>load_state_from_store_to_prefill_cache</code></td><td>{{cite deepinfer/worker/cache_engine.py:763}}, {{cite deepinfer/worker/cache_engine.py:821}}</td><td>Read or write the stored part of a state slot (for KV saving; not called by the engine in this release).</td></tr>
+    <tr><td><code>CacheEngine.__init__</code></td><td>{{cite deepinfer/worker/cache_engine.py:862}}</td><td>Counts layers, takes the block count, allocates.</td></tr>
+    <tr><td><code>allocate_gpu_cache</code></td><td>{{cite deepinfer/worker/cache_engine.py:918}}</td><td>Allocates <code>gpu_blocks</code> and <code>gpu_states</code>; writes three sizes into <code>cache_config</code>.</td></tr>
+    <tr><td><code>get_cache_block_size</code>, <code>get_state_shape</code></td><td>{{cite deepinfer/worker/cache_engine.py:969}}, {{cite deepinfer/worker/cache_engine.py:902}}</td><td>Sizes without an allocation, for the profile.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>allocate_gpu_cache</code>: two buffers</h3>
+<x-code file="deepinfer/worker/cache_engine.py" lines="918-966" highlight="919,937-938,948-951,955-958,960-965">
+<x-tr line="931">The lengths of the layers already include their 32-byte padding; their sum is the row size before finalize().</x-tr>
+</x-code>
+<ol>
+  <li>Line 919: the row size of one block comes from a layout pass without memory.</li>
+  <li>Lines 937-938: one {{term gpu-blocks}} buffer, <code>uint8 [num_gpu_blocks, bytes_per_block]</code>. The comment on line 936 shows a 6-D shape from vLLM. It does not describe this layout.</li>
+  <li>Lines 948-951: the state shape is <code>(num_state_slots, bytes_per_slot)</code>. Three sizes go into the shared <code>cache_config</code>; the engine reads them to make the two block managers ({{cite deepinfer/engine/llm_engine.py:262-266}}).</li>
+  <li>Lines 955-958: the {{term gpu-states}} buffer. A model with no state gets an empty tensor.</li>
+  <li>Lines 960-965: <code>GPUCacheInterface</code> runs the layout again, now with the buffers, and keeps the per-layer views.</li>
+</ol>
+<x-note title="Memory outside the PyTorch allocator">
+<p><code>alloc_tensor</code> calls <code>cuMemAlloc</code> and rounds the size up to a page ({{cite csrc/cuda_utils.cpp:77-82}}). So the cache does not appear in <code>torch.cuda.memory_allocated()</code>. On Ascend, <code>asc_utils.cpp</code> has its own <code>alloc_tensor</code> ({{cite csrc/asc_utils.cpp:88}}).</p>
+</x-note>
+
+<h3><code>KVCacheManager.process</code>: one layer</h3>
+<x-code file="deepinfer/worker/cache_engine.py" lines="406-422" title="SWA view (in the state row)" highlight="411-416,420-422" />
+<x-code file="deepinfer/worker/cache_engine.py" lines="428-443" title="Indexer keys (in the block row)" highlight="429-431,433-438,441-443" />
+<x-code file="deepinfer/worker/cache_engine.py" lines="447-465" title="Main compressed cache (in the block row)" highlight="448-449,452-458,459-461,463-465" />
+<ol>
+  <li><strong>SWA.</strong> A layer with <code>sink_mode == "swa"</code> gets a ring of <code>swa_block_size</code> entries in the state row. A YOCO consumer layer puts its ring into the "dropped" part ({{cite deepinfer/worker/cache_engine.py:113-116}}). The view <code>[slots, ring, 1, bytes_per_token]</code> uses the full slot stride.</li>
+  <li><strong>Indexer keys.</strong> A sparse layer (<code>index_topk &gt; 0</code>) gets <code>block_size // ratio</code> FP4 keys per block. A layer that reuses the keys of an earlier layer takes that view and adds no bytes.</li>
+  <li><strong>Main cache.</strong> A layer with <code>ratio &gt; 0</code> gets <code>block_size // ratio</code> entries per block. A ratio above 1 (for example 2) also gets fp32 compression state in the state row ({{cite deepinfer/worker/cache_engine.py:119-120}}).</li>
+  <li>Each block-row part and each SWA ring is padded to 32 bytes; the fp32 compression state is not padded. A full-attention layer (ratio 0 and no SWA) raises <code>AssertionError</code> ({{cite deepinfer/worker/cache_engine.py:466-468}}).</li>
+</ol>
+
+<h3><code>finalize</code>: the row size</h3>
+<x-code file="deepinfer/worker/cache_engine.py" lines="479-492" highlight="483-484" />
+<p>The row is padded to <code>lcm(128, bytes_per_token)</code>: 1,152 bytes for FP4 entries and 4,224 bytes for MXFP8 entries. The comment gives the reasons: DeepGEMM needs a block stride that is a multiple of 128 bytes, and the main attention needs a multiple of the entry size.</p>
+
+<h3><code>StateBlock</code>: one state slot</h3>
+<x-code file="deepinfer/worker/cache_engine.py" lines="221-241">
+<x-tr line="222">The physical layout of one seq in the state cache.</x-tr>
+<x-tr line="224-227">States that must be stored go first, in the stored region. States that are not stored but that the run still needs go after it, in the dropped region. PE→CE transfers both parts; to disk only the first state_size_to_disk bytes of the inference layout, so a length cut excludes the whole dropped region. With extra state on, the kvstore ring is first reordered into the inference window; with it off, the code can cut the original buffer directly.</x-tr>
+<x-tr line="229-231">Layout from low to high address: [stored region: SWA] [dropped region: YOCO consumer SWA | compression state].</x-tr>
+<x-tr line="237-238">Each sub-region is in runtime layer order; each SWA layer is aligned to 32 B. With SWA, the whole block is aligned to lcm(32, SWA bytes per token), else to align_to.</x-tr>
+</x-code>
+<p>PE and CE mean the prefill engine and the completion engine of a disaggregated deployment, which is not in this release. The offline engine uses only the inference sizes.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="process() on a toy config: every offset">
+<p>Toy config (example values, not from the repo): 3 layers, FP4 main entries (288 B), <code>index_head_dim = 128</code>, a window of 128, <code>nextn = 5</code>, <code>max_num_seqs = 4</code>.</p>
+<table>
+  <thead><tr><th>Layer</th><th>Kind</th><th>Block row: offset, length</th><th>State row: offset, length</th></tr></thead>
+  <tbody>
+    <tr><td>L0</td><td>SWA only (ratio 0)</td><td>none (<code>kv_length = 0</code>, not in <code>layout</code>)</td><td>SWA ring: 0, 70,752</td></tr>
+    <tr><td>L1</td><td>ratio 1, sparse, SWA</td><td><code>ica_cache</code>: 0, 128 × 68 = 8,704; <code>ca_cache</code>: 8,704, 128 × 288 = 36,864</td><td>SWA ring: 70,752, 70,752 (ratio 1 has no state)</td></tr>
+    <tr><td>L2</td><td>ratio 2, dense, SWA</td><td><code>ca_cache</code>: 45,568, 64 × 288 = 18,432</td><td>SWA ring: 141,504, 70,752; <code>ca_state</code>: 212,256, 28,672</td></tr>
+  </tbody>
+</table>
+<ol>
+  <li><strong>Backtracking.</strong> <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> is at least <code>nextn + 1 = 6</code> ({{cite deepinfer/environ.py:132}}). SWA ring: <code>128 + 6 = 134</code> entries ({{cite deepinfer/worker/cache_engine.py:88-93}}); <code>134 × 528 = 70,752</code> B, already a multiple of 32.</li>
+  <li><strong>Indexer key.</strong> <code>128 / 2 + 128 / 32 = 68</code> B ({{cite deepinfer/worker/cache_engine.py:76-78}}); <code>128 × 68 = 8,704</code>, a multiple of 32.</li>
+  <li><strong>Compression state</strong> for ratio 2: ring <code>2 + max(0, 6 − 1) = 7</code> tokens ({{cite deepinfer/worker/cache_engine.py:131-133}}); fp32 <code>[7, 2, 512]</code> = <code>7 × 2 × 512 × 4 = 28,672</code> B ({{cite deepinfer/worker/cache_engine.py:41-43}}). The view is <code>[slots, 7, 2, 512]</code> float32 ({{cite deepinfer/worker/cache_engine.py:367-374}}).</li>
+  <li><strong>Block row.</strong> The offset ends at 64,000. <code>lcm(128, 288) = 1,152</code>; <code>ceil(64,000 / 1,152) × 1,152 = 56 × 1,152 = 64,512</code> B per block.</li>
+  <li><strong>State row.</strong> The offset ends at 240,928. With SWA, the slot is aligned to <code>lcm(32, 528) = 528</code>: <code>457 × 528 = 241,296</code> B ({{cite deepinfer/worker/cache_engine.py:301-305}}).</li>
+  <li><strong>Slots.</strong> <code>int(4 × 1.2) + 1 = 5</code> ({{cite deepinfer/worker/cache_engine.py:201-202}}), so <code>gpu_states</code> is <code>uint8 [5, 241,296]</code>. Slot 0 is never handed out ({{cite csrc/engine/block_manager.hpp:27-35}}).</li>
+</ol>
+<p><strong>Views share one row.</strong> <code>ca_cache</code> of L1 is <code>gpu_blocks[:, 8704:45568]</code> seen as <code>[num_blocks, 128, 1, 288]</code> with stride <code>(64,512, 288, 288, 1)</code> ({{cite deepinfer/worker/cache_engine.py:455-458}}). So block id <code>b</code> means row <code>b</code> for every layer.</p>
+</x-deepdive>
+
+<x-deepdive title="The profile run and the temporary cache">
+<x-code file="deepinfer/worker/model_runner.py" lines="498-512" highlight="505-507,510-512">
+<x-tr line="498-503">Run the profile with a small real KV cache, so that the memory of the cache read and write kernels counts. The allocation uses cuMemAlloc, is not in the torch statistics, and is freed when this function returns, so it does not change the count of profile_num_available_blocks. Zero it because the full gather of chunked prefill reads cache areas that nothing wrote, and the values must be finite. NOTE allocate_gpu_cache also writes bytes_per_block / num_state_seqs / bytes_of_state_per_seqs into cache_config, with the same values as the real allocation later (only num_gpu_blocks differs).</x-tr>
+</x-code>
+<ol>
+  <li>The dummy sequences use blocks <code>0, 1, 2, ...</code> in order, so <code>num_blocks</code> is the sum of their block counts ({{cite deepinfer/worker/model_runner.py:476-495}}).</li>
+  <li>The constructor argument <code>num_gpu_blocks</code> overrides <code>cache_config.num_gpu_blocks</code>, which is still <code>None</code> at this time ({{cite deepinfer/worker/cache_engine.py:869}}, {{cite deepinfer/worker/cache_engine.py:882}}, {{cite deepinfer/config.py:137}}).</li>
+  <li>The profile sets <code>DEEPINFER_FORCE_IMBALANCE_RATIO = 1.8</code> for the run and sets it back to 0 after ({{cite deepinfer/worker/model_runner.py:510-512}}). The comment says only "MoE simulated imbalance enabled"; this site infers that the aim is a high MoE memory peak.</li>
+  <li>After the run, <code>profile_num_available_blocks</code> subtracts <code>2 × prod(state_shape)</code> bytes and divides by <code>get_cache_block_size</code> ({{cite deepinfer/worker/base.py:237-245}}). With the toy config: <code>2 × 5 × 241,296 = 2,412,960</code> B for state, then <code>free // 64,512</code> blocks.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Clones and the state copy: who else touches the buffers">
+<p><code>clone_and_zero_states_and_blocks</code> copies whole rows on the current stream with <code>cudaMemcpyAsync</code> ({{cite csrc/engine/scheduler.hpp:1273-1301}}). One state copy is <code>states[0].nbytes()</code>, one block copy is <code>blocks[0].nbytes()</code>: a full row each. A block pair with <code>dst = 0</code> is not copied; only its source is returned for release ({{cite csrc/engine/scheduler.hpp:1296-1299}}). <code>zero_states</code> clears whole state rows ({{cite csrc/engine/scheduler.hpp:1303-1309}}).</p>
+<p>The engine's <code>do_copy_state</code> copies one state row into <code>copy_state</code> for KV saving ({{cite deepinfer/engine/llm_engine.py:787-798}}). <code>copy_state</code> is <code>None</code> in this release, so this does nothing.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths and checks">
+<table>
+  <thead><tr><th>Check</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>More than one KV head</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/cache_engine.py:624}}, {{cite deepinfer/worker/cache_engine.py:674}}</td></tr>
+    <tr><td><code>kv_lora_rank + qk_rope_head_dim</code> is not 512</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/cache_engine.py:54}}</td></tr>
+    <tr><td>Indexer layers with different key sizes</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/cache_engine.py:68}}</td></tr>
+    <tr><td>A shared layer points to a later layer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/cache_engine.py:161}}, {{cite deepinfer/worker/cache_engine.py:393-399}}</td></tr>
+    <tr><td>A full-attention layer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/cache_engine.py:466-468}}</td></tr>
+    <tr><td>Offsets of <code>process</code> and <code>StateBlock</code> disagree</td><td><code>AssertionError</code> in <code>finalize</code></td><td>{{cite deepinfer/worker/cache_engine.py:488-492}}</td></tr>
+    <tr><td><code>cuMemAlloc</code> fails</td><td>error log, then <code>AssertionError</code> "failed to allocate kvcache"</td><td>{{cite csrc/cuda_utils.cpp:83-87}}, {{cite deepinfer/worker/cache_engine.py:915}}</td></tr>
+    <tr><td>No SWA layer, but extra state is on</td><td><code>AssertionError</code></td><td>{{cite deepinfer/worker/cache_engine.py:671-672}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that this file reads">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td><code>max(value, nextn + 1)</code>; unset gives 6 ({{cite deepinfer/environ.py:132}})</td><td>{{cite deepinfer/worker/cache_engine.py:93}}, {{cite deepinfer/worker/cache_engine.py:133}}</td><td>Extra ring entries for rejected drafts.</td></tr>
+    <tr><td><code>DEEPINFER_NUM_STATE_SLOTS_RATIO</code></td><td><code>1.2</code> ({{cite deepinfer/environ.py:162}})</td><td>{{cite deepinfer/worker/cache_engine.py:202}}</td><td>State slots per <code>max_num_seqs</code>.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code></td><td>off ({{cite deepinfer/environ.py:163}})</td><td>{{cite deepinfer/worker/cache_engine.py:109}}, {{cite deepinfer/worker/cache_engine.py:788}}</td><td>Longer SWA ring for KV storing.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_STORE_EXTRA_SIZE</code></td><td><code>128</code> ({{cite deepinfer/environ.py:164}})</td><td>{{cite deepinfer/worker/cache_engine.py:109}}</td><td>Extra ring entries when the flag above is on.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code>, <code>_KEEP_TOKENS</code></td><td><code>off</code>, <code>0</code></td><td>{{cite deepinfer/worker/cache_engine.py:96-98}}</td><td>More ring entries for YOCO truncation (only with extra state).</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code></td><td>{{cite deepinfer/worker/cache_engine.py:880}}</td><td>Layer count of a config without an attention list.</td></tr>
+  </tbody>
+</table>
+<p><code>get_inference_compress_block_size</code> has an <code>lru_cache</code>. Its docstring says: "environment changes require clearing the cache" ({{cite deepinfer/worker/cache_engine.py:130-138}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link learn/kv-cache}}: the layout in simple terms, with the memory formulas.</li>
+  <li>{{link concepts/paged-kv-cache}}: the block managers that hand out rows of these buffers.</li>
+  <li>{{link concepts/sliding-window-attention}} and {{link concepts/kv-compression}}: what the rings and the state hold.</li>
+  <li>{{link concepts/cross-layer-kv-sharing}}: the layer maps that let a layer reuse another layer's cache.</li>
+  <li>{{link code/worker-base}}: the profile that sets the block count.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">How many device buffers does <code>CacheEngine</code> allocate for the cache, and what are their shapes?
+    <x-a><p>Two: <code>gpu_blocks</code>, <code>uint8 [num_gpu_blocks, bytes_per_block]</code>, and <code>gpu_states</code>, <code>uint8 [num_state_slots, bytes_per_slot]</code> ({{cite deepinfer/worker/cache_engine.py:937-938}}, {{cite deepinfer/worker/cache_engine.py:948-958}}). Every layer gets views into them.</p></x-a>
+  </x-q>
+  <x-q level="medium">Does the SWA cache of a layer use KV blocks? Where is it?
+    <x-a><p>No. It is a ring in the state slot of the sequence, cut from the state row ({{cite deepinfer/worker/cache_engine.py:406-422}}). A layer with only SWA has <code>kv_length = 0</code> and is not in the block layout ({{cite deepinfer/worker/cache_engine.py:640-642}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the profile run zero its temporary cache?
+    <x-a><p>The comment says that the full gather of chunked prefill reads cache areas that nothing wrote, and the values must be finite ({{cite deepinfer/worker/model_runner.py:498-507}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the toy config, a layer has ratio 2 and is dense. How many bytes does it take in one block row and in one state slot, without SWA?
+    <x-a><p>Block row: <code>128 // 2 = 64</code> entries of 288 B = 18,432 B ({{cite deepinfer/worker/cache_engine.py:452-453}}). State: a ring of <code>2 + 6 − 1 = 7</code> tokens of fp32 <code>[2, 512]</code> = 28,672 B ({{cite deepinfer/worker/cache_engine.py:131-133}}, {{cite deepinfer/worker/cache_engine.py:41-43}}). See the deep dive "process() on a toy config".</p></x-a>
+  </x-q>
+</x-quiz>
