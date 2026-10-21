@@ -1,0 +1,152 @@
+---
+title: Prefill and decode
+level: Beginner
+prerequisites: learn/what-an-llm-does, learn/attention
+related: learn/kv-cache, learn/batching, learn/gpus-kernels, concepts/scheduler, concepts/engine-step-loop, concepts/speculative-decoding, concepts/cuda-graphs, concepts/dp-step-votes, code/scheduler-hpp, code/prepare-sample-cpp
+summary: Generation has two phases. Prefill reads the whole prompt in one step, fills the KV cache and samples the first token. Decode then adds one token per step. Prefill is limited by compute, decode by memory reads. In DeepInfer each step is either a prefill step or a decode step, never a mix.
+---
+<x-sentence>Generation has two phases. Prefill reads the whole prompt in one step and fills the KV cache; decode then adds one token per step.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Two phases of one request</h3>
+<p>The loop of {{link learn/what-an-llm-does}} runs the model once per new token. But the first run is special:</p>
+<ul>
+  <li><strong>{{term prefill | Prefill}}.</strong> The prompt is known in full. So the model reads all prompt tokens in one step. It computes the keys and values of every prompt token and stores them in the {{term kv-cache | KV cache}}. The last position gives the first new token.</li>
+  <li><strong>{{term decode | Decode}}.</strong> Each later step has only one new token: the token from the step before. The model reads the keys and values of all earlier tokens from the cache, computes them for the new token, and samples the next token.</li>
+</ul>
+<p>Take a request with a prompt of 1,000 tokens and an answer of 200 tokens. It has one prefill step with 1,000 tokens. Then it has 199 decode steps with one token each.</p>
+
+<h3>Why prefill can be parallel and decode cannot</h3>
+<p>In prefill, all inputs are known before the step starts. The {{term causal-mask | causal mask}} makes sure that position 5 sees only positions 0 to 5. So the model can compute all positions at the same time, as one big matrix multiply. The result is the same as one position at a time.</p>
+<p>In decode, the next input does not exist until the step before has finished. Step 2 needs the token of step 1. So the steps of one request must run one after the other.</p>
+
+<h3>Why the two phases feel different to the hardware</h3>
+<p>Each step must read all {{term model-weights | weights}} of the model from device memory. What changes is how many tokens use each weight in that step:</p>
+<ul>
+  <li><strong>Prefill:</strong> each weight serves all prompt tokens, often thousands. The device does a lot of math per byte that it reads. The speed limit is the math: prefill is {{term compute-bound}}.</li>
+  <li><strong>Decode:</strong> each weight serves only one token per sequence. Even with many sequences in a {{term batch}}, the math per byte is small. The speed limit is how fast memory can deliver the weights and the KV cache: decode is {{term memory-bound}}.</li>
+</ul>
+<p>Users feel the two phases as two latencies. The time to the first token ({{term ttft | TTFT}}) is mostly prefill. The time between later tokens ({{term tbt | TBT}}) is the time of one decode step.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a translator who gets a letter and must answer it. First, the translator reads the whole letter quickly, all at once. Then the translator writes the answer word by word, and each word depends on the words before it.</p>
+<p>The comparison stops here. A human remembers a summary of the letter. The model keeps the keys and values of <em>every</em> token in the KV cache, and each decode step reads all of them again.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1_prefill_decode" alt="Panel 1: a prompt of 6 tokens goes into the model in one step; the step writes 6 KV cache entries and outputs the first token 'mat'. Panel 2: decode step 2 sends 'mat', reads 6 old entries, writes 1 and outputs '.'; decode step 3 sends '.', reads 7 old entries, writes 1 and outputs EOS, which ends the request. Panel 3: three cards: prefill uses the whole prompt per weight read and is limited by compute (TTFT); decode uses 1 token plus drafts and is limited by memory reads (TBT); in DeepInfer a step is prefill or decode, never mixed, and decode can replay a CUDA graph." caption="Figure: a prefill step (panel 1), decode steps (panel 2), and why the hardware sees them differently (panel 3). Click to zoom." />
+<p>Panel 1 has many tokens in one step. Panel 2 has one token per step, and the cache grows by one entry each time. Panel 3 sums up the difference, and how DeepInfer keeps the two kinds of steps apart.</p>
+<x-simplified><p>"Compute-bound" and "memory-bound" are tendencies, not laws. A very short prompt can make a prefill step memory-bound, and a large decode batch with long texts has much attention work. The page {{link learn/gpus-kernels}} explains the limits with the roofline model.</p></x-simplified>
+
+<h2>In DeepInfer</h2>
+<p>This is a basics page, so this part is short. The page {{link concepts/scheduler}} goes further.</p>
+
+<h3>Step 1: each step is a prefill step or a decode step</h3>
+<p>The C++ {{term scheduler}} decides the kind of each step. A NORMAL engine (the default) mostly runs decode steps. It tries a prefill step only at fixed points:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="308-322" highlight="308-309,313" caption="Attempt points: every <code>prefill_attempt_interval</code> decode steps (default 70) and every <code>prefill_any_attempt_interval</code> decode steps (default 100). A prefill needs waiting work and cache usage of 90 % or less." />
+<p>The defaults come from <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> and <code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code> ({{cite deepinfer/environ.py:174-178}}). After a prefill step, the decode counter goes back to 0 ({{cite csrc/engine/scheduler.hpp:676-680}}).</p>
+
+<h3>Step 2: a batch never mixes the two</h3>
+<p>The sampler input check makes this a hard rule:</p>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="60-61" />
+<p>In a prefill step, the sampler takes only the last row of each sequence, at the position <code>seqlen_k</code> ({{cite csrc/engine/prepare_sample.cpp:197-198}}).</p>
+
+<h3>Step 3: decode steps send one token plus drafts</h3>
+<p>DeepInfer uses speculative decoding by default. A decode step sends the newest token plus the draft tokens of each sequence ({{cite csrc/engine/mtp_varlen.hpp:153-157}}). The default number of drafts is 5 ({{cite deepinfer/environ.py:129}}), so a sequence sends up to 6 tokens per decode step. Decode steps can also replay a {{term cuda-graph | CUDA graph}}; prefill steps never do ({{cite deepinfer/worker/model_runner.py:182}}).</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Arithmetic intensity with numbers">
+<p>{{term arithmetic-intensity | Arithmetic intensity}} is the math per byte: FLOPs divided by bytes moved. Use the rule of thumb from {{link learn/what-an-llm-does}}: about 2 FLOPs per weight per token. All numbers below are illustrative, for a dense model with 10 billion weights in BF16 (2 bytes each).</p>
+<table>
+  <thead><tr><th>Step</th><th>Tokens</th><th>FLOPs (2 × 10<sup>10</sup> × tokens)</th><th>Weight bytes</th><th>FLOPs per byte</th></tr></thead>
+  <tbody>
+    <tr><td>Prefill, 1 prompt of 2,000 tokens</td><td>2,000</td><td>4 × 10<sup>13</sup></td><td>2 × 10<sup>10</sup></td><td>2,000</td></tr>
+    <tr><td>Decode, batch of 64 sequences</td><td>64</td><td>1.28 × 10<sup>12</sup></td><td>2 × 10<sup>10</sup></td><td>64</td></tr>
+    <tr><td>Decode, 1 sequence</td><td>1</td><td>2 × 10<sup>10</sup></td><td>2 × 10<sup>10</sup></td><td>1</td></tr>
+  </tbody>
+</table>
+<p>Take an illustrative device with 2,000 TFLOP/s and 8 TB/s. It can do 2,000 / 8 = 250 FLOPs in the time it reads one byte (its ridge point).</p>
+<ol>
+  <li>Prefill: 2,000 FLOPs per byte is above 250, so the math sets the time: 4 × 10<sup>13</sup> / 2 × 10<sup>15</sup> = 20 ms.</li>
+  <li>Decode with 64 sequences: 64 is below 250, so the memory sets the time. 2 × 10<sup>10</sup> B / 8 × 10<sup>12</sup> B/s = 2.5 ms per step, for 64 tokens.</li>
+  <li>Decode with 1 sequence: also 2.5 ms, but for 1 token. The device does almost no math.</li>
+</ol>
+<x-simplified><p>The table leaves out the KV cache. A decode step also reads the cache of every sequence, and those bytes grow with the length of the text. For an MoE model, each token uses only some experts, so the bytes and FLOPs per token are different. See {{link learn/batching}} and {{link learn/moe}}.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="How DeepInfer chooses the kind of step, line by line">
+<x-code file="csrc/engine/scheduler.hpp" lines="288-341" highlight="291,294,308-309,313,316,318,332-334">
+<x-tr line="290">The PROMPT engine only does prefill. It returns a (possibly empty) prefill result even if no request was scheduled.</x-tr>
+<x-tr line="293">The COMPLETION engine only does decode.</x-tr>
+<x-tr line="296">NORMAL engine: decide if the whole group does a prompt step or a decode step. Inside DP the kind must be the same, so a vote decides it.</x-tr>
+<x-tr line="299-302">ALL point (every prefill_attempt_interval decode steps): prefill only if every rank has prefill work. ANY point (every prefill_any_attempt_interval decode steps): one rank with work is enough; an isolated rank's prefill waits at most this many decode steps.</x-tr>
+<x-tr line="305-306">A prompt step sets decode_step to 0, so the next step is again an ALL point.</x-tr>
+<x-tr line="328-331">Second vote: check that some rank really scheduled a prefill. If all ranks came back empty-handed, do a decode step, else the loop could hang.</x-tr>
+<x-tr line="339">Some rank does a prompt step: this rank joins with an empty prompt step, so all ranks run the same kind of step.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 288-294: an engine of type PROMPT does only prefill; COMPLETION does only decode. These two types are for separate prefill and decode machines.</li>
+  <li>Lines 308-312: a NORMAL engine counts decode steps in <code>decode_step</code>. Between attempt points, it always does decode.</li>
+  <li>Line 313: this rank <em>wants</em> a prefill if cache usage is at most 90 % and the first waiting request is schedulable.</li>
+  <li>Lines 315-319: the {{term data-parallelism | data-parallel}} ranks vote with an all-reduce (MIN). At an ANY point one "yes" is enough; at an ALL point every rank must say yes.</li>
+  <li>Lines 324-338: if the vote says yes, the rank schedules a prefill. A second vote makes sure that at least one rank found work.</li>
+</ol>
+<p><strong>Worked example</strong> (one rank, defaults 70 and 100). A long decode is running, and the counter <code>decode_step</code> is 5 when a new request arrives.</p>
+<ol>
+  <li>Counter values 5 to 69: no attempt point, so each step is a decode step. The request waits.</li>
+  <li>Counter value 70: an ALL point. The rank wants a prefill, and the vote of one rank says yes. This step is a prefill step for the new request.</li>
+  <li>The counter goes back to 0. The next step is again an ALL point. If more requests wait, it is also a prefill step.</li>
+</ol>
+<p>So a new request can wait up to 69 decode steps for its prefill. The page {{link concepts/dp-step-votes}} explains the votes with several ranks.</p>
+</x-deepdive>
+
+<x-deepdive title="Chunked prefill and the token budget">
+<p>One step may hold at most <code>max_num_batched_tokens</code> tokens. The default is the largest of <code>max_model_len</code>, 4,096 and <code>max_num_seqs × (1 + drafts)</code> ({{cite deepinfer/config.py:219-228}}). With the default <code>max_num_seqs</code> = 256 ({{cite deepinfer/engine/arg_utils.py:36}}) and 5 drafts, the last term is 256 × 6 = 1,536.</p>
+<p>A long prompt can be larger than the budget that is left in the step. With {{term chunked-prefill | chunked prefill}}, the scheduler cuts the prompt and runs the rest in later prefill steps ({{cite csrc/engine/scheduler.hpp:470-475}}). Chunked prefill is off by default ({{cite deepinfer/engine/arg_utils.py:42}}). Without it, a prompt that does not fit in the rest of the budget waits for a later step ({{cite csrc/engine/scheduler.hpp:504-507}}). Also, the prompt limit is the smaller of <code>max_model_len</code> and <code>max_num_batched_tokens</code> ({{cite csrc/engine/scheduler.hpp:112}}), and the config refuses a budget below <code>max_model_len</code> ({{cite deepinfer/config.py:208-212}}).</p>
+<p><strong>Worked example</strong> (chunked prefill on, budget 8,192, no context parallelism). A prompt of 20,000 tokens runs in three prefill steps, as chunks of 8,192, 8,192 and 3,616 tokens. Every chunk writes its keys and values to the cache. Only the last chunk produces the first output token.</p>
+<p>The deployment notes describe the production prefill budget: 32,768 tokens per step, with the chunk size solved from a time budget ({{cite doc/inference_deployment_qa.md:115}}). That load balancer is not in this repository.</p>
+</x-deepdive>
+
+<x-deepdive title="Decode steps with draft tokens">
+<p>With speculative decoding, a decode step does not send one token per sequence. It sends the last accepted token plus the draft tokens that the draft module proposed in the step before. The main model checks all of them in one step. This turns part of decode into a small prefill: several tokens per sequence share one read of the weights.</p>
+<ul>
+  <li><strong>Number of tokens.</strong> Without the confidence scheduler, a sequence sends <code>1 + len(draft_tokens)</code> tokens ({{cite csrc/engine/mtp_varlen.hpp:153-157}}). That scheduler, <code>DEEPINFER_ENABLE_MTP_VARLEN</code>, is off by default ({{cite deepinfer/environ.py:131}}). The sampler checks that this is at most <code>nextn + 1</code> ({{cite csrc/engine/prepare_sample.cpp:212}}).</li>
+  <li><strong>After prefill.</strong> The draft list starts with placeholder ids, <code>vocab_size − 1</code>, one per draft ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:9-11}}).</li>
+  <li><strong>Sampling.</strong> In a decode step, the sampler gets every row of the sequence, not only the last one ({{cite csrc/engine/prepare_sample.cpp:202-206}}). It accepts or rejects each draft.</li>
+</ul>
+<p>The page {{link concepts/speculative-decoding}} explains the accept rule. The production numbers: the draft module proposes 5 tokens, and dynamic verification checks 3.2 to 4.4 of them on average ({{cite doc/inference_deployment_qa.md:243}}, {{cite doc/inference_deployment_qa.md:247}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Prefill and decode on separate machines (production)">
+<p>Because the two phases stress the hardware differently, large services often run them on different machines. The DeepSeek deployment notes describe:</p>
+<ul>
+  <li>ordinary 8-GPU machines for prefill, and 64- to 128-GPU supernodes for decode ({{cite doc/inference_deployment_qa.md:11}});</li>
+  <li>prefill with expert parallelism 2 to 8, decode with expert parallelism 64 to 128 ({{cite doc/inference_deployment_qa.md:47-49}}).</li>
+</ul>
+<p>The engine types PROMPT and COMPLETION exist for this split ({{cite csrc/engine/scheduler.hpp:288-294}}). But this release does not include the parts that connect them: the README lists prefill/decode disaggregation as "not included in this release" ({{cite README.md:38-41}}). An offline <code>LLM</code> runs a NORMAL engine that does both.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A long wait for the first token.</strong> A NORMAL engine tries a prefill only at attempt points, by default every 70 decode steps. A new request can wait up to 69 decode steps (deep dive "How DeepInfer chooses"). Lower <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> for lower TTFT; decode then pauses more often.</li>
+  <li><strong>No prefill when the cache is full.</strong> Above 90 % cache usage, the rank does not want a prefill ({{cite csrc/engine/scheduler.hpp:80}}, {{cite csrc/engine/scheduler.hpp:313}}). New requests wait until running requests finish.</li>
+  <li><strong>A prompt that is too long.</strong> A prompt above the prompt limit ends with <code>"prompt_length_exceeded"</code> and never runs ({{cite csrc/engine/scheduler.hpp:377-384}}).</li>
+  <li><strong>Mixed batches.</strong> Code that tries to put prefill and decode sequences in one batch fails the check in <code>prepare_sample.cpp</code> ({{cite csrc/engine/prepare_sample.cpp:61}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Almost every design choice of an inference engine treats the two phases differently: batch sizes, CUDA graphs, chunking, parallelism, even separate machines. When you read about a feature, ask which phase it makes faster.</p>
+
+<x-quiz>
+  <x-q level="easy">A request has a prompt of 300 tokens and gets 50 output tokens, with no draft tokens. How many prefill steps and decode steps does it need, without chunked prefill?
+    <x-a><p>One prefill step with 300 tokens, which also makes output token 1. Then 49 decode steps make tokens 2 to 50.</p></x-a>
+  </x-q>
+  <x-q level="easy">Why can the model process all prompt tokens at the same time, but not all output tokens?
+    <x-a><p>All prompt tokens are known before the step, and the causal mask keeps each position from seeing later ones. An output token is unknown until the step before it has finished.</p></x-a>
+  </x-q>
+  <x-q level="medium">In the illustrative table, why does a decode step for 1 sequence take about as long as a decode step for 64 sequences?
+    <x-a><p>Both steps must read all 20 GB of weights, and at 8 TB/s that takes about 2.5 ms. The math for 64 tokens is still much less than the device can do in that time, so the memory read sets the time.</p></x-a>
+  </x-q>
+  <x-q level="hard">A DeepInfer NORMAL engine with one rank and default settings is at decode step 71 when a request arrives. At which decode step can its prefill run, and why?
+    <x-a><p>At decode step 100, the next ANY point: <code>decode_step % 100 == 0</code>. The next ALL point would be 140. With one rank, both votes give the wish of that rank ({{cite csrc/engine/scheduler.hpp:308-319}}). The defaults are 70 and 100 ({{cite deepinfer/environ.py:174-178}}). The cache usage must also be at most 90 % ({{cite csrc/engine/scheduler.hpp:313}}).</p></x-a>
+  </x-q>
+</x-quiz>

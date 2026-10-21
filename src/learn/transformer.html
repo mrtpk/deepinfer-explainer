@@ -1,0 +1,155 @@
+---
+title: Inside a transformer
+level: Beginner
+prerequisites: learn/what-an-llm-does, learn/tokens
+related: learn/attention, learn/moe, learn/kv-cache, concepts/model-map, concepts/mla-attention, concepts/moe-routing, concepts/mhc-residual, tours/decoder-layer, code/deepseek, code/decoder-layer
+summary: A transformer turns token ids into vectors, changes them in a stack of identical layers (attention plus a feed-forward network), and turns the last vectors into one score per vocabulary token. DeepSeek V4.1 in DeepInfer keeps this skeleton but uses MLA attention, MoE layers and mHC residual paths.
+---
+<x-sentence>A transformer turns token ids into vectors and changes them in a stack of identical layers. Then it turns each vector into one score per vocabulary token.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Three parts</h3>
+<p>Almost every LLM is a {{term transformer}}. It has three parts:</p>
+<ol>
+  <li><strong>The embedding.</strong> The {{term embedding}} is a table with one row per token id. The model looks up the row of each input token. Each row is a vector of <code>d</code> numbers, where <code>d</code> is the hidden size (often a few thousand). This vector is the {{term hidden-state}} of the token.</li>
+  <li><strong>A stack of N layers.</strong> Each {{term decoder-layer}} reads the hidden states of all tokens and writes new ones of the same shape. N is often between 30 and 100.</li>
+  <li><strong>The output head.</strong> A final norm, then the {{term lm-head | LM head}}: a matrix that turns each hidden state into one score per vocabulary token. These scores are the {{term logits}}.</li>
+</ol>
+<p>So a text of T tokens is a matrix of shape <code>[T, d]</code> inside the model. Every layer keeps this shape. Only the content changes: each layer adds information to each token's vector.</p>
+
+<h3>Inside one layer</h3>
+<p>A decoder layer has two blocks:</p>
+<ul>
+  <li><strong>{{term attention | Attention}}.</strong> Tokens exchange information. Each token looks at the earlier tokens and copies a weighted mix of their information. This is the only place where tokens see each other. The page {{link learn/attention}} explains it step by step.</li>
+  <li><strong>Feed-forward network ({{term ffn | FFN}}).</strong> Each token alone goes through two or three large matrix multiplies. Most of the weights of a model are here. In an {{term moe | MoE}} model, this block has many "experts", and a router selects a few of them for each token ({{link learn/moe}}).</li>
+</ul>
+<p>Two more parts keep the stack stable:</p>
+<ul>
+  <li><strong>Normalization.</strong> Before each block, a {{term rmsnorm | RMSNorm}} rescales the vector of each token to a standard size.</li>
+  <li><strong>The residual stream.</strong> A block does not replace its input. It adds its result to the input: <code>x = x + block(norm(x))</code>. The hidden state that flows through all layers is the {{term residual-stream | residual stream}}.</li>
+</ul>
+
+<h3>Where the order of the tokens comes from</h3>
+<p>Attention by itself does not know which token comes first. A transformer adds position information. Most modern LLMs, also DeepSeek, use {{term rope | RoPE}}: it turns the query and key vectors by an angle that depends on the position. The attention scores then depend on the distance between two tokens.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a folder that goes along an assembly line, one folder per token. At each station, a worker reads the folder and adds a note. Some stations let the worker look into the folders of earlier tokens (attention). Other stations work on one folder alone (FFN). Nothing is removed; notes only accumulate. At the end, a clerk reads each folder and writes a guess for the next token.</p>
+<p>The comparison stops here. The "notes" are numbers, not words, and nobody designed what each station does. Training found the numbers. Also, the real model sends all folders through a station at the same time, as one matrix.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1_transformer" alt="Panel 1: three boxes from left to right: embedding (ids [T] to hidden [T, d]), N decoder layers ([T, d] to [T, d]), final norm plus LM head ([T, d] times [d, V] gives logits [T, V]). Panel 2: one decoder layer: the residual stream x runs from left to right; a branch goes through RMSNorm and attention and is added back; a second branch goes through RMSNorm and the feed-forward network and is added back. Panel 3: three DeepSeek V4.1 changes: MLA attention with one shared KV head of 512 numbers, an MoE feed-forward with routed and shared experts, and mHC with hc_mult residual paths." caption="Figure: the transformer skeleton (panel 1), one decoder layer (panel 2), and what DeepSeek V4.1 changes in DeepInfer (panel 3). Click to zoom." />
+<p>Read panel 1 from left to right. The shape stays <code>[T, d]</code> until the LM head. Panel 2 shows that each block only <em>adds</em> to the residual stream. Panel 3 names the three changes in the model of DeepInfer; each has its own concept page.</p>
+
+<h2>In DeepInfer</h2>
+<p>DeepInfer serves one model: DeepSeek-V4.1-Flash ({{cite README.md:5-7}}). The code keeps the skeleton above. The page {{link concepts/model-map}} gives the full map, and the tour {{link tours/decoder-layer}} walks through one layer.</p>
+
+<h3>Step 1: the model forward returns hidden states</h3>
+<p><code>DeepseekModel.forward</code> embeds the ids, runs the layers, and applies the final norm. It returns hidden states, not logits:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="209-218" caption="The layer loop. Each layer gets the hidden states, its own part of the KV cache (<code>kv_caches[i]</code>) and the batch metadata." />
+<p>The embedding lookup is at the start of the function ({{cite deepinfer/model_executor/models/deepseek.py:161-162}}). The final norm is at the end ({{cite deepinfer/model_executor/models/deepseek.py:239}}). The LM head matrix belongs to the outer class <code>DeepseekForCausalLM</code>. The sampler uses it to compute logits only for the rows that it samples ({{cite deepinfer/model_executor/models/deepseek.py:383-400}}).</p>
+
+<h3>Step 2: one decoder layer</h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="143-173" highlight="143,155-161,162,169-173" caption="Norm and attention, then norm and MLP. The norms also do the mHC mixing (<code>attn_norm_forward</code>, <code>ffn_norm_forward</code>)." />
+
+<h3>Step 3: the three changes of DeepSeek V4.1</h3>
+<ul>
+  <li><strong>MLA attention.</strong> All query heads share one key/value entry per token. The start-up code requires exactly one KV head ({{cite deepinfer/hugging_face/config.py:53-58}}). See {{link concepts/mla-attention}}.</li>
+  <li><strong>MoE feed-forward.</strong> Every layer is an MoE block. The decoder layer asserts this type; another block type stops with <code>AssertionError</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:57}}, {{cite deepinfer/model_executor/models/decoder_layer.py:38-42}}). See {{link concepts/moe-routing}}.</li>
+  <li><strong>mHC residual.</strong> The residual stream has <code>hc_mult</code> parallel paths, with shape <code>[n, hc_mult, hidden_size]</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:58}}). See {{link concepts/mhc-residual}}.</li>
+</ul>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Shapes and dtypes through the model">
+<p>In DeepInfer, one step packs the tokens of all sequences of the batch into one long list. So T below is the total number of tokens in the step, not the length of one sequence ({{link concepts/input-metadata}}).</p>
+<table>
+  <thead><tr><th>Stage</th><th>Tensor</th><th>Shape</th><th>Dtype</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Input</td><td>token ids</td><td><code>[T]</code></td><td>int32</td><td>{{cite deepinfer/entrypoints/llm.py:157}}</td></tr>
+    <tr><td>Embedding</td><td>table <code>[V, d]</code> → hidden</td><td><code>[T, d]</code></td><td>BF16</td><td>{{cite deepinfer/model_executor/models/deepseek.py:140-148}}</td></tr>
+    <tr><td>Decoder layers</td><td>residual stream (mHC)</td><td><code>[T, hc_mult, d]</code></td><td>BF16</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:252}}</td></tr>
+    <tr><td>Block input</td><td>normed hidden</td><td><code>[T, d]</code></td><td>BF16, or FP8 with scales</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:32-33}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:256-266}}</td></tr>
+    <tr><td>After the last layer</td><td>mix paths back, final norm</td><td><code>[T, d]</code></td><td>BF16</td><td>{{cite deepinfer/model_executor/models/deepseek.py:225-239}}</td></tr>
+    <tr><td>Sampler</td><td>logits of sampled rows</td><td><code>[rows, V]</code></td><td>float32</td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:20-28}}</td></tr>
+  </tbody>
+</table>
+<p>The checkpoint must use BF16 parameters; other dtypes stop start-up with <code>ValueError</code> ({{cite deepinfer/hugging_face/config.py:59-60}}). Some weights are FP8 or FP4 at run time; see {{link learn/number-formats}}.</p>
+<p><strong>Worked example.</strong> A step with 3 sequences: one prefill of 1,000 tokens, two prefills of 12 tokens. Then T = 1,024. The embedding gives <code>[1024, d]</code>. The layers keep <code>[1024, hc_mult, d]</code>. The sampler selects 3 rows, one per sequence, and computes logits of shape <code>[3, V]</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="RMSNorm and the residual stream, with numbers">
+<p><strong>RMSNorm.</strong> DeepInfer's class documents the formula ({{cite deepinfer/model_executor/layers/layernorm.py:15-18}}):</p>
+<pre><code class="language-none">RMSNorm(x) = w ⊙ x / sqrt(mean(x²) + eps)</code></pre>
+<p>Worked example with <code>x = (3, 4)</code>, <code>w = (1, 1)</code>, eps ≈ 0:</p>
+<ol>
+  <li>mean(x²) = (9 + 16) / 2 = 12.5.</li>
+  <li>sqrt(12.5) = 3.536.</li>
+  <li>x / 3.536 = (0.849, 1.131). The root mean square of the result is 1.</li>
+</ol>
+<p>The value of eps comes from <code>rms_norm_eps</code> in the checkpoint config ({{cite deepinfer/hugging_face/config.py:281}}).</p>
+<p><strong>Pre-norm residual.</strong> A standard pre-norm layer computes:</p>
+<pre><code class="language-none">h   = x + Attention(RMSNorm(x))
+out = h + FFN(RMSNorm(h))</code></pre>
+<p>The input x reaches the output unchanged, plus two additions. This direct path lets training send its signal through many layers. It also means that a layer can learn to change only a little.</p>
+<p><strong>mHC in DeepInfer.</strong> mHC widens the residual stream to <code>hc_mult</code> paths. Before each block, learned weights mix the paths into one block input. After the block, the output goes back into the paths. At the end of the model, the paths are mixed back into one hidden state ({{cite deepinfer/model_executor/models/v4_modules/hc.py:57-68}}). The details are on {{link concepts/mhc-residual}}.</p>
+</x-deepdive>
+
+<x-deepdive title="The feed-forward network, and where the weights are">
+<p>A standard FFN with the {{term swiglu | SwiGLU}} activation has three matrices. For one token vector x of size d, with an inner size d<sub>ff</sub>:</p>
+<pre><code class="language-none">FFN(x) = W2 · ( SiLU(W1 · x) ⊙ (W3 · x) )        W1, W3: [d_ff, d]   W2: [d, d_ff]
+SiLU(z) = z · sigmoid(z)</code></pre>
+<p>DeepInfer requires this activation: the checkpoint must say <code>hidden_act: silu</code>, and the config maps it to <code>swiglu</code> ({{cite deepinfer/hugging_face/config.py:53-58}}, {{cite deepinfer/hugging_face/config.py:278}}).</p>
+<p><strong>Weight count per layer</strong> (standard dense layer, illustrative numbers):</p>
+<table>
+  <thead><tr><th>Block</th><th>Weights</th><th>d = 4,096, d<sub>ff</sub> = 11,008</th></tr></thead>
+  <tbody>
+    <tr><td>Attention (Q, K, V, output; full multi-head)</td><td>4 · d²</td><td>67.1 million</td></tr>
+    <tr><td>FFN (SwiGLU)</td><td>3 · d · d<sub>ff</sub></td><td>135.3 million</td></tr>
+    <tr><td>Two RMSNorm weights</td><td>2 · d</td><td>8,192</td></tr>
+  </tbody>
+</table>
+<p>So in this example the FFN holds about two thirds of the layer. An MoE layer replaces the one FFN with many expert FFNs. Each token uses only a few of them, so the model can be very large but the work per token stays small.</p>
+<x-simplified><p>The numbers are a generic example, not DeepSeek V4.1. MLA attention uses low-rank projections, so its weight count is different. DeepInfer reads all sizes from the checkpoint config ({{cite deepinfer/hugging_face/config.py:271-300}}).</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="DeepSeek V4.1 in DeepInfer: the checks at start-up">
+<p>The config loader accepts only the variant that the run-time code supports:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="51-60" />
+<ol>
+  <li>SwiGLU (<code>hidden_act = silu</code>), no attention bias, attention dropout 0.</li>
+  <li><code>num_key_value_heads = 1</code>: one KV head, the MLA design.</li>
+  <li>BF16 parameters in the checkpoint.</li>
+</ol>
+<p>Other start-up facts that a reader of the model code meets:</p>
+<ul>
+  <li><strong>Head size.</strong> The KV entry has <code>kv_lora_rank + qk_rope_head_dim</code> numbers, and the config sets <code>kv_lora_rank = head_dim − qk_rope_head_dim</code> ({{cite deepinfer/hugging_face/config.py:287-289}}). The cache code asserts that the sum is the 512 elements of the KV cache format ({{cite deepinfer/worker/cache_engine.py:46-56}}, {{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-111}}). So <code>head_dim</code> is 512 (inferred).</li>
+  <li><strong>Head count.</strong> The attention kernels accept 64 or 128 query heads. Another count up to 128 is padded with zeros to the next allowed count; more than 128 raises <code>ValueError</code> ({{cite deepinfer/model_executor/layers/attention_backend.py:5-23}}).</li>
+  <li><strong>One architecture.</strong> The registry maps <code>DeepseekV41ForCausalLM</code> to the vision-language class <code>DeepseekVLForCausalLM</code> ({{cite deepinfer/model_executor/models/__init__.py:14-17}}). The text model is inside it; see {{link concepts/vision-encoder}}.</li>
+  <li><strong>Extra parts.</strong> Some layers also have {{link concepts/engram | Engram}} memory ({{cite deepinfer/model_executor/models/decoder_layer.py:80-83}}). A draft module (DFlash) shares the embedding and the LM head ({{cite deepinfer/model_executor/models/deepseek.py:300-302}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Another model.</strong> A checkpoint with several KV heads, attention bias or a non-BF16 dtype stops at start-up with <code>ValueError</code> ({{cite deepinfer/hugging_face/config.py:53-60}}).</li>
+  <li><strong>Too many heads.</strong> More than 128 query heads raise <code>ValueError</code> in the attention backend ({{cite deepinfer/model_executor/layers/attention_backend.py:15-16}}).</li>
+  <li><strong>A dense layer.</strong> The decoder layer accepts only MoE blocks. Another block type fails the assert in <code>DeepseekDecoderLayer.__init__</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:57}}). The helper that builds the MLP also raises <code>NotImplementedError</code> for other types ({{cite deepinfer/model_executor/models/decoder_layer.py:38-42}}).</li>
+  <li><strong>Logits from the model.</strong> Code that expects the forward pass to return logits gets hidden states. Call the sampler path, or multiply by the LM head yourself ({{cite deepinfer/model_executor/models/deepseek.py:246-248}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> All model pages of this site use this skeleton. A page can talk about MLA, MoE, mHC, Engram or YOCO. For each one, ask two questions: which part of the skeleton does it change, and does the shape <code>[T, d]</code> stay the same?</p>
+
+<x-quiz>
+  <x-q level="easy">A step has 500 tokens and the hidden size is d. What is the shape of the hidden states between two decoder layers, in a plain transformer?
+    <x-a><p><code>[500, d]</code>. Every layer keeps this shape. Only the LM head changes it, to <code>[rows, V]</code>.</p></x-a>
+  </x-q>
+  <x-q level="easy">In which block do tokens exchange information?
+    <x-a><p>In attention. The FFN works on each token alone.</p></x-a>
+  </x-q>
+  <x-q level="medium">Compute RMSNorm of <code>x = (1, 1, 1, 1)</code> with weights of 1 and eps ≈ 0. Then compute it for <code>x = (2, 2, 2, 2)</code>.
+    <x-a><p>Both give <code>(1, 1, 1, 1)</code>. mean(x²) is 1 and 4, the roots are 1 and 2, and x divided by the root is 1 in both cases. RMSNorm removes the overall size of the vector.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>DeepseekModel.forward</code> in DeepInfer return hidden states and not logits? Give the reason from the code and a number.
+    <x-a><p>The sampler needs logits only for the rows that it samples: in a prefill step, the last token of each sequence ({{cite csrc/engine/prepare_sample.cpp:197}}). It gathers those rows first, then multiplies by the LM head weight ({{cite deepinfer/model_executor/layers/sampler.py:140-142}}, {{cite deepinfer/model_executor/models/deepseek.py:392-394}}). Take a prefill of 1,024 tokens and V = 129,280 (inferred). Logits for all rows would need 1,024 × 129,280 × 4 bytes ≈ 530 MB. One row needs about 517 KB.</p></x-a>
+  </x-q>
+</x-quiz>

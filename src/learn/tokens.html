@@ -1,0 +1,166 @@
+---
+title: Tokens and tokenizers
+level: Beginner
+prerequisites: learn/what-an-llm-does
+related: learn/transformer, learn/sampling, tours/life-of-a-request, concepts/engram, concepts/vision-encoder, code/entrypoints-llm, code/llm-engine
+summary: A tokenizer cuts text into tokens from a fixed vocabulary and gives each token an integer id. DeepInfer loads the Hugging Face tokenizer of the checkpoint, checks its special ids (BOS 0, EOS 1, PAD 2) and encodes each prompt in LLM._add_request.
+---
+<x-sentence>A tokenizer cuts text into tokens from a fixed vocabulary and gives each token an integer id. The model sees only these ids.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Why not letters or words?</h3>
+<p>A neural network works on numbers. So the text must become a list of numbers first. There are three simple choices:</p>
+<ul>
+  <li><strong>One id per letter (or byte).</strong> The vocabulary is small, but the lists are very long. The model must then do many steps for each word, and each step costs time.</li>
+  <li><strong>One id per word.</strong> The lists are short, but there are millions of words, names and spellings. A word that is not in the list cannot be written.</li>
+  <li><strong>One id per common piece of text.</strong> This is the middle way. Frequent words are one piece. Rare words are cut into several pieces. Any text can be written with the pieces.</li>
+</ul>
+<p>LLMs use the third choice. Each piece is a {{term token}}. The program that cuts text into tokens is the {{term tokenizer}}. The fixed list of all tokens is the {{term vocabulary}}. As a rough guide, one token of English text is about three quarters of a word. Code, numbers and other languages often need more tokens per word.</p>
+
+<h3>How the tokenizer finds the pieces</h3>
+<p>Most LLM tokenizers use {{term bpe | BPE}} (byte-pair encoding), or a method like it. Training the tokenizer happens once, before the model is trained:</p>
+<ol>
+  <li>Start with single bytes. Every text can be written as bytes, so no text is "unknown".</li>
+  <li>Count all pairs of neighbours in a large amount of text.</li>
+  <li>Merge the most frequent pair into one new piece. Add it to the vocabulary.</li>
+  <li>Repeat until the vocabulary has the size that you want.</li>
+</ol>
+<p>To encode a new text, the tokenizer applies the learned merges in the same order. A frequent word such as " the" ends as one token. A rare word such as "Tokenization" can end as "Token" + "ization".</p>
+
+<h3>Special tokens</h3>
+<p>Some ids are not text. They are {{term special-token | special tokens}} with a control meaning:</p>
+<ul>
+  <li><strong>BOS</strong> (begin of sequence) marks the start of the input.</li>
+  <li><strong>EOS</strong> (end of sequence) is the token that the model writes to say "I am done". The engine stops the request when it sees EOS ({{term eos-token}}).</li>
+  <li><strong>PAD</strong> fills unused places when lists must have the same length.</li>
+</ul>
+<p>Chat models use more special tokens, for example to mark where the user text starts. DeepInfer's release tokenizer must put BOS at id 0, EOS at id 1 and PAD at id 2. The section "In DeepInfer" shows the check.</p>
+
+<h3>Ids are only names</h3>
+<p>The number of a token tells the model nothing. Id 15400 is not "more" than id 498. The first layer of the model, the {{term embedding}}, looks up one learned vector for each id. That vector carries the meaning. The page {{link learn/transformer}} continues from there.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a box of building bricks. The box has many large bricks for common shapes, and small bricks for everything else. You can build any shape. Common shapes need few bricks, and unusual shapes need many small ones. A tokenizer builds text in the same way.</p>
+<p>The comparison stops here: you choose your bricks freely, but a tokenizer has no choice. It applies its fixed rules, so the same text always gives the same tokens. Also, it does not know what the text means.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1_tokens" alt="Panel 1: the text 'Tokenization isn't hard.' becomes the pieces BOS, Token, ization, space-isn, 't, space-hard and a full stop, with illustrative ids; BOS has id 0. Panel 2: a toy BPE run on 'low lower lowest' merges l and o, then lo and w, then low and e. Panel 3: DeepInfer's release policy: BOS id 0, EOS id 1, PAD id 2, and 21 multimodal tokens at ids 129280 to 129300." caption="Figure: text to ids (panel 1), how BPE learns pieces (panel 2), and the special ids that DeepInfer checks (panel 3). Click to zoom." />
+<p>Panel 1 shows the result of a tokenizer. Only the id of BOS is real; the other ids are made up. Panel 2 shows how the pieces were learned: each line merges the most frequent pair. Panel 3 shows the special ids that DeepInfer checks when it loads a tokenizer.</p>
+
+<h2>In DeepInfer</h2>
+<p>DeepInfer does not have its own tokenizer. It loads the Hugging Face tokenizer files of the checkpoint. The tour stop {{link tours/life-of-a-request | Life of a request, stop 3}} follows one prompt through these lines.</p>
+
+<h3>Step 1: load the tokenizer once</h3>
+<p>The engine loads the tokenizer once, when it starts ({{cite deepinfer/engine/llm_engine.py:200-205}}). <code>get_hf_tokenizer</code> needs the files <code>tokenizer.json</code> and <code>tokenizer_config.json</code> in the model folder:</p>
+<x-code file="deepinfer/hugging_face/tokenizer.py" lines="96-99" />
+
+<h3>Step 2: check the special tokens</h3>
+<p>With the default <code>"release"</code> policy, <code>_apply_release_fixups</code> checks BOS, EOS and PAD. A tokenizer with other ids stops the start-up:</p>
+<x-code file="deepinfer/hugging_face/tokenizer.py" lines="36-41" />
+<p>Then it turns on BOS insertion. After this, <code>encode()</code> always puts id 0 first ({{cite deepinfer/hugging_face/tokenizer.py:59-61}}, {{cite deepinfer/hugging_face/tokenizer.py:68-69}}).</p>
+
+<h3>Step 3: encode each prompt</h3>
+<p>The offline API encodes each text prompt in <code>LLM._add_request</code>:</p>
+<x-code file="deepinfer/entrypoints/llm.py" lines="153-157" highlight="156-157" caption="Text becomes ids only if you did not pass ids. The ids become a NumPy <code>int32</code> array." />
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="BPE, step by step">
+<p>This is the general algorithm. The deployment notes rely on "how BPE tokenizers work" when they describe the encoding of DeepSeek prompts ({{cite doc/inference_deployment_qa.md:304}}). Its rules are in the Hugging Face file <code>tokenizer.json</code> of the checkpoint. DeepInfer does not change how it cuts text.</p>
+<p><strong>Training</strong> (done once by the model makers):</p>
+<ol>
+  <li>Split the training text into words at spaces and punctuation. This "pre-tokenization" keeps merges inside a word. Many tokenizers keep the space at the start of the next word, so " hard" is one piece.</li>
+  <li>Write each word as a list of bytes. The start vocabulary is the 256 byte values.</li>
+  <li>Count every pair of neighbours over all words, weighted by how often each word occurs.</li>
+  <li>Take the most frequent pair (A, B). Add the new piece AB to the vocabulary. Record the merge rule "A B → AB" with its rank (1, 2, 3 ...).</li>
+  <li>Replace every A B in the words with AB. Go back to step 3.</li>
+  <li>Stop at the target vocabulary size. Add the special tokens with their own ids.</li>
+</ol>
+<p><strong>Worked example</strong> (panel 2 of the figure). Corpus: "low", "lower", "lowest".</p>
+<table>
+  <thead><tr><th>Merge</th><th>Most frequent pair</th><th>Count</th><th>Words after the merge</th></tr></thead>
+  <tbody>
+    <tr><td>start</td><td>—</td><td>—</td><td><code>l o w</code> · <code>l o w e r</code> · <code>l o w e s t</code></td></tr>
+    <tr><td>1</td><td>(l, o)</td><td>3</td><td><code>lo w</code> · <code>lo w e r</code> · <code>lo w e s t</code></td></tr>
+    <tr><td>2</td><td>(lo, w)</td><td>3</td><td><code>low</code> · <code>low e r</code> · <code>low e s t</code></td></tr>
+    <tr><td>3</td><td>(low, e)</td><td>2</td><td><code>low</code> · <code>lowe r</code> · <code>lowe s t</code></td></tr>
+  </tbody>
+</table>
+<p>After merge 3, every remaining pair occurs once: (lowe, r), (lowe, s), (s, t). A real run continues with many more words.</p>
+<p><strong>Encoding</strong> a new word, for example "lowest":</p>
+<ol>
+  <li>Start with bytes: <code>l o w e s t</code>.</li>
+  <li>Find the pair with the best (lowest) merge rank in the word. Apply it.</li>
+  <li>Repeat until no learned merge applies: <code>lo w e s t</code> → <code>low e s t</code> → <code>lowe s t</code>.</li>
+  <li>Look up the id of each remaining piece.</li>
+</ol>
+<p><strong>Decoding</strong> is simple: look up the bytes of each id and join them. The text after decoding is the same as the original, because every step only joins bytes.</p>
+<x-simplified><p>Real tokenizers add rules for numbers, for some languages, and for the normalization of text. Some use other methods, for example SentencePiece unigram models. The idea of a fixed vocabulary of pieces stays the same.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="The vocabulary size in DeepInfer, and what it costs">
+<p>DeepInfer reads <code>vocab_size</code> from the <code>config.json</code> of the checkpoint ({{cite deepinfer/hugging_face/config.py:276}}). The repository does not contain that file. The tokenizer code requires 21 multimodal tokens at ids 129280 to 129300 and says that their ids are <code>vocab_size + offset</code> ({{cite deepinfer/hugging_face/tokenizer.py:25-30}}, {{cite deepinfer/hugging_face/tokenizer.py:48-56}}). Both rules agree only if <code>vocab_size</code> is 129280. So this site uses <strong>V = 129,280 (inferred)</strong>: text ids 0 to 129,279.</p>
+<p>The vocabulary size sets the size of three things:</p>
+<table>
+  <thead><tr><th>Object</th><th>Shape</th><th>Example size</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Embedding table</td><td><code>[V, d]</code></td><td>illustrative d = 4,096, BF16: 129,280 × 4,096 × 2 B ≈ 1.06 GB</td><td>{{cite deepinfer/model_executor/models/deepseek.py:144-148}}</td></tr>
+    <tr><td>LM head</td><td><code>[V, d]</code></td><td>the same size</td><td>{{cite deepinfer/model_executor/models/deepseek.py:290-294}}</td></tr>
+    <tr><td>Logits of one sampled row</td><td><code>[V]</code> float32</td><td>129,280 × 4 B ≈ 517 KB</td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:20-28}}</td></tr>
+  </tbody>
+</table>
+<p>The hidden size <code>d</code> also comes from the checkpoint config. The value 4,096 above is only an example.</p>
+<p>A larger vocabulary makes texts shorter (fewer steps), but the embedding, the LM head and every logits row grow. With 256 rows to sample in one decode step, the logits alone take 256 × 517 KB ≈ 132 MB.</p>
+</x-deepdive>
+
+<x-deepdive title="The release policy, line by line">
+<x-code file="deepinfer/hugging_face/tokenizer.py" lines="33-74" highlight="36,38,40,42,59-61,68" />
+<ol>
+  <li>Lines 36-41: BOS must be <code>&lt;｜begin▁of▁sentence｜&gt;</code> at id 0, EOS <code>&lt;｜end▁of▁sentence｜&gt;</code> at id 1, PAD <code>&lt;｜▁pad▁｜&gt;</code> at id 2. Else <code>ValueError</code>.</li>
+  <li>Lines 42-43: the tokenizer must have an <code>add_bos_token</code> setting (True or False), and <code>add_eos_token</code> must be False: no EOS at the end of a prompt.</li>
+  <li>Lines 47-56: the 21 multimodal tokens must get ids 129280 to 129300, in order. The code checks the ids <em>before</em> it adds the tokens.</li>
+  <li>Lines 59-61: turn on <code>add_bos_token</code>.</li>
+  <li>Lines 62-64: use the real PAD token, not EOS as PAD.</li>
+  <li>Lines 65-67: add the missing multimodal tokens as special tokens.</li>
+  <li>Lines 68-71: final checks. <code>encode("")</code> must give <code>[0]</code>: an empty text is only BOS.</li>
+  <li>Lines 72-73: log what was changed.</li>
+</ol>
+<p>Which class loads the files: a class from the checkpoint if <code>tokenizer_config.json</code> has an <code>auto_map</code>; <code>AutoTokenizer</code> with the policy <code>"native"</code>; else <code>LlamaTokenizerFast</code> ({{cite deepinfer/hugging_face/tokenizer.py:103-112}}). The policy comes from <code>tokenizer_compatibility</code> in <code>config.json</code>, default <code>"release"</code> ({{cite deepinfer/hugging_face/tokenizer.py:89-94}}). With <code>"native"</code>, none of the checks above run ({{cite deepinfer/hugging_face/tokenizer.py:121}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The way of the ids through DeepInfer">
+<ol>
+  <li><strong>Encode.</strong> <code>LLM._add_request</code> calls <code>tokenizer.encode(prompt)</code> and converts the result to <code>np.int32</code> ({{cite deepinfer/entrypoints/llm.py:153-157}}).</li>
+  <li><strong>Check.</strong> <code>LLMEngine.add_request</code> raises <code>ValueError</code> for an empty prompt ({{cite deepinfer/engine/llm_engine.py:553-554}}). It drops a request with an id below 0 or at or above <code>vocab_size</code> (plus the image ids for a multimodal request). It logs this at info level and returns <code>None</code> ({{cite deepinfer/engine/llm_engine.py:580-589}}).</li>
+  <li><strong>Engram ids.</strong> For a model with {{link concepts/engram | Engram}} whose config turns on tokenizer compression, the engine also maps each id to a <em>compressed</em> id with a lookup table ({{cite deepinfer/engine/arg_utils.py:89-90}}, {{cite deepinfer/engine/llm_engine.py:564-567}}, {{cite deepinfer/model_executor/models/v4_modules/engram.py:62-66}}).</li>
+  <li><strong>Embed.</strong> The model looks up one row of the embedding table per id ({{cite deepinfer/model_executor/models/deepseek.py:161-162}}).</li>
+  <li><strong>Sample.</strong> The sampler gives back new ids, one or more per sequence and step.</li>
+  <li><strong>Decode.</strong> At the end, <code>LLM</code> turns the output ids back into text: <code>tokenizer.decode([...])</code> ({{cite deepinfer/entrypoints/llm.py:189-190}}).</li>
+</ol>
+<p><strong>Tokenizer speed in production.</strong> The deployment notes describe a separate component, DeepSeek Recipe, for the API-to-token step. It records where special tokens go and encodes the text segments between them in parallel ({{cite doc/inference_deployment_qa.md:304}}). That component is not in this repository. The offline <code>LLM</code> class calls <code>encode()</code> once per prompt.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Missing files.</strong> Without <code>tokenizer.json</code> or <code>tokenizer_config.json</code>, start-up raises <code>FileNotFoundError</code> ({{cite deepinfer/hugging_face/tokenizer.py:96-99}}).</li>
+  <li><strong>Another tokenizer.</strong> A tokenizer with other special ids stops with <code>ValueError</code> under the default policy ({{cite deepinfer/hugging_face/tokenizer.py:36-41}}). An unknown <code>tokenizer_compatibility</code> value also raises <code>ValueError</code> ({{cite deepinfer/hugging_face/tokenizer.py:93-94}}).</li>
+  <li><strong>Ids without BOS.</strong> If you pass <code>prompt_token_ids</code>, DeepInfer does not call the tokenizer ({{cite deepinfer/entrypoints/llm.py:153-156}}). So it does not add BOS for you. Put id 0 first yourself, as <code>encode()</code> does.</li>
+  <li><strong>Special text in user input.</strong> A Hugging Face tokenizer can map the text of a special token to its special id. The deployment notes say that their production encoder prevents this, so user text cannot inject control tokens ({{cite doc/inference_deployment_qa.md:300}}). Check prompts that contain such strings.</li>
+</ul>
+<p><strong>Why it matters.</strong> Every count in an inference engine is in tokens: prompt length, <code>max_tokens</code>, KV cache size, batch size. A text that needs more tokens costs more memory and more steps. The special ids also control when a request ends.</p>
+
+<x-quiz>
+  <x-q level="easy">Why do LLMs not use one id per word?
+    <x-a><p>There are too many words, names and spellings. The vocabulary would be very large, and any word that is not in it could not be written. Subword tokens keep the vocabulary at a fixed size and can still write any text.</p></x-a>
+  </x-q>
+  <x-q level="easy">What does <code>tokenizer.encode("")</code> return for DeepInfer's release tokenizer?
+    <x-a><p><code>[0]</code>: only the BOS token. The release policy turns on BOS insertion and checks exactly this ({{cite deepinfer/hugging_face/tokenizer.py:68-69}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A BPE corpus has the words "low", "lower" and "lowest". After the merges (l, o) and (lo, w), which pair comes next, and why?
+    <x-a><p>(low, e). The words are now <code>low</code>, <code>low e r</code> and <code>low e s t</code>. The pair (low, e) occurs 2 times. Every other pair occurs once.</p></x-a>
+  </x-q>
+  <x-q level="hard">You call <code>llm.generate(prompt_token_ids=[[15400, 2860]])</code>. Name two ways in which this request differs from a text prompt, from the code.
+    <x-a><p>(1) DeepInfer does not call the tokenizer, so no BOS id 0 is added in front ({{cite deepinfer/entrypoints/llm.py:153-157}}). (2) The ids still go through the range check in <code>add_request</code>. An id below 0, or at or above the limit, drops the request with an info log ({{cite deepinfer/engine/llm_engine.py:580-589}}). The limit is <code>vocab_size</code> + 5. <code>LLM</code> always adds empty multimodal data when the engine has a multimodal processor, so the 5 image ids are also valid ({{cite deepinfer/entrypoints/llm.py:158-159}}, {{cite deepinfer/multimodal_tokens.py:28}}).</p></x-a>
+  </x-q>
+</x-quiz>

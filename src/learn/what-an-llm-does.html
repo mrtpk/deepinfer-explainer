@@ -1,0 +1,156 @@
+---
+title: What an LLM does
+level: Beginner
+prerequisites: none
+related: learn/tokens, learn/transformer, learn/sampling, learn/prefill-decode, learn/kv-cache, tours/life-of-a-request, concepts/engine-step-loop
+summary: An LLM reads a list of tokens and gives a probability to every possible next token. It writes text with a loop: pick one token, add it to the input, and run the model again.
+---
+<x-sentence>An LLM reads a list of tokens and gives a probability to every possible next token. It writes text by repeating this, one token at a time.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Text in, one token out</h3>
+<p>A large language model ({{term llm | LLM}}) does not work on letters or words. It works on {{term token | tokens}}: small pieces of text, each with an integer id. The page {{link learn/tokens}} shows how text becomes ids.</p>
+<p>The model is a mathematical function with a fixed list of inputs and outputs:</p>
+<ul>
+  <li><strong>Input:</strong> a list of token ids, for example the ids of "The cat sat on".</li>
+  <li><strong>Output:</strong> one probability for each token in the {{term vocabulary}}. The vocabulary is the list of all tokens that the model knows. A modern vocabulary often has between 32,000 and 256,000 tokens.</li>
+</ul>
+<p>Take "The cat sat on". The model can give "the" a probability of 0.41, "a" 0.22 and "his" 0.09. Every other token gets a very small probability. These numbers are made up, but real outputs look like this. The model does not give one answer. It gives a probability distribution over all possible next tokens.</p>
+
+<h3>Writing text is a loop</h3>
+<p>To write an answer, an inference engine runs the model in a loop. This kind of generation is {{term autoregressive}}:</p>
+<ol>
+  <li>Run the model on all tokens so far. Get the probabilities of the next token.</li>
+  <li>Select one token from these probabilities. This is {{term sampling}}. The page {{link learn/sampling}} explains the rules.</li>
+  <li>Add the selected token to the end of the input.</li>
+  <li>Stop if the token is the end-of-sequence token ({{term eos-token | EOS}}), or if the answer has the maximum number of tokens. Else go back to step 1.</li>
+</ol>
+<p>So an answer of 200 tokens needs 200 runs of the model. Each run makes exactly one new token. (Speculative decoding can make more than one token per run. DeepInfer uses it, but the idea stays the same.)</p>
+
+<h3>Where the knowledge is</h3>
+<p>The model has billions of learned numbers, the {{term model-weights | weights}}. Training set them: the model read a very large amount of text and learned to predict the next token. All the "knowledge" of the model is in these numbers.</p>
+<p>Generation does not change the weights. Each run reads all of them from device memory and uses them for the math. This is why LLM inference needs large and fast {{term accelerator | accelerators}}. It is also why an engine such as DeepInfer uses each read of the weights for many requests at the same time.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of the word suggestions on a phone keyboard. You type "See you", and the keyboard suggests "soon", "tomorrow" or "later". When you tap one word, the keyboard adds it and suggests the next word. An LLM does the same thing, one token at a time.</p>
+<p>The comparison stops here. A keyboard looks at the last few words and shows three choices. An LLM looks at all the text so far, often thousands of tokens. It gives a probability to every token in its vocabulary. Then the sampler, not the user, makes the choice.</p>
+
+<h3>What an inference engine adds</h3>
+<p>The loop above is simple. An engine such as DeepInfer makes it fast for many users at the same time:</p>
+<ul>
+  <li>It keeps the intermediate results of earlier tokens, so each run computes only the new token. This memory is the {{term kv-cache | KV cache}} ({{link learn/kv-cache}}).</li>
+  <li>It splits the work into two phases: {{term prefill}} reads the whole prompt once, and each {{term decode}} step adds one token ({{link learn/prefill-decode}}).</li>
+  <li>It runs the tokens of many requests in one step, so one read of the weights serves all of them ({{link learn/batching}}).</li>
+  <li>A {{term scheduler}} decides in each step which requests run.</li>
+</ul>
+
+<h2>The picture</h2>
+<x-diagram name="b1_llm_loop" alt="Panel 1: the tokenizer turns the text 'The cat sat on' into five ids that start with BOS id 0; the model turns the ids into one score per vocabulary token; the sampler shows probabilities the 0.41, a 0.22, his 0.09, top 0.05 and picks 'the'. Panel 2: four rows show the input growing by one token per step: the prefill step outputs 'the', decode step 1 outputs 'mat', decode step 2 outputs '.', and decode step 3 outputs EOS, which stops the loop." caption="Figure: one step of an LLM (panel 1) and the loop of steps that writes an answer (panel 2). Ids and probabilities are illustrative. Click to zoom." />
+<p>Read panel 1 from left to right: text, ids, probabilities, one token. Panel 2 shows the loop. Each row is one run of the model. The green token of each row becomes the last input token of the next row. The loop stops at EOS.</p>
+<x-simplified><p>The figure leaves out the KV cache, batching and draft tokens. It also shows "probabilities" from the model directly. In DeepInfer, the model returns hidden states, and the sampler computes the scores and the probabilities. The page {{link learn/transformer}} shows this split.</p></x-simplified>
+
+<h2>In DeepInfer</h2>
+<p>This is a basics page, so this part is short. The tour {{link tours/life-of-a-request}} follows one request through all of these places.</p>
+
+<h3>Step 1: the user calls generate()</h3>
+<p>The offline API is the class <code>LLM</code>. <code>generate()</code> adds one request per prompt. If you give no <code>SamplingParams</code>, it uses the default values ({{cite deepinfer/entrypoints/llm.py:125-127}}). Then it runs the loop:</p>
+<x-code file="deepinfer/entrypoints/llm.py" lines="174-186" highlight="177-178" caption="The loop of the engine. Each call of <code>step()</code> is one run of the model for all active requests. The loop ends when no request is unfinished." />
+
+<h3>Step 2: the engine stops a request</h3>
+<p>After each step, C++ code checks each sequence for the stop rules of the loop:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="1035-1051" highlight="1038,1048" caption="Three stop rules: the EOS token (unless <code>ignore_eos</code> is set), the maximum model length, and <code>max_tokens</code>." />
+<p>The status becomes a finish reason in the output: <code>"stop"</code> for EOS and <code>"length"</code> for the two length limits ({{cite csrc/engine/sequence.hpp:45-50}}).</p>
+
+<h3>Step 3: ids become text again</h3>
+<p>At the end, <code>LLM</code> collects the tokens of each request. With <code>decode_sequence=True</code> (the default), it turns the token ids back into text with the same tokenizer ({{cite deepinfer/entrypoints/llm.py:187-190}}, {{cite deepinfer/entrypoints/llm.py:64}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time.</p>
+
+<x-deepdive title="The math of next-token prediction">
+<p>Write the tokens of a text as x<sub>1</sub>, x<sub>2</sub>, …, x<sub>n</sub>. An LLM gives the probability of the whole text as a product of next-token probabilities (the chain rule of probability):</p>
+<pre><code class="language-none">P(x1, x2, ..., xn) = P(x1) · P(x2 | x1) · P(x3 | x1, x2) · ... · P(xn | x1 ... xn-1)</code></pre>
+<p>The model computes each factor P(x<sub>t+1</sub> | x<sub>1</sub> … x<sub>t</sub>) in the same way:</p>
+<ol>
+  <li>Input: token ids, an integer tensor of shape <code>[T]</code>.</li>
+  <li>The layers of the model make one {{term hidden-state}} vector per token: shape <code>[T, d]</code>, where <code>d</code> is the hidden size.</li>
+  <li>The output head multiplies each hidden state by a matrix of shape <code>[d, V]</code>, where <code>V</code> is the vocabulary size. The result is the {{term logits}}: shape <code>[T, V]</code>, one raw score per token.</li>
+  <li>{{term softmax | Softmax}} turns the logits of one row into probabilities: p<sub>i</sub> = exp(z<sub>i</sub>) / Σ<sub>j</sub> exp(z<sub>j</sub>).</li>
+</ol>
+<p>Row <em>t</em> of the logits predicts token <em>t</em> + 1. During training, the model uses all rows: every position predicts its next token. During generation, only the <strong>last</strong> row matters, because only that row predicts a token that does not exist yet.</p>
+<p><strong>DeepInfer uses this fact.</strong> In a prefill step, the sampler selects only the last row of each sequence ({{cite csrc/engine/prepare_sample.cpp:197}}). The sampler then computes the logits only for the selected rows, in float32 ({{cite deepinfer/model_executor/layers/sampler.py:140-142}}, {{cite deepinfer/model_executor/layers/sampler_utils.py:25}}). A request with prompt logprobs is an exception: it also needs the other rows. For a prompt of 1,000 tokens and V = 129,280 (inferred, see {{link learn/tokens}}), this saves 999 × 129,280 ≈ 129 million logits per sequence.</p>
+<p><strong>Worked example.</strong> These probabilities are made up. Take P("The") = 0.02, P("cat" | "The") = 0.01, P("sat" | "The cat") = 0.10, P("on" | "The cat sat") = 0.50:</p>
+<pre><code class="language-none">P("The cat sat on") = 0.02 × 0.01 × 0.10 × 0.50 = 0.00001
+log P               = ln 0.02 + ln 0.01 + ln 0.10 + ln 0.50
+                    = −3.912 − 4.605 − 2.303 − 0.693 = −11.513</code></pre>
+<p>Products of many small numbers become too small for floating point. So engines work with the sum of log probabilities. One such value per token is a {{term logprob}}. DeepInfer can return the logprob of each output token and of the best alternatives (<code>top_logprobs</code>, {{cite deepinfer/sampling_params.py:31-33}}).</p>
+</x-deepdive>
+
+<x-deepdive title="How much work is one token?">
+<p>A common rule of thumb: one forward pass costs about <strong>2 × N</strong> floating-point operations (FLOPs) per token. N is the number of weights that the token uses. Each weight takes part in one multiply and one add.</p>
+<x-simplified><p>The rule leaves out attention. Attention grows with the length of the text. For long texts it adds a large part of the work. The page {{link learn/attention}} gives its cost.</p></x-simplified>
+<p><strong>Illustrative example</strong> (not a DeepInfer model): a dense model with 10 billion weights and 2-byte numbers.</p>
+<ol>
+  <li>Compute per token: 2 × 10 × 10<sup>9</sup> = 2 × 10<sup>10</sup> FLOPs.</li>
+  <li>Weights to read per step: 10 × 10<sup>9</sup> × 2 bytes = 20 GB.</li>
+  <li>An answer of 500 tokens needs 500 steps. Each step reads the 20 GB again, if the engine runs this one request alone.</li>
+</ol>
+<p>So the engine reads the same weights again and again. If 64 requests share each step, one read of 20 GB serves 64 tokens. This is the main reason for {{link learn/batching | batching}}.</p>
+<p><strong>Mixture of experts.</strong> A {{term moe | MoE}} model has many more weights than one token uses. A router selects a few experts per token. So N in the rule is the number of <em>active</em> weights per token, not all weights. DeepSeek V4.1, the model of DeepInfer, is an MoE model ({{link learn/moe}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The generation loop in DeepInfer, line by line">
+<x-code file="deepinfer/entrypoints/llm.py" lines="117-142" highlight="125-127,135-141" />
+<ol>
+  <li>Lines 117-118: you must give text prompts or token ids. Else <code>generate()</code> raises <code>ValueError</code>.</li>
+  <li>Lines 119-122: a single string becomes a list of one prompt.</li>
+  <li>Lines 125-127: no <code>sampling_params</code> means <code>SamplingParams()</code> with its defaults. The default <code>max_tokens</code> is 16 ({{cite deepinfer/sampling_params.py:53}}).</li>
+  <li>Lines 131-141: one request per prompt. A list of <code>SamplingParams</code> gives each prompt its own settings.</li>
+  <li>Line 142: <code>_run_engine</code> runs the loop of steps.</li>
+</ol>
+<p><code>_add_request</code> copies the parameters, gives the request the next integer id as a string, and calls the tokenizer if you gave text ({{cite deepinfer/entrypoints/llm.py:151-157}}). The ids become a NumPy <code>int32</code> array.</p>
+<p><strong>The step results.</strong> Each <code>step()</code> returns output objects. The loop clones each one, because the engine reuses their memory in the next step ({{cite deepinfer/entrypoints/llm.py:179-182}}). With zero-overhead scheduling ({{term zos | ZOS}}), a step returns the results of the <em>previous</em> step. So after the last step, the loop calls <code>flush_inflight_reqs()</code> once to collect the last results ({{cite deepinfer/entrypoints/llm.py:178}}). The page {{link concepts/zero-overhead-scheduling}} explains why.</p>
+<p><strong>The result.</strong> <code>generate()</code> sorts the requests by id. It returns one string per prompt, or the list of output objects if <code>decode_sequence=False</code> ({{cite deepinfer/entrypoints/llm.py:187-190}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Stop conditions and their settings">
+<table>
+  <thead><tr><th>Rule</th><th>Setting</th><th>Default</th><th>Finish reason</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>The last token is EOS (id 1)</td><td><code>ignore_eos=True</code> turns it off</td><td><code>False</code></td><td><code>"stop"</code></td><td>{{cite csrc/engine/scheduler.hpp:1038-1041}}</td></tr>
+    <tr><td>The text is longer than the model limit</td><td><code>max_model_len</code> (engine)</td><td>from the engine config</td><td><code>"length"</code></td><td>{{cite csrc/engine/scheduler.hpp:1043-1046}}</td></tr>
+    <tr><td>The output has <code>max_tokens</code> tokens</td><td><code>max_tokens</code> (per request)</td><td>16</td><td><code>"length"</code></td><td>{{cite csrc/engine/scheduler.hpp:1048-1051}}, {{cite deepinfer/sampling_params.py:53}}</td></tr>
+  </tbody>
+</table>
+<p>Edge cases:</p>
+<ul>
+  <li><code>max_tokens=0</code> becomes 1 ({{cite deepinfer/sampling_params.py:70-71}}). A negative value raises <code>ValueError</code> ({{cite deepinfer/sampling_params.py:100-101}}).</li>
+  <li><code>first_n_token_no_eos=1</code> forbids EOS as the first output token. The sampler sets the EOS logit to −∞ in the prefill step ({{cite deepinfer/model_executor/layers/sampler.py:183-185}}). The engine always sets the EOS id of the request to the EOS id of the tokenizer ({{cite deepinfer/engine/llm_engine.py:527}}).</li>
+  <li>A prompt that is longer than the prompt limit never runs. It ends with the reason <code>"prompt_length_exceeded"</code> ({{cite csrc/engine/scheduler.hpp:377-384}}, {{cite csrc/engine/sequence.hpp:53-54}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Very short answers.</strong> The default <code>max_tokens</code> is 16 ({{cite deepinfer/sampling_params.py:53}}). Set a larger value for real answers.</li>
+  <li><strong>Answers that never end early.</strong> With <code>ignore_eos=True</code>, every request runs to <code>max_tokens</code>. Benchmarks use this on purpose; normal use does not.</li>
+  <li><strong>An empty prompt.</strong> <code>add_request</code> raises <code>ValueError("prompt must not be empty")</code> ({{cite deepinfer/engine/llm_engine.py:553-554}}).</li>
+  <li><strong>A bad token id.</strong> If you pass a token id below 0, or at or above the valid limit, <code>add_request</code> logs an info message and returns <code>None</code>. It does not raise ({{cite deepinfer/engine/llm_engine.py:580-589}}). The limit is <code>vocab_size</code>, plus 5 image ids if the request has multimodal data ({{cite deepinfer/multimodal_tokens.py:28}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every later page builds on this loop. Prefill and decode are the first run and the later runs. The KV cache saves the work of earlier tokens. Batching and the scheduler decide which loops share a step. Sampling is step 2 of the loop.</p>
+
+<x-quiz>
+  <x-q level="easy">An LLM gets the tokens of "The cat sat on". What does one run of the model give back?
+    <x-a><p>One probability for every token of the vocabulary: the chance that this token comes next. The model does not give one word. A separate sampling step selects one token from these probabilities.</p></x-a>
+  </x-q>
+  <x-q level="easy">An answer has 300 tokens. How many runs of the model does the plain loop need, without speculative decoding?
+    <x-a><p>300. Each run makes exactly one new token, which becomes part of the input of the next run.</p></x-a>
+  </x-q>
+  <x-q level="medium">You call <code>llm.generate("Hello")</code> with no sampling parameters. Why is the answer so short?
+    <x-a><p><code>generate()</code> uses <code>SamplingParams()</code> ({{cite deepinfer/entrypoints/llm.py:125-127}}). Its default <code>max_tokens</code> is 16 ({{cite deepinfer/sampling_params.py:53}}). The scheduler stops the request with the reason <code>"length"</code> after 16 output tokens ({{cite csrc/engine/scheduler.hpp:1048-1051}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A prompt has 2,000 tokens, and the vocabulary has 129,280 tokens (inferred). How many logits does the DeepInfer sampler compute for this sequence in its prefill step, and why not 2,000 rows?
+    <x-a><p>One row: 129,280 logits. Only the last row predicts a new token. The sampler input selects only the last token row of each prefill sequence ({{cite csrc/engine/prepare_sample.cpp:197}}). <code>Sampler.forward</code> gathers these rows and only then computes the logits ({{cite deepinfer/model_executor/layers/sampler.py:140-142}}). The other 1,999 rows would need 1,999 × 129,280 ≈ 258 million float32 values. (This assumes that the request asks for no prompt logprobs.)</p></x-a>
+  </x-q>
+</x-quiz>

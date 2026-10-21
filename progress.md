@@ -15,17 +15,17 @@ Current phase: **Full build — wave 1** (plan section 13)
 
 | Batch | Writer | Fact check | Committed |
 |---|---|---|---|
-| B1 Basics I | done | running | — |
-| B2 Basics II | running | — | — |
-| B3a Engine + scheduler | running | — | — |
+| B1 Basics I | done | done (23 defects fixed) | yes |
+| B2 Basics II | done | running | — |
+| B3a Engine + scheduler | done | running | — |
 | B3b API + cache | running | — | — |
 | B4a Inputs + graphs | running | — | — |
 | B4b Worker + ZOS | running | — | — |
 | B5a Attention I | done | running | — |
-| B5b Attention II | wave 2 | — | — |
-| B6a Layer + mHC | wave 2 | — | — |
+| B5b Attention II | running | — | — |
+| B6a Layer + mHC | running | — | — |
 | B6b Engram + VL | wave 2 | — | — |
-| B7 MoE + EP | running | — | — |
+| B7 MoE + EP | done | running | — |
 | B8 Scale | wave 3 | — | — |
 | B9 Decoding | done | running | — |
 | B10a SO + precision | wave 3 | — | — |
@@ -35,6 +35,13 @@ Current phase: **Full build — wave 1** (plan section 13)
 | F Final pass | later | — | — |
 
 ## Done
+
+- FINAL-PASS TODO: code/llm-engine.html says no Python code calls fork_seq — examples/benchmark.py does (facts.md). Tour 1 simplification box: the fifth request starts at the next attempt point after a slot frees, not when another finishes.
+- FINAL-PASS TODO (CSS): wide tables inside deep dives scroll sideways; add a wrapping table style.
+
+- IDEA for B10a/final: interactive number-format converter (value → BF16 / E4M3 / E2M1 bits) for learn/number-formats and concepts/low-precision-formats.
+
+- FINAL-PASS TODO: reference/env-vars.html: (a) DEEPINFER_FORCE_IMBALANCE_RATIO from the env never takes effect (model_runner.py ~509-512); (b) line ~494 says the shared expert runs "while combine runs" — wrong order (see facts.md B7).
 
 - FINAL-PASS TODO: learn/kv-cache.html (already fact-checked) may say ica_state is float32 state for ratio-2 layers and that the main KV entry is 528 B; per B5a, ica_state is None in practice and the loader default is FP4 (288 B). Check and fix in pass F.
 - 2026-10-21: build.py --preview writes site/ even with errors (writers asked: one broken page blocked all previews).

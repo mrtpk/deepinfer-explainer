@@ -1,0 +1,199 @@
+---
+title: Attention, step by step
+level: Beginner
+prerequisites: learn/transformer
+related: learn/kv-cache, learn/prefill-decode, concepts/mla-attention, concepts/sparse-attention-indexer, concepts/sliding-window-attention, concepts/determinism, tours/decoder-layer, code/v4-attn
+summary: Attention lets each token take information from earlier tokens. It scores its query against their keys, turns the scores into weights with softmax, and mixes their values. Fewer KV heads (GQA, MQA, MLA) make the KV cache smaller; DeepInfer uses MLA with one shared KV entry per token.
+scripts: viz/attention_toy.js
+---
+<x-sentence>Attention lets each token take information from earlier tokens. It compares its query with their keys, turns the scores into weights, and mixes their values.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>The problem: a token alone has no context</h3>
+<p>After the embedding, each token has its own vector. The vector of "bank" is the same in "river bank" and in "bank account". The model must mix in information from the other tokens to know which meaning is correct. {{term attention | Attention}} is the step that does this mix. It is the only place in a {{term transformer}} where tokens see each other.</p>
+
+<h3>Query, key and value</h3>
+<p>Each token makes three vectors from its hidden state, with three learned weight matrices ({{term query-key-value}}):</p>
+<ul>
+  <li>The <strong>query</strong> (q) says what this token looks for.</li>
+  <li>The <strong>key</strong> (k) says what this token offers to others.</li>
+  <li>The <strong>value</strong> (v) is the information that this token gives when another token selects it.</li>
+</ul>
+
+<h3>Four steps</h3>
+<p>For one token with query q, attention does four steps:</p>
+<ol>
+  <li><strong>Score.</strong> Compare q with the key of every token: the dot product q·k. A high score means a good match. Divide each score by √d<sub>h</sub>, where d<sub>h</sub> is the size of one head's vectors. The deep dive explains why.</li>
+  <li><strong>Mask.</strong> A token may look only at itself and at earlier tokens. The {{term causal-mask | causal mask}} sets the scores of later tokens to −∞.</li>
+  <li><strong>Softmax.</strong> {{term softmax | Softmax}} turns the scores into weights: exp(score) divided by the sum of all exp values. The weights are positive and add up to 1. A masked token gets weight 0, because exp(−∞) = 0.</li>
+  <li><strong>Mix.</strong> The output is the weighted sum of the values: Σ weight<sub>j</sub> · v<sub>j</sub>.</li>
+</ol>
+
+<h3>A worked example</h3>
+<p>Here is one head with vectors of 2 numbers (d<sub>h</sub> = 2). The text is "The cat sat on", and we compute the row of "on". These are the same numbers as on the page {{link learn/kv-cache}}.</p>
+<table>
+  <thead><tr><th>Token</th><th>Key</th><th>Value</th><th>q·k with q = (1, 2)</th><th>Score / √2</th><th>Weight</th></tr></thead>
+  <tbody>
+    <tr><td>The</td><td><code>(1, 0)</code></td><td><code>(2, 0)</code></td><td>1</td><td>0.707</td><td>0.065</td></tr>
+    <tr><td>cat</td><td><code>(0, 1)</code></td><td><code>(0, 2)</code></td><td>2</td><td>1.414</td><td>0.131</td></tr>
+    <tr><td>sat</td><td><code>(1, 1)</code></td><td><code>(1, 1)</code></td><td>3</td><td>2.121</td><td>0.266</td></tr>
+    <tr><td>on</td><td><code>(2, 1)</code></td><td><code>(0, 3)</code></td><td>4</td><td>2.828</td><td>0.539</td></tr>
+  </tbody>
+</table>
+<p>The output of "on" is 0.065·(2, 0) + 0.131·(0, 2) + 0.266·(1, 1) + 0.539·(0, 3) = (0.395, 2.144). The token "on" takes most of its new information from itself and from "sat".</p>
+
+<h3>Many heads</h3>
+<p>One attention computation is one {{term attention-head | head}}. A layer runs many heads in parallel, often 32 to 128. Each head has its own weight matrices, so each head can look for a different relation. For example, one head can find the subject of a verb, and another the previous word. The outputs of all heads are joined and multiplied by one more matrix. This is {{term mha | multi-head attention}}.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a search in a library. Your question is the query. The label on each book is its key. The text in the book is its value. You compare your question with every label, and you read the books with the best labels.</p>
+<p>The comparison stops here. Attention does not select one book. It reads <em>all</em> earlier books and mixes them, with more weight for the better matches. Also, nobody writes the labels: training learns how each token makes its query, key and value.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1_attention" alt="Panel 1: hidden states X of shape [T, d] are multiplied by three matrices to give Q, K and V, with the values of the worked example. Panel 2: a 4 by 4 grid of scaled scores; the cells above the diagonal are masked with minus infinity; the row of 'on' (0.71, 1.41, 2.12, 2.83) goes into softmax, which gives the weights 0.065, 0.131, 0.266 and 0.539; the output is the weighted sum of the values, (0.395, 2.144). Panel 3: three layouts with 8 query heads: MHA with 8 KV heads, GQA with 2 KV heads, and MQA with 1 KV head." caption="Figure: where Q, K and V come from (panel 1), the four steps for one row (panel 2), and why fewer KV heads save memory (panel 3). Click to zoom." />
+<p>Read panel 2 from left to right. Each row of the grid is one query token, and each column is one key token. The grey cells above the diagonal are later tokens, so the mask hides them. Panel 3 shows the KV heads that the {{term kv-cache | KV cache}} must store.</p>
+
+<h3 id="try-it">Try it: the attention toy</h3>
+<p>The toy below has 6 tokens and one head with d<sub>h</sub> = 2. Tokens 1 to 4 have the keys and values of the worked example, and row "on" has its query q = (1, 2). The queries of the other rows are made up for the toy.</p>
+<x-viz id="attention-toy" title="Attention toy: scores, mask, softmax, mix" caption="Keyboard: Tab to a token or a control; press Enter or Space on a token. Use the arrow keys on a slider. The values are fixed, so every reader sees the same example; Reset starts again." />
+<p>Things to try:</p>
+<ol>
+  <li>Click each token from left to right. Each row has one more non-zero weight than the row before. This is the causal mask.</li>
+  <li>Move <em>Sharpness</em> to 0. Every visible key gets the same weight. Move it to 4. The best key takes almost all the weight.</li>
+  <li>Select row "on". Edit the key of "cat" and set k[1] to 3. Watch the weight of "cat" grow and the output move toward the value of "cat", (0, 2).</li>
+  <li>Turn off the causal mask. Row "The" can now see "mat". A decoder LLM never does this; an encoder model, such as a model for text classification, can.</li>
+</ol>
+<x-simplified>
+<p>The toy is a model of one head with made-up vectors of 2 numbers. DeepInfer's model differs in these ways:</p>
+<ul>
+  <li>Many query heads (the kernels accept 64 or 128) and head size 512 (inferred), not 2 ({{cite deepinfer/model_executor/layers/attention_backend.py:5-23}}).</li>
+  <li>One shared key/value entry per token for all heads ({{term mla | MLA}}), not one per head.</li>
+  <li>No mask matrix. For each query, the kernels get a list of the key positions that it may read. The list holds a sliding window and, in sparse layers, the top-k positions from an indexer.</li>
+  <li>An {{term attention-sink | attention sink}}: one extra fp32 value per head that the kernel gets as an argument ({{cite deepinfer/model_executor/layers/attention_backend.py:40}}).</li>
+</ul>
+</x-simplified>
+
+<h2>In DeepInfer</h2>
+<p>Attention is in <code>v4_modules/attn.py</code>. The page {{link concepts/mla-attention}} explains the full design. Here are three pointers.</p>
+
+<h3>Step 1: the scale is 1/√head_dim</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="70-78" highlight="78" caption="<code>softmax_scale = qk_head_dim ** -0.5</code>. With head_dim 512 (inferred) the scale is 1/√512 ≈ 0.0442." />
+
+<h3>Step 2: prefill and decode use different kernels</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="859-877" highlight="859,870" caption="A prefill step computes attention for many new tokens at once. A decode step reads the keys and values from the cache. The page {{link learn/prefill-decode}} explains the two phases." />
+
+<h3>Step 3: an index list instead of a mask</h3>
+<p>The attention backend calls the {{term flashmla | FlashMLA}} library. Its docstring gives the shapes ({{cite deepinfer/model_executor/layers/attention_backend.py:35-49}}):</p>
+<ul>
+  <li><code>query</code>: <code>[total_q, num_heads_q, head_dim]</code>, BF16. One row per new token, all heads.</li>
+  <li><code>kv_a_with_mqa</code>: <code>[total_k, 1, head_dim]</code>. The "1" is the single shared KV head.</li>
+  <li><code>index_topk</code>: <code>[total_q, topk_tokens]</code>, int32. For each query, the key rows that it may read.</li>
+</ul>
+<p>The plain decode call turns off the causal flag, because the index list already contains only allowed keys. On GPU with 64 or 128 heads, sparse layers and layers without a compressed cache use a fused FlashMLA kernel instead ({{cite deepinfer/model_executor/models/v4_modules/attn.py:87-92}}). That call has no causal flag at all, and it also reads only the listed rows ({{cite deepinfer/model_executor/layers/attention_backend.py:107-121}}).</p>
+<x-code file="deepinfer/model_executor/layers/attention_backend.py" lines="125-136" highlight="133">
+<x-tr line="128">FlashMLA keeps this parameter but ignores it at present.</x-tr>
+<x-tr line="129">The same.</x-tr>
+<x-tr line="133">Sparse attention supports only non-causal mode.</x-tr>
+<x-tr line="134">The V4.1 KV cache is paged FP8.</x-tr>
+</x-code>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="The full formula with shapes">
+<p>Take one head with T new query tokens and S key tokens. S ≥ T; in a decode step, S is the cached length plus the new tokens.</p>
+<pre><code class="language-none">Q : [T, d_h]      K : [S, d_h]      V : [S, d_v]
+
+S_raw = Q · Kᵀ                         [T, S]
+S     = S_raw · scale                  scale = 1 / sqrt(d_h)
+S     = S + M                          M[i, j] = 0 if key j is allowed for query i, else −∞
+P     = softmax(S, along each row)     [T, S], each row sums to 1
+O     = P · V                          [T, d_v]</code></pre>
+<p>With H heads, each head does this with its own Q, K and V. The outputs <code>[T, H, d_v]</code> are joined to <code>[T, H · d_v]</code> and multiplied by an output matrix to get back to <code>[T, d]</code>.</p>
+<p><strong>Cost.</strong> The two matrix products cost about 2·T·S·d<sub>h</sub> + 2·T·S·d<sub>v</sub> FLOPs per head. They grow with T·S, so a long prompt costs much more than a short one. Double the prompt, and the attention work of a prefill becomes about four times as large.</p>
+<p><strong>Memory of the score matrix.</strong> Illustrative numbers: T = S = 8,192, H = 128, float32. The full matrix P needs 8,192 × 8,192 × 128 × 4 bytes ≈ 34 GB. No engine stores it. Fused attention kernels compute P in tiles and keep only a running maximum and a running sum per row. FlashMLA returns that per-row value as <code>lse</code> (log-sum-exp), shape <code>[total_q, num_heads_q]</code>, fp32 ({{cite deepinfer/model_executor/layers/attention_backend.py:46-48}}).</p>
+<x-simplified><p>"Tiles and a running maximum" is the general idea of fused attention kernels. This site does not describe the inside of FlashMLA, which is not in the repository.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Why divide by √d_h?">
+<p>Take q and k with d<sub>h</sub> random numbers each, every number with mean 0 and variance 1. Then q·k is a sum of d<sub>h</sub> products. Each product has variance 1, so the sum has variance d<sub>h</sub> and a typical size of √d<sub>h</sub>.</p>
+<ul>
+  <li>d<sub>h</sub> = 2: typical score about 1.4.</li>
+  <li>d<sub>h</sub> = 512 (DeepInfer, inferred): typical score about 22.6.</li>
+</ul>
+<p>With scores of size 20 or more, softmax puts almost all the weight on one token. The gradients of the other tokens then become almost zero, and training gets stuck. Division by √d<sub>h</sub> brings the typical score back to about 1.</p>
+<p><strong>The effect in the worked example.</strong> Row "on", scores 1, 2, 3, 4:</p>
+<table>
+  <thead><tr><th></th><th>The</th><th>cat</th><th>sat</th><th>on</th></tr></thead>
+  <tbody>
+    <tr><td>softmax(scores), no scale</td><td>0.032</td><td>0.087</td><td>0.237</td><td>0.644</td></tr>
+    <tr><td>softmax(scores / √2)</td><td>0.065</td><td>0.131</td><td>0.266</td><td>0.539</td></tr>
+  </tbody>
+</table>
+<p>The scaled weights are flatter. In the toy above, <em>Sharpness</em> m multiplies the scaled scores, and m = 1 is the real rule. A value of m = √2 ≈ 1.41 would give the "no scale" row. The slider moves in steps of 0.25, so m = 1.5 is the nearest setting (weights 0.028, 0.080, 0.230, 0.663).</p>
+</x-deepdive>
+
+<x-deepdive title="Softmax numerics">
+<p><strong>Subtract the maximum.</strong> exp(z) overflows float32 for z above about 88.7. Kernels therefore compute softmax as:</p>
+<pre><code class="language-none">m      = max_j z_j
+p_j    = exp(z_j − m) / Σ_k exp(z_k − m)</code></pre>
+<p>The result is the same, because the factor exp(−m) cancels. Now the largest exponent is exp(0) = 1, so nothing overflows.</p>
+<p><strong>Worked example.</strong> Scores (1000, 1001). exp(1000) overflows to infinity, and inf / inf is NaN. With the maximum subtracted: exp(−1) = 0.368 and exp(0) = 1, so the weights are 0.269 and 0.731.</p>
+<p><strong>Masked entries.</strong> −∞ − m is still −∞, and exp(−∞) = 0, so a masked key gets exactly weight 0. A row with <em>only</em> masked entries gives 0 / 0 = NaN. The causal mask never does this, because each token may always see itself.</p>
+<p><strong>Log-sum-exp.</strong> The value lse = m + ln Σ<sub>k</sub> exp(z<sub>k</sub> − m) summarizes a row. With it, two partial results of the same row (for example, from two groups of keys) can be joined exactly later. This is why attention kernels often return it.</p>
+<p><strong>The toy uses the same rule.</strong> The script subtracts the row maximum before exp and gives masked cells weight 0 (<code>assets/viz/attention_toy.js</code>).</p>
+</x-deepdive>
+
+<x-deepdive title="The causal mask in prefill and in decode">
+<p><strong>Prefill.</strong> All T prompt tokens are queries at the same time. Query i may read keys 0 … i. The mask is a lower triangle: T·(T + 1)/2 allowed pairs out of T². For T = 4 that is 10 of 16, as in the figure.</p>
+<p><strong>Decode.</strong> The new token is the last one. It may read every cached key and itself, so a decode step needs no triangle. With draft tokens, a decode step has several new tokens. Each new token may read the cache and the new tokens before it, so the new rows need a small triangle among themselves.</p>
+<p><strong>In DeepInfer the "mask" is a list of indices.</strong> For each new token, the batch metadata holds the key rows that it may read:</p>
+<ul>
+  <li><code>kv_swa_full_index</code> / <code>kv_swa_index</code>: shape <code>[total_q, window_size]</code>, the rows of the {{term sliding-window-attention | sliding window}} ({{cite deepinfer/model_executor/models/v4_modules/attn.py:853}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:857}}).</li>
+  <li><code>kv_ca_index</code>: rows of the compressed cache. In sparse layers, an indexer selects the top-k rows ({{cite deepinfer/model_executor/models/v4_modules/attn.py:802-809}}). See {{link concepts/sparse-attention-indexer}}.</li>
+</ul>
+<p>A token never gets an index of a later token, so the index list does the work of the causal mask. That is why the plain decode call passes <code>causal=False</code> ({{cite deepinfer/model_executor/layers/attention_backend.py:133}}), and the fused call has no causal argument ({{cite deepinfer/model_executor/layers/attention_backend.py:107-121}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Heads, MQA, GQA, MLA and KV memory">
+<p>The KV cache stores, for each token and layer, one key and one value per <em>KV head</em>:</p>
+<pre><code class="language-none">bytes per token per layer = 2 × n_kv_heads × d_h × bytes_per_number</code></pre>
+<p>Illustrative model (not DeepInfer): 32 query heads, d<sub>h</sub> = 128, BF16 (2 bytes).</p>
+<table>
+  <thead><tr><th>Design</th><th>KV heads</th><th>Bytes per token per layer</th><th>Relative</th></tr></thead>
+  <tbody>
+    <tr><td>MHA (multi-head)</td><td>32</td><td>2 × 32 × 128 × 2 = 16,384</td><td>1</td></tr>
+    <tr><td>{{term gqa | GQA}}, groups of 4</td><td>8</td><td>2 × 8 × 128 × 2 = 4,096</td><td>1/4</td></tr>
+    <tr><td>{{term mqa | MQA}}</td><td>1</td><td>2 × 1 × 128 × 2 = 512</td><td>1/32</td></tr>
+  </tbody>
+</table>
+<p>Decode steps read the whole cache for every new token, so a smaller cache also makes decode faster. The cost: with fewer KV heads, the heads can no longer look at different things. This can lower quality.</p>
+<p><strong>MLA</strong> (multi-head latent attention) keeps one small <em>latent</em> vector per token and lets each query head use it through its own learned projections. In DeepInfer, one cache entry has 512 numbers and serves all heads. Layers with KV compression keep one entry for a group of tokens; the ratio of each layer comes from the checkpoint config ({{cite deepinfer/hugging_face/config.py:148-152}}). In FP8 with scale bytes, one entry takes 528 bytes ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-118}}). The code checks one KV head ({{cite deepinfer/worker/cache_engine.py:624}}). The page {{link concepts/mla-attention}} gives the full design; the page {{link learn/kv-cache}} compares the bytes.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>No scale.</strong> Without the division by √d<sub>h</sub>, softmax becomes very sharp for large heads (deep dive "Why divide by √d_h?"). DeepInfer passes the scale to every attention call ({{cite deepinfer/model_executor/models/v4_modules/attn.py:621}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:664}}).</li>
+  <li><strong>A wrong mask.</strong> If a query can read a later token, the model sees text that it must predict. In DeepInfer, a wrong index list would do the same, because the kernel does not add its own causal mask.</li>
+  <li><strong>Overflow.</strong> Softmax without the maximum subtracted gives infinity or NaN for large scores.</li>
+  <li><strong>Results that depend on the batch.</strong> The same request can give slightly different numbers in different batches, because the kernels sum in a different order. DeepInfer has a batch-invariant mode, <code>DEEPINFER_BATCH_INVARIANT</code>, that it passes to the decode kernel ({{cite deepinfer/model_executor/models/v4_modules/attn.py:666}}). See {{link concepts/determinism}}.</li>
+</ul>
+<p><strong>Why it matters.</strong> Attention is the only part of the model whose cost grows with the length of the text. It is also the reason for the KV cache. Most of DeepInfer's model pages (MLA, sliding window, sparse indexer, KV compression) are ways to make attention cheaper in time or in memory.</p>
+
+<x-quiz>
+  <x-q level="easy">In the worked example, why does the row of "The" have only one non-zero weight?
+    <x-a><p>"The" is the first token. The causal mask hides all later tokens, so the only allowed key is its own. Softmax over one score gives weight 1.</p></x-a>
+  </x-q>
+  <x-q level="medium">Compute the weights for the scores (2, 2, 0) after the division by √d<sub>h</sub> has been applied.
+    <x-a><p>exp(2) = 7.389, exp(2) = 7.389, exp(0) = 1. Sum: 15.778. Weights: 0.468, 0.468, 0.063.</p></x-a>
+  </x-q>
+  <x-q level="medium">An illustrative model has 64 query heads, d<sub>h</sub> = 128 and BF16. How many KV cache bytes per token per layer does it need with MHA, and with GQA in groups of 8?
+    <x-a><p>MHA: 2 × 64 × 128 × 2 = 32,768 bytes. GQA with groups of 8 has 8 KV heads: 2 × 8 × 128 × 2 = 4,096 bytes, one eighth.</p></x-a>
+  </x-q>
+  <x-q level="hard">DeepInfer's plain decode attention call passes <code>causal=False</code>. Why does a decode token still not see later tokens?
+    <x-a><p>The kernel reads only the key rows in the index lists that the batch metadata gives, for example <code>kv_swa_index</code> of shape <code>[total_q, window_size]</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:857}}). These lists never contain a later position. The translated comment says that sparse attention supports only non-causal mode ({{cite deepinfer/model_executor/layers/attention_backend.py:133}}). The fused decode kernel has no causal argument, so it depends on the same lists ({{cite deepinfer/model_executor/layers/attention_backend.py:107-121}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With d<sub>h</sub> = 512 and random unit-variance q and k, what is the typical size of q·k, and what does DeepInfer multiply it by?
+    <x-a><p>The variance is 512, so the typical size is √512 ≈ 22.6. DeepInfer multiplies by <code>softmax_scale = head_dim ** -0.5</code> = 1/√512 ≈ 0.0442 ({{cite deepinfer/model_executor/models/v4_modules/attn.py:78}}), which brings the typical size back to about 1.</p></x-a>
+  </x-q>
+</x-quiz>
