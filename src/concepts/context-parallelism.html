@@ -1,0 +1,184 @@
+---
+title: Context parallelism (mirror CP)
+nav_title: Context parallelism (mirror CP)
+level: Advanced
+prerequisites: learn/parallelism, learn/attention, learn/prefill-decode, concepts/input-metadata
+related: concepts/dp-step-votes, concepts/expert-parallelism, tours/multi-gpu-step, code/parallel-state, code/shm-broadcast, code/userbuffer, code/model-runner, code/input-metadata, tours/life-of-a-request
+summary: With context parallelism, the devices of one engine share the tokens of a long prefill. A mirrored token order gives each device the same amount of causal attention work.
+---
+<x-sentence>With context parallelism, several devices of one engine share the tokens of a prefill. Each device takes one early part and one late part of each prompt, so the work is balanced.</x-sentence>
+
+<h2>The idea</h2>
+<p>A long prompt needs much prefill work. {{term context-parallelism | Context parallelism}} (CP) splits this work by {{term token | tokens}}. One engine uses <code>cp_size</code> devices. Each device computes the rows of some tokens of each prompt. The README lists this feature as "balanced CP" ({{cite README.md:12}}).</p>
+<p>A plain split has a problem. Attention is causal: token <em>i</em> reads the keys of tokens 0 to <em>i</em>. So late tokens cost more than early tokens. If device 0 takes the first half and device 1 takes the second half, device 1 does much more attention work.</p>
+<p>DeepInfer uses a mirrored order, the {{term cp-mirror | CP mirror}}. It cuts each prompt into <code>2 × cp_size</code> equal parts. Rank <em>r</em> takes part <em>r</em> and part <code>2 × cp_size − 1 − r</code>. So each rank gets one cheap part from the start and one expensive part from the end.</p>
+<p>The ranks still need each other's keys and values. In every attention layer, each rank computes K and V for its own rows. Then an {{term all-gather}} gives every rank the K and V of all tokens. At the end of the model, a second all-gather gives every rank the output of all tokens.</p>
+<p><strong>An everyday comparison.</strong> Two people must read a staircase of books: book 1 has 1 page, book 2 has 2 pages, up to book 8 with 8 pages. One person takes books 1 to 4, and the other takes books 5 to 8. Then the first reads 10 pages and the second reads 26. If the first takes books 1, 2, 7 and 8, and the second takes books 3 to 6, both read 18 pages. The analogy stops here: in DeepInfer, the ranks also exchange data (the keys and values) in every layer, and all ranks store the full result.</p>
+<x-simplified><p>The page counts are the number of keys that each query reads in plain causal attention. The real cost per token also depends on sliding-window and sparse attention, which read a limited number of keys. See {{link concepts/sliding-window-attention}} and {{link concepts/sparse-attention-indexer}}.</p></x-simplified>
+
+<h2>The picture</h2>
+<x-diagram name="b8_cp_mirror" alt="Panel 1: eight prompt tokens t0 to t7 in four parts of two tokens. Parts 0 and 3 go to rank 0, parts 1 and 2 go to rank 1. Rank 0 computes t0, t1, t6, t7 and reads 18 keys in total; rank 1 computes t2 to t5 and also reads 18 keys. A plain split would give 10 and 26. Panel 2: six cards for one prefill step: embed all tokens and keep the own rows, project K and V for the own rows, all-gather over the CP group and reorder to the full KV, store the full KV and attend for the own queries, MoE on the own rows, and an all-gather of the hidden states after the last layer." caption="Figure: the mirror layout for one 8-token prompt on 2 CP ranks (panel 1), and what each rank does in one prefill step (panel 2). Click to zoom." />
+<p>Read panel 1 from top to bottom. The colour of a token shows its rank. In panel 2, green cards run on the own rows of one rank. Amber cards are all-gathers over the CP group. After an amber card, every rank has the data of all 8 tokens again.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: CP ranks are processes of one engine</h3>
+<p>One engine is one {{term data-parallelism | data-parallel}} replica. With <code>context_parallel_size</code> above 1, the engine starts <code>cp_size − 1</code> extra processes. The engine process itself is CP rank 0, the {{term driver-worker | driver}}:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="368-414" highlight="377,384-385,389-391,402-414" caption="CP ranks 1 to cp−1 are spawned processes. The driver Worker runs in the engine process with <code>local_rank</code> 0 and <code>cp_rank</code> 0." />
+<p>A spawned process makes a <code>Worker</code> and never returns. At the end of its constructor, a {{term cp-follower | CP follower}} enters a loop. In the loop, it gets a method name and arguments from the driver, and calls that method ({{cite deepinfer/worker/base.py:120-123}}, {{cite deepinfer/worker/base.py:129-133}}). The driver sends each call before it runs the same method itself:</p>
+<x-code file="deepinfer/worker/base.py" lines="290-302" highlight="300,302" />
+<p>The channel is a {{term shm-message-queue | MessageQueue}} in {{term posix-shm | shared memory}} on the CPU CP group ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:17-23}}, {{cite deepinfer/model_executor/parallel_utils/parallel_state.py:122-124}}). The page {{link code/shm-broadcast}} explains it.</p>
+<p>The global rank of a process is <code>engine_rank × cp_size + cp_rank</code> ({{cite deepinfer/worker/base.py:329}}). So the CP ranks of one engine are neighbours, and each CP group is a block of <code>cp_size</code> ranks ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:96-99}}). The "model parallel size" of DeepInfer is the CP size ({{cite deepinfer/config.py:171}}).</p>
+
+<h3>Step 2: the driver sends the inputs</h3>
+<p>Only the driver has the scheduler and the sequence list. The followers get <code>seq_metadata_list = None</code>. So the driver builds the {{term input-metadata}} and sends it to the followers:</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="200-230" highlight="212,217,227" caption="Driver (lines 200-212) and follower (lines 216-230). With a CUDA graph, only five small values go out. The graph broadcasts its own tensors (see the deep dive)." />
+<p><code>broadcast_tensor_dict</code> splits the dict. Small Python values and the shapes of the tensors go through the shared-memory queue. The tensor data goes through a device {{term broadcast}} (NCCL or HCCL):</p>
+<x-code file="deepinfer/model_executor/parallel_utils/communication_op.py" lines="51-82" highlight="67-68,72,77,81" />
+<p>The sampler inputs use the same function a second time in each step ({{cite deepinfer/worker/model_runner.py:250-275}}).</p>
+
+<h3>Step 3: each rank takes its mirror rows</h3>
+<p>The model reorders the rows at the start of a prefill step. Every CP rank embeds all tokens, then keeps only its own rows:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="161-170" highlight="168-170" />
+<p><code>prepare_for_mirror_cp</code> calls a {{term tilelang}} kernel that makes two index tensors ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:169-208}}):</p>
+<ul>
+  <li><code>mirror_cp_index</code>, int32 <code>[cp_mirror_len]</code>: for each row of this rank, the token index in the original batch, or −1 for a padding row ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:65-67}}).</li>
+  <li><code>mirror_cp_reverse_index</code>, int32 <code>[total_q]</code>: for each token, its row in the tensor that the CP all-gather makes ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:68-69}}).</li>
+</ul>
+<p>The method also reorders <code>positions</code> and sets <code>valid_token_mask = mirror_cp_index != −1</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:203-208}}). The C++ side computes the row count of one rank: <code>cp_mirror_len = 2 × Σ ⌈seqlen_q / (2 × cp_size)⌉</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:146-155}}).</p>
+
+<h3>Step 4: attention gathers K and V over the CP group</h3>
+<p>In a prefill step with CP, each attention layer opens a session on the CP buffer. It starts the all-gather of the projected K and V first, and computes the query projection while the data moves:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="766-797" highlight="766,782-785,792-797" />
+<p>The all-gather is a method of <code>CPManager</code>. It returns a function. The caller calls that function later to wait and to get the result:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/cp.py" lines="36-51" highlight="39-40,49-51" caption="The result has shape <code>[cp_size × rows, ...]</code>: the rows of rank 0, then the rows of rank 1, and so on." />
+<p>The layer then puts the gathered window (SWA) keys back in the original token order, with <code>mirror_cp_reverse_index</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:826-829}}). It writes the window keys of all tokens to its own SWA cache ({{cite deepinfer/model_executor/models/v4_modules/attn.py:855}}). The compressor kernels read the gathered K/V rows through the same reverse index, so the compressed cache also gets all tokens ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:34-43}}). So every CP rank holds the full KV cache of each sequence. The queries stay on their own rank: each rank computes attention only for its <code>cp_mirror_len</code> rows ({{cite deepinfer/model_executor/models/v4_modules/attn.py:859-868}}).</p>
+<p>The buffer under <code>CPManager</code> is a DeepEP {{term bucket-buffer | BucketBuffer}} ({{cite deepinfer/model_executor/parallel_utils/cp.py:16-20}}). This site does not explain DeepEP internals.</p>
+
+<h3>Step 5: the end of the forward pass, and who samples</h3>
+<p>After the last layer, a second all-gather collects the output rows. Every CP rank then has the hidden states of all tokens, in the original order:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="241-244" />
+<p>All CP ranks call the sampler, but only the driver samples. A follower builds its <code>SamplerInputs</code> without driver inputs ({{cite deepinfer/worker/model_runner.py:271-275}}). In the sampler, a follower computes the {{term logits}}, then returns an empty output ({{cite deepinfer/model_executor/layers/sampler.py:142-161}}). In a decode step it also runs the draft model ({{cite deepinfer/model_executor/layers/sampler.py:155-160}}). The code gives no reason. Our reading: the draft layers have MoE blocks, and their EP collectives need every rank ({{cite deepinfer/model_executor/models/mtp/dflash.py:389-392}}). A source comment says: "sampler is after CP, CP is transparent to the sampler" (translated, {{cite deepinfer/worker/model_runner.py:240}}).</p>
+
+<h3>Step 6: decode steps</h3>
+<p>The mirror layout is for prefill only. Both the reorder and the attention all-gather check <code>is_prompt</code> ({{cite deepinfer/model_executor/models/deepseek.py:168}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:766}}). In a decode step, the driver sends the same input metadata to all CP ranks, and each CP rank runs the full decode batch. This works because each CP rank holds the full KV cache from step 4.</p>
+<x-note title="CP in the docs">
+<p>The deployment notes say: "TP and CP are not used for now" ({{cite doc/inference_deployment_qa.md:53}}). The code and the examples support CP, for example <code>python examples/offline_inference.py --ep 2 --cp 8</code> ({{cite examples/README.md:8}}).</p>
+</x-note>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="The mirror layout: formulas and worked examples">
+<p>The repository has a plain Python reference of the kernel. Its docstring says: "Pure Python reference that directly expands the zigzag definition."</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/prepare_cp_mirror.py" lines="126-157" highlight="135-136,146-152" />
+<ol>
+  <li>Line 135: the part size of sequence <em>i</em> is <code>ps = ⌈sq / (2 × cp)⌉</code>.</li>
+  <li>Line 136: each rank gets <code>2 × ps</code> rows per sequence. <code>cu_elems</code> is the running row offset inside one rank. <code>total_per_rank</code> is <code>cp_mirror_len</code>.</li>
+  <li>Line 146: rank <em>r</em> takes block <em>r</em> (half 0) and block <code>2cp − 1 − r</code> (half 1).</li>
+  <li>Line 150: the reverse index of a token is <code>rank × total_per_rank + cu_elems[i] + half × ps + j</code>. This is its row in the gathered tensor <code>[cp × cp_mirror_len, ...]</code>.</li>
+  <li>Line 152: a slot past the end of the sequence gets −1. The row is padding.</li>
+  <li>Lines 153-156: <code>ks</code> and <code>ke</code> are the start and end of the compressed keys that the query can see. Only models with indexer attention use them ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:196-199}}).</li>
+</ol>
+<p><strong>Example 1: 8 tokens, cp = 2</strong> (values from the reference function). <code>ps = 2</code>, <code>cp_mirror_len = 4</code>.</p>
+<table>
+  <thead><tr><th>rank</th><th>blocks</th><th><code>mirror_cp_index</code></th><th>keys read (causal)</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>0, 3</td><td><code>[0, 1, 6, 7]</code></td><td>1 + 2 + 7 + 8 = 18</td></tr>
+    <tr><td>1</td><td>1, 2</td><td><code>[2, 3, 4, 5]</code></td><td>3 + 4 + 5 + 6 = 18</td></tr>
+  </tbody>
+</table>
+<p><code>mirror_cp_reverse_index = [0, 1, 4, 5, 6, 7, 2, 3]</code>. The gathered tensor has the rows <code>[t0, t1, t6, t7 | t2, t3, t4, t5]</code>. Row 4 of it is t2, so token 2 maps to 4.</p>
+<p><strong>Example 2: 16 tokens, cp = 4</strong> (eight parts of 2 tokens). The ranks get <code>[0, 1, 14, 15]</code>, <code>[2, 3, 12, 13]</code>, <code>[4, 5, 10, 11]</code> and <code>[6, 7, 8, 9]</code>. Each rank reads 34 keys. A plain split gives 10, 26, 42 and 58.</p>
+<p><strong>Example 3: padding.</strong> 10 tokens with cp = 2: <code>ps = ⌈10 / 4⌉ = 3</code>, so each rank has 6 rows. Rank 0 gets <code>[0, 1, 2, 9, −1, −1]</code>. Rank 1 gets <code>[3, 4, 5, 6, 7, 8]</code>. The −1 rows are zero rows, because <code>gather</code> fills out-of-range indices with 0 ({{cite deepinfer/model_executor/layers/tilelang_ops/gather.py:29-39}}). Their <code>valid_token_mask</code> is False, so the MoE gate masks them ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:387}}).</p>
+<p><strong>Example 4: a one-token placeholder.</strong> With cp = 2, rank 0 gets <code>[0, −1]</code> and rank 1 gets <code>[−1, −1]</code>. A rank can have only padding rows. It still takes part in every collective.</p>
+<p><strong>Why the work is balanced.</strong> For a part size <em>p</em> and part <em>k</em>, the causal key count is <code>p × (k × p) + p(p+1)/2</code>. Parts <em>r</em> and <code>2cp − 1 − r</code> add up to <code>p² × (2cp − 1) + p(p+1)</code>, which does not depend on <em>r</em>. (This is our arithmetic for a prompt with no cached context. With cached context, each query reads the same extra keys, and the sum stays equal.)</p>
+</x-deepdive>
+
+<x-deepdive title="Shapes in one CP prefill step">
+<p>One sequence of <code>sq</code> new tokens, <code>cp</code> ranks, hidden size <code>H</code> (from the checkpoint). <code>L = cp_mirror_len</code>.</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Shape on each rank</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>input_ids</code></td><td><code>[total_q]</code>, full layout</td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:33-34}}</td></tr>
+    <tr><td>embeddings</td><td><code>[total_q, H]</code>, then <code>[L, H]</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:161-170}}</td></tr>
+    <tr><td><code>positions</code>, <code>valid_token_mask</code></td><td><code>[L]</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:203-208}}</td></tr>
+    <tr><td>projected K/V of a layer</td><td><code>[L, ...]</code> own, <code>[cp × L, ...]</code> gathered</td><td>{{cite deepinfer/model_executor/parallel_utils/cp.py:42-51}}</td></tr>
+    <tr><td>current SWA keys</td><td><code>[total_q, 1, head_dim]</code> after the reorder</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:815-828}}</td></tr>
+    <tr><td>queries</td><td><code>[L, heads, head_dim]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:799}}</td></tr>
+    <tr><td>MoE input and output</td><td><code>[L, H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:565-616}}</td></tr>
+    <tr><td>model output</td><td><code>[cp × L, H]</code> gathered, then <code>[total_q, H]</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:241-244}}</td></tr>
+  </tbody>
+</table>
+<p>Example with 8 tokens and cp = 2: <code>L = 4</code>. Each rank sends 4 rows and gets 8 rows back in each all-gather.</p>
+</x-deepdive>
+
+<x-deepdive title="CPManager and the size of the CP buffer">
+<p>The model makes the CP buffer once, after the MoE buffers:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="97-125" highlight="107-110,115,121-124" />
+<ol>
+  <li>Line 104: with one CP rank there is no buffer, and <code>cp_session</code> does nothing (line 121).</li>
+  <li>Line 107: the size is <code>max_num_tokens × max_ag_bytes_per_token × cp_size</code>, plus 8 alignment pads (line 108), rounded up to the DeepEP allocation alignment (lines 109-110).</li>
+  <li><code>max_num_tokens</code> is <code>max_num_prefilling_tokens = max_num_batched_tokens // cp_size</code> ({{cite deepinfer/model_executor/model_loader.py:120}}, {{cite deepinfer/model_executor/models/deepseek.py:432-436}}).</li>
+  <li><code>max_ag_bytes_per_token</code> starts at <code>hidden_size × 2</code> (the BF16 output gather, {{cite deepinfer/model_executor/models/deepseek.py:415}}). Each attention layer can raise it: its SWA keys in FP32 plus its projected K/V and indexer keys ({{cite deepinfer/model_executor/models/v4_modules/attn.py:375-384}}).</li>
+</ol>
+<p><strong>Sessions.</strong> <code>session()</code> asserts that no other session is open ({{cite deepinfer/model_executor/parallel_utils/cp.py:26-34}}). The class docstring gives two rules: the wait functions must run inside the session, and gathered tensors alias the buffer, which the next session reuses ({{cite deepinfer/model_executor/parallel_utils/cp.py:10-14}}). So a layer must copy what it keeps, before the session ends. <code>get_inplace_tensor</code> gives a rank its slot in the gathered region, so a kernel can write its rows there directly, with no copy ({{cite deepinfer/model_executor/parallel_utils/cp.py:36-40}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:411}}).</p>
+<p><strong>Worked example</strong> (illustrative numbers): <code>max_num_batched_tokens = 32768</code> and cp = 8 give 4096 tokens per rank. With 12 KiB per token, one session needs 4096 × 12 KiB × 8 = 384 MiB, plus the pads.</p>
+</x-deepdive>
+
+<x-deepdive title="The scheduler side: alignment to 2 × cp">
+<p>The scheduler knows the CP size and pads each prompt chunk in its token budget to a multiple of <code>2 × cp</code> ({{cite csrc/engine/scheduler.hpp:90}}, {{cite csrc/engine/scheduler.hpp:1175-1176}}):</p>
+<ul>
+  <li>A chunk that does not fit is cut to the free budget, rounded down to a multiple of <code>cp_align</code> ({{cite csrc/engine/scheduler.hpp:467-472}}).</li>
+  <li>Each scheduled chunk counts as <code>⌈seqlen_q / cp_align⌉ × cp_align</code> tokens ({{cite csrc/engine/scheduler.hpp:515}}).</li>
+</ul>
+<p>Example with cp = 4 (<code>cp_align = 8</code>): a 41-token prompt counts as 48 tokens in the budget. Its mirror layout has <code>ps = ⌈41 / 8⌉ = 6</code>, so each rank gets 12 rows and 48 rows exist in total. The scheduler count matches the padded rows.</p>
+<p>The benchmark script also checks the alignment of its prefill batch: <code>cp_alignment = 2 * cp_size</code> ({{cite examples/benchmark.py:83-84}}, {{cite examples/benchmark.py:118-121}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Sizes, groups and the related settings">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Where read</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>EngineArgs.context_parallel_size</code></td><td>1</td><td>{{cite deepinfer/engine/arg_utils.py:29}}</td><td>Number of CP ranks per engine.</td></tr>
+    <tr><td><code>--cp</code> of the examples</td><td>1</td><td>{{cite examples/offline_inference.py:15}}</td><td>Passed to <code>create_llm</code>. <code>dp_size = max(ep // cp, 1)</code> ({{cite examples/offline_inference.py:27}}).</td></tr>
+    <tr><td><code>ParallelConfig.model_parallel_size</code></td><td>= CP size</td><td>{{cite deepinfer/config.py:171}}</td><td>World size = <code>max(cp × dp, enp)</code> ({{cite deepinfer/config.py:173}}).</td></tr>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code> per engine</td><td><code>cp</code> devices</td><td>{{cite examples/_config.py:55-63}}</td><td>Engine <em>e</em> sees <code>cp</code> devices from <code>(e × cp) mod N</code> on, where <code>N</code> is the device count of the host (plus <code>DEVICE_OFFSET</code>). A follower uses <code>local_rank = cp_rank % ngpus</code> ({{cite deepinfer/engine/llm_engine.py:384}}).</td></tr>
+    <tr><td>shared-memory queue</td><td>1 MiB chunks × 10</td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:123-124}}</td><td>Only when <code>cp_size &gt; 1</code>.</td></tr>
+  </tbody>
+</table>
+<p><strong>Engine types.</strong> CP is not allowed for a COMPLETION (decode-only) engine: <code>assert engine_type != EngineType.COMPLETION</code> ({{cite deepinfer/engine/llm_engine.py:248-249}}).</p>
+<p><strong>CUDA graphs.</strong> Decode steps can replay a CUDA graph. The graph was captured with <code>input_metadata_device.broadcast()</code> inside ({{cite deepinfer/worker/cuda_graph_runner.py:61-65}}). So at replay, the graph itself broadcasts the metadata tensors from rank 0, and the driver sends only five small values ({{cite deepinfer/worker/model_runner.py:202-209}}).</p>
+<p><strong>Prompt log-probabilities.</strong> Only CP rank 0 makes the result. The followers run the same chunk loop and compute the logits, but return <code>None</code> ({{cite deepinfer/model_executor/layers/sampler_utils.py:62-64}}, {{cite deepinfer/model_executor/layers/sampler_utils.py:81-106}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Keep one CP group on one host">
+<p><code>MessageQueue.create_from_process_group</code> assumes that the group does not cross hosts: every reader is a shared-memory reader ({{cite deepinfer/distributed/shm_broadcast.py:442-444}}). A follower on another host cannot open the shared memory ({{cite deepinfer/distributed/shm_broadcast.py:117-121}}). The examples give each engine <code>cp</code> devices of one host ({{cite examples/_config.py:55-63}}).</p>
+</x-warning>
+<ul>
+  <li><strong>A follower that waits forever.</strong> A follower blocks in <code>cp_broadcast_object</code> until the driver sends a call. If the driver dies, the kernel stops the follower with <code>SIGKILL</code>, because the follower set <code>PR_SET_PDEATHSIG</code> ({{cite deepinfer/worker/base.py:42-46}}, {{cite deepinfer/worker/base.py:129-130}}).</li>
+  <li><strong>A CPU tensor in a broadcast.</strong> <code>broadcast_tensor_dict</code> asserts that every tensor is on the device ({{cite deepinfer/model_executor/parallel_utils/communication_op.py:67}}). The source rank must be 0 (line 59).</li>
+  <li><strong>Nested CP sessions.</strong> <code>CPManager.session</code> asserts that no session is open ({{cite deepinfer/model_executor/parallel_utils/cp.py:28}}). The YOCO path opens its own session before the main one, "with no nesting" ({{cite deepinfer/model_executor/models/v4_modules/attn.py:773}}).</li>
+  <li><strong>Data that changes after the session.</strong> A gathered tensor aliases the buffer. The next session overwrites it ({{cite deepinfer/model_executor/parallel_utils/cp.py:12-13}}).</li>
+  <li><strong>A wrong engine type.</strong> CP with a COMPLETION engine stops start-up with an <code>AssertionError</code> ({{cite deepinfer/engine/llm_engine.py:248-249}}).</li>
+  <li><strong>Decode does not get faster.</strong> In a decode step, every CP rank runs the full batch (step 6). CP helps prefill only.</li>
+</ul>
+<p><strong>Why it matters.</strong> CP makes the prefill of a long prompt faster without a split of the weights. The mirror layout keeps the ranks equally busy, so no rank waits for a slower neighbour at each all-gather. The cost is extra memory: each CP rank stores the full KV cache.</p>
+
+<x-quiz>
+  <x-q level="easy">With <code>cp_size = 2</code>, which tokens of an 8-token prompt does rank 1 compute?
+    <x-a><p>Tokens 2, 3, 4 and 5. The prompt has 4 parts of 2 tokens. Rank 1 takes part 1 and part <code>2 × 2 − 1 − 1 = 2</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/prepare_cp_mirror.py:146}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which CP rank samples the next token, and why do the other ranks call the sampler at all?
+    <x-a><p>Only the driver (CP rank 0). The followers have no driver sampler inputs and return an empty output after the logits ({{cite deepinfer/model_executor/layers/sampler.py:145-161}}). The code does not say why they call it. In a decode step, the follower runs the draft model there (lines 155-160). Our reading: the draft layers have MoE blocks, whose EP collectives need all ranks.</p></x-a>
+  </x-q>
+  <x-q level="medium">A 41-token prompt runs with cp = 4. What is <code>cp_mirror_len</code>, and how many tokens does the scheduler charge to the budget?
+    <x-a><p><code>ps = ⌈41 / 8⌉ = 6</code>, so <code>cp_mirror_len = 2 × 6 = 12</code> rows per rank ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:151-153}}). The scheduler rounds 41 up to a multiple of <code>cp_align = 8</code>: 48 tokens ({{cite csrc/engine/scheduler.hpp:515}}). That equals 4 × 12 rows.</p></x-a>
+  </x-q>
+  <x-q level="medium">Does each CP rank hold the whole KV cache of a sequence, or only the K and V of its own rows?
+    <x-a><p>The whole KV cache. Each attention layer all-gathers the K and V and reads them in token order through <code>mirror_cp_reverse_index</code>. Then it stores the entries of all tokens ({{cite deepinfer/model_executor/models/v4_modules/attn.py:826-829}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:855}}, {{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:34-43}}). This is why a decode step can run the full batch on each CP rank.</p></x-a>
+  </x-q>
+  <x-q level="hard">In a decode step that replays a CUDA graph, the driver sends only five small values to the followers. How do the followers get the metadata tensors (slot mappings, positions)?
+    <x-a><p>The graph was captured around <code>_run_model</code>, which calls <code>input_metadata_device.broadcast()</code> when the CP group has more than one rank ({{cite deepinfer/worker/cuda_graph_runner.py:61-65}}). That method broadcasts the tensors from rank 0 with <code>cp_broadcast_multi_tensor</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:120-167}}). The device broadcast is part of the graph, so each replay sends the new values into the fixed graph buffers. The followers select the same graph from <code>total_q</code> ({{cite deepinfer/worker/model_runner.py:223-225}}).</p></x-a>
+  </x-q>
+</x-quiz>

@@ -26,11 +26,11 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B6a Layer + mHC | done | done (30 defects fixed) | yes |
 | B6b Engram + VL | done | done (36 defects fixed) | yes |
 | B7 MoE + EP | done | done (40 defects fixed) | yes |
-| B8 Scale | running | — | — |
+| B8 Scale | done | done (27 defects fixed) | yes |
 | B9 Decoding | done | done (25 defects fixed) | yes |
-| B10a SO + precision | running | — | — |
+| B10a SO + precision | done | running | — |
 | B10b Kernels + loading | running (6 pages; 2 TileLang pages DEFERRED by user) | — | — |
-| B11 Start-up + reference | running | — | — |
+| B11 Start-up + reference | done | running | — |
 | D Diagrams to 1100 | done | n/a | yes |
 | F Final pass | later | — | — |
 
@@ -43,6 +43,12 @@ Resume order after the reset:
 Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
+
+- FINAL-PASS TODO: other pages may say split groups / DP votes use the 14400 s Gloo time-out — only the default group does (facts.md B8). Check reference/env-vars and any page that mentions GLOO_TIMEOUT.
+
+- USER INSTRUCTION 2026-10-22 (usage at 77%): normal plan, but first let the 4 running subagents finish (B8/B10a/B11 fact checks, B10b writer), then build, commit and PUSH, then PAUSE for user approval. UPDATE: the user wants the B10b fact check BEFORE the build/commit/push. Then a NORMAL build (not strict; user decision 2026-10-22, because links to the deferred TileLang pages give expected warnings), commit, push, and pause. Final pass (consistency, site check) and README + final commit wait for user approval.
+
+- FINAL-PASS TODO: add a link from learn/number-formats to concepts/low-precision-formats#converter (the interactive format converter).
 
 - USER DECISION 2026-10-21: B10b option 1. Write the 6 other B10b pages now. The two TileLang pages (concepts/tilelang-kernels, code/tilelang-ops) are DEFERRED: the user will revisit them later. They stay "soon" in the nav. Reason: a safety classifier stopped the first B10b writer on concepts/tilelang-kernels (probably a false positive); we do not retry it without the user. Saved for that work: diagrams/b10b_tilelang_path.py and the B10b facts in notes/facts.md.
 

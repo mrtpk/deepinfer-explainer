@@ -1,0 +1,183 @@
+---
+title: deep_cluster/: hardware discovery and NUMA binding
+nav_title: deep_cluster/
+level: Intermediate
+prerequisites: concepts/hardware-discovery
+related: concepts/hardware-discovery, concepts/hardware-platforms, code/platform, code/worker-base, code/ve
+summary: deep_cluster is a small package next to deepinfer. Its hardware part finds the accelerator, the devices and their NUMA nodes from Linux files; its topology part binds a process to the CPU cores and memory of a NUMA node. It never imports PyTorch.
+---
+<h2>Purpose</h2>
+<p><code>deep_cluster</code> tells the rest of DeepInfer which accelerator and which devices the host has, and binds a process near its device, without any device runtime.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td>8 Python files, 656 lines: <code>hardware/</code> (<code>__init__.py</code> 35, <code>device.py</code> 182, <code>nvidia.py</code> 129, <code>ascend.py</code> 155, <code>cpu.py</code> 47) and <code>topology/</code> (<code>__init__.py</code> 9, <code>bind.py</code> 99). <code>deep_cluster/__init__.py</code> is empty.</td></tr>
+    <tr><th>Main function</th><td><code>accelerator_kind()</code> ({{cite deep_cluster/hardware/device.py:17-23}}). No classes, except a ctypes structure in <code>bind.py</code>.</td></tr>
+    <tr><th>Runs in</th><td>Any process: <code>setup.py</code>, the example launchers, the engine and worker processes, the image worker, the kernel tests. CPU only.</td></tr>
+    <tr><th>Called by</th><td><code>setup.py</code>, <code>deepinfer/__init__.py</code>, <code>platform.py</code>, <code>utils.py</code>, <code>worker/base.py</code>, <code>worker/runtime_config.py</code>, <code>engine/llm_engine.py</code>, <code>ve/multimodal_processor.py</code>, <code>vit.py</code>, examples and tests.</td></tr>
+    <tr><th>Calls</th><td>The file system (<code>/proc</code>, <code>/sys</code>, <code>/dev</code>), <code>lscpu</code> and <code>npu-smi</code> through <code>subprocess</code>, <code>libnvidia-ml</code> and <code>libnuma</code> through <code>ctypes</code>, <code>psutil</code>.</td></tr>
+    <tr><th>Not in this package</th><td>No PyTorch, no CUDA, no CANN. No choice of the Platform object (that is <code>platform.py</code>). No process launch.</td></tr>
+  </tbody>
+</table>
+<p>The package is installed together with <code>deepinfer</code>: <code>find_packages(include=("deepinfer", "deepinfer.*", "deep_cluster", "deep_cluster.*"))</code> ({{cite setup.py:87}}). The example scripts add the repository root to <code>sys.path</code>, so they can import it from a clean checkout ({{cite examples/_config.py:17-24}}).</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b8_hw_discovery" alt="Panel 1: accelerator_kind tests Ascend files, then NVIDIA files, else returns cpu. Panel 2: a table of the device count, the visible-device variable, the NUMA source and the BF16 TFLOPS limit for each kind. Panel 3: the callers in time order: setup.py, the example launcher, import deepinfer, the first use of PLATFORM, worker start-up and engine start-up." caption="Figure: the decision, the derived values and the callers of deep_cluster. The page Hardware discovery explains the same figure. Click to zoom." />
+
+<h3>Who calls it</h3>
+<table>
+  <thead><tr><th>Caller</th><th>Function</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite setup.py:10-12}}</td><td><code>accelerator_kind</code></td><td>Build an NPU or a CUDA extension.</td></tr>
+    <tr><td>{{cite deepinfer/__init__.py:15-25}}</td><td><code>accelerator_kind</code></td><td>Folder tag of the compiled extension, if <code>DEEPINFER_ACCELERATOR</code> is empty.</td></tr>
+    <tr><td>{{cite deepinfer/platform.py:222-227}}</td><td><code>accelerator_kind</code></td><td>Make <code>PlatformNPU</code> or <code>PlatformGPU</code>.</td></tr>
+    <tr><td>{{cite deepinfer/worker/runtime_config.py:13-26}}</td><td><code>accelerator_kind</code>, <code>get_actual_num_gpus</code></td><td>On NVIDIA with Engram GPU storage, show all GPUs to the CUDA driver for <code>cuInit</code>, then restore the variable.</td></tr>
+    <tr><td>{{cite deepinfer/utils.py:143-161}}</td><td><code>get_actual_num_gpus</code>, <code>set_cpu_affinity</code></td><td><code>bind_cpu</code> and <code>get_idle_cpus</code>: cores per device.</td></tr>
+    <tr><td>{{cite deepinfer/worker/base.py:347-357}}</td><td><code>which_numa</code>, <code>bind_numa</code></td><td>Bind each worker to the NUMA node of its device.</td></tr>
+    <tr><td>{{cite deepinfer/engine/llm_engine.py:298-305}}</td><td><code>get_bf16_tflops_limit</code></td><td>The peak speed for the MFU statistic.</td></tr>
+    <tr><td>{{cite deepinfer/ve/multimodal_processor.py:172-192}}</td><td><code>which_numa</code>, <code>bind_numa</code>, <code>set_cpu_affinity</code>, <code>get_actual_num_gpus</code></td><td>Bind the image worker.</td></tr>
+    <tr><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:42}}</td><td><code>is_sm_major_10</code>, <code>accelerator_kind</code></td><td>Choose a BF16 path in the vision encoder.</td></tr>
+    <tr><td>{{cite examples/_config.py:26}}, {{cite examples/offline_inference.py:8}}</td><td><code>accelerator_kind</code>, <code>get_actual_num_gpus</code></td><td>Device split per engine; NVIDIA-only defaults.</td></tr>
+    <tr><td>{{cite deepinfer/model_executor/layers/tilelang_ops/conftest.py:27-46}}</td><td><code>accelerator_kind</code>, <code>get_actual_num_gpus</code></td><td>One GPU per pytest-xdist worker.</td></tr>
+  </tbody>
+</table>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>Files:</strong> <code>/dev/davinci_manager</code>, <code>/dev/davinci&lt;N&gt;</code>, <code>/sys/class/ubcore/udma*</code>, <code>/proc/driver/nvidia/gpus/*</code>, <code>/dev/nvidia&lt;N&gt;</code>, <code>/sys/bus/pci/devices/*/numa_node</code>, <code>/sys/class/infiniband/mlx5_*/device/numa_node</code>.</li>
+  <li><strong>Tools:</strong> <code>lscpu -p=CPU,NODE,SOCKET,CORE,ONLINE</code> ({{cite deep_cluster/hardware/cpu.py:17-21}}) and <code>npu-smi info -t topo -i 0</code> ({{cite deep_cluster/hardware/ascend.py:109}}).</li>
+  <li><strong>Libraries through ctypes:</strong> <code>libnvidia-ml</code> ({{cite deep_cluster/hardware/nvidia.py:82-108}}) and <code>libnuma.so.1</code> ({{cite deep_cluster/topology/bind.py:25-39}}).</li>
+  <li><strong>Python package:</strong> <code>psutil</code>, imported inside <code>set_cpu_affinity</code> ({{cite deep_cluster/topology/bind.py:96-99}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>hardware/__init__.py</code></td><td>{{cite deep_cluster/hardware/__init__.py:3-18}}</td><td>Re-exports the 14 public functions of <code>device.py</code>.</td></tr>
+    <tr><td><code>accelerator_kind</code></td><td>{{cite deep_cluster/hardware/device.py:17-23}}</td><td><code>"ascend"</code>, <code>"nvidia"</code> or <code>"cpu"</code>; cached.</td></tr>
+    <tr><td><code>physical_device_count</code></td><td>{{cite deep_cluster/hardware/device.py:26-33}}</td><td>All devices of the kind; cached.</td></tr>
+    <tr><td><code>visible_device_env_name</code>, <code>visible_devices</code>, <code>visible_device_ids</code>, <code>visible_device_count</code></td><td>{{cite deep_cluster/hardware/device.py:36-78}}</td><td>Read the visible-device variable of the kind.</td></tr>
+    <tr><td><code>physical_device_id</code></td><td>{{cite deep_cluster/hardware/device.py:81-90}}</td><td>Visible index to id string.</td></tr>
+    <tr><td><code>set_visible_devices</code>, <code>assign_visible_devices</code></td><td>{{cite deep_cluster/hardware/device.py:93-126}}</td><td>Write the variable; split devices by rank.</td></tr>
+    <tr><td><code>device_numa_node</code></td><td>{{cite deep_cluster/hardware/device.py:129-136}}</td><td>NUMA node of a physical device; cached.</td></tr>
+    <tr><td><code>get_actual_num_gpus</code>, <code>num_gpus</code></td><td>{{cite deep_cluster/hardware/device.py:139-148}}</td><td>Physical count; visible count.</td></tr>
+    <tr><td><code>get_bf16_tflops_limit</code>, <code>is_sm_major_10</code></td><td>{{cite deep_cluster/hardware/device.py:151-164}}</td><td>Peak BF16 TFLOPS; SM 10.x check through NVML.</td></tr>
+    <tr><td><code>nvidia.device_ids</code>, <code>device_numa_node</code>, <code>compute_capability</code></td><td>{{cite deep_cluster/hardware/nvidia.py:40-129}}</td><td>NVIDIA discovery.</td></tr>
+    <tr><td><code>ascend.is_available</code>, <code>discover_npu_devices</code>, <code>device_numa_node</code>, <code>IS_NPU</code></td><td>{{cite deep_cluster/hardware/ascend.py:61-155}}</td><td>Ascend discovery.</td></tr>
+    <tr><td><code>cpu.physical_core_cpus_by_numa</code></td><td>{{cite deep_cluster/hardware/cpu.py:9-47}}</td><td>Physical cores per NUMA node, from <code>lscpu</code>; cached.</td></tr>
+    <tr><td><code>which_numa</code>, <code>bind_numa</code>, <code>set_cpu_affinity</code></td><td>{{cite deep_cluster/topology/bind.py:42-99}}</td><td>Find the node of a device or NIC; bind CPU and memory; set CPU affinity.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>device.py</code>: the dispatcher</h3>
+<p>The functions that depend on the hardware call <code>accelerator_kind()</code> first. <code>physical_device_count</code> and <code>device_numa_node</code> then call the function with the same name in <code>ascend.py</code> or <code>nvidia.py</code>. The <code>visible_*</code> functions read the variable whose name depends on the kind:</p>
+<x-code file="deep_cluster/hardware/device.py" lines="17-43" highlight="19-23,28-33,38-43" />
+<p>The CPU kind has no devices: the count is 0 and the variable name is <code>None</code>. Most functions take a keyword-only <code>_root</code>, so a test can point the paths at a fake tree (<code>get_bf16_tflops_limit</code> and <code>is_sm_major_10</code> do not). The <code>@functools.cache</code> key includes <code>_root</code>.</p>
+
+<h3><code>nvidia.py</code>: procfs first, device nodes second</h3>
+<x-code file="deep_cluster/hardware/nvidia.py" lines="14-52" highlight="19-23,33-35,41-44" />
+<ol>
+  <li>Lines 14-15: <code>_path</code> joins the root and an absolute path, so <code>_root=Path("/tmp/x")</code> reads <code>/tmp/x/proc/...</code>.</li>
+  <li>Lines 18-25: one folder per GPU in <code>/proc/driver/nvidia/gpus</code>, sorted by name. An unreadable folder raises <code>OSError</code> with the path.</li>
+  <li>Lines 28-37: numbers of the files <code>/dev/nvidia&lt;N&gt;</code>, sorted. The pattern <code>^nvidia(\d+)$</code> skips <code>nvidiactl</code> and <code>nvidia-uvm</code> ({{cite deep_cluster/hardware/nvidia.py:11}}).</li>
+  <li>Lines 40-44: the procfs names win; the device nodes are the fall-back.</li>
+</ol>
+
+<h3><code>ascend.py</code>: three signals and a device list</h3>
+<x-code file="deep_cluster/hardware/ascend.py" lines="61-89" highlight="62,64-67,73-85" />
+<p><code>discover_npu_devices</code> returns one tuple per device: the ubcore entry name, a physical id, and the raw NUMA value (−1 if unknown). The physical id is the name of the folder that <code>device</code> resolves to, unless that name is <code>"device"</code> (line 80-81). The module also has <code>IS_NPU</code>, set at import time from <code>/dev/davinci_manager</code> only ({{cite deep_cluster/hardware/ascend.py:153}}), and its own <code>get_actual_num_gpus</code>, which raises on a host with no Ascend device ({{cite deep_cluster/hardware/ascend.py:147-150}}). The public <code>get_actual_num_gpus</code> is the one in <code>device.py</code>.</p>
+
+<h3><code>cpu.py</code>: physical cores per NUMA node</h3>
+<x-code file="deep_cluster/hardware/cpu.py" lines="9-47" highlight="17-21,39-42,44-47" />
+<p>For each <code>(node, socket, core)</code>, the function keeps the smallest logical CPU number. So a core with two hyper-threads counts once. Offline CPUs and CPUs with no node (−1) are skipped (line 39). Only the Ascend NUMA code uses this function.</p>
+
+<h3><code>topology/bind.py</code>: from a device to a bound process</h3>
+<x-code file="deep_cluster/topology/bind.py" lines="42-71" highlight="49,52-61,65-67" />
+<ol>
+  <li>Line 49: the caller must give a device index or an InfiniBand index.</li>
+  <li>Lines 51-61: for a device, map the visible index to the physical id, then to the physical index (trailing digits on Ascend), then to the NUMA node.</li>
+  <li>Lines 62-63: any <code>IndexError</code> on the way becomes <code>AssertionError("no such GPU found")</code>.</li>
+  <li>Lines 65-71: for an InfiniBand index <em>i</em>, read <code>/sys/class/infiniband/mlx5_&lt;i&gt;/device/numa_node</code>. No caller in the repository uses this branch.</li>
+</ol>
+<p><code>bind_numa</code> then sets the CPU affinity and the memory policy with libnuma ({{cite deep_cluster/topology/bind.py:79-93}}), and <code>set_cpu_affinity</code> sets a CPU list with <code>psutil</code> ({{cite deep_cluster/topology/bind.py:96-99}}). The page {{link concepts/hardware-discovery}} reads <code>bind_numa</code> line by line.</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data types and caching">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Cached</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><code>accelerator_kind()</code></td><td><code>Literal["cpu", "nvidia", "ascend"]</code></td><td>yes</td><td><code>"nvidia"</code></td></tr>
+    <tr><td><code>nvidia.device_ids()</code></td><td><code>tuple[str, ...]</code></td><td>no</td><td><code>("0000:18:00.0", ...)</code></td></tr>
+    <tr><td><code>visible_device_ids()</code></td><td><code>tuple[str, ...]</code></td><td>no (reads the variable each time)</td><td><code>("2", "3")</code></td></tr>
+    <tr><td><code>discover_npu_devices()</code></td><td><code>list[tuple[str, str, int]]</code></td><td>no</td><td><code>[("udma0", "udma0", 0), ...]</code></td></tr>
+    <tr><td><code>physical_core_cpus_by_numa()</code></td><td><code>dict[int, list[int]]</code></td><td>yes (size 1)</td><td><code>{0: [0..63], 1: [64..127]}</code></td></tr>
+    <tr><td><code>compute_capability()</code></td><td><code>tuple[int, int] | None</code></td><td>yes</td><td><code>(10, 0)</code></td></tr>
+    <tr><td><code>device_numa_node(i)</code></td><td><code>int</code></td><td>yes</td><td><code>1</code></td></tr>
+  </tbody>
+</table>
+<p>The cached values never change during the life of a process. A process that changes <code>CUDA_VISIBLE_DEVICES</code> still gets fresh answers from the <code>visible_*</code> functions, because those are not cached.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one engine on a host with 8 GPUs">
+<p>Run <code>examples/offline_inference.py --ep 4 --cp 2</code> on one host with 8 SM100 GPUs, 2 NUMA nodes, 128 physical cores. Two engines start (DP 2).</p>
+<ol>
+  <li>The launcher imports <code>deep_cluster.hardware</code>: <code>accelerator_kind() = "nvidia"</code>, <code>get_actual_num_gpus() = 8</code>.</li>
+  <li><code>setup_cuda_visible_devices(engine_rank=1, cp_size=2, device_count=8)</code>: <code>local_engine_rank = 1 × 2 % 8 // 2 = 1</code>, so <code>CUDA_VISIBLE_DEVICES = "2,3"</code> ({{cite examples/_config.py:55-61}}).</li>
+  <li>The engine 1 process makes its driver worker with <code>local_rank = 0</code>: <code>which_numa(0)</code> → physical id <code>"2"</code> → physical index 2 → the NUMA node of GPU 2, say 0. <code>bind_numa(0)</code> binds to node 0.</li>
+  <li><code>bind_cpu(gpu_id=2)</code>: 128 // 8 = 16 cores per GPU, so cores 32 to 47 ({{cite deepinfer/utils.py:143-151}}).</li>
+  <li>The CP follower (<code>local_rank = 1</code>) does the same for GPU 3: cores 48 to 63.</li>
+  <li>The engine computes <code>tflops_limit = 2250 × 2 = 4500</code> on x86 ({{cite deepinfer/engine/llm_engine.py:304}}).</li>
+</ol>
+<p>The NUMA node number in step 3 is an example. On a real host, it comes from <code>/sys/bus/pci/devices/&lt;bus id of GPU 2&gt;/numa_node</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Ascend: what a visible id looks like">
+<p>On Ascend, <code>which_numa</code> reads the visible id with <code>re.search(r"(\d+)$", identifier)</code>, so <code>"5"</code> and <code>"npu5"</code> both give 5 ({{cite deep_cluster/topology/bind.py:56-58}}). An id that starts with <code>"-"</code> raises <code>IndexError</code> (lines 53-54), which becomes the <code>AssertionError</code>. A value of exactly <code>"-1"</code> gives an empty visible list, so <code>physical_device_id</code> raises first, with the same result ({{cite deep_cluster/hardware/device.py:64-65}}, {{cite deep_cluster/hardware/device.py:88-89}}). The example launcher copies <code>CUDA_VISIBLE_DEVICES</code> into <code>ASCEND_RT_VISIBLE_DEVICES</code> ({{cite examples/_config.py:62-63}}), so the two variables agree, as <code>PlatformNPU</code> requires.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Function</th><th>Situation</th><th>Raises</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>physical_device_id</code></td><td>index outside the visible list</td><td><code>IndexError</code></td><td>{{cite deep_cluster/hardware/device.py:88-89}}</td></tr>
+    <tr><td><code>set_visible_devices</code></td><td>kind is <code>"cpu"</code></td><td><code>RuntimeError</code></td><td>{{cite deep_cluster/hardware/device.py:101-102}}</td></tr>
+    <tr><td><code>assign_visible_devices</code></td><td><code>devices_per_rank ≤ 0</code>, or the count is not divisible</td><td><code>ValueError</code></td><td>{{cite deep_cluster/hardware/device.py:117-121}}</td></tr>
+    <tr><td><code>device_numa_node</code></td><td>kind is <code>"cpu"</code></td><td><code>IndexError</code></td><td>{{cite deep_cluster/hardware/device.py:136}}</td></tr>
+    <tr><td><code>get_bf16_tflops_limit</code></td><td>not Ascend, not SM 10.x</td><td><code>RuntimeError("unknown GPU type")</code></td><td>{{cite deep_cluster/hardware/device.py:156}}</td></tr>
+    <tr><td><code>nvidia.device_numa_node</code></td><td>no procfs entries, or no NUMA file</td><td><code>RuntimeError</code></td><td>{{cite deep_cluster/hardware/nvidia.py:61-62}}, {{cite deep_cluster/hardware/nvidia.py:79}}</td></tr>
+    <tr><td><code>ascend.device_numa_node</code></td><td>raw NUMA is −1</td><td><code>RuntimeError</code></td><td>{{cite deep_cluster/hardware/ascend.py:142-143}}</td></tr>
+    <tr><td><code>cpu.physical_core_cpus_by_numa</code></td><td><code>lscpu</code> missing or fails</td><td><code>FileNotFoundError</code> or <code>CalledProcessError</code> (caught by the Ascend caller)</td><td>{{cite deep_cluster/hardware/cpu.py:17-21}}</td></tr>
+    <tr><td><code>which_numa</code></td><td>bad index, or neither argument</td><td><code>AssertionError</code></td><td>{{cite deep_cluster/topology/bind.py:49}}, {{cite deep_cluster/topology/bind.py:62-63}}</td></tr>
+    <tr><td><code>_libnuma</code></td><td>no <code>libnuma.so.1</code></td><td><code>OSError</code></td><td>{{cite deep_cluster/topology/bind.py:27-30}}</td></tr>
+    <tr><td><code>bind_numa</code></td><td>a libnuma call fails</td><td>none: prints to stderr, returns −1</td><td>{{cite deep_cluster/topology/bind.py:74-92}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Environment variables.</strong> The package reads only <code>CUDA_VISIBLE_DEVICES</code> or <code>ASCEND_RT_VISIBLE_DEVICES</code> (through <code>visible_devices</code>), and writes them in <code>set_visible_devices</code>. It reads no <code>DEEPINFER_*</code> variable.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/hardware-discovery}}: the concept page for this package, with the NUMA and CPU binding in detail.</li>
+  <li>{{link concepts/hardware-platforms}}: how <code>accelerator_kind()</code> becomes the Platform object.</li>
+  <li>{{link code/worker-base}}: where each worker binds itself.</li>
+  <li>{{link code/ve}}: the image worker, which binds itself too.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which files in <code>/dev</code> make <code>accelerator_kind()</code> return <code>"nvidia"</code> when <code>/proc/driver/nvidia/gpus</code> does not exist?
+    <x-a><p>Files named <code>nvidia&lt;N&gt;</code>, such as <code>/dev/nvidia0</code>. The pattern <code>^nvidia(\d+)$</code> does not match <code>nvidiactl</code> ({{cite deep_cluster/hardware/nvidia.py:11}}, {{cite deep_cluster/hardware/nvidia.py:28-44}}). And no Ascend signal must exist, because Ascend is tested first.</p></x-a>
+  </x-q>
+  <x-q level="easy">Does <code>get_actual_num_gpus()</code> count the visible devices?
+    <x-a><p>No. It returns <code>physical_device_count()</code>, all devices of the host ({{cite deep_cluster/hardware/device.py:139-140}}). <code>num_gpus()</code> returns the visible count ({{cite deep_cluster/hardware/device.py:143-148}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With <code>CUDA_VISIBLE_DEVICES="-1"</code> on an NVIDIA host with 8 GPUs, what do <code>visible_device_ids()</code> and <code>visible_device_count()</code> return?
+    <x-a><p><code>()</code> and 0. The value <code>"-1"</code> means no visible device ({{cite deep_cluster/hardware/device.py:64-65}}), and the count is <code>min(0, 8) = 0</code> ({{cite deep_cluster/hardware/device.py:74-78}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>cpu.physical_core_cpus_by_numa</code> keep only the smallest logical CPU of each <code>(node, socket, core)</code>?
+    <x-a><p>So that each physical core appears once, not once per hardware thread. The Ascend NUMA code compares an NPU's CPU affinity with these sets, and the node with the largest overlap wins ({{cite deep_cluster/hardware/cpu.py:13-15}}, {{cite deep_cluster/hardware/ascend.py:121-126}}). The docstring says the lists "contain only physical cores (one id per core, not per hardware thread)".</p></x-a>
+  </x-q>
+</x-quiz>

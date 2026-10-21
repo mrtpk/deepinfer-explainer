@@ -1,0 +1,179 @@
+---
+title: Data parallelism and step votes
+nav_title: DP and step votes
+level: Intermediate
+prerequisites: learn/parallelism, learn/prefill-decode, concepts/scheduler
+related: concepts/scheduler, concepts/engine-step-loop, concepts/expert-parallelism, concepts/context-parallelism, concepts/eplb, tours/multi-gpu-step, code/scheduler-hpp, code/llm-engine, code/parallel-state
+summary: Each data-parallel replica is a separate engine process with its own requests. All replicas must run the same kind of step at the same time, so they vote with all-reduces over the DP group.
+---
+<x-sentence>Each data-parallel replica is its own engine process, but the MoE layers connect them. So the replicas vote with all-reduces, and then all run a prefill step or all run a decode step.</x-sentence>
+
+<h2>The idea</h2>
+<p>DeepInfer uses {{term data-parallelism}} (DP) for attention. One DP replica is one engine: one Python process with its own <code>LLMEngine</code>, its own scheduler, its own requests and its own KV cache. Replicas do not share requests. The docs say "attention uses data parallelism (#DP = #EP)" ({{cite doc/inference_deployment_qa.md:33}}).</p>
+<p>The replicas are not independent, because of the MoE layers. With {{term expert-parallelism}}, each rank holds only some experts. In each MoE layer, DeepEP sends tokens to the ranks of their experts and back. These are {{term collective | collectives}}: every rank of the EP group must call them, also a rank with no tokens.</p>
+<p>So the replicas must keep in step. Three rules make this true:</p>
+<ol>
+  <li><strong>The same number of steps.</strong> A replica keeps calling <code>step()</code> while <em>any</em> replica has work.</li>
+  <li><strong>The same kind of step.</strong> At a prefill {{term attempt-point | attempt point}}, the replicas vote. Then all run a prefill step, or all run a decode step.</li>
+  <li><strong>A step with no work is still a step.</strong> A replica with nothing to do runs a {{term placeholder-step | placeholder step}}: the model runs on one dummy sequence.</li>
+</ol>
+<p>Each vote is an {{term all-reduce}} over the DP group. We call it a {{term step-vote | step vote}}.</p>
+<p><strong>An everyday comparison.</strong> Think of rowers in one boat. Each rower has an own oar and own strength, like a replica with its own requests. The boat moves well only if all rowers pull at the same time. Before a change of stroke, the crew agrees on the new stroke. A rower with no strength left still moves the oar with the others. The analogy stops at the vote: DeepInfer replicas do not vote before every step, only at attempt points. Between attempt points, all replicas run decode steps without a vote.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b8_dp_votes" alt="Panel 1: a grid of steps for four replicas at decode_step 69, 70 (ALL point), 71, 99, 100 (ANY point) and 0 (ALL point). Replicas 0 to 2 run decode steps; replica 3 runs empty decode steps. At 70 the ALL vote fails because replica 3 has no work. At 100 the ANY vote succeeds: replicas 0 to 2 prefill and replica 3 runs an empty prefill step. At 0 the ALL vote fails again. Panel 2: two lists of the device collectives of a prefill step and of a decode step, which differ, and a rule that a collective finishes only when every rank calls it." caption="Figure: what four replicas run around two attempt points (panel 1), and why one step type for all replicas is necessary (panel 2). Click to zoom." />
+<p>Read panel 1 column by column. A column is one engine step, the same step on all four replicas. Grey dashed cells are placeholder steps. Panel 2 lists the differences between the two step types. A replica in a prefill step and a replica in a decode step call different collectives, so they would wait for each other.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: one process per replica</h3>
+<p>The example launcher starts one process per DP rank. It uses the <code>spawn</code> method and waits for all of them:</p>
+<x-code file="examples/_launch.py" lines="26-50" highlight="38-40" caption="With RANK and WORLD_SIZE (number of hosts), each host starts only its own DP ranks. With dp_size 1, the function runs in the current process." />
+<p>Each process makes its own <code>LLM</code> with <code>engine_rank = dp_rank</code> ({{cite examples/offline_inference.py:45-51}}, {{cite examples/_config.py:113-117}}). <code>ParallelConfig</code> stores <code>data_parallel_rank = engine_rank % data_parallel_size</code> ({{cite deepinfer/config.py:167}}). The {{term engine-rank | engine rank}} also sets the global rank: <code>engine_rank × cp_size + cp_rank</code> ({{cite deepinfer/worker/base.py:329}}).</p>
+<p>The example gives the replicas different work on purpose: replica <em>r</em> gets <code>r + 1</code> copies of the test prompts ({{cite examples/_prompts.py:100}}). So replica 0 finishes first and then runs placeholder steps until the last replica is done.</p>
+
+<h3>Step 2: the DP group</h3>
+<p><code>create_process_groups</code> makes the DP group and a Gloo (CPU) copy of it:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="91-94" />
+<p>The rearrange puts ranks with the same <code>cp_rank</code> into one group. With CP size 1, the DP group is all engines. With CP size 2 and 4 engines, the DP groups are <code>[0, 2, 4, 6]</code> and <code>[1, 3, 5, 7]</code>. The scheduler runs only in the engine process (CP rank 0), so only the group <code>[0, 2, 4, 6]</code> votes.</p>
+<p>The engine gives the scheduler the Gloo copy when {{term zos}} is on (the default for a NORMAL engine), else the device group ({{cite deepinfer/engine/llm_engine.py:313}}). The scheduler stores the choice and puts its vote tensor on the CPU or on the device ({{cite csrc/engine/scheduler.hpp:109-111}}, {{cite csrc/engine/scheduler.hpp:170-182}}).</p>
+
+<h3>Step 3: the same number of steps</h3>
+<p><code>LLM._run_engine</code> calls <code>step()</code> while <code>has_unfinished_requests()</code> is true ({{cite deepinfer/entrypoints/llm.py:176-178}}). That function takes the maximum over the DP group:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="665-679" highlight="673-678" />
+<p>So the loop ends on all replicas in the same call. A replica with no requests keeps calling <code>step()</code> until the busiest replica is done.</p>
+
+<h3>Step 4: the same kind of step</h3>
+<p>The C++ scheduler makes the decision in <code>_schedule</code>, in the branch for the NORMAL engine:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="295-341" highlight="308-309,313,316,318,332,340">
+<x-tr line="296">NORMAL engine: decide whether the whole group runs a prompt step or a decode step in this step. Inside DP, the type must be the same; a vote makes it the same.</x-tr>
+<x-tr line="299-300">ALL point (every prefill_attempt_interval decode steps): prefill only if all ranks have prefill work. This prevents steps where one rank works and the other ranks run empty prompt steps with it.</x-tr>
+<x-tr line="301-303">ANY point (every prefill_any_attempt_interval decode steps): prefill together if one rank has work. This is the safety net for an isolated rank: its prefill waits at most this many decode steps. If both kinds of point fall on the same step, it counts as ANY.</x-tr>
+<x-tr line="305-307">A prompt step sets decode_step to 0 (see schedule()). So the step right after a prefill has decode_step == 0 and is an ALL point again: to prefill again, all ranks must have work. decode_step is the same on every rank, so the number and the meaning of the votes match in the group, and the all-reduce does not hang.</x-tr>
+<x-tr line="328-331">Second vote: confirm that some rank really scheduled a prefill. "want" looked only at a non-empty waiting queue, but _schedule_prefill can still come back empty (slots full, not enough KV blocks). If the whole group comes back empty, the step must be a decode step. A forced empty prompt step would set decode_step to 0; the next step would vote and come back empty again; with running full and waiting not empty, this is an endless loop.</x-tr>
+<x-tr line="339">Some rank in the group really runs a prompt step: this rank runs an empty prompt step with it, so that the step type stays the same.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 308-312: if <code>decode_step</code> is not an attempt point, the step is a decode step. No vote runs.</li>
+  <li>Line 313: this replica "wants" a prefill if the KV cache use is 90 % or less and the front of <code>waiting</code> is schedulable.</li>
+  <li>Lines 315-319: vote 1, an all-reduce MIN. The encoding makes MIN mean "any" at an ANY point and "all" at an ALL point.</li>
+  <li>Lines 324-326: only a replica that wants a prefill tries to schedule one.</li>
+  <li>Line 332: vote 2. If no replica got a batch, all run a decode step.</li>
+  <li>Line 340: a replica with no batch returns an empty prompt step. The engine turns it into a placeholder step.</li>
+</ol>
+<p><code>decode_step</code> is set to 0 after a prompt step and goes up by 1 after a decode step ({{cite csrc/engine/scheduler.hpp:676-680}}). All replicas run the same step types, so the counter has the same value on all of them. The page {{link concepts/scheduler}} explains the intervals and the watermark in full.</p>
+
+<h3>Step 5: placeholder steps</h3>
+<p>The engine marks a step with no scheduled sequence as a placeholder ({{cite deepinfer/engine/llm_engine.py:972}}). The worker then runs the model on one dummy sequence:</p>
+<x-code file="deepinfer/worker/worker.py" lines="121-127" highlight="125-127" />
+<p>The dummy sequence has one token with id 0, block table <code>[0]</code> and greedy sampling ({{cite deepinfer/worker/model_runner.py:386-403}}). The free list of the block manager starts at block 1, so block 0 is never given to a real sequence ({{cite csrc/engine/block_manager.hpp:27-30}}). So the dummy step does not change the data of real sequences. The model still runs every layer, so every MoE collective runs. The engine ignores the sampler output of a placeholder step ({{cite deepinfer/engine/llm_engine.py:987}}).</p>
+
+<h3>Step 6: why one step type</h3>
+<p>The source comment states the rule (line 296 above) but not the reason. The code shows these collectives in a step:</p>
+<ul>
+  <li><strong>MoE dispatch and combine</strong> over the EP group, in every MoE layer ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:565-616}}). The EP group is a block of <code>ep_size</code> neighbour ranks, or the world group ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:101-106}}). So it holds the ranks of several replicas. The dispatch passes a different token limit in a prefill step and in a decode step ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:476}}).</li>
+  <li><strong>The draft model</strong> runs only in decode steps, and its layers have MoE blocks ({{cite deepinfer/model_executor/layers/sampler.py:236-248}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:389-392}}).</li>
+  <li><strong>CP all-gathers</strong> run only in prefill steps ({{cite deepinfer/model_executor/models/v4_modules/attn.py:766}}).</li>
+  <li><strong>The EPLB statistics</strong> run an all-gather over the EP group once every 128 steps (<code>DEEPINFER_MOE_LB_STAT_INTERVAL</code>, {{cite deepinfer/environ.py:118}}, {{cite deepinfer/model_executor/eplb/__init__.py:167-190}}). This needs the same number of steps on all ranks.</li>
+</ul>
+<p>A collective finishes only when every rank of the group calls it. If two ranks call different collectives, or the same collective with different arguments, they can wait for each other with no end. (This is general behaviour of collectives, not a DeepInfer rule.)</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="All the all-reduces of one step">
+<table>
+  <thead><tr><th>When</th><th>Value sent by each replica</th><th>Op</th><th>Meaning of the result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>every loop check</td><td><code>1</code> if it has unfinished work</td><td>MAX</td><td><code>1</code>: some replica has work, keep stepping</td><td>{{cite deepinfer/engine/llm_engine.py:673-678}}</td></tr>
+    <tr><td>ANY point, vote 1</td><td><code>0</code> if it wants a prefill, else <code>1</code></td><td>MIN</td><td><code>0</code>: at least one wants</td><td>{{cite csrc/engine/scheduler.hpp:316}}</td></tr>
+    <tr><td>ALL point, vote 1</td><td><code>1</code> if it wants a prefill, else <code>0</code></td><td>MIN</td><td><code>1</code>: all want</td><td>{{cite csrc/engine/scheduler.hpp:318}}</td></tr>
+    <tr><td>vote 2 (only after vote 1 passes)</td><td><code>0</code> if it has a batch, else <code>1</code></td><td>MIN</td><td><code>0</code>: at least one has a batch</td><td>{{cite csrc/engine/scheduler.hpp:332}}</td></tr>
+  </tbody>
+</table>
+<p>So a normal decode step has one all-reduce: the loop check. An attempt point has two or three. The vote tensors are one int32 value ({{cite csrc/engine/scheduler.hpp:170-182}}). The loop check uses one int64 value ({{cite deepinfer/engine/llm_engine.py:676}}).</p>
+<p><strong>Device or CPU.</strong> With ZOS on, both use the Gloo group and CPU tensors ({{cite deepinfer/engine/llm_engine.py:667-669}}, {{cite deepinfer/engine/llm_engine.py:313}}). A device all-reduce followed by <code>.item()</code> waits for the device. A CPU vote does not. With ZOS off, both use the device group.</p>
+<p><strong>A detail with one replica.</strong> The comment above <code>_dp_allreduce</code> says that it communicates also when <code>dp_size == 1</code>, and the caller must skip it ({{cite csrc/engine/scheduler.hpp:169}}). <code>_schedule</code> does not skip it. With one replica, the vote is an all-reduce over a group of one rank. The loop check in Python does skip it ({{cite deepinfer/engine/llm_engine.py:675}}).</p>
+</x-deepdive>
+
+<x-deepdive title="A worked example with four replicas">
+<p>Setting: <code>--ep 4</code>, so 4 replicas and an EP group of 4 ranks ({{cite examples/offline_inference.py:24-28}}). Default intervals: ALL every 70, ANY every 100 ({{cite deepinfer/environ.py:174-177}}). Replicas 0-2 have running sequences. Replica 3 has none.</p>
+<ol>
+  <li><code>decode_step</code> 1 to 69: decode steps, no vote. Replica 3 runs placeholder decode steps.</li>
+  <li><code>decode_step = 70</code> (ALL): one new request has arrived at each of replicas 0, 1 and 2. Vote 1: <code>MIN(1, 1, 1, 0) = 0</code>. No prefill. All decode.</li>
+  <li>71 to 99: decode steps, no vote. The new requests wait.</li>
+  <li>100 (ANY): vote 1: <code>MIN(0, 0, 0, 1) = 0</code>, so a prefill step. Replicas 0-2 schedule their prompts. Vote 2: <code>MIN(0, 0, 0, 1) = 0</code>. Replica 3 returns an empty prompt step and runs a placeholder prefill. <code>decode_step</code> becomes 0 on all replicas.</li>
+  <li>Next step, <code>decode_step = 0</code> (ALL): replica 0 has a second chunk to prefill. Replica 3 has nothing, so vote 1 fails. All decode, and <code>decode_step</code> becomes 1. The second chunk waits until step 70 (ALL, fails again if replica 3 is still empty) or step 100 (ANY).</li>
+</ol>
+<p>The result: the new requests waited 30 decode steps for their first prefill. Without the idle replica 3, they would have started at step 70. The ANY points bound the wait: a prefill waits at most about 100 decode steps, the comment says ({{cite csrc/engine/scheduler.hpp:301-302}}).</p>
+<p>Where the 90 % watermark comes in: a replica with a full KV cache does not want a prefill (line 313). At an ALL point it blocks the others. At an ANY point the others prefill without it.</p>
+</x-deepdive>
+
+<x-deepdive title="Data-parallel load balancing: in the docs, not in this release">
+<p>In this release, nothing moves requests between replicas. Each process gets its own requests from its caller. The README lists "Load balancing across data-parallel replicas for both prefill and decode" under "Required for a complete inference service (not included in this release)" ({{cite README.md:38-42}}).</p>
+<p>The deployment Q&amp;A describes the production balancers in its section "Data-parallel load balancing" ({{cite doc/inference_deployment_qa.md:105-127}}):</p>
+<ul>
+  <li><strong>Prefill.</strong> Requests go into 4 tiers by total context length: under 16K, 16-64K, 64-256K and 256K or more. Engines pull work by their remaining compute quota. Inside a DP group, each request goes to the DP rank with the lowest quota load ({{cite doc/inference_deployment_qa.md:109-113}}).</li>
+  <li><strong>Inside one GPU.</strong> FIFO, with a chunk size from a time budget and a fitted quadratic cost model, at most 32,768 tokens. "The budget itself is further reduced by an all-reduce MIN within the DP group" ({{cite doc/inference_deployment_qa.md:115}}).</li>
+  <li><strong>Decode.</strong> Uniform routing over all GPUs of all decode instances, which balances the request count and the total KV length ({{cite doc/inference_deployment_qa.md:119}}).</li>
+  <li><strong>Result.</strong> "roughly 80% of a perfectly balanced offline benchmark" ({{cite doc/inference_deployment_qa.md:127}}).</li>
+</ul>
+<p>The code of this release does not have the compute quota or the cost model in its scheduler. The step votes are the only coordination between replicas in this release.</p>
+</x-deepdive>
+
+<x-deepdive title="How the DP group is built, with the replica dimension">
+<p>The rank list is <code>arange(max(enp_size, dp_size × cp_size))</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:80}}). The DP rearrange is <code>"(replica dp cp) -&gt; (replica cp) dp"</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:92}}). The <code>replica</code> axis is not 1 only when the Engram group is larger than <code>dp × cp</code> ({{cite deepinfer/config.py:172-173}}).</p>
+<table>
+  <thead><tr><th>Run</th><th>dp, cp</th><th>World</th><th>DP groups</th><th>EP groups</th></tr></thead>
+  <tbody>
+    <tr><td><code>--ep 8</code></td><td>8, 1</td><td>8</td><td><code>[0..7]</code></td><td><code>[0..7]</code> (world)</td></tr>
+    <tr><td><code>--ep 2 --dp 8</code></td><td>8, 1</td><td>8</td><td><code>[0..7]</code></td><td><code>[0,1] [2,3] [4,5] [6,7]</code></td></tr>
+    <tr><td><code>--ep 4 --cp 2</code></td><td>2, 2</td><td>4</td><td><code>[0,2] [1,3]</code></td><td><code>[0..3]</code> (world)</td></tr>
+    <tr><td><code>--ep 2 --cp 8</code></td><td>1, 8</td><td>8</td><td>one rank each</td><td><code>[0,1] [2,3] [4,5] [6,7]</code></td></tr>
+  </tbody>
+</table>
+<p>Sources: the example sizes ({{cite examples/offline_inference.py:24-28}}), the three example commands ({{cite examples/README.md:6-8}}) and the EP rearrange ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:101-106}}). In the second row, an EP group holds 2 replicas, but the vote still runs over all 8. In the last row there is one replica, and each EP group is inside its CP group.</p>
+</x-deepdive>
+
+<x-deepdive title="Settings">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code></td><td>70</td><td>{{cite deepinfer/environ.py:174}}</td><td>Distance between ALL points. Must be 1 or more ({{cite csrc/engine/scheduler.hpp:105-106}}).</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code></td><td>100</td><td>{{cite deepinfer/environ.py:177}}</td><td>Distance between ANY points ({{cite csrc/engine/scheduler.hpp:107-108}}).</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>on for a NORMAL engine</td><td>{{cite deepinfer/engine/arg_utils.py:51-55}}</td><td>Votes on the Gloo (CPU) DP group.</td></tr>
+    <tr><td><code>DEEPINFER_MOE_LB_STAT_INTERVAL</code></td><td>128</td><td>{{cite deepinfer/environ.py:118}}</td><td>Steps between the EPLB statistics all-gathers.</td></tr>
+    <tr><td><code>DEEPINFER_GLOO_TIMEOUT</code></td><td>14400 s</td><td>{{cite deepinfer/environ.py:110}}</td><td>Time-out of the default Gloo process group ({{cite deepinfer/worker/base.py:334-340}}).</td></tr>
+    <tr><td><code>--dp</code>, <code>--ep</code>, <code>--cp</code></td><td>auto, 8, 1</td><td>{{cite examples/offline_inference.py:13-15}}</td><td>The number of replicas: <code>max(ep // cp, 1)</code> if <code>--dp</code> is not given.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Do not call step() on only some replicas">
+<p>Every replica must call <code>step()</code> the same number of times. <code>LLM.generate</code> does this with the MAX vote. Code that drives the engine directly, such as a benchmark, must keep this rule too. A replica that stops early leaves the others waiting in a collective.</p>
+</x-warning>
+<ul>
+  <li><strong>Slow first tokens with uneven load.</strong> One replica with no waiting request makes every ALL vote fail. New requests on the other replicas then wait for the next ANY point, up to about 100 decode steps ({{cite csrc/engine/scheduler.hpp:301-302}}).</li>
+  <li><strong>Wasted device time.</strong> A replica with no work runs placeholder steps, each with a full pass through all layers. The example launcher makes this visible: replica 0 has the fewest prompts ({{cite examples/_prompts.py:100}}).</li>
+  <li><strong>Finished requests in the queue.</strong> Without a clean-up, an aborted request that stays in <code>waiting</code> would block the ALL votes of the group for ever. The source comment gives this reason, and the decode branch removes such requests ({{cite csrc/engine/scheduler.hpp:564-577}}).</li>
+  <li><strong>A hang, not an error.</strong> If the replicas disagree on a collective, nothing raises at once. The ranks wait. <code>DEEPINFER_GLOO_TIMEOUT</code> (4 hours) applies only to the default group ({{cite deepinfer/worker/base.py:334-340}}). The DP groups come from <code>new_group</code> with no time-out argument, so the PyTorch default applies ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:34}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> DP for attention needs no communication in the attention layers, but MoE with EP ties all replicas together. The votes are the price: one replica with no work, or with a full cache, can delay the prefills of all replicas. A production system needs a load balancer in front of the replicas. This release does not have one.</p>
+
+<x-quiz>
+  <x-q level="easy">Is one DP replica a thread, a process or a device group?
+    <x-a><p>A process. <code>run_dp</code> starts one process per DP rank with the <code>spawn</code> method ({{cite examples/_launch.py:35-44}}). Each process makes its own <code>LLM</code> and engine. With CP above 1, the replica also starts CP follower processes.</p></x-a>
+  </x-q>
+  <x-q level="easy">Replica 2 has no requests, but replica 0 still has three. Does replica 2 call <code>step()</code>?
+    <x-a><p>Yes. <code>has_unfinished_requests()</code> takes the MAX over the DP group, so it is true on every replica ({{cite deepinfer/engine/llm_engine.py:673-678}}). Replica 2 runs placeholder steps ({{cite deepinfer/worker/worker.py:125-127}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">At an ANY point, replica 1 wants a prefill, but its <code>_schedule_prefill</code> returns nothing because all slots are full. The other replicas do not want a prefill. What kind of step runs?
+    <x-a><p>A decode step on all replicas. Vote 1 passes (replica 1 sent 0). Vote 2 fails: every replica sends 1 because no replica has a batch, and <code>MIN = 1</code> ({{cite csrc/engine/scheduler.hpp:332-335}}). The comment explains why: an empty prompt step would reset <code>decode_step</code> and could loop for ever.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the vote use MIN for both ALL and ANY points?
+    <x-a><p>Only the encoding changes. For ALL, "wants" is 1, so MIN is 1 only if all send 1. For ANY, "wants" is 0, so MIN is 0 if one sends 0 ({{cite csrc/engine/scheduler.hpp:315-319}}). One reduce op serves both.</p></x-a>
+  </x-q>
+  <x-q level="hard">You run <code>--ep 2 --dp 8</code>. Replicas 0 and 1 share an EP group. Could replicas 0-1 and replicas 2-3 safely run different step types? What does the code do?
+    <x-a><p>From the MoE side, perhaps: their EP groups are disjoint (<code>[0,1]</code> and <code>[2,3]</code>, {{cite deepinfer/model_executor/parallel_utils/parallel_state.py:101-106}}). But the code does not make this choice. The scheduler votes over the whole DP group of 8 replicas ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:91-93}}, {{cite csrc/engine/scheduler.hpp:170-182}}). So all 8 run the same step type. One empty replica can make the ALL votes of all 8 fail.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,218 @@
+---
+title: shared_memory.py: the pinned memory pool for images
+nav_title: shared_memory.py
+level: Advanced
+prerequisites: concepts/hardware-platforms, learn/gpus-kernels
+related: code/shm-broadcast, code/ve, concepts/vision-encoder, code/llm-engine, code/platform, concepts/hardware-platforms
+summary: shared_memory.py has SharedTorchMemoryPool, a pool of pinned host memory that the image worker process and the engine process share. The image worker writes preprocessed image tensors into it, and the engine copies them to the device with no extra copy. The file also has an unused SharedMemory class.
+---
+<h2>Purpose</h2>
+<p><code>shared_memory.py</code> gives the image worker process and the engine process one shared block of {{term pinned-memory | pinned}} host memory, with a small allocator, so that preprocessed image tensors go from the worker to the device without a pickle and without a second copy.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/shared_memory.py</code>, 363 lines of Python. Most comments and docstrings are in Chinese.</td></tr>
+    <tr><th>Main class</th><td><code>SharedTorchMemoryPool</code> ({{cite deepinfer/shared_memory.py:80}}). Also <code>BlockHandle</code> ({{cite deepinfer/shared_memory.py:68-72}}), the factory <code>get_multi_modal_pool()</code> ({{cite deepinfer/shared_memory.py:359-363}}), and a class <code>SharedMemory</code> that no file uses ({{cite deepinfer/shared_memory.py:24-65}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process (makes the pool, reads tensors, frees blocks) and the forked image worker process (allocates blocks, writes tensors). CPU only; the device copy happens elsewhere.</td></tr>
+    <tr><th>Called by</th><td><code>MultimodalProcessor</code> in <code>deepinfer/ve/multimodal_processor.py</code> and the helpers in <code>deepinfer/ve/schema.py</code>.</td></tr>
+    <tr><th>Calls</th><td><code>multiprocessing.shared_memory</code>, <code>torch</code> (<code>share_memory_()</code>, <code>from_numpy</code>), <code>multiprocessing.Lock</code>, <code>PLATFORM.pin_host_memory</code> / <code>unpin_host_memory</code>.</td></tr>
+    <tr><th>Not in this file</th><td>Not the shared-memory queue of the CP group: that is {{link code/shm-broadcast}}. Not the KV cache. Not the image preprocessing itself.</td></tr>
+  </tbody>
+</table>
+<x-note title="What this module is, in one line">
+<p>The name is general, but in this release the pool has one user: images. <code>get_multi_modal_pool()</code> is the only factory, and it reads <code>DEEPINFER_USE_MULTIMODAL_POOL</code> and <code>DEEPINFER_MULTIMODAL_POOL_SIZE_GB</code> ({{cite deepinfer/shared_memory.py:359-363}}).</p>
+</x-note>
+
+<h2>Where it sits</h2>
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The engine process makes the pool.</strong> <code>MultimodalProcessor._start_workers</code> calls <code>get_multi_modal_pool()</code> and passes the pool to the worker process, which it starts with <code>fork</code> ({{cite deepinfer/ve/multimodal_processor.py:93-104}}). The pool is made before the fork, so the child inherits the mapping, the shared metadata and the lock.</li>
+  <li><strong>The image worker allocates and writes.</strong> For each tensor of a preprocessed image, it calls <code>alloc_tensor</code>, copies the tensor in, stores <code>(handle, shape, dtype)</code> and sets the dict value to <code>None</code> ({{cite deepinfer/ve/multimodal_processor.py:202-211}}). Only the small handles go back over the <code>mp.Queue</code>.</li>
+  <li><strong>The engine reads.</strong> <code>fetch()</code> turns each handle back into a tensor view with <code>get_tensor</code> ({{cite deepinfer/ve/multimodal_processor.py:296-299}}).</li>
+  <li><strong>The engine frees.</strong> In the input preparation of the step whose prefill reaches the last image token, <code>defer_expiring_pool_handles</code> takes the handles and records a device event ({{cite deepinfer/ve/schema.py:53-65}}, called at {{cite deepinfer/ve/prepare_tensor_input_vl.py:124}}). <code>free_deferred_pool_handles</code> waits for that event and frees the blocks, in <code>pre_sampler_sync</code> of the same step ({{cite deepinfer/ve/schema.py:68-77}}, {{cite deepinfer/engine/llm_engine.py:118-119}}). Aborts free at once ({{cite deepinfer/engine/llm_engine.py:654-655}}, {{cite deepinfer/ve/multimodal_processor.py:293-295}}).</li>
+  <li><strong>Shut-down.</strong> <code>MultimodalProcessor.stop</code> stops the workers, clears the factory cache and calls <code>close()</code> ({{cite deepinfer/ve/multimodal_processor.py:317-326}}).</li>
+</ul>
+<h3>What it calls</h3>
+<ul>
+  <li><code>shared_memory.SharedMemory(create=True, size=...)</code> for the data block ({{cite deepinfer/shared_memory.py:116}}).</li>
+  <li><code>PLATFORM.pin_host_memory(self.buffer)</code>: <code>cudaHostRegister</code> on NVIDIA, <code>aclrtHostRegisterV2</code> on Ascend ({{cite deepinfer/shared_memory.py:119}}). See {{link concepts/hardware-platforms}}.</li>
+  <li><code>torch.full(...).share_memory_().numpy()</code> for the metadata arrays ({{cite deepinfer/shared_memory.py:75-77}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>SharedMemory</code></td><td>{{cite deepinfer/shared_memory.py:24-65}}</td><td>A named POSIX shared-memory object through <code>posix_ipc</code>, mapped with <code>mmap</code> on first use. No caller in the repository.</td></tr>
+    <tr><td><code>BlockHandle</code></td><td>{{cite deepinfer/shared_memory.py:68-72}}</td><td>Frozen dataclass: <code>block_id</code>, <code>offset</code>, <code>nbytes</code>. Small and picklable.</td></tr>
+    <tr><td><code>_shared_array</code></td><td>{{cite deepinfer/shared_memory.py:75-77}}</td><td>A NumPy view of a torch tensor in shared memory.</td></tr>
+    <tr><td><code>SharedTorchMemoryPool.__init__</code></td><td>{{cite deepinfer/shared_memory.py:96-137}}</td><td>Makes and pins the data block; makes the metadata arrays and the lock.</td></tr>
+    <tr><td><code>_init_metadata</code></td><td>{{cite deepinfer/shared_memory.py:139-147}}</td><td>Node 0 = one free block over all memory; nodes 1.. form the list of unused nodes.</td></tr>
+    <tr><td><code>alloc(nbytes)</code></td><td>{{cite deepinfer/shared_memory.py:167-215}}</td><td>First fit in the address-sorted free list; waits if nothing fits.</td></tr>
+    <tr><td><code>free(handle)</code></td><td>{{cite deepinfer/shared_memory.py:217-261}}</td><td>Puts the block back in address order and merges it with free neighbours.</td></tr>
+    <tr><td><code>get_buffer_slice</code>, <code>get_tensor</code>, <code>alloc_tensor</code></td><td>{{cite deepinfer/shared_memory.py:263-310}}</td><td>Views of a block as bytes or as a typed tensor; no copy.</td></tr>
+    <tr><td><code>_validate_handle</code></td><td>{{cite deepinfer/shared_memory.py:312-321}}</td><td>Rejects stale or freed handles.</td></tr>
+    <tr><td><code>dump_free_list</code></td><td>{{cite deepinfer/shared_memory.py:323-336}}</td><td>Debug: list of <code>(node, start, size)</code>.</td></tr>
+    <tr><td><code>close</code>, <code>_disown_mapping</code></td><td>{{cite deepinfer/shared_memory.py:338-356}}</td><td>Unpin, close the mapping (or give it away if views are alive), unlink the name.</td></tr>
+    <tr><td><code>get_multi_modal_pool()</code></td><td>{{cite deepinfer/shared_memory.py:359-363}}</td><td>Cached factory: <code>None</code> if the pool is off, else one pool of <code>SIZE_GB × 2³⁰</code> bytes.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>: one pinned block and shared metadata</h3>
+<x-code file="deepinfer/shared_memory.py" lines="80-137" highlight="116-119,123-135">
+<x-tr line="82-87">Multi-process shared-memory pool. The whole block self.buffer comes from multiprocessing.shared_memory, with a torch view, and is pinned. The metadata is torch storage after share_memory_(), read and written through NumPy views (shared only, not pinned). A multiprocessing.Lock makes concurrent use safe. Only CPU tensors are supported.</x-tr>
+<x-tr line="113-115">The real large shared-memory block. SharedMemory makes it shared across processes; then it is pinned as host pinned memory to make H2D copies faster (GPU: cudaHostRegister; NPU: aclrtHostRegisterV2, see platform.py).</x-tr>
+<x-tr line="122">Metadata: all shared.</x-tr>
+<x-tr line="128">Head of the free-block list.</x-tr>
+<x-tr line="131">Head of the free list of metadata nodes (1..max_blocks-1 can be reused).</x-tr>
+<x-tr line="134">Lock: multi-process synchronization.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 102-107: the size must be positive, <code>max_blocks</code> at least 2, and <code>align</code> a power of two.</li>
+  <li>Lines 116-119: make the block, wrap it as a <code>uint8</code> tensor, pin it.</li>
+  <li>Lines 123-126: four arrays of <code>max_blocks</code> entries (default 4096): start, size, next node and state of each node.</li>
+  <li>Lines 129-132: two list heads, each a one-element shared array.</li>
+  <li>Line 135: the lock. A <code>multiprocessing.Lock</code> works across <code>fork</code>, because the child inherits it.</li>
+</ol>
+
+<h3><code>alloc</code>: first fit, then wait</h3>
+<x-code file="deepinfer/shared_memory.py" lines="167-215" highlight="174,177,185-195,197-209,214-215">
+<x-tr line="186">Case 1: the same size. Turn this free node into an allocated node.</x-tr>
+<x-tr line="197">Case 2: cut a piece off. This needs a new metadata node for the allocated part.</x-tr>
+<x-tr line="204">The free node shrinks from the front.</x-tr>
+<x-tr line="214">"Shared-memory pool short of {need} bytes, waiting for release"</x-tr>
+</x-code>
+<ol>
+  <li>Line 174: round the size up to a multiple of <code>align</code> (64).</li>
+  <li>Lines 177-212: under the lock, walk the free list from its head. The list is sorted by address, so this is first fit by address.</li>
+  <li>Lines 187-195: an exact fit takes the free node itself.</li>
+  <li>Lines 198-209: a larger block gives its first <code>need</code> bytes to a new node and keeps the rest.</li>
+  <li>Lines 214-215: if no block fits, log a warning, sleep 10 ms (outside the lock) and try again. There is no time-out.</li>
+</ol>
+
+<h3><code>free</code>: back in address order, then merge</h3>
+<x-code file="deepinfer/shared_memory.py" lines="217-261" highlight="230-231,239-241,252-255,258-261">
+<x-tr line="219">Free a block, and try to merge it with free neighbours.</x-tr>
+<x-tr line="235">Put it back in the free list in address order.</x-tr>
+<x-tr line="251">Try to merge with the next block.</x-tr>
+<x-tr line="257">Try to merge with the previous block.</x-tr>
+</x-code>
+<p>A double free raises <code>ValueError</code> (lines 230-231). Each merge returns one node to the list of unused metadata nodes (<code>_push_meta_node</code>, {{cite deepinfer/shared_memory.py:160-165}}).</p>
+
+<h3><code>get_tensor</code> and <code>alloc_tensor</code>: typed views</h3>
+<x-code file="deepinfer/shared_memory.py" lines="270-310" highlight="287-291,293-294,305-310">
+<x-tr line="277-281">Interpret the block as a tensor view of the given dtype and shape, with no copy. Needs: the shape and dtype that were used at alloc time (rounded up; padding at the end of the block is allowed), and an offset that is aligned for the dtype (align ≥ 64 is enough for common types).</x-tr>
+</x-code>
+<p>The view is a <code>narrow</code> of the pinned <code>uint8</code> buffer, then a <code>view(dtype)</code> and a <code>view(*shape)</code>. So the device copy of this tensor is a DMA from pinned memory. <code>alloc_tensor</code> frees the block again if the view fails (lines 306-310).</p>
+
+<h3><code>close</code>: unpin, release, unlink</h3>
+<x-code file="deepinfer/shared_memory.py" lines="338-356" highlight="349,351,354-356">
+<x-tr line="339">Give up ownership of the mmap: the last live view (or the exit of the process) frees the mapping.</x-tr>
+<x-tr line="346">Free the large shared-memory block: remove the pinned registration, give up the mapping, unlink the name.</x-tr>
+</x-code>
+<p>If a tensor view is still alive, <code>SharedMemory.close()</code> raises <code>BufferError</code>. The code then drops its own references to the mapping instead (lines 340-343) and unlinks the name anyway. The memory stays until the last view is gone.</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data flow of one image request">
+<table>
+  <thead><tr><th>#</th><th>Process</th><th>What happens</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>engine</td><td><code>add()</code> puts <code>(id, multi_modal_data)</code> into <code>input_queue</code>.</td><td>{{cite deepinfer/ve/multimodal_processor.py:248-262}}</td></tr>
+    <tr><td>2</td><td>image worker</td><td><code>multi_modal_mapper</code> preprocesses the images into tensors.</td><td>{{cite deepinfer/ve/multimodal_processor.py:199-201}}</td></tr>
+    <tr><td>3</td><td>image worker</td><td>For each non-empty tensor: <code>alloc_tensor(shape, dtype)</code>, <code>copy_</code>, keep the handle, set the value to <code>None</code>.</td><td>{{cite deepinfer/ve/multimodal_processor.py:205-211}}</td></tr>
+    <tr><td>4</td><td>image worker</td><td>Puts the dict (now small) into <code>output_queue</code>.</td><td>{{cite deepinfer/ve/multimodal_processor.py:212}}</td></tr>
+    <tr><td>5</td><td>engine</td><td><code>fetch()</code>: <code>get_tensor(handle, shape, dtype)</code> for each key; the <code>"handle"</code> entry stays and marks ownership.</td><td>{{cite deepinfer/ve/multimodal_processor.py:296-299}}</td></tr>
+    <tr><td>6</td><td>engine</td><td>Input preparation concatenates the views and copies them to the device (async, from pinned memory).</td><td>{{cite deepinfer/ve/prepare_tensor_input_vl.py:123}}, {{cite deepinfer/utils.py:164-176}}</td></tr>
+    <tr><td>7</td><td>engine</td><td>When <code>seqlen_k</code> covers all image tokens, the handles move to a module list and an event is recorded.</td><td>{{cite deepinfer/ve/schema.py:53-65}}</td></tr>
+    <tr><td>8</td><td>engine</td><td>In <code>pre_sampler_sync</code>: wait for the event, then <code>pool.free(handle)</code>.</td><td>{{cite deepinfer/ve/schema.py:68-77}}</td></tr>
+  </tbody>
+</table>
+<p>Step 8 waits for the event because the copy in step 6 is asynchronous. The docstring says, translated: <em>"The pool memory is pinned and the H2D copy of try_concat is asynchronous, so wait for the event first; then reuse of a block does not overwrite a copy in flight."</em> ({{cite deepinfer/ve/schema.py:69-70}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the allocator on a 1024-byte pool">
+<p>A pool with <code>total_bytes = 1024</code> and <code>align = 64</code>. The table shows the free list <code>(node, start, size)</code> after each call (we ran a copy of the algorithm in plain Python).</p>
+<table>
+  <thead><tr><th>Call</th><th>Returns <code>(block_id, offset, nbytes)</code></th><th>Free list after</th></tr></thead>
+  <tbody>
+    <tr><td>start</td><td>-</td><td><code>(0, 0, 1024)</code></td></tr>
+    <tr><td><code>A = alloc(100)</code></td><td><code>(1, 0, 128)</code></td><td><code>(0, 128, 896)</code></td></tr>
+    <tr><td><code>B = alloc(64)</code></td><td><code>(2, 128, 64)</code></td><td><code>(0, 192, 832)</code></td></tr>
+    <tr><td><code>C = alloc(300)</code></td><td><code>(3, 192, 320)</code></td><td><code>(0, 512, 512)</code></td></tr>
+    <tr><td><code>free(A)</code></td><td>-</td><td><code>(1, 0, 128)</code>, <code>(0, 512, 512)</code></td></tr>
+    <tr><td><code>free(B)</code></td><td>-</td><td><code>(1, 0, 192)</code>, <code>(0, 512, 512)</code>: B merged into A's node</td></tr>
+    <tr><td><code>D = alloc(200)</code></td><td><code>(2, 512, 256)</code></td><td><code>(1, 0, 192)</code>, <code>(0, 768, 256)</code>: the first block is too small</td></tr>
+    <tr><td><code>free(C)</code></td><td>-</td><td><code>(1, 0, 512)</code>, <code>(0, 768, 256)</code></td></tr>
+    <tr><td><code>free(D)</code></td><td>-</td><td><code>(1, 0, 1024)</code>: all merged again</td></tr>
+  </tbody>
+</table>
+<p>Node ids move: after the last merge, node 0 is unused and node 1 holds the whole pool. Each free region and each allocated block uses one of the <code>max_blocks</code> nodes, so together they can use at most 4096 nodes. When <code>alloc</code> must cut a block and no unused node is left, <code>_pop_meta_node</code> raises <code>MemoryError</code> ({{cite deepinfer/shared_memory.py:152-158}}, {{cite deepinfer/shared_memory.py:197-198}}). An exact fit needs no new node (lines 187-195).</p>
+<p><strong>Sizes in practice.</strong> The default pool is 8 GiB = 8,589,934,592 bytes ({{cite deepinfer/environ.py:208}}). The log line counts it per rank: on a host with 8 devices it gives "expected resident 64GB" for the host (translated, {{cite deepinfer/ve/multimodal_processor.py:49-56}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, the lock and why the metadata is shared">
+<ul>
+  <li>The pool is made in the engine process, then the image worker is forked ({{cite deepinfer/ve/multimodal_processor.py:97-104}}). A fork copies normal memory lazily (copy-on-write). A write in one process is then not seen in the other. So the metadata must be in shared memory: <code>share_memory_()</code> moves each tensor storage there before the fork ({{cite deepinfer/shared_memory.py:75-77}}).</li>
+  <li>The data block comes from <code>multiprocessing.shared_memory</code>, which is shared by name and by mapping.</li>
+  <li>The worker calls <code>alloc</code>, the engine calls <code>free</code>, both under the same <code>mp.Lock</code>. <code>get_tensor</code> and <code>_validate_handle</code> read the metadata without the lock.</li>
+  <li>The engine starts one image worker: <code>num_workers</code> defaults to 1, and the engine does not pass it ({{cite deepinfer/ve/multimodal_processor.py:36}}, {{cite deepinfer/engine/llm_engine.py:213-219}}).</li>
+  <li>Only the process with <code>rank &lt;= 0</code> logs the pool size ({{cite deepinfer/ve/multimodal_processor.py:49}}). Each DP replica has its own engine, so each has its own pool.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Settings and error paths">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_MULTIMODAL_POOL</code></td><td>off in <code>environ.py</code>; <code>EngineArgs</code> sets it to 1 for every engine type except COMPLETION, if it is not set</td><td>{{cite deepinfer/environ.py:207}}, {{cite deepinfer/engine/arg_utils.py:56-60}}</td><td>Off: images go through the queue as normal tensors, and <code>get_multi_modal_pool()</code> returns <code>None</code>.</td></tr>
+    <tr><td><code>DEEPINFER_MULTIMODAL_POOL_SIZE_GB</code></td><td>8</td><td>{{cite deepinfer/environ.py:208}}</td><td>Pool size in GiB, per engine.</td></tr>
+  </tbody>
+</table>
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Bad constructor arguments</td><td><code>ValueError</code></td><td>{{cite deepinfer/shared_memory.py:102-107}}</td></tr>
+    <tr><td>Pool full</td><td>warning, sleep 10 ms, retry for ever</td><td>{{cite deepinfer/shared_memory.py:214-215}}</td></tr>
+    <tr><td>All metadata nodes used</td><td><code>MemoryError("No free metadata nodes left; increase max_blocks")</code></td><td>{{cite deepinfer/shared_memory.py:155}}</td></tr>
+    <tr><td>Double free, freed or stale handle</td><td><code>ValueError</code></td><td>{{cite deepinfer/shared_memory.py:230-231}}, {{cite deepinfer/shared_memory.py:312-321}}</td></tr>
+    <tr><td>Shape or dtype that does not match the block</td><td><code>ValueError("shape/dtype bytes mismatch ...")</code></td><td>{{cite deepinfer/shared_memory.py:287-288}}</td></tr>
+    <tr><td>Pin fails on Ascend</td><td>warning only; copies use the slow path</td><td>{{cite deepinfer/platform.py:202-207}}</td></tr>
+    <tr><td>Image preprocessing fails</td><td>the worker frees its blocks and sends <code>None</code>; the engine aborts the request</td><td>{{cite deepinfer/ve/multimodal_processor.py:213-217}}, {{cite deepinfer/ve/multimodal_processor.py:290-292}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="The unused SharedMemory class">
+<x-code file="deepinfer/shared_memory.py" lines="24-65" />
+<p>This class wraps <code>posix_ipc.SharedMemory</code>: a named POSIX object, made with <code>O_CREX</code> (fail if it exists) and mode <code>0o777</code>, sized with <code>ftruncate</code>, and mapped with <code>mmap</code> on the first access of <code>buf</code>. Its <code>__reduce__</code> pickles only the name, so another process opens it by name. A search of the repository finds no import of it; the package <code>posix_ipc==1.3.2</code> is in <code>requirements.txt</code> only for this file ({{cite requirements.txt:7}}). The pool above uses the standard <code>multiprocessing.shared_memory</code> instead.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/vision-encoder}}: what the image tensors are for.</li>
+  <li>{{link code/ve}}: the image worker and its queues.</li>
+  <li>{{link concepts/hardware-platforms}}: how each platform pins host memory.</li>
+  <li>{{link code/shm-broadcast}}: the other shared-memory module, for messages in a CP group.</li>
+  <li>{{link code/llm-engine}}: <code>pre_sampler_sync</code> and <code>DeferredRelease</code>, where blocks are freed.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which two processes share the pool, and which one allocates?
+    <x-a><p>The engine process and the forked image worker. The image worker allocates and writes the tensors ({{cite deepinfer/ve/multimodal_processor.py:205-211}}). The engine reads them and frees the blocks ({{cite deepinfer/ve/schema.py:68-77}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Why is the data block pinned?
+    <x-a><p>So that the copy to the device is a fast DMA from page-locked memory. The comment says so, translated: "pinned as host pinned memory to make H2D copies faster" ({{cite deepinfer/shared_memory.py:114-115}}, {{cite deepinfer/shared_memory.py:119}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The pool has <code>align = 64</code>. A tensor of shape <code>[3, 5]</code> in <code>float32</code> is allocated. How many bytes does the block have, and does <code>get_tensor(handle, (3, 5), torch.float32)</code> work?
+    <x-a><p>3 × 5 × 4 = 60 bytes, rounded up to 64. <code>get_tensor</code> checks <code>align_up(60) == 64 == handle.nbytes</code>, so yes; it views only the first 60 bytes ({{cite deepinfer/shared_memory.py:285-294}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>free_deferred_pool_handles</code> synchronize on an event before it frees, and what could go wrong without it?
+    <x-a><p>The device copy from the pool is asynchronous. Without the wait, the engine could free a block, the image worker could allocate it for a new image and overwrite it, while the old copy is still in flight. The event was recorded after the copies were issued ({{cite deepinfer/ve/schema.py:53-77}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The pool is made in the engine process. Why are the metadata arrays made with <code>share_memory_()</code> and not as plain NumPy arrays?
+    <x-a><p>The image worker is forked after the pool exists ({{cite deepinfer/ve/multimodal_processor.py:97-104}}). Plain memory is copy-on-write after a fork: the worker's <code>alloc</code> would change only its own copy, and the engine's <code>free</code> would not see it. Shared storage makes both processes see one set of metadata ({{cite deepinfer/shared_memory.py:75-77}}).</p></x-a>
+  </x-q>
+</x-quiz>

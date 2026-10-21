@@ -1,0 +1,212 @@
+---
+title: parallel_utils/parallel_state.py: the process groups
+nav_title: parallel_state.py
+level: Advanced
+prerequisites: learn/parallelism, concepts/dp-step-votes, concepts/context-parallelism
+related: code/shm-broadcast, code/userbuffer, code/worker-base, code/platform, concepts/expert-parallelism, concepts/hardware-platforms, tours/multi-gpu-step, learn/parallelism
+summary: parallel_state.py makes all torch.distributed process groups of one rank (world, local, DP, CP, EP, EP-in-DP, Engram and three Gloo copies), the shared-memory queue of the CP group, and the global PG object that the rest of the code reads.
+---
+<h2>Purpose</h2>
+<p><code>parallel_state.py</code> makes the {{term process-group | process groups}} of one {{term rank}} and keeps them in the global object <code>PG</code>, which all other code reads.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/parallel_utils/parallel_state.py</code>, 230 lines of Python.</td></tr>
+    <tr><th>Main class</th><td><code>ParallelProcessGroup</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:51}}), and the module-level instance <code>PG</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:190}}).</td></tr>
+    <tr><th>Runs in</th><td>Every rank process: the engine process (CP rank 0) and each CP follower process. Called once per process, at worker start-up.</td></tr>
+    <tr><th>Called by</th><td><code>_init_distributed_environment</code> in <code>deepinfer/worker/base.py</code>. About 20 files read <code>PG</code>.</td></tr>
+    <tr><th>Calls</th><td><code>torch.distributed.new_group</code>, <code>einops.rearrange</code>, <code>PLATFORM</code> (backend and options), <code>MessageQueue</code>, and <code>deep_ep.get_physical_domain_size</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The first connection of all ranks (<code>init_process_group</code>, in <code>worker/base.py</code>). The collectives themselves (<code>communication_op.py</code>, <code>cp.py</code>, DeepEP). No tensor- or pipeline-parallel group.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b2_collectives_groups" alt="Panel 1: all-reduce, all-gather and all-to-all on three ranks. Panel 2: eight ranks with dp_size 4 and cp_size 2. CP groups are the pairs 0-1, 2-3, 4-5, 6-7. DP groups are ranks 0, 2, 4, 6 and ranks 1, 3, 5, 7. The EP group and the Engram group contain all eight ranks." caption="Figure (from the page Parallelism basics): panel 2 shows the groups that this file makes for 8 ranks with dp_size 4 and cp_size 2. Click to zoom." />
+<p>Panel 2 is the result of <code>create_process_groups</code> for <code>dp_size = 4</code>, <code>cp_size = 2</code>, <code>ep_size = 8</code>. The rest of this page shows how the file computes those lists.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>_init_distributed_environment</code></strong> joins all ranks with a Gloo default group, then calls <code>init_parallel_groups(dp_size, ep_size=..., cp_size=..., enp_size=...)</code> ({{cite deepinfer/worker/base.py:315-344}}). Each <code>Worker</code> runs it in <code>init_dist</code> ({{cite deepinfer/worker/base.py:196-201}}).</li>
+  <li><strong>Readers of <code>PG</code>.</strong> The engine reads the DP group for the votes ({{cite deepinfer/engine/llm_engine.py:313}}, {{cite deepinfer/engine/llm_engine.py:665-679}}). The model reads the CP group for mirror CP ({{cite deepinfer/model_executor/models/deepseek.py:168}}) and the EP group for MoE ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:192-194}}). The worker reads the world group to agree on the KV block count ({{cite deepinfer/worker/base.py:265-266}}) and the CPU CP group to send method calls ({{cite deepinfer/worker/base.py:298-300}}).</li>
+  <li><strong><code>cp_broadcast_object</code></strong> is used by the worker loop ({{cite deepinfer/worker/base.py:132}}), <code>broadcast_tensor_dict</code> ({{cite deepinfer/model_executor/parallel_utils/communication_op.py:72-75}}) and <code>InputMetadata.broadcast</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:153-156}}).</li>
+  <li><strong><code>PG_dict</code></strong> is read by the NCCL memory statistics, which label each communicator with its group name ({{cite deepinfer/model_executor/parallel_utils/nccl_memory.py:26-34}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>torch.distributed.new_group</code> through <code>_split_group_cached</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:26-37}}).</li>
+  <li><code>PLATFORM.distributed_backend</code> (<code>"nccl"</code> or <code>"hccl"</code>) and <code>PLATFORM.get_distributed_options()</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:82-83}}). See {{link concepts/hardware-platforms}}.</li>
+  <li><code>MessageQueue.create_from_process_group</code> for the CP group ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:122-124}}). See {{link code/shm-broadcast}}.</li>
+  <li><code>deep_ep.get_physical_domain_size</code> in <code>is_within_nvl_domain</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:130-134}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>cp_broadcast_object(obj)</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:17-23}}</td><td>Sends a Python object from CP rank 0 to the other CP ranks through the shared-memory queue.</td></tr>
+    <tr><td><code>_split_group_cached</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:26-37}}</td><td>Makes one group per rank list; returns the group of this rank. Cached.</td></tr>
+    <tr><td><code>_split_group</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:40-48}}</td><td>Turns lists into tuples (hashable), calls the cached function, asserts that this rank is in a group.</td></tr>
+    <tr><td><code>ParallelProcessGroup</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:51-68}}</td><td>Holds 7 device groups, 3 CPU groups, the tag, the rank and the queue.</td></tr>
+    <tr><td><code>create_process_groups</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:70-126}}</td><td>Computes the rank lists and makes all groups.</td></tr>
+    <tr><td><code>is_within_nvl_domain</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:130-134}}</td><td>True if a group fits in one NVLink domain (always True on NPU).</td></tr>
+    <tr><td>accessors</td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:138-157}}</td><td><code>data_parallel_group()</code>, <code>context_parallel_group()</code>, <code>expert_parallel_group()</code>, ... and <code>get_rank()</code>.</td></tr>
+    <tr><td><code>cleanup_shm_broadcast</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:161-169}}</td><td>Closes and unlinks the shared memory of the queue at shut-down.</td></tr>
+    <tr><td><code>init_device_groups</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:173-187}}</td><td>Runs one small all-reduce on each NCCL/HCCL group, so that its communicator exists.</td></tr>
+    <tr><td><code>PG</code>, <code>PG_dict</code>, <code>DEFAULT_PG_TAG</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:190-193}}</td><td>The global groups, all groups by tag, the default tag.</td></tr>
+    <tr><td><code>init_parallel_groups</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:196-230}}</td><td>Entry point: makes a <code>ParallelProcessGroup</code>, logs the ranks, copies it into <code>PG</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>create_process_groups</code>: the rank lists</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="79-126" highlight="80,92,97,102-106,109,113-118,123-124" />
+<ol>
+  <li>Line 80: the rank list is <code>0 … max(enp_size, dp_size × cp_size) − 1</code>. It is the world of this job.</li>
+  <li>Lines 86-89: <code>world</code> is one group of all ranks. <code>local</code> has one group per rank (each rank alone).</li>
+  <li>Line 92: DP groups. The pattern <code>"(replica dp cp) -&gt; (replica cp) dp"</code> makes one group for each <code>(replica, cp_rank)</code> pair. Its members are the ranks with that <code>cp_rank</code> in each engine.</li>
+  <li>Line 97: CP groups are blocks of <code>cp_size</code> neighbour ranks: the ranks of one engine.</li>
+  <li>Lines 102-106: EP groups are blocks of <code>ep_size</code> neighbour ranks. If <code>ep_size</code> is the world size, the code reuses the world group object.</li>
+  <li>Line 109: Engram groups are blocks of <code>enp_size</code> neighbour ranks.</li>
+  <li>Lines 113-118: EP-in-DP groups use the same block rule as EP. With <code>ep_size = 1</code>, the code reuses <code>local</code>.</li>
+  <li>Lines 94, 99, 118: Gloo copies of the DP, CP and EP-in-DP groups, for CPU tensors.</li>
+  <li>Lines 123-124: with more than one CP rank, the CPU CP group gets a shared-memory queue: chunks of <code>1 &lt;&lt; 20</code> bytes (1 MiB), 10 chunks.</li>
+  <li>Line 126: start the device communicators (next section).</li>
+</ol>
+<x-warning title="Every rank must make every group">
+<p><code>_split_group_cached</code> calls <code>dist.new_group</code> for every rank list, also for lists that do not contain this rank ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:33-36}}). PyTorch requires that all processes call <code>new_group</code> for each group, in the same order. So all ranks must call <code>create_process_groups</code> with the same sizes.</p>
+</x-warning>
+
+<h3><code>_split_group_cached</code>: one group per rank list, made once</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="26-48" highlight="26,34-36,45,47" />
+<p>The cache key is <code>(rank lists, backend, options)</code>. The caller turns the lists into tuples, because the cache needs hashable keys (line 45). Inside one call of <code>create_process_groups</code>, the options object is the same for all device groups (line 83). So two splits with the same rank lists return the same group object. The deep dive shows where this happens.</p>
+
+<h3><code>cp_broadcast_object</code>: objects from the CP driver</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="17-23" />
+<p>The writer of the queue is CP rank 0 (the default <code>writer_rank</code>, {{cite deepinfer/distributed/shm_broadcast.py:432-437}}). On rank 0, the function puts the object into the queue and returns it. On the other ranks, it waits for the next object and returns it. The call order must be the same on all CP ranks: the k-th call on a follower returns the object of the k-th call on the driver.</p>
+
+<h3><code>init_device_groups</code>: start the communicators</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="173-187" highlight="179-187">
+<x-tr line="174">After the default process group changed to the CPU (gloo) backend, the NCCL/HCCL subgroups lost their eager/split initialization. All of them are lazy: a collective must run once before the communicator really exists.</x-tr>
+<x-tr line="176">Single-rank groups cannot be skipped either: Engram's deep_ep reuses the communicator made here through <code>backend._comm_ptr()</code>, and a null pointer gives a segmentation fault at once.</x-tr>
+</x-code>
+<ol>
+  <li>Line 179: walk all attributes of the object, in the order of <code>__init__</code>: <code>dp</code>, <code>cp</code>, <code>ep</code>, <code>ep_in_dp</code>, <code>enp</code>, <code>world</code>, <code>local</code>, then the rest.</li>
+  <li>Lines 180-184: skip everything that is not a NCCL or HCCL process group (the Gloo copies, the tag, the queue).</li>
+  <li>Lines 185-187: run one all-reduce of a one-element tensor on each group object once. A group object that two attributes share runs once (the <code>id</code> check).</li>
+</ol>
+<p>All ranks walk the same attribute order, so the collectives match.</p>
+
+<h3><code>init_parallel_groups</code>: the entry point</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="196-230" highlight="205-212,225-227" />
+<p>The function makes a new object, stores it in <code>PG_dict[tag]</code>, and for the default tag copies all its attributes into the global <code>PG</code> (line 227). Modules that ran <code>from ... import PG</code> before this call see the new groups, because <code>PG</code> is the same object. The log line lists the ranks, for example <code>RANK 3, DP 1/4, CP 1/2, EP 3/8 (ep_in_dp:3), ENP 3/8, WORLD 3/8, GPU 1</code> for <code>--ep 8 --cp 2</code> (lines 214-229). The ENP part appears because <code>enp_size</code> defaults to 8 here.</p>
+
+<h3>The small methods</h3>
+<ul>
+  <li><code>is_within_nvl_domain(group)</code>: True on NPU. On GPU, True for a group of one rank, or if the group size is at most the NVLink domain size that DeepEP reports ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:130-134}}). The MoE layer uses it to choose mega-MoE ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:184-188}}).</li>
+  <li><code>cleanup_shm_broadcast()</code>: closes the shared memory of the queue, and unlinks it on the rank that made it. The docstring gives the reason: "so that the resource_tracker won't report leaked shared_memory warnings" ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:161-169}}). <code>WorkerBase.stop</code> calls it ({{cite deepinfer/worker/base.py:147}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="The groups and their backends">
+<table>
+  <thead><tr><th>Attribute</th><th>Backend</th><th>Rank lists (pattern)</th><th>Used for</th></tr></thead>
+  <tbody>
+    <tr><td><code>world</code></td><td>NCCL/HCCL</td><td>all ranks</td><td>KV block count all-reduce ({{cite deepinfer/worker/base.py:265}})</td></tr>
+    <tr><td><code>local</code></td><td>NCCL/HCCL</td><td>each rank alone</td><td>fallback for <code>ep_in_dp</code></td></tr>
+    <tr><td><code>dp</code></td><td>NCCL/HCCL</td><td><code>(replica dp cp) -&gt; (replica cp) dp</code></td><td>votes with ZOS off</td></tr>
+    <tr><td><code>cp</code></td><td>NCCL/HCCL</td><td><code>(dp cp) -&gt; dp cp</code></td><td>input broadcasts, CP all-gather buffer</td></tr>
+    <tr><td><code>ep</code></td><td>NCCL/HCCL</td><td><code>(edp ep) -&gt; edp ep</code>, or <code>world</code></td><td>DeepEP dispatch/combine, EPLB</td></tr>
+    <tr><td><code>ep_in_dp</code></td><td>NCCL/HCCL</td><td>same lists as <code>ep</code>; <code>local</code> if <code>ep_size = 1</code></td><td>only the log line in this release</td></tr>
+    <tr><td><code>enp</code></td><td>NCCL/HCCL</td><td><code>(replica enp) -&gt; replica enp</code></td><td>Engram ({{cite deepinfer/model_executor/models/v4_modules/engram.py:79}})</td></tr>
+    <tr><td><code>cpu_dp_group</code></td><td>Gloo</td><td>as <code>dp</code></td><td>votes with ZOS on ({{cite deepinfer/engine/llm_engine.py:313}})</td></tr>
+    <tr><td><code>cpu_cp_group</code></td><td>Gloo</td><td>as <code>cp</code></td><td>method calls, the shared-memory queue handshake</td></tr>
+    <tr><td><code>cpu_ep_in_dp</code></td><td>Gloo</td><td>as <code>ep_in_dp</code></td><td>no reader in this release</td></tr>
+  </tbody>
+</table>
+<p>A search of the repository for <code>ep_in_dp</code> and <code>cpu_ep_in_dp</code> outside this file finds no reader. The NCCL memory statistics see them only as names of groups.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: --ep 8 --cp 2 (8 ranks)">
+<p><code>dp = max(1, 8 // 2) = 4</code> ({{cite deepinfer/config.py:161-162}}). <code>enp</code> defaults to <code>cp × dp = 8</code> ({{cite deepinfer/config.py:172}}). So <code>ranks = [0 … 7]</code>, and rank <em>r</em> is engine <code>r // 2</code>, CP rank <code>r % 2</code>.</p>
+<table>
+  <thead><tr><th>Split</th><th>Rank lists</th><th>Object</th></tr></thead>
+  <tbody>
+    <tr><td>world</td><td><code>[[0..7]]</code></td><td>W</td></tr>
+    <tr><td>local</td><td><code>[[0], [1], …, [7]]</code></td><td>8 groups, each rank keeps its own</td></tr>
+    <tr><td>dp</td><td><code>[[0, 2, 4, 6], [1, 3, 5, 7]]</code></td><td>new</td></tr>
+    <tr><td>cp</td><td><code>[[0, 1], [2, 3], [4, 5], [6, 7]]</code></td><td>new</td></tr>
+    <tr><td>ep</td><td><code>ep_size == 8</code></td><td>W (line 103)</td></tr>
+    <tr><td>enp</td><td><code>[[0..7]]</code></td><td>W again (cache hit: same key as world)</td></tr>
+    <tr><td>ep_in_dp</td><td><code>[[0..7]]</code></td><td>W again (cache hit)</td></tr>
+  </tbody>
+</table>
+<p>So <code>init_device_groups</code> runs only four all-reduces on rank 3: <code>dp</code>, <code>cp</code>, W and <code>local</code>. The Gloo copies are three more splits (DP, CP and EP-in-DP), with <code>backend="gloo"</code> and no options. Each split calls <code>new_group</code> once per rank list.</p>
+<p><strong>With <code>--ep 2 --dp 8</code>:</strong> <code>ep</code> is <code>[[0,1],[2,3],[4,5],[6,7]]</code>, and <code>ep_in_dp</code> has the same lists. The cache returns the <code>ep</code> object for <code>ep_in_dp</code>, because the key <code>(lists, backend, options)</code> is the same.</p>
+<p><strong>With a larger Engram group</strong> (for example <code>dp = 2</code>, <code>cp = 1</code>, <code>enp = 4</code>): the world has 4 ranks, and <code>replica = 2</code>. The DP groups are <code>[0, 1]</code> and <code>[2, 3]</code>: two separate DP worlds that share one Engram group <code>[0..3]</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, order and start-up cost">
+<ul>
+  <li><strong>Who runs it.</strong> Every rank process, once. In a CP engine, the driver and each follower run it inside their own <code>Worker.__init__</code> ({{cite deepinfer/worker/base.py:114-118}}).</li>
+  <li><strong>Order of collectives.</strong> Each <code>new_group</code> call, the queue handshake and the warm-up all-reduces are collectives. They run in program order, the same on all ranks.</li>
+  <li><strong>The queue handshake.</strong> <code>create_from_process_group</code> broadcasts a handle object over the Gloo CP group and then waits until all readers connected ({{cite deepinfer/distributed/shm_broadcast.py:446-461}}).</li>
+  <li><strong>The device tensor.</strong> The warm-up uses <code>torch.zeros(1).cuda()</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:187}}). On Ascend, <code>torch.cuda</code> is mapped to <code>torch.npu</code> ({{link concepts/hardware-platforms}}).</li>
+  <li><strong>Several tags.</strong> <code>init_parallel_groups</code> can make extra group sets with another <code>tag</code>. Only the default tag goes into <code>PG</code>. In this release, only the worker calls it, with the default tag ({{cite deepinfer/worker/base.py:343}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A rank is in no group of a split</td><td><code>AssertionError</code> in <code>_split_group</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:47}}</td></tr>
+    <tr><td>Sizes that do not divide the rank count</td><td><code>einops</code> raises in <code>rearrange</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:92-113}}</td></tr>
+    <tr><td><code>cp_broadcast_object</code> with no queue (CP size 1)</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:18}}</td></tr>
+    <tr><td>An exception in the warm-up type check</td><td>ignored; the attribute is skipped</td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:180-184}}</td></tr>
+    <tr><td>Ranks call the setup with different sizes</td><td>the group calls do not match, and the ranks can hang. The code does not check this case.</td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:33-36}}</td></tr>
+  </tbody>
+</table>
+<p><code>ParallelConfig._verify_args</code> checks the sizes earlier, with asserts ({{cite deepinfer/config.py:176-182}}). The callers of <code>cp_broadcast_object</code> check the CP size first ({{cite deepinfer/worker/base.py:298-300}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Settings that affect this file">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect here</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_NCCL_NUM_SMS</code></td><td>32</td><td>{{cite deepinfer/environ.py:108}}</td><td>NCCL options of every device group: <code>max_ctas</code> and <code>min_ctas</code> ({{cite deepinfer/platform.py:75-83}}).</td></tr>
+    <tr><td><code>DEEPINFER_GLOO_TIMEOUT</code></td><td>14400 s</td><td>{{cite deepinfer/environ.py:110}}</td><td>Time-out of the default Gloo group only ({{cite deepinfer/worker/base.py:334-340}}). <code>new_group</code> gets no <code>timeout</code> argument (line 34), so the split groups use the PyTorch default time-out (general PyTorch behaviour).</td></tr>
+    <tr><td><code>context_parallel_size</code>, <code>expert_parallel_size</code>, <code>data_parallel_size</code>, <code>engram_parallel_size</code></td><td>1, 1, 0 (then <code>max(1, ep // cp)</code>), 0 (then <code>cp × dp</code>)</td><td>{{cite deepinfer/engine/arg_utils.py:28-31}}, {{cite deepinfer/config.py:161-173}}</td><td>The four sizes passed in ({{cite deepinfer/worker/base.py:319-343}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link learn/parallelism}}: the kinds of parallelism and the collectives.</li>
+  <li>{{link concepts/dp-step-votes}}: what the DP group is for.</li>
+  <li>{{link concepts/context-parallelism}}: what the CP group and its queue are for.</li>
+  <li>{{link concepts/expert-parallelism}}: what the EP group is for.</li>
+  <li>{{link code/shm-broadcast}}: the queue behind <code>cp_broadcast_object</code>.</li>
+  <li>{{link tours/multi-gpu-step}}: all groups at work in one step.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Does DeepInfer have a tensor-parallel group?
+    <x-a><p>No. <code>ParallelProcessGroup</code> has <code>dp</code>, <code>cp</code>, <code>ep</code>, <code>ep_in_dp</code>, <code>enp</code>, <code>world</code> and <code>local</code>, and three Gloo copies ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:52-65}}). There is no TP or PP group.</p></x-a>
+  </x-q>
+  <x-q level="easy">Which backend do the CPU groups use, and which group carries the method calls from the CP driver?
+    <x-a><p>Gloo. The method calls go through the shared-memory queue that is set up on <code>cpu_cp_group</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:99}}, {{cite deepinfer/model_executor/parallel_utils/parallel_state.py:123-124}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With <code>dp_size = 2</code> and <code>cp_size = 4</code>, what are the DP groups and the CP groups?
+    <x-a><p>Ranks 0..7. CP: <code>(dp cp) -&gt; dp cp</code> gives <code>[0, 1, 2, 3]</code> and <code>[4, 5, 6, 7]</code>. DP: <code>(replica dp cp) -&gt; (replica cp) dp</code> gives <code>[0, 4]</code>, <code>[1, 5]</code>, <code>[2, 6]</code> and <code>[3, 7]</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:92-98}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>init_device_groups</code> run an all-reduce on the <code>local</code> group, which has only one rank?
+    <x-a><p>The default process group is Gloo, so the NCCL/HCCL subgroups start lazily; a collective must run once to make the communicator. The translated docstring says that single-rank groups cannot be skipped: Engram's deep_ep reuses the communicator through <code>backend._comm_ptr()</code>, and a null pointer gives a segmentation fault ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:174-176}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In a run with <code>--ep 8 --cp 1</code> (8 ranks), are <code>PG.ep</code>, <code>PG.enp</code> and <code>PG.world</code> three groups or one?
+    <x-a><p>One object. <code>ep_size</code> equals the rank count, so <code>ep = world</code> (line 103). <code>enp_size</code> defaults to 8, so the Engram split is <code>[[0..7]]</code> with the same backend and options as the world split, and <code>_split_group_cached</code> returns the cached world group ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:26-37}}, {{cite deepinfer/config.py:172}}). <code>init_device_groups</code> warms it up once, because of the <code>id</code> check.</p></x-a>
+  </x-q>
+</x-quiz>

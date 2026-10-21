@@ -1,0 +1,201 @@
+---
+title: distributed/shm_broadcast.py: MessageQueue
+nav_title: distributed/shm_broadcast.py
+level: Advanced
+prerequisites: concepts/context-parallelism, code/parallel-state
+related: code/parallel-state, code/shared-memory, code/worker-base, code/model-runner, concepts/context-parallelism, tours/multi-gpu-step
+summary: MessageQueue sends pickled Python objects from one writer process to several reader processes through a ring buffer in shared memory. DeepInfer uses it inside each context-parallel group, from the driver to the followers.
+---
+<h2>Purpose</h2>
+<p><code>shm_broadcast.py</code> sends Python objects from one process to several processes on the same host, through a ring buffer in {{term posix-shm | shared memory}}, with {{term zeromq | ZeroMQ}} sockets for set-up and for large objects.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/distributed/shm_broadcast.py</code>, 461 lines of Python. "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/distributed/shm_broadcast.py:1-2}}). <code>deepinfer/distributed/__init__.py</code> is empty.</td></tr>
+    <tr><th>Main classes</th><td><code>ShmRingBuffer</code> ({{cite deepinfer/distributed/shm_broadcast.py:33}}), <code>Handle</code> ({{cite deepinfer/distributed/shm_broadcast.py:152-159}}), <code>MessageQueue</code> ({{cite deepinfer/distributed/shm_broadcast.py:162}}).</td></tr>
+    <tr><th>Runs in</th><td>The CPU side of every rank of a CP group with more than one rank: the writer in the engine process (CP rank 0), a reader in each CP follower process. No device code.</td></tr>
+    <tr><th>Called by</th><td><code>ParallelProcessGroup.create_process_groups</code> (set-up) and <code>cp_broadcast_object</code> (every message), both in <code>parallel_state.py</code>.</td></tr>
+    <tr><th>Calls</th><td><code>multiprocessing.shared_memory</code>, <code>pickle</code>, <code>zmq</code>, <code>torch.distributed.broadcast_object_list</code> (one time, for the handle).</td></tr>
+    <tr><th>Not in this file</th><td>Tensor data. Device tensors go through NCCL or HCCL broadcasts in <code>communication_op.py</code>. The pinned memory pool for images is a different module: {{link code/shared-memory}}.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b8_shm_ring" alt="Panel 1: the shared memory holds ten 1 MiB data chunks and then ten 4-byte flag rows; a data chunk has an overflow byte and the pickled object; a flag row has the written flag and one flag per reader. Panel 2: four states of a chunk's flags: 0??? not written, 1000 just written, 1101 read by two readers, 1111 read by all; the writer can write in the first and last state. Panel 3: four steps: pickle on CP rank 0, acquire_write spins until the chunk is free, small objects go into the chunk and large ones over a ZeroMQ socket, and each follower dequeues." caption="Figure: the ring buffer of one CP group with 4 ranks (panel 1), the life of one chunk (panel 2), and the path of one object (panel 3). Click to zoom." />
+<p>Read panel 2 from left to right. The dashed arrow is the writer that comes back to the same chunk 10 messages later. Panel 3 is the path of every call from the CP driver to its followers.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Set-up.</strong> <code>create_process_groups</code> makes one queue per CP group, with 1 MiB chunks and 10 chunks, only if <code>cp_size &gt; 1</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:122-124}}).</li>
+  <li><strong>Every message.</strong> <code>cp_broadcast_object</code> calls <code>enqueue</code> on the writer and <code>dequeue</code> on a reader ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:17-23}}). Three kinds of callers use it:
+    <ul>
+      <li>method calls of the worker: <code>run_workers</code> on the driver, the slave loop on the followers ({{cite deepinfer/worker/base.py:296-300}}, {{cite deepinfer/worker/base.py:129-133}});</li>
+      <li>the non-tensor part of <code>broadcast_tensor_dict</code> ({{cite deepinfer/model_executor/parallel_utils/communication_op.py:72-75}});</li>
+      <li>the non-tensor fields of <code>InputMetadata.broadcast</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:153-156}}).</li>
+    </ul></li>
+  <li><strong>Shut-down.</strong> <code>cleanup_shm_broadcast</code> closes and unlinks the buffer ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:161-169}}).</li>
+  <li><strong>Test.</strong> <code>tests/distributed/test_shm_broadcast.py</code> sends 10,000 random arrays (about 400 MB) from rank 2 of 4 processes, with 40 KiB chunks, so that many arrays use the overflow path ({{cite tests/distributed/test_shm_broadcast.py:108-136}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>multiprocessing.shared_memory.SharedMemory</code> to make or open the buffer ({{cite deepinfer/distributed/shm_broadcast.py:100-121}}).</li>
+  <li><code>zmq</code> XPUB and SUB sockets on <code>127.0.0.1</code> ({{cite deepinfer/distributed/shm_broadcast.py:193-201}}, {{cite deepinfer/distributed/shm_broadcast.py:260-264}}).</li>
+  <li><code>dist.broadcast_object_list</code> on the Gloo CP group, to send the handle to the readers ({{cite deepinfer/distributed/shm_broadcast.py:454-458}}).</li>
+  <li><code>deepinfer.utils.get_open_port</code> and <code>get_ip</code> ({{cite deepinfer/utils.py:40-49}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>ShmRingBuffer.__init__</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:34-121}}</td><td>Makes (writer) or opens (reader) the shared memory; the docstring describes the layout and the flag protocol.</td></tr>
+    <tr><td><code>handle</code>, <code>__reduce__</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:123-127}}</td><td>Pickles as <code>(n_reader, max_chunk_bytes, max_chunks, name)</code>, so another process opens the same memory.</td></tr>
+    <tr><td><code>__del__</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:129-135}}</td><td>Closes; the creator also unlinks.</td></tr>
+    <tr><td><code>get_data</code>, <code>get_metadata</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:137-149}}</td><td>Memory views of one chunk and of its flag row.</td></tr>
+    <tr><td><code>Handle</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:152-159}}</td><td>Dataclass that a reader needs: IP, local reader ranks, buffer handle, ports.</td></tr>
+    <tr><td><code>MessageQueue.__init__</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:163-239}}</td><td>Writer side: the ring buffer, an XPUB socket for local readers, another for remote readers.</td></tr>
+    <tr><td><code>create_from_handle</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:244-284}}</td><td>Reader side: opens the buffer and connects a SUB socket.</td></tr>
+    <tr><td><code>wait_until_ready</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:286-306}}</td><td>Handshake: the writer waits for all subscriptions, then sends <code>b"READY"</code>.</td></tr>
+    <tr><td><code>_spin_wait</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:308-318}}</td><td>One wait turn: yield the CPU, log now and then, raise on time-out.</td></tr>
+    <tr><td><code>acquire_write</code>, <code>acquire_read</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:320-387}}</td><td>Context managers that wait for a usable chunk and update its flags.</td></tr>
+    <tr><td><code>enqueue</code>, <code>dequeue</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:389-422}}</td><td>Pickle and write; read and unpickle. Large objects go over the socket.</td></tr>
+    <tr><td><code>broadcast_object</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:424-429}}</td><td>Writer enqueues, reader dequeues. DeepInfer uses its own copy of this logic in <code>cp_broadcast_object</code>; only the test calls this method.</td></tr>
+    <tr><td><code>create_from_process_group</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:431-461}}</td><td>Collective set-up over a process group: writer makes, readers open, all wait until ready.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>create_from_process_group</code>: set-up over a group</h3>
+<x-code file="deepinfer/distributed/shm_broadcast.py" lines="431-461" highlight="442-444,446-454,457-460" />
+<ol>
+  <li>Line 442: the comment states the assumption. Every reader is a local (shared-memory) reader. So the group must be on one host.</li>
+  <li>Lines 446-454: the writer (group rank 0 by default) makes the queue and broadcasts its <code>Handle</code> with <code>broadcast_object_list</code>. This is a Gloo collective on the CPU CP group.</li>
+  <li>Lines 455-459: the readers get the handle and open the queue.</li>
+  <li>Line 460: all ranks call <code>wait_until_ready</code>.</li>
+</ol>
+
+<h3><code>MessageQueue.__init__</code> and <code>create_from_handle</code>: the two sides</h3>
+<x-code file="deepinfer/distributed/shm_broadcast.py" lines="184-209" highlight="188,193,197-201,203" />
+<p>The writer makes a <code>ShmRingBuffer</code> with one flag per local reader, and binds an XPUB socket on a free local port. <code>XPUB_VERBOSE</code> makes the socket pass every subscription message to the writer, so the writer can count the readers (the comment on lines 194-196). A reader opens the same buffer from the handle and connects a SUB socket that accepts all messages ({{cite deepinfer/distributed/shm_broadcast.py:252-264}}). The reader's position in <code>local_reader_ranks</code> is its flag number ({{cite deepinfer/distributed/shm_broadcast.py:256}}).</p>
+<p>When a reader opens the buffer, the code patches <code>multiprocessing.resource_tracker.register</code> to do nothing. The comment explains: "Python incorrectly tracks shared memory even if it is not created by the process" ({{cite deepinfer/distributed/shm_broadcast.py:110-115}}).</p>
+
+<h3><code>acquire_write</code>: wait for a free chunk</h3>
+<x-code file="deepinfer/distributed/shm_broadcast.py" lines="320-357" highlight="327-335,341,343-344,351-356" />
+<ol>
+  <li>Lines 326-335: look at the flag row of chunk <code>current_idx</code>. If it is written and not read by all readers, wait one turn and look again.</li>
+  <li>Line 341: set <code>written = 0</code>. The chunk is now "not written" for all readers.</li>
+  <li>Lines 343-344: give the chunk to the caller, which writes the data.</li>
+  <li>Lines 351-355: set all reader flags to 0, then set <code>written = 1</code>. The comment on lines 347-350 says the order is important: with the other order, a reader could see "written and already read" for a short time.</li>
+  <li>Line 356: the next write uses the next chunk, modulo 10.</li>
+</ol>
+
+<h3><code>acquire_read</code>: wait for a new chunk</h3>
+<x-code file="deepinfer/distributed/shm_broadcast.py" lines="359-387" highlight="366-368,376,380-381,385-386" />
+<p>Each reader keeps its own <code>current_idx</code>. It waits until its chunk is written and its own flag is 0. After the caller has read the data, it sets its own flag to 1 and moves to the next chunk. Readers never touch the <code>written</code> flag.</p>
+
+<h3><code>enqueue</code> and <code>dequeue</code>: the object path</h3>
+<x-code file="deepinfer/distributed/shm_broadcast.py" lines="389-422" highlight="392,396-402,410-417" />
+<ol>
+  <li>Line 392: pickle the object with the highest protocol.</li>
+  <li>Line 396: the object "overflows" if its pickle has <code>max_chunk_bytes</code> bytes or more (1 MiB in the CP queue).</li>
+  <li>Lines 397-400: byte 0 of the chunk is the overflow flag. A small object goes into bytes 1 and up.</li>
+  <li>Lines 401-402: a large object goes over the local XPUB socket. The chunk still goes through the ring, as a ticket.</li>
+  <li>Lines 410-417: the reader reads byte 0. For a small object, <code>pickle.loads(buf[1:])</code> reads the object; pickle knows its own length (comment, lines 412-414). For a large object, the reader reads one message from its SUB socket.</li>
+</ol>
+<x-note title="Why the order of messages is safe">
+<p>The ring and the socket are two channels. A reader always takes the chunk first, and reads the socket only when byte 0 says "overflow". The writer sends a large object over the socket in the same order as the chunks. So the k-th socket message belongs to the k-th overflow chunk.</p>
+</x-note>
+
+<h3><code>wait_until_ready</code> and <code>_spin_wait</code></h3>
+<x-code file="deepinfer/distributed/shm_broadcast.py" lines="286-318" highlight="297-300,303,311,313-317">
+<x-tr line="310">Spin-wait for one turn: give up the CPU, write a debug log at intervals, raise TimeoutError on time-out. Returns the updated n_warning.</x-tr>
+</x-code>
+<p>The handshake (lines 290-306) makes sure that every SUB socket is connected before the first large object goes out. A ZeroMQ publisher drops messages for subscribers that are not connected yet (general ZeroMQ behaviour). The wait loop (lines 308-318) calls <code>os.sched_yield()</code> on each turn. It does not sleep.</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data flow: what goes through the queue in one step">
+<p>With CP above 1, each prefill step sends these objects from the driver, in this order (the first three come from <code>run_workers</code>, <code>_prepare_input_driver</code> and <code>prepare_sampler_inputs</code>):</p>
+<table>
+  <thead><tr><th>#</th><th>Object</th><th>Typical size</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>("execute_model_step", {"is_prompt": True, "is_placeholder": False})</code></td><td>tens of bytes</td><td>{{cite deepinfer/worker/base.py:300}}</td></tr>
+    <tr><td>2</td><td>list of <code>(key, value)</code>: the input metadata, with a <code>TensorMetadata(dtype, size)</code> for each tensor</td><td>a few KiB</td><td>{{cite deepinfer/model_executor/parallel_utils/communication_op.py:64-72}}</td></tr>
+    <tr><td>3</td><td>the sampler metadata dict, the same way</td><td>small</td><td>{{cite deepinfer/worker/model_runner.py:252-259}}</td></tr>
+  </tbody>
+</table>
+<p>The tensor data does not go through the queue. After each metadata list, <code>cp_broadcast_multi_tensor</code> sends the tensors with one device broadcast per tensor ({{cite deepinfer/model_executor/parallel_utils/communication_op.py:36-43}}). So the 1 MiB chunk is large enough for normal steps, and the overflow path is rare. (Sizes in the table are estimates, not measured.)</p>
+<p><strong>Types.</strong> Any picklable object can go. The input metadata dict contains a class object (<code>"type": type(input_metadata)</code>), which pickle stores by name ({{cite deepinfer/worker/model_runner.py:204}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and CPU use">
+<ul>
+  <li><strong>Writer:</strong> the engine process, on the thread that runs <code>step()</code>. <code>enqueue</code> spins only if the reader is 10 messages behind.</li>
+  <li><strong>Readers:</strong> each CP follower process, in <code>start_slave_worker_loop</code>. Between steps, the follower sits in <code>acquire_read</code>. That loop calls <code>os.sched_yield()</code> and checks the flag again, with no sleep ({{cite deepinfer/distributed/shm_broadcast.py:308-318}}, {{cite deepinfer/distributed/shm_broadcast.py:364-377}}). So an idle follower keeps one CPU core busy.</li>
+  <li><strong>ZeroMQ context:</strong> <code>Context.instance()</code> is one context per process ({{cite deepinfer/distributed/shm_broadcast.py:182}}).</li>
+  <li><strong>The slow-reader log.</strong> After 60 s of waiting (<code>DEEPINFER_RINGBUFFER_WARNING_INTERVAL</code>), the waiter writes a debug log "No available shared memory block after ... seconds", then again after 120 s, and so on ({{cite deepinfer/environ.py:184}}, {{cite deepinfer/distributed/shm_broadcast.py:312-315}}). At the default log level, a debug log may not show.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: chunk numbers over 12 messages">
+<p>CP group of 4: writer W, readers R0, R1, R2, 10 chunks. W sends messages m0 to m11.</p>
+<ol>
+  <li>m0 to m9 go into chunks 0 to 9. Each chunk becomes <code>1 0 0 0</code>.</li>
+  <li>R0 and R2 are fast. They read m0 to m9; the rows become <code>1 1 0 1</code>. R1 is slow and has read only m0 to m3: chunks 0-3 are <code>1 1 1 1</code>.</li>
+  <li>m10 goes to chunk 0 (<code>10 % 10</code>). Chunk 0 is <code>1 1 1 1</code>, so W can write at once.</li>
+  <li>m11 goes to chunk 1, also free.</li>
+  <li>m14 would go to chunk 4. Chunk 4 is <code>1 1 0 1</code>, so W waits until R1 reads m4.</li>
+</ol>
+<p>So the writer can be at most 10 messages ahead of the slowest reader. In DeepInfer, each step sends 3 messages (the method call, the input metadata and the sampler metadata), so the driver CPU can be about 3 steps ahead before it waits.</p>
+<x-simplified><p>The count of 3 comes from the code paths in the first deep dive. A decode step that replays a CUDA graph also sends 3: its input metadata message holds only the five small values ({{cite deepinfer/worker/model_runner.py:202-212}}). <code>InputMetadata.broadcast</code> uses the queue only while the graph is captured; a replay does not run that Python code. Other worker methods, such as start-up calls, add their own messages.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>enqueue</code> on a reader, <code>acquire_read</code> on the writer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:322}}, {{cite deepinfer/distributed/shm_broadcast.py:361}}, {{cite deepinfer/distributed/shm_broadcast.py:391}}</td></tr>
+    <tr><td><code>dequeue</code> on the writer</td><td><code>RuntimeError("Only readers can dequeue")</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:420-421}}</td></tr>
+    <tr><td>Time-out passed and reached</td><td><code>TimeoutError</code>. DeepInfer passes no time-out, so it waits for ever.</td><td>{{cite deepinfer/distributed/shm_broadcast.py:316-317}}</td></tr>
+    <tr><td>A reader on another host</td><td>The buffer does not exist there; <code>FileNotFoundError</code> is suppressed, and the object has no <code>shared_memory</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:117-121}}</td></tr>
+    <tr><td>Buffer size differs from the handle</td><td><code>AssertionError</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:116}}</td></tr>
+    <tr><td>Handshake message is not <code>b"READY"</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/distributed/shm_broadcast.py:303}}, {{cite deepinfer/distributed/shm_broadcast.py:306}}</td></tr>
+    <tr><td>Buffer already unlinked at <code>__del__</code></td><td>suppressed</td><td>{{cite deepinfer/distributed/shm_broadcast.py:133-135}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Settings.</strong> The only environment variable in this file is <code>DEEPINFER_RINGBUFFER_WARNING_INTERVAL</code> (default 60, {{cite deepinfer/environ.py:184}}). The chunk size and count come from the caller: 1 MiB and 10 for the CP queue ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:124}}). The defaults of the class are 10 MiB and 10 ({{cite deepinfer/distributed/shm_broadcast.py:168-169}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Remote readers: in the code, not used by DeepInfer">
+<p>The class can also serve readers on other hosts. For them, the writer binds a second XPUB socket on <code>tcp://*:&lt;port&gt;</code>, and <code>enqueue</code> sends every object over it ({{cite deepinfer/distributed/shm_broadcast.py:211-220}}, {{cite deepinfer/distributed/shm_broadcast.py:403-404}}). The writer's IP comes from <code>get_ip()</code>, which opens a UDP socket toward <code>8.8.8.8</code> to learn the local address; no packet is needed ({{cite deepinfer/utils.py:40-43}}). IPv6 addresses set the <code>IPV6</code> socket option.</p>
+<p><code>create_from_process_group</code> always sets <code>n_local_reader = n_reader</code> ({{cite deepinfer/distributed/shm_broadcast.py:443-453}}), so in DeepInfer the remote path stays unused.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/context-parallelism}}: why the CP driver sends method calls and metadata to the followers.</li>
+  <li>{{link code/parallel-state}}: where the queue is made, and <code>cp_broadcast_object</code>.</li>
+  <li>{{link code/model-runner}}: the driver and follower paths of <code>_prepare_input</code>.</li>
+  <li>{{link code/shared-memory}}: the other shared-memory module, for image tensors.</li>
+  <li>{{link tours/multi-gpu-step}}: the queue in one step on many GPUs.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which process writes to the CP queue, and which processes read from it?
+    <x-a><p>CP rank 0 (the engine process with the driver worker) writes. Each CP follower reads. The writer is <code>writer_rank = 0</code> of the CPU CP group ({{cite deepinfer/distributed/shm_broadcast.py:436}}, {{cite deepinfer/model_executor/parallel_utils/parallel_state.py:124}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Does the queue carry the tensor data of the input metadata?
+    <x-a><p>No. It carries the keys, the small values and a <code>TensorMetadata(dtype, size)</code> for each tensor. The tensors go with device broadcasts ({{cite deepinfer/model_executor/parallel_utils/communication_op.py:64-81}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A pickled object has exactly 1,048,576 bytes (1 MiB). Which path does it take in the CP queue?
+    <x-a><p>The overflow path. <code>overflow = len(serialized_obj) &gt;= max_chunk_bytes</code> ({{cite deepinfer/distributed/shm_broadcast.py:396}}), and 1 MiB is not smaller than 1 MiB. Byte 0 of the chunk becomes 1, and the bytes go over the local ZeroMQ socket. (The chunk also needs byte 0 for the flag, so an inline object can have at most <code>max_chunk_bytes − 1</code> bytes.)</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>acquire_write</code> reset the reader flags before it sets <code>written = 1</code>, and not after?
+    <x-a><p>With the other order, the row would go from <code>0 1 1 1</code> to <code>1 1 1 1</code> and <code>1 0 1 1</code> before it reaches <code>1 0 0 0</code>. These intermediate rows say "written and already read" for a message that nobody has read. The docstring calls this intermediate case 3 "not correct" ({{cite deepinfer/distributed/shm_broadcast.py:80-85}}, {{cite deepinfer/distributed/shm_broadcast.py:347-355}}). The reset-first order keeps the row in a valid state at every moment. (Our reading of <code>acquire_read</code>: a reader that sees its own flag still at 1 does not skip the chunk. It waits one more turn, because it moves to the next chunk only after it reads, lines 365-377.)</p></x-a>
+  </x-q>
+  <x-q level="hard">A follower is idle for an hour between two requests. What does its CPU do, and what appears in the logs?
+    <x-a><p>It spins in <code>acquire_read</code>: each turn reads the flag row and calls <code>os.sched_yield()</code>, with no sleep, so one core stays busy ({{cite deepinfer/distributed/shm_broadcast.py:364-377}}). Every 60 s it writes a debug line "No available shared memory block after ... seconds" ({{cite deepinfer/distributed/shm_broadcast.py:312-315}}). Note: with <code>LLM.generate</code>, the driver keeps calling <code>step()</code> while there is work. When it stops, the follower waits.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,209 @@
+---
+title: Tour: One step on many GPUs
+nav_title: One step on many GPUs
+level: Advanced
+prerequisites: tours/engine-step, concepts/dp-step-votes, concepts/context-parallelism, concepts/expert-parallelism
+related: concepts/dp-step-votes, concepts/context-parallelism, concepts/expert-parallelism, concepts/eplb, code/parallel-state, code/shm-broadcast, code/model-runner, code/v4-mlp, tours/engine-step
+summary: Follow one prefill step on 4 GPUs (2 data-parallel engines, each with 2 context-parallel ranks) in 10 stops, from the step vote to the outputs, with the rank, the group and the tensor shapes at each stop.
+---
+<x-sentence>We follow one prefill step on 4 GPUs. Two engines vote, each driver feeds its CP follower, the ranks share keys and experts, and the drivers sample.</x-sentence>
+
+<h2>The idea</h2>
+<p>The tour {{link tours/engine-step}} followed one step on one device. This tour runs the same kind of step on four devices, and watches the communication. At each stop you see which {{term rank | ranks}} work, which group talks, and the shapes of the data.</p>
+<p><strong>The set-up.</strong> <code>python examples/offline_inference.py --ep 4 --cp 2</code> on one host with 4 GPUs. The script computes <code>dp_size = max(4 // 2, 1) = 2</code> and a world of 4 ranks ({{cite examples/offline_inference.py:24-28}}). So there are two engines (two {{term data-parallelism | DP}} replicas), and each engine has two {{term context-parallelism | CP}} ranks:</p>
+<table>
+  <thead><tr><th>Rank</th><th>Engine</th><th><code>cp_rank</code></th><th>Process</th><th>Device</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>0</td><td>0 (driver)</td><td>engine 0, started by <code>_launch.py</code></td><td>0</td></tr>
+    <tr><td>1</td><td>0</td><td>1 (follower)</td><td>spawned by engine 0</td><td>1</td></tr>
+    <tr><td>2</td><td>1</td><td>0 (driver)</td><td>engine 1, started by <code>_launch.py</code></td><td>2</td></tr>
+    <tr><td>3</td><td>1</td><td>1 (follower)</td><td>spawned by engine 1</td><td>3</td></tr>
+  </tbody>
+</table>
+<p>Rank = <code>engine_rank × 2 + cp_rank</code> ({{cite deepinfer/worker/base.py:329}}). The groups are: CP <code>[0, 1]</code> and <code>[2, 3]</code>; DP <code>[0, 2]</code> and <code>[1, 3]</code>; EP <code>[0, 1, 2, 3]</code>. The EP group is the world group, because <code>ep_size</code> equals the rank count ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:91-106}}).</p>
+<p><strong>The work.</strong> Engine 0 has one new request A with 8 prompt tokens. Engine 1 has no waiting request. The scheduler counter is at <code>decode_step = 100</code>, an ANY point. ZOS is on (the default). <code>H</code> is the hidden size of the checkpoint; the repository does not fix it.</p>
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Ranks</th><th>Group</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The engines vote for a prefill step</td><td>0, 2</td><td>DP (Gloo)</td></tr>
+    <tr><td>2</td><td>Each engine schedules its batch</td><td>0, 2</td><td>none</td></tr>
+    <tr><td>3</td><td>The driver sends the method call</td><td>0 → 1, 2 → 3</td><td>CP (shared memory)</td></tr>
+    <tr><td>4</td><td>The driver sends the input metadata</td><td>0 → 1, 2 → 3</td><td>CP (shared memory + NCCL)</td></tr>
+    <tr><td>5</td><td>Each rank takes its mirror rows</td><td>all</td><td>none</td></tr>
+    <tr><td>6</td><td>Attention gathers K and V</td><td>all</td><td>CP (DeepEP BucketBuffer)</td></tr>
+    <tr><td>7</td><td>MoE dispatch and combine</td><td>all</td><td>EP</td></tr>
+    <tr><td>8</td><td>EPLB counts the tokens per expert</td><td>all</td><td>EP (every 128 steps)</td></tr>
+    <tr><td>9</td><td>The last all-gather, and the drivers sample</td><td>all; sampling on 0, 2</td><td>CP</td></tr>
+    <tr><td>10</td><td>Outputs</td><td>0, 2</td><td>none</td></tr>
+  </tbody>
+</table>
+
+<h2>The picture</h2>
+<x-diagram name="b8_tour_map" alt="Panel 1: two dashed engine boxes. Engine 0 sees devices 0 and 1 and holds rank 0 (driver with LLMEngine, scheduler and sampler) and rank 1 (CP follower, Worker only). Engine 1 sees devices 2 and 3 and holds ranks 2 and 3 in the same way. Panel 2: ten cards for the stops: votes over DP group 0 and 2; scheduling; the method call through shared memory; the input metadata broadcast; the mirror layout with rows t0 t1 t6 t7 on rank 0 and t2 to t5 on rank 1; attention with a CP all-gather; MoE dispatch and combine over all 4 ranks; EPLB counting; the last all-gather with sampling on ranks 0 and 2; outputs. Each card has a pill with its group." caption="Figure: the four ranks of the example (panel 1) and the ten stops of the tour, with the group that communicates at each stop (panel 2). Click to zoom." />
+<p>Read panel 2 from top to bottom. Amber cards talk inside one engine (CP). Violet cards talk across both engines (EP). The green card is the only stop where the two drivers talk to each other directly.</p>
+
+<x-stop n="1" title="The engines vote for a prefill step">
+<p>We are in <code>Scheduler::_schedule</code> (C++), called from <code>LLMEngine.step()</code> on ranks 0 and 2. Only the engine processes run a scheduler; ranks 1 and 3 wait in their worker loop.</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="308-319" highlight="308,313,316" />
+<p><code>decode_step = 100</code>, so this is an ANY point. Engine 0 wants a prefill (A is schedulable and the cache has room) and sends 0. Engine 1 sends 1. <code>MIN(0, 1) = 0</code>: both engines prefill. With ZOS, the vote uses the Gloo copy of the DP group <code>[0, 2]</code> and a CPU tensor ({{cite deepinfer/engine/llm_engine.py:313}}, {{cite csrc/engine/scheduler.hpp:170-182}}).</p>
+<x-deepdive title="Stop 1 in detail: the other two all-reduces">
+<p>Before this call of <code>step()</code>, <code>LLM._run_engine</code> asked <code>has_unfinished_requests()</code>. Engine 0 sent 1 and engine 1 sent 0; the MAX is 1, so both engines call <code>step()</code> ({{cite deepinfer/engine/llm_engine.py:673-678}}).</p>
+<p>After vote 1, engine 0 runs <code>_schedule_prefill</code> and gets a batch. Vote 2 then asks whether any engine got a batch: engine 0 sends 0, engine 1 sends 1, <code>MIN = 0</code>. Engine 1 returns an empty prompt step ({{cite csrc/engine/scheduler.hpp:332-340}}). The page {{link concepts/dp-step-votes}} explains the encodings.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="2" title="Each engine schedules its batch">
+<p>Still in <code>LLMEngine.step()</code>. Engine 0 now has one {{term sequence-metadata}} for A, with <code>seqlen_q = 8</code>. The scheduler pads the CP work in its token budget to a multiple of <code>2 × cp = 4</code>; 8 is already a multiple ({{cite csrc/engine/scheduler.hpp:515}}). Engine 1 has no sequence. The engine hands both cases to the worker in the same way:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="961-975" highlight="967-972" />
+<p>On engine 1, <code>is_placeholder</code> is true. Its worker runs the model on one dummy sequence with one token ({{cite deepinfer/worker/worker.py:125-127}}, {{cite deepinfer/worker/model_runner.py:386-403}}).</p>
+<x-deepdive title="Stop 2 in detail: the data on each engine">
+<pre><code class="language-python"># engine 0 (rank 0)                       # engine 1 (rank 2)
+seq_metadata_list = [A]                     seq_metadata_list = []  # worker uses [placeholder]
+is_prompt, is_placeholder = True, False     is_prompt, is_placeholder = True, True
+A.seqlen_q = 8, A.seqlen_k = 8              placeholder: seqlen_q = 1, block_table = [0]</code></pre>
+<p>Both engines will run a prompt step. That is the point of the vote: the ranks of both engines must call the same collectives in the stops that follow.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="3" title="The driver sends the method call to its follower">
+<p>We are in <code>WorkerBase.run_workers</code> on ranks 0 and 2. Before the driver runs <code>execute_model_step</code> itself, it sends the method name and the keyword arguments to its CP follower:</p>
+<x-code file="deepinfer/worker/base.py" lines="290-302" highlight="300,302" />
+<p>On ranks 1 and 3, the follower loop gets the tuple and calls the same method ({{cite deepinfer/worker/base.py:129-133}}). The channel is the {{term shm-message-queue | MessageQueue}} of the CP group: a ring buffer in {{term posix-shm | shared memory}}, written by CP rank 0 ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:17-23}}).</p>
+<x-deepdive title="Stop 3 in detail: what the follower gets">
+<p>The follower gets <code>("execute_model_step", {"is_prompt": True, "is_placeholder": False})</code> on rank 1, and the same with <code>is_placeholder = True</code> on rank 3. The <code>driver_kwargs</code> (the sequence list and the scheduler outputs) stay on the driver ({{cite deepinfer/engine/llm_engine.py:965-973}}). So in <code>execute_model_step</code>, a follower has <code>seq_metadata_list = None</code>, and it skips the ZOS correction, which only the driver does ({{cite deepinfer/worker/worker.py:116-118}}).</p>
+<p>The pickled tuple is a few tens of bytes, far below the 1 MiB chunk size of the queue ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:124}}). The page {{link code/shm-broadcast}} explains the queue.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="4" title="The driver sends the input metadata">
+<p>We are in <code>ModelRunner._prepare_input</code>. The driver builds the {{term input-metadata}} of its batch in C++, moves it to the device, and broadcasts it in the CP group. The follower receives it:</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="200-230" highlight="212,217,227" />
+<p><code>broadcast_tensor_dict</code> sends a list of keys, small values and <code>(dtype, size)</code> pairs through the shared-memory queue. Then it sends each tensor with a device broadcast from CP rank 0 ({{cite deepinfer/model_executor/parallel_utils/communication_op.py:51-82}}).</p>
+<x-deepdive title="Stop 4 in detail: shapes on engine 0">
+<table>
+  <thead><tr><th>Field</th><th>Value on rank 0 and, after the broadcast, on rank 1</th></tr></thead>
+  <tbody>
+    <tr><td><code>input_ids</code></td><td>int32 <code>[8]</code>, the 8 prompt tokens</td></tr>
+    <tr><td><code>positions</code></td><td><code>[8]</code>: 0 to 7</td></tr>
+    <tr><td><code>cu_seqlens_q</code>, <code>cu_seqlens_k</code></td><td>int32 <code>[2]</code>: <code>[0, 8]</code></td></tr>
+    <tr><td><code>total_q</code></td><td>8</td></tr>
+    <tr><td><code>cp_mirror_len</code></td><td><code>2 × ⌈8 / 4⌉ = 4</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:146-155}})</td></tr>
+  </tbody>
+</table>
+<p>On engine 1, the placeholder has <code>total_q = 1</code> and <code>cp_mirror_len = 2 × ⌈1 / 4⌉ = 2</code>. A second, smaller broadcast follows in stop 9, for the sampler inputs ({{cite deepinfer/worker/model_runner.py:250-275}}).</p>
+<p>The broadcast is CP-only: ranks 0 and 1 talk, and ranks 2 and 3 talk. Each CP group has its own queue and its own NCCL group.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="5" title="Each rank takes its mirror rows">
+<p>We are in <code>DeepseekModel.forward</code>, on all four ranks. Each rank embeds all tokens, computes the {{term cp-mirror | mirror}} indices, and keeps only its own rows:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="161-170" highlight="168-170" />
+<p>A has 8 tokens and cp = 2, so it has 4 parts of 2 tokens. Rank 0 takes parts 0 and 3; rank 1 takes parts 1 and 2:</p>
+<table>
+  <thead><tr><th>Rank</th><th><code>mirror_cp_index</code></th><th>Hidden states after the gather</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td><code>[0, 1, 6, 7]</code></td><td><code>[4, H]</code></td></tr>
+    <tr><td>1</td><td><code>[2, 3, 4, 5]</code></td><td><code>[4, H]</code></td></tr>
+    <tr><td>2 (placeholder)</td><td><code>[0, −1]</code></td><td><code>[2, H]</code>, row 1 is zeros</td></tr>
+    <tr><td>3 (placeholder)</td><td><code>[−1, −1]</code></td><td><code>[2, H]</code>, all zeros</td></tr>
+  </tbody>
+</table>
+<p>The values come from the repository's reference function for the kernel ({{cite deepinfer/model_executor/layers/tilelang_ops/prepare_cp_mirror.py:126-157}}). <code>valid_token_mask</code> is <code>mirror_cp_index != −1</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:208}}).</p>
+<x-deepdive title="Stop 5 in detail: the reverse index">
+<p>The kernel also returns <code>mirror_cp_reverse_index</code>, one entry per token. For A it is <code>[0, 1, 4, 5, 6, 7, 2, 3]</code>. An all-gather makes the tensor <code>[rank 0 rows | rank 1 rows]</code>, and token 2 is row 4 of it. Stops 6 and 9 use it. The page {{link concepts/context-parallelism}} derives these numbers.</p>
+<p>Rank 3 has no real row. It still runs every layer, because its collectives must match the other ranks.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="6" title="Attention gathers K and V over the CP group">
+<p>We are in the attention layer (<code>v4_modules/attn.py</code>), inside each decoder layer, on all ranks. In a prefill step with CP, the layer opens a CP session and starts the all-gather of its projected K and V. It computes the queries while the data moves:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="766-797" highlight="766,782,785,792-797" />
+<p>The all-gather runs through <code>CPManager</code> on a DeepEP <code>BucketBuffer</code> ({{cite deepinfer/model_executor/parallel_utils/cp.py:42-51}}). Each rank sends 4 rows and gets 8 rows: <code>[2 × 4, ...]</code>. The layer reorders them with <code>mirror_cp_reverse_index</code> back to token order ({{cite deepinfer/model_executor/models/v4_modules/attn.py:826-829}}). So rank 0 and rank 1 both store the K and V of all 8 tokens in their KV caches. Each rank computes attention only for its 4 query rows.</p>
+<x-deepdive title="Stop 6 in detail: who talks to whom">
+<ul>
+  <li>Ranks 0 and 1 exchange the K and V of A. Ranks 2 and 3 each send 2 rows; of these 4 rows, only one is a real token.</li>
+  <li>The two CP groups do not talk to each other in this stop.</li>
+  <li>The CP buffer was sized at start-up from <code>max_num_prefilling_tokens = max_num_batched_tokens // cp_size</code> ({{cite deepinfer/model_executor/model_loader.py:120}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:97-117}}).</li>
+  <li>Gathered tensors alias the buffer. The next session overwrites them, so the layer copies what it keeps ({{cite deepinfer/model_executor/parallel_utils/cp.py:10-14}}).</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="7" title="MoE: dispatch and combine across both engines">
+<p>We are in <code>DeepseekMoE.forward</code> (<code>v4_modules/mlp.py</code>), after the attention of each layer. This is the stop where the two engines meet. The EP group holds all 4 ranks. So a token of A can go to an expert on rank 2 or rank 3, which belong to engine 1:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="565-610" highlight="574,578-585,604-610" />
+<p>Each rank routes its own rows: 4 rows on ranks 0 and 1, 2 rows on ranks 2 and 3. The gate masks the rows with <code>valid_token_mask = False</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:387}}). After the combine, each rank again has its own rows, <code>[4, H]</code> or <code>[2, H]</code>.</p>
+<x-deepdive title="Stop 7 in detail: why engine 1 must take part">
+<p>Dispatch and combine are collectives over the EP group. Ranks 2 and 3 have no real token, but the experts on their devices can receive tokens of A. Assume that engine 1 ran a decode step now. It would call dispatch with the decode token limit, and it would run other layers (the draft model) after the forward pass ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:476}}). The vote in stop 1 prevents this.</p>
+<p>The page shows the DeepEP path. If the EP group fits in one {{term nvlink-domain | NVLink domain}}, the layer can use mega-MoE instead, with the same group ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:184-188}}, {{link concepts/mega-moe}}). This site does not explain DeepEP internals.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="8" title="EPLB counts the tokens per expert">
+<p>The dispatch call also passes a counter: <code>cumulative_local_expert_recv_stats=self._eplb_layer().expert_count</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:474}}). It adds the number of tokens that each local expert slot receives in this layer. After the forward pass, the sampler step calls the load balancer:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="402-409" highlight="404" />
+<x-code file="deepinfer/model_executor/eplb/__init__.py" lines="131-138" highlight="133,136-138" />
+<p>With EP above 1, <code>step</code> updates the rearrangement window, but only if rearrangement is on. Then it adds the token counts of the step to the statistics and sets the counters back to zero.</p>
+<x-deepdive title="Stop 8 in detail: the EP all-gather every 128 steps">
+<p><code>_update_load_balance_stats</code> stores the token sum per layer for this step. Every <code>DEEPINFER_MOE_LB_STAT_INTERVAL</code> steps (default 128), it all-gathers the window over the EP group and computes the mean and the maximum per rank ({{cite deepinfer/model_executor/eplb/__init__.py:167-192}}, {{cite deepinfer/environ.py:118}}). This all-gather is one more reason why all 4 ranks must run the same number of steps, also the placeholder ranks. Shape of the counter: <code>[num_moe_layers, num_local_physical_experts]</code> ({{cite deepinfer/model_executor/eplb/__init__.py:49}}). See {{link concepts/eplb}}.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="9" title="The last all-gather, and only the drivers sample">
+<p>After the last layer, each CP group gathers the output rows and puts them back in token order. Every rank of engine 0 now has the hidden states of all 8 tokens, <code>[8, H]</code>:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="241-244" />
+<p>Then the worker calls the sampler on all ranks. The driver sends the sampler inputs (row 7 for A: the last prompt token) with a second <code>broadcast_tensor_dict</code> ({{cite deepinfer/worker/model_runner.py:250-261}}, {{cite csrc/engine/prepare_sample.cpp:197}}). A follower makes <code>SamplerInputs</code> with no driver part ({{cite deepinfer/worker/model_runner.py:271-275}}). In the sampler, it computes the logits and returns an empty output:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="142-161" highlight="145,161" />
+<p>So rank 0 samples the first output token of A. Rank 2 samples a token for the placeholder; the engine ignores it in stop 10.</p>
+<x-deepdive title="Stop 9 in detail: shapes in the sampler">
+<ul>
+  <li>Hidden states: <code>[8, H]</code> on ranks 0 and 1. On ranks 2 and 3 they are <code>[1, H]</code>, because the placeholder has one token (<code>total_q = 1</code>).</li>
+  <li><code>selected_token_indices = [7]</code> on engine 0: one row goes to the logits, fp32 <code>[1, vocab]</code>.</li>
+  <li>A prefill step runs no draft model. In a decode step, the followers would also run the draft layers ({{cite deepinfer/model_executor/layers/sampler.py:155-160}}). The code gives no reason; our reading is that the draft MoE collectives need every rank.</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="10" title="Outputs">
+<p>We are back in <code>Worker.execute_model_step</code>. A prompt step is post-processed at once, also with ZOS ({{cite deepinfer/worker/worker.py:182-187}}). Only the driver calls the engine's callback and gets request outputs:</p>
+<x-code file="deepinfer/worker/worker.py" lines="262-272" highlight="268,270-271" />
+<p>On rank 0, <code>LLMEngine.post_process</code> gives the token of A to the scheduler and builds a <code>RequestOutput</code>. On rank 2, the step is a placeholder, so the engine uses no sampler output ({{cite deepinfer/engine/llm_engine.py:987}}). Ranks 1 and 3 return an empty array and wait for the next method call.</p>
+<x-deepdive title="Stop 10 in detail: what the next step looks like">
+<p>The prompt step sets <code>decode_step = 0</code> on both engines ({{cite csrc/engine/scheduler.hpp:676-677}}). That is an ALL point. Engine 1 still has no work, so vote 1 fails, and both engines run decode steps. In a decode step:</p>
+<ul>
+  <li>No mirror layout and no CP all-gather: both checks need <code>is_prompt</code> ({{cite deepinfer/model_executor/models/deepseek.py:168}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:766}}). Ranks 0 and 1 both run A's decode tokens, with the full KV cache that stop 6 stored.</li>
+  <li>With a CUDA graph, the driver sends only five small values; the graph broadcasts the metadata tensors itself ({{cite deepinfer/worker/model_runner.py:202-209}}, {{cite deepinfer/worker/cuda_graph_runner.py:61-65}}).</li>
+  <li>Engine 1 runs placeholder decode steps until it gets work.</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<h2>What can go wrong</h2>
+<x-warning title="All ranks must reach every collective">
+<p>A collective finishes only when every rank of its group calls it. If one rank of the EP group does not reach the dispatch of a layer, the other three wait. <code>DEEPINFER_GLOO_TIMEOUT</code> (14400 s) applies only to the default Gloo group ({{cite deepinfer/worker/base.py:334-340}}). The split groups get no time-out argument, so the PyTorch defaults apply ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:34}}).</p>
+</x-warning>
+<ul>
+  <li><strong>A follower dies.</strong> The driver waits in the next CP broadcast or all-gather. If the driver dies, the followers get <code>SIGKILL</code> ({{cite deepinfer/worker/base.py:129-130}}).</li>
+  <li><strong>One idle engine slows the other.</strong> Engine 1 runs placeholder steps with full passes through all layers. Its empty ALL votes delay the next prefill of engine 0 ({{link concepts/dp-step-votes}}).</li>
+  <li><strong>A CP group across hosts.</strong> The shared-memory queue assumes one host per CP group ({{cite deepinfer/distributed/shm_broadcast.py:442}}).</li>
+  <li><strong>Wrong device order.</strong> Each engine sees <code>cp_size</code> devices from <code>CUDA_VISIBLE_DEVICES</code>. A follower uses <code>local_rank = cp_rank % ngpus</code> ({{cite deepinfer/engine/llm_engine.py:384}}). If the variable lists fewer devices than <code>cp_size</code>, two ranks share a device.</li>
+</ul>
+<p><strong>Why it matters.</strong> This step shows the three kinds of communication in DeepInfer. The DP group only votes. The CP group moves the inputs and the keys and values inside one engine. The EP group ties all engines together in every MoE layer. Most of the rules of the multi-GPU code follow from the last point.</p>
+
+<x-quiz>
+  <x-q level="easy">In this tour, which ranks run a scheduler, and which ranks sample?
+    <x-a><p>Ranks 0 and 2, the drivers of the two engines. The followers (ranks 1 and 3) have no scheduler and return before sampling ({{cite deepinfer/model_executor/layers/sampler.py:145-161}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Through which channel does rank 1 learn that the next method is <code>execute_model_step</code>?
+    <x-a><p>Through the shared-memory MessageQueue of the CP group: <code>run_workers</code> calls <code>cp_broadcast_object((method, kwargs))</code>, and the follower loop dequeues it ({{cite deepinfer/worker/base.py:300}}, {{cite deepinfer/worker/base.py:132}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Which stop is the first in which ranks of engine 0 and ranks of engine 1 exchange device data?
+    <x-a><p>Stop 7, the MoE dispatch. The votes in stop 1 exchange one-element CPU tensors over the Gloo group, between the drivers only. Stops 3, 4, 6 and 9 stay inside one CP group. The EP group is the world group <code>[0, 1, 2, 3]</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:102-103}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How many rows does rank 1 send in each attention all-gather of this step, and how many rows does it get back?
+    <x-a><p>It sends its <code>cp_mirror_len = 4</code> rows and gets <code>2 × 4 = 8</code> rows: the all-gather result has shape <code>[cp_size × rows, ...]</code> ({{cite deepinfer/model_executor/parallel_utils/cp.py:42-51}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Rank 3 has no real token in this step. Name three collectives that it must still call, and the group of each.
+    <x-a><p>(1) The broadcasts of the input metadata and the sampler inputs from rank 2, in the CP group <code>[2, 3]</code> ({{cite deepinfer/worker/model_runner.py:217}}, {{cite deepinfer/worker/model_runner.py:261}}). (2) The CP all-gathers in every attention layer and after the last layer, also in <code>[2, 3]</code> ({{cite deepinfer/model_executor/models/deepseek.py:241-244}}). (3) The MoE dispatch and combine in every layer, in the EP group <code>[0, 1, 2, 3]</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:578-610}}). Every 128 steps, also the EPLB all-gather in the EP group.</p></x-a>
+  </x-q>
+</x-quiz>
