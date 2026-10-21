@@ -1,7 +1,7 @@
 # DeepInfer Explainer — Progress
 
 Last update: 2026-10-21
-Current phase: **Full build — wave 1** (plan section 13)
+Current phase: **Paused for user approval** — all 16 batches committed and pushed; final pass F and README update wait for approval
 
 ## Phase status
 
@@ -43,6 +43,8 @@ Resume order after the reset:
 Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
+
+- 2026-10-22: All 16 batches written, fact-checked and committed (B10b without the 2 deferred TileLang pages). Normal build: 106 pages, 321 glossary terms, 91 diagrams, 0 errors, 8 warnings (all links to the deferred TileLang pages). Pushed to origin. PAUSED for user approval of the final pass (consistency, site check) and README + final commit.
 
 - FINAL-PASS TODO: concepts/hardware-platforms names only sampler.py for the Ascend torch.topk fallback; sampler_utils.py also gets it.
 

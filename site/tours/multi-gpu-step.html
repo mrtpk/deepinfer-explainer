@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tour: One step on many GPUs · DeepInfer Explained</title>
+<meta name="description" content="Follow one prefill step on 4 GPUs (2 data-parallel engines, each with 2 context-parallel ranks) in 10 stops, from the step vote to the outputs, with the rank, the group and the tensor shapes at each stop.">
+<script>try{var t=localStorage.getItem("di-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="tours/multi-gpu-step">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">DI</span><span class="brand-name">DeepInfer Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/what-an-llm-does.html">What an LLM does</a></li>
+<li><a href="../learn/tokens.html">Tokens and tokenizers</a></li>
+<li><a href="../learn/transformer.html">Inside a transformer</a></li>
+<li><a href="../learn/attention.html">Attention, step by step</a></li>
+<li><a href="../learn/prefill-decode.html">Prefill and decode</a></li>
+<li><a href="../learn/kv-cache.html">The KV cache</a></li>
+<li><a href="../learn/sampling.html">Sampling</a></li>
+<li><a href="../learn/batching.html">Batching</a></li>
+<li><a href="../learn/gpus-kernels.html">GPUs, kernels, and speed</a></li>
+<li><a href="../learn/parallelism.html">Parallelism basics</a></li>
+<li><a href="../learn/moe.html">Mixture of Experts (MoE)</a></li>
+<li><a href="../learn/number-formats.html">Number formats</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">DeepInfer concepts</span><span class="nav-count" title="33 of 34 pages written">33/34</span></summary>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../concepts/engine-step-loop.html">Offline API and the step loop</a></li>
+<li><a href="../concepts/request-lifecycle.html">Request and sequence lifecycle</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/paged-kv-cache.html">Paged KV cache and block manager</a></li>
+<li><a href="../concepts/input-metadata.html">Input metadata</a></li>
+<li><a href="../concepts/cuda-graphs.html">CUDA graphs</a></li>
+<li><a href="../concepts/zero-overhead-scheduling.html">Zero-overhead scheduling</a></li>
+</ul>
+<p class="nav-group">Model (V4.1)</p>
+<ul>
+<li><a href="../concepts/model-map.html">Model map</a></li>
+<li><a href="../concepts/mla-attention.html">MLA attention</a></li>
+<li><a href="../concepts/sparse-attention-indexer.html">Sparse attention indexer</a></li>
+<li><a href="../concepts/sliding-window-attention.html">Sliding-window attention</a></li>
+<li><a href="../concepts/kv-compression.html">KV compression</a></li>
+<li><a href="../concepts/cross-layer-kv-sharing.html">Cross-layer KV sharing</a></li>
+<li><a href="../concepts/yoco-swa-replay.html">YOCO and SWA bounded replay</a></li>
+<li><a href="../concepts/mhc-residual.html">mHC residual mixing</a></li>
+<li><a href="../concepts/moe-routing.html">MoE routing</a></li>
+<li><a href="../concepts/mega-moe.html">Mega-MoE</a></li>
+<li><a href="../concepts/engram.html">Engram n-gram memory</a></li>
+<li><a href="../concepts/vision-encoder.html">Vision encoder (VL)</a></li>
+</ul>
+<p class="nav-group">Decoding</p>
+<ul>
+<li><a href="../concepts/sampler.html">The sampler</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/dspark.html">DSpark confidence scheduling</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/determinism.html">Determinism</a></li>
+</ul>
+<p class="nav-group">Scale</p>
+<ul>
+<li><a href="../concepts/dp-step-votes.html">DP and step votes</a></li>
+<li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a></li>
+<li><a href="../concepts/expert-parallelism.html">Expert parallelism (dispatch/combine)</a></li>
+<li><a href="../concepts/eplb.html">Expert load balancing (EPLB)</a></li>
+<li><a href="../concepts/hardware-discovery.html">Hardware discovery</a></li>
+</ul>
+<p class="nav-group">Platform</p>
+<ul>
+<li><a href="../concepts/hardware-platforms.html">NVIDIA and Ascend</a></li>
+<li class="soon"><span>TileLang kernels</span><span class="soon-tag">soon</span></li>
+<li><a href="../concepts/python-cpp-boundary.html">Python and C++</a></li>
+<li><a href="../concepts/low-precision-formats.html">Low-precision formats</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="6 of 6 pages written">6/6</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-request.html">Life of a request</a></li>
+<li><a href="../tours/startup.html">Start-up</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/decoder-layer.html">Inside one decoder layer</a></li>
+<li><a href="../tours/spec-decode-round.html">One speculative decoding round</a></li>
+<li><a class="current" aria-current="page" href="../tours/multi-gpu-step.html">One step on many GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="49 of 50 pages written">49/50</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">User API and engine</p>
+<ul>
+<li><a href="../code/entrypoints-llm.html">entrypoints/llm.py</a></li>
+<li><a href="../code/sampling-params.html">sampling_params.py</a></li>
+<li><a href="../code/llm-engine.html">engine/llm_engine.py</a></li>
+<li><a href="../code/sequence.html">sequence.py</a></li>
+<li><a href="../code/config.html">config.py</a></li>
+<li><a href="../code/environ.html">environ.py</a></li>
+<li><a href="../code/stats-logger.html">engine/stats_logger.py</a></li>
+</ul>
+<p class="nav-group">C++ engine (csrc/engine/)</p>
+<ul>
+<li><a href="../code/engine-pyi.html">_C/engine.pyi</a></li>
+<li><a href="../code/sequence-hpp.html">sequence.hpp</a></li>
+<li><a href="../code/block-manager-hpp.html">block_manager.hpp</a></li>
+<li><a href="../code/scheduler-hpp.html">scheduler.hpp</a></li>
+<li><a href="../code/zos-cpp.html">zos.cpp</a></li>
+<li><a href="../code/prepare-tensor-input-v4.html">prepare_tensor_input_v4.cpp</a></li>
+<li><a href="../code/prepare-sample-cpp.html">prepare_sample.cpp</a></li>
+<li><a href="../code/outputs-hpp.html">outputs.hpp</a></li>
+</ul>
+<p class="nav-group">Worker</p>
+<ul>
+<li><a href="../code/worker-base.html">worker/base.py</a></li>
+<li><a href="../code/worker.html">worker/worker.py</a></li>
+<li><a href="../code/model-runner.html">worker/model_runner.py</a></li>
+<li><a href="../code/input-metadata.html">input_metadata/</a></li>
+<li><a href="../code/cache-engine.html">worker/cache_engine.py</a></li>
+<li><a href="../code/cuda-graph-runner.html">worker/cuda_graph_runner.py</a></li>
+</ul>
+<p class="nav-group">Model (models/)</p>
+<ul>
+<li><a href="../code/deepseek.html">deepseek.py</a></li>
+<li><a href="../code/decoder-layer.html">decoder_layer.py</a></li>
+<li><a href="../code/v4-hc.html">v4_modules/hc.py</a></li>
+<li><a href="../code/v4-attn.html">v4_modules/attn.py</a></li>
+<li><a href="../code/v4-mla-attn.html">v4_modules/mla_attn.py</a></li>
+<li><a href="../code/v4-index-attn.html">v4_modules/index_attn.py</a></li>
+<li><a href="../code/v4-compress.html">v4_modules/compress.py</a></li>
+<li><a href="../code/v4-cross-layer.html">v4_modules/cross_layer.py</a></li>
+<li><a href="../code/v4-mlp.html">v4_modules/mlp.py</a></li>
+<li><a href="../code/v4-engram.html">v4_modules/engram.py</a></li>
+<li><a href="../code/dflash.html">mtp/dflash.py</a></li>
+<li><a href="../code/deepseek-vl.html">deepseek_vl.py</a></li>
+<li><a href="../code/vit.html">vision_encoder/vit.py</a></li>
+</ul>
+<p class="nav-group">Layers and kernels (layers/)</p>
+<ul>
+<li><a href="../code/sampler.html">sampler.py</a></li>
+<li><a href="../code/linear.html">linear.py</a></li>
+<li class="soon"><span>tilelang_ops/</span><span class="soon-tag">soon</span></li>
+</ul>
+<p class="nav-group">Parallelism and memory</p>
+<ul>
+<li><a href="../code/parallel-state.html">parallel_state.py</a></li>
+<li><a href="../code/shm-broadcast.html">distributed/shm_broadcast.py</a></li>
+<li><a href="../code/shared-memory.html">shared_memory.py</a></li>
+<li><a href="../code/userbuffer.html">userbuffer.py</a></li>
+<li><a href="../code/eplb.html">eplb/</a></li>
+</ul>
+<p class="nav-group">Loading, platform, other</p>
+<ul>
+<li><a href="../code/model-loader.html">model_loader.py</a></li>
+<li><a href="../code/hf-weights.html">hugging_face/weights.py</a></li>
+<li><a href="../code/platform.html">platform.py</a></li>
+<li><a href="../code/npu-ops.html">npu_ops/</a></li>
+<li><a href="../code/deep-cluster.html">deep_cluster/</a></li>
+<li><a href="../code/structure-output.html">structure_output/</a></li>
+<li><a href="../code/ve.html">ve/ (images)</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="5 of 5 pages written">5/5</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/cpp-engine-api.html">C++ engine API</a></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li><a href="../reference/faq.html">FAQ</a></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Guided tours</span><span class="sep">›</span><span aria-current="page">One step on many GPUs</span></nav>
+<h1 class="page-title">Tour: One step on many GPUs</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Guided tours</span><span class="meta-time">about 11 min read + 5 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: DeepInfer @ <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener" title="9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"><code>9bd9cf2</code></a> · 2026-10-21</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../tours/engine-step.html">Tour: One engine step</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/dp-step-votes.html">Data parallelism and step votes</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/expert-parallelism.html">Expert parallelism: dispatch, grouped GEMM, combine</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">We follow one prefill step on 4 GPUs. Two engines vote, each driver feeds its CP follower, the ranks share keys and experts, and the drivers sample.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>The tour <a href="../tours/engine-step.html">Tour: One engine step</a> followed one step on one device. This tour runs the same kind of step on four devices, and watches the communication. At each stop you see which <a class="term" href="../reference/glossary.html#term-rank" data-term="rank" data-def="The number of one process in a distributed job. In DeepInfer, one rank normally drives one GPU or NPU.">ranks</a> work, which group talks, and the shapes of the data.</p>
+<p><strong>The set-up.</strong> <code>python examples/offline_inference.py --ep 4 --cp 2</code> on one host with 4 GPUs. The script computes <code>dp_size = max(4 // 2, 1) = 2</code> and a world of 4 ranks (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/offline_inference.py#L24-L28" target="_blank" rel="noopener" title="examples/offline_inference.py:24-28 at 9bd9cf2"><code>examples/offline_inference.py:24-28</code></a>). So there are two engines (two <a class="term" href="../reference/glossary.html#term-data-parallelism" data-term="data parallelism" data-def="DP. Several devices run the same model part, and each device works on different requests.">DP</a> replicas), and each engine has two <a class="term" href="../reference/glossary.html#term-context-parallelism" data-term="context parallelism" data-def="Several devices share the tokens of one long prefill. In DeepInfer, CP ranks are extra worker processes that receive their inputs from the driver.">CP</a> ranks:</p>
+<table>
+  <thead><tr><th>Rank</th><th>Engine</th><th><code>cp_rank</code></th><th>Process</th><th>Device</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>0</td><td>0 (driver)</td><td>engine 0, started by <code>_launch.py</code></td><td>0</td></tr>
+    <tr><td>1</td><td>0</td><td>1 (follower)</td><td>spawned by engine 0</td><td>1</td></tr>
+    <tr><td>2</td><td>1</td><td>0 (driver)</td><td>engine 1, started by <code>_launch.py</code></td><td>2</td></tr>
+    <tr><td>3</td><td>1</td><td>1 (follower)</td><td>spawned by engine 1</td><td>3</td></tr>
+  </tbody>
+</table>
+<p>Rank = <code>engine_rank × 2 + cp_rank</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L329" target="_blank" rel="noopener" title="deepinfer/worker/base.py:329 at 9bd9cf2"><code>deepinfer/worker/base.py:329</code></a>). The groups are: CP <code>[0, 1]</code> and <code>[2, 3]</code>; DP <code>[0, 2]</code> and <code>[1, 3]</code>; EP <code>[0, 1, 2, 3]</code>. The EP group is the world group, because <code>ep_size</code> equals the rank count (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L91-L106" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:91-106 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:91-106</code></a>).</p>
+<p><strong>The work.</strong> Engine 0 has one new request A with 8 prompt tokens. Engine 1 has no waiting request. The scheduler counter is at <code>decode_step = 100</code>, an ANY point. ZOS is on (the default). <code>H</code> is the hidden size of the checkpoint; the repository does not fix it.</p>
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Ranks</th><th>Group</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The engines vote for a prefill step</td><td>0, 2</td><td>DP (Gloo)</td></tr>
+    <tr><td>2</td><td>Each engine schedules its batch</td><td>0, 2</td><td>none</td></tr>
+    <tr><td>3</td><td>The driver sends the method call</td><td>0 → 1, 2 → 3</td><td>CP (shared memory)</td></tr>
+    <tr><td>4</td><td>The driver sends the input metadata</td><td>0 → 1, 2 → 3</td><td>CP (shared memory + NCCL)</td></tr>
+    <tr><td>5</td><td>Each rank takes its mirror rows</td><td>all</td><td>none</td></tr>
+    <tr><td>6</td><td>Attention gathers K and V</td><td>all</td><td>CP (DeepEP BucketBuffer)</td></tr>
+    <tr><td>7</td><td>MoE dispatch and combine</td><td>all</td><td>EP</td></tr>
+    <tr><td>8</td><td>EPLB counts the tokens per expert</td><td>all</td><td>EP (every 128 steps)</td></tr>
+    <tr><td>9</td><td>The last all-gather, and the drivers sample</td><td>all; sampling on 0, 2</td><td>CP</td></tr>
+    <tr><td>10</td><td>Outputs</td><td>0, 2</td><td>none</td></tr>
+  </tbody>
+</table>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8_tour_map"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: two dashed engine boxes. Engine 0 sees devices 0 and 1 and holds rank 0 (driver with LLMEngine, scheduler and sampler) and rank 1 (CP follower, Worker only). Engine 1 sees devices 2 and 3 and holds ranks 2 and 3 in the same way. Panel 2: ten cards for the stops: votes over DP group 0 and 2; scheduling; the method call through shared memory; the input metadata broadcast; the mirror layout with rows t0 t1 t6 t7 on rank 0 and t2 to t5 on rank 1; attention with a CP all-gather; MoE dispatch and combine over all 4 ranks; EPLB counting; the last all-gather with sampling on ranks 0 and 2; outputs. Each card has a pill with its group."><svg role="img" aria-label="Panel 1: two dashed engine boxes. Engine 0 sees devices 0 and 1 and holds rank 0 (driver with LLMEngine, scheduler and sampler) and rank 1 (CP follower, Worker only). Engine 1 sees devices 2 and 3 and holds ranks 2 and 3 in the same way. Panel 2: ten cards for the stops: votes over DP group 0 and 2; scheduling; the method call through shared memory; the input metadata broadcast; the mirror layout with rows t0 t1 t6 t7 on rank 0 and t2 to t5 on rank 1; attention with a CP all-gather; MoE dispatch and combine over all 4 ranks; EPLB counting; the last all-gather with sampling on ranks 0 and 2; outputs. Each card has a pill with its group." xmlns="http://www.w3.org/2000/svg" width="1100" height="1232" viewBox="0 0 1100 1232">
+<defs><marker id="dg-b8_tour_map-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker><marker id="dg-b8_tour_map-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b8_tour_map-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker><marker id="dg-b8_tour_map-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker></defs>
+<rect width="1100" height="1232" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">One prefill step on 4 GPUs: ranks, groups, stops</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">--ep 4 --cp 2  -&gt;  2 DP replicas (engines) x 2 CP ranks  ·  request A: 8 prompt tokens on engine 0  ·  commit 9bd9cf2</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank = engine_rank x 2 + cp_rank   CP groups [0,1] [2,3]   DP groups [0,2] [1,3]   EP group [0,1,2,3]</text>
+<rect x="20.0" y="112.0" width="1060.0" height="274.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="138.0" r="13" fill="#111827"/>
+<text x="46.0" y="142.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="143.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which processes and ranks take part?</text>
+<text x="68.0" y="162.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Each engine is one DP replica. Its driver spawns one CP follower process.</text>
+<rect x="46.0" y="184.0" width="494.0" height="178.0" rx="12" fill="#ffffff" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="4 4"/>
+<text x="60.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">engine 0  (engine_rank 0, CUDA_VISIBLE_DEVICES=0,1)</text>
+<rect x="60.0" y="222.0" width="226.0" height="124.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="72.0" y="244.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0  (cp_rank 0)</text>
+<text x="72.0" y="264.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">driver: LLMEngine + Worker</text>
+<text x="72.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduler, sampler</text>
+<text x="72.0" y="304.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">process from _launch.py</text>
+<text x="72.0" y="322.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">device 0</text>
+<rect x="296.0" y="222.0" width="226.0" height="124.0" rx="8" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.5"/>
+<text x="308.0" y="244.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 1  (cp_rank 1)</text>
+<text x="308.0" y="264.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CP follower: Worker only</text>
+<text x="308.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no scheduler, no sampling</text>
+<text x="308.0" y="304.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">spawned by _init_workers</text>
+<text x="308.0" y="322.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">device 1</text>
+<rect x="560.0" y="184.0" width="494.0" height="178.0" rx="12" fill="#ffffff" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="4 4"/>
+<text x="574.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">engine 1  (engine_rank 1, CUDA_VISIBLE_DEVICES=2,3)</text>
+<rect x="574.0" y="222.0" width="226.0" height="124.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="586.0" y="244.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 2  (cp_rank 0)</text>
+<text x="586.0" y="264.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">driver: LLMEngine + Worker</text>
+<text x="586.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduler, sampler</text>
+<text x="586.0" y="304.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">process from _launch.py</text>
+<text x="586.0" y="322.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">device 2</text>
+<rect x="810.0" y="222.0" width="226.0" height="124.0" rx="8" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.5"/>
+<text x="822.0" y="244.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 3  (cp_rank 1)</text>
+<text x="822.0" y="264.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CP follower: Worker only</text>
+<text x="822.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no scheduler, no sampling</text>
+<text x="822.0" y="304.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">spawned by _init_workers</text>
+<text x="822.0" y="322.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">device 3</text>
+<rect x="20.0" y="406.0" width="1060.0" height="702.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="432.0" r="13" fill="#111827"/>
+<text x="46.0" y="436.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="437.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What are the stops of the tour?</text>
+<text x="68.0" y="456.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Each card is one stop. The pill names the group that communicates in that stop.</text>
+<rect x="46.0" y="478.0" width="1008.0" height="50.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<rect x="46.0" y="478.0" width="6.0" height="50.0" rx="3" fill="#059669" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="495.0" r="10" fill="#059669"/>
+<text x="70.0" y="499.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="88.0" y="500.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">votes: prefill or decode?</text>
+<text x="88.0" y="518.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">all-reduce MIN over DP [0,2] -&gt; both engines prefill</text>
+<rect x="971.0" y="486.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1"/>
+<text x="1007.5" y="499.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">DP group</text>
+<line x1="70.0" y1="528.0" x2="70.0" y2="538.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m0)"/>
+<rect x="46.0" y="540.0" width="1008.0" height="50.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="46.0" y="540.0" width="6.0" height="50.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="557.0" r="10" fill="#2563eb"/>
+<text x="70.0" y="561.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="88.0" y="562.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">each engine schedules</text>
+<text x="88.0" y="580.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine 0: A, 8 tokens   engine 1: empty prompt step (placeholder)</text>
+<rect x="918.0" y="548.0" width="126.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="981.0" y="561.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">no communication</text>
+<line x1="70.0" y1="590.0" x2="70.0" y2="600.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m1)"/>
+<rect x="46.0" y="602.0" width="1008.0" height="50.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="46.0" y="602.0" width="6.0" height="50.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="619.0" r="10" fill="#d97706"/>
+<text x="70.0" y="623.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="88.0" y="624.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">driver sends the method call</text>
+<text x="88.0" y="642.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(&#x27;execute_model_step&#x27;, is_prompt=True) through shm</text>
+<rect x="971.0" y="610.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="1007.5" y="623.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">CP group</text>
+<line x1="70.0" y1="652.0" x2="70.0" y2="662.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m2)"/>
+<rect x="46.0" y="664.0" width="1008.0" height="50.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="46.0" y="664.0" width="6.0" height="50.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="681.0" r="10" fill="#d97706"/>
+<text x="70.0" y="685.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<text x="88.0" y="686.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">driver sends the input metadata</text>
+<text x="88.0" y="704.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">broadcast_tensor_dict: objects via shm, tensors via NCCL/HCCL</text>
+<rect x="971.0" y="672.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="1007.5" y="685.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">CP group</text>
+<line x1="70.0" y1="714.0" x2="70.0" y2="724.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m2)"/>
+<rect x="46.0" y="726.0" width="1008.0" height="50.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="46.0" y="726.0" width="6.0" height="50.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="743.0" r="10" fill="#2563eb"/>
+<text x="70.0" y="747.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5</text>
+<text x="88.0" y="748.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">mirror-CP layout</text>
+<text x="88.0" y="766.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0: t0 t1 t6 t7   rank 1: t2 t3 t4 t5   [4, H] each</text>
+<rect x="918.0" y="734.0" width="126.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="981.0" y="747.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">no communication</text>
+<line x1="70.0" y1="776.0" x2="70.0" y2="786.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m1)"/>
+<rect x="46.0" y="788.0" width="1008.0" height="50.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="46.0" y="788.0" width="6.0" height="50.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="805.0" r="10" fill="#d97706"/>
+<text x="70.0" y="809.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<text x="88.0" y="810.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">attention with CP all-gather</text>
+<text x="88.0" y="828.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV [2 x 4] -&gt; full [8] on both CP ranks (CPManager)</text>
+<rect x="971.0" y="796.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="1007.5" y="809.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">CP group</text>
+<line x1="70.0" y1="838.0" x2="70.0" y2="848.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m2)"/>
+<rect x="46.0" y="850.0" width="1008.0" height="50.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="46.0" y="850.0" width="6.0" height="50.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="867.0" r="10" fill="#7c3aed"/>
+<text x="70.0" y="871.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">7</text>
+<text x="88.0" y="872.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">MoE: dispatch and combine</text>
+<text x="88.0" y="890.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">own rows to the experts on all 4 ranks and back</text>
+<rect x="971.0" y="858.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="1007.5" y="871.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">EP group</text>
+<line x1="70.0" y1="900.0" x2="70.0" y2="910.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m3)"/>
+<rect x="46.0" y="912.0" width="1008.0" height="50.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="46.0" y="912.0" width="6.0" height="50.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="929.0" r="10" fill="#7c3aed"/>
+<text x="70.0" y="933.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">8</text>
+<text x="88.0" y="934.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EPLB counting</text>
+<text x="88.0" y="952.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">expert_count += received tokens; all-gather each 128 steps</text>
+<rect x="971.0" y="920.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="1007.5" y="933.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">EP group</text>
+<line x1="70.0" y1="962.0" x2="70.0" y2="972.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m3)"/>
+<rect x="46.0" y="974.0" width="1008.0" height="50.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="46.0" y="974.0" width="6.0" height="50.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="991.0" r="10" fill="#d97706"/>
+<text x="70.0" y="995.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<text x="88.0" y="996.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">last all-gather, sample on driver</text>
+<text x="88.0" y="1014.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hidden [8, H] on both; only rank 0 and rank 2 sample</text>
+<rect x="971.0" y="982.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="1007.5" y="995.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">CP group</text>
+<line x1="70.0" y1="1024.0" x2="70.0" y2="1034.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b8_tour_map-m2)"/>
+<rect x="46.0" y="1036.0" width="1008.0" height="50.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="46.0" y="1036.0" width="6.0" height="50.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="1053.0" r="10" fill="#2563eb"/>
+<text x="70.0" y="1057.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">10</text>
+<text x="88.0" y="1058.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">outputs</text>
+<text x="88.0" y="1076.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">driver post-processes; RequestOutput for A</text>
+<rect x="918.0" y="1044.0" width="126.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="981.0" y="1057.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">no communication</text>
+<text x="30.0" y="1141.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="1130.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="118.3" y="1141.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DP group</text>
+<rect x="195.1" y="1130.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="216.1" y="1141.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CP group</text>
+<rect x="292.9" y="1130.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="313.9" y="1141.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">EP group</text>
+<rect x="390.6" y="1130.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="411.6" y="1141.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one rank, no communication</text>
+<rect x="594.1" y="1130.0" width="14.0" height="14.0" rx="3" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.4"/>
+<text x="615.1" y="1141.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CP driver</text>
+<rect x="695.5" y="1130.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="716.5" y="1141.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CP follower</text>
+<text x="30.0" y="1168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">H = hidden size (from the checkpoint). Stops 6-7 repeat in every decoder layer; the stop-8 counter grows in each MoE layer.</text>
+<text x="30.0" y="1186.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Engine 1 runs the same stops on a placeholder sequence.</text>
+<text x="30.0" y="1204.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Device numbers assume DEVICE_OFFSET = 0 on one host with 4 devices (examples/_config.py:55-63).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the four ranks of the example (panel 1) and the ten stops of the tour, with the group that communicates at each stop (panel 2). Click to zoom.</figcaption><a class="diagram-open" href="../diagrams/b8_tour_map.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read panel 2 from top to bottom. Amber cards talk inside one engine (CP). Violet cards talk across both engines (EP). The green card is the only stop where the two drivers talk to each other directly.</p>
+
+<section class="stop" id="stop-1"><h2 id="1the-engines-vote-for-a-prefill-step" class="stop-title"><span class="stop-num">1</span>The engines vote for a prefill step<a class="h-anchor" href="#1the-engines-vote-for-a-prefill-step" aria-label="Link to this section">#</a></h2><p>We are in <code>Scheduler::_schedule</code> (C++), called from <code>LLMEngine.step()</code> on ranks 0 and 2. Only the engine processes run a scheduler; ranks 1 and 3 wait in their worker loop.</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L308-L319" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/scheduler.hpp:308-319</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L308-L319" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">308</span><span class="ln">309</span><span class="ln">310</span><span class="ln">311</span><span class="ln">312</span><span class="ln hl">313</span><span class="ln">314</span><span class="ln">315</span><span class="ln hl">316</span><span class="ln">317</span><span class="ln">318</span><span class="ln">319</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-cpp">            bool is_any_point = (decode_step != 0) &amp;&amp; (decode_step % prefill_any_attempt_interval == 0);
+            bool is_all_point = (decode_step % prefill_attempt_interval == 0);
+            if (!is_any_point &amp;&amp; !is_all_point) {
+                return _schedule_decode(acquire);
+            }
+            bool want = (get_gpu_cache_usage() &lt;= GPU_CACHE_PREFILL_WATERMARK) &amp;&amp; _has_prefill_waiting();
+            bool do_prefill;
+            if (is_any_point) {
+                do_prefill = (_dp_allreduce(want ? 0 : 1, c10d::ReduceOp::MIN) == 0); // ANY：任一 rank 想做即触发
+            } else {
+                do_prefill = (_dp_allreduce(want ? 1 : 0, c10d::ReduceOp::MIN) == 1); // ALL：全员想做才触发
+            }</code></pre></div></div></div></figure>
+<p><code>decode_step = 100</code>, so this is an ANY point. Engine 0 wants a prefill (A is schedulable and the cache has room) and sends 0. Engine 1 sends 1. <code>MIN(0, 1) = 0</code>: both engines prefill. With ZOS, the vote uses the Gloo copy of the DP group <code>[0, 2]</code> and a CPU tensor (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L313" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:313 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:313</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L170-L182" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:170-182 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:170-182</code></a>).</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-1-in-detail-the-other-two-all-reduces" class="dd-title">Stop 1 in detail: the other two all-reduces</h3></summary><div class="dd-body"><p>Before this call of <code>step()</code>, <code>LLM._run_engine</code> asked <code>has_unfinished_requests()</code>. Engine 0 sent 1 and engine 1 sent 0; the MAX is 1, so both engines call <code>step()</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L673-L678" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:673-678 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:673-678</code></a>).</p>
+<p>After vote 1, engine 0 runs <code>_schedule_prefill</code> and gets a batch. Vote 2 then asks whether any engine got a batch: engine 0 sends 0, engine 1 sends 1, <code>MIN = 0</code>. Engine 1 returns an empty prompt step (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L332-L340" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:332-340 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:332-340</code></a>). The page <a href="../concepts/dp-step-votes.html">Data parallelism and step votes</a> explains the encodings.</p></div></details></section>
+
+<section class="stop" id="stop-2"><h2 id="2each-engine-schedules-its-batch" class="stop-title"><span class="stop-num">2</span>Each engine schedules its batch<a class="h-anchor" href="#2each-engine-schedules-its-batch" aria-label="Link to this section">#</a></h2><p>Still in <code>LLMEngine.step()</code>. Engine 0 now has one <a class="term" href="../reference/glossary.html#term-sequence-metadata" data-term="SequenceMetadata" data-def="A per-step view of one scheduled sequence: how many query tokens it sends (seqlen_q), how many tokens attention reads in this step (seqlen_k), its block table and sampling values.">SequenceMetadata</a> for A, with <code>seqlen_q = 8</code>. The scheduler pads the CP work in its token budget to a multiple of <code>2 × cp = 4</code>; 8 is already a multiple (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L515" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:515 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:515</code></a>). Engine 1 has no sequence. The engine hands both cases to the worker in the same way:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L961-L975" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/engine/llm_engine.py:961-975</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L961-L975" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">961</span><span class="ln">962</span><span class="ln">963</span><span class="ln">964</span><span class="ln">965</span><span class="ln">966</span><span class="ln hl">967</span><span class="ln hl">968</span><span class="ln hl">969</span><span class="ln hl">970</span><span class="ln hl">971</span><span class="ln hl">972</span><span class="ln">973</span><span class="ln">974</span><span class="ln">975</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><pre><code class="language-python">    def _execute_model_async_step(
+        self, seq_metadata_list: list[SequenceMetadata], scheduler_outputs: SchedulerOutputs
+    ) -&gt; np.ndarray[np.uint64]:
+        with cpu_timer.record(&quot;run_workers&quot;):
+            request_outputs = self._run_workers(
+                &quot;execute_model_step&quot;,
+                driver_kwargs=dict(
+                    seq_metadata_list=seq_metadata_list,
+                    scheduler_outputs=scheduler_outputs,
+                ),
+                is_prompt=scheduler_outputs.prompt_run,
+                is_placeholder=scheduler_outputs.is_empty(),
+            )
+        self.deferred_release.collect_request_outputs(request_outputs)
+        return request_outputs</code></pre></div></div></div></figure>
+<p>On engine 1, <code>is_placeholder</code> is true. Its worker runs the model on one dummy sequence with one token (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L125-L127" target="_blank" rel="noopener" title="deepinfer/worker/worker.py:125-127 at 9bd9cf2"><code>deepinfer/worker/worker.py:125-127</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L386-L403" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:386-403 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:386-403</code></a>).</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-2-in-detail-the-data-on-each-engine" class="dd-title">Stop 2 in detail: the data on each engine</h3></summary><div class="dd-body"><pre><code class="language-python"># engine 0 (rank 0)                       # engine 1 (rank 2)
+seq_metadata_list = [A]                     seq_metadata_list = []  # worker uses [placeholder]
+is_prompt, is_placeholder = True, False     is_prompt, is_placeholder = True, True
+A.seqlen_q = 8, A.seqlen_k = 8              placeholder: seqlen_q = 1, block_table = [0]</code></pre>
+<p>Both engines will run a prompt step. That is the point of the vote: the ranks of both engines must call the same collectives in the stops that follow.</p></div></details></section>
+
+<section class="stop" id="stop-3"><h2 id="3the-driver-sends-the-method-call-to-its-follower" class="stop-title"><span class="stop-num">3</span>The driver sends the method call to its follower<a class="h-anchor" href="#3the-driver-sends-the-method-call-to-its-follower" aria-label="Link to this section">#</a></h2><p>We are in <code>WorkerBase.run_workers</code> on ranks 0 and 2. Before the driver runs <code>execute_model_step</code> itself, it sends the method name and the keyword arguments to its CP follower:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L290-L302" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/worker/base.py:290-302</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L290-L302" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">290</span><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln">295</span><span class="ln">296</span><span class="ln">297</span><span class="ln">298</span><span class="ln">299</span><span class="ln hl">300</span><span class="ln">301</span><span class="ln hl">302</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><pre><code class="language-python">    def run_workers(
+        self,
+        method: str,
+        driver_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -&gt; Any:
+        with cpu_timer.record(&quot;broadcast_method&quot;, enable=False):
+            assert self.is_driver_worker
+            cp_group = PG.cpu_cp_group
+            if cp_group and cp_group.size() &gt; 1:
+                cp_broadcast_object((method, kwargs))
+
+        return getattr(self, method)(**(driver_kwargs or {}), **kwargs)</code></pre></div></div></div></figure>
+<p>On ranks 1 and 3, the follower loop gets the tuple and calls the same method (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L129-L133" target="_blank" rel="noopener" title="deepinfer/worker/base.py:129-133 at 9bd9cf2"><code>deepinfer/worker/base.py:129-133</code></a>). The channel is the <a class="term" href="../reference/glossary.html#term-shm-message-queue" data-term="MessageQueue" data-def="DeepInfer&#x27;s one-writer, many-reader queue in shared memory (shm_broadcast.py). The CP driver uses it to send method calls and small objects to the CP followers.">MessageQueue</a> of the CP group: a ring buffer in <a class="term" href="../reference/glossary.html#term-posix-shm" data-term="shared memory (POSIX)" data-def="Operating-system memory that several processes on one host can map at the same time, by name (on Linux, files in /dev/shm). Not the same as GPU shared memory (SMEM).">shared memory</a>, written by CP rank 0 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L17-L23" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:17-23 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:17-23</code></a>).</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-3-in-detail-what-the-follower-gets" class="dd-title">Stop 3 in detail: what the follower gets</h3></summary><div class="dd-body"><p>The follower gets <code>("execute_model_step", {"is_prompt": True, "is_placeholder": False})</code> on rank 1, and the same with <code>is_placeholder = True</code> on rank 3. The <code>driver_kwargs</code> (the sequence list and the scheduler outputs) stay on the driver (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L965-L973" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:965-973 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:965-973</code></a>). So in <code>execute_model_step</code>, a follower has <code>seq_metadata_list = None</code>, and it skips the ZOS correction, which only the driver does (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L116-L118" target="_blank" rel="noopener" title="deepinfer/worker/worker.py:116-118 at 9bd9cf2"><code>deepinfer/worker/worker.py:116-118</code></a>).</p>
+<p>The pickled tuple is a few tens of bytes, far below the 1 MiB chunk size of the queue (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L124" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:124 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:124</code></a>). The page <a href="../code/shm-broadcast.html">distributed/shm_broadcast.py: MessageQueue</a> explains the queue.</p></div></details></section>
+
+<section class="stop" id="stop-4"><h2 id="4the-driver-sends-the-input-metadata" class="stop-title"><span class="stop-num">4</span>The driver sends the input metadata<a class="h-anchor" href="#4the-driver-sends-the-input-metadata" aria-label="Link to this section">#</a></h2><p>We are in <code>ModelRunner._prepare_input</code>. The driver builds the <a class="term" href="../reference/glossary.html#term-input-metadata" data-term="input metadata" data-def="The index tensors that the model kernels read in one step: positions, start offsets, cache slots and attention windows. In DeepInfer it is an InputMetadataV4 object.">input metadata</a> of its batch in C++, moves it to the device, and broadcasts it in the CP group. The follower receives it:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L200-L230" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/worker/model_runner.py:200-230</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L200-L230" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">200</span><span class="ln">201</span><span class="ln">202</span><span class="ln">203</span><span class="ln">204</span><span class="ln">205</span><span class="ln">206</span><span class="ln">207</span><span class="ln">208</span><span class="ln">209</span><span class="ln">210</span><span class="ln">211</span><span class="ln hl">212</span><span class="ln">213</span><span class="ln">214</span><span class="ln">215</span><span class="ln">216</span><span class="ln hl">217</span><span class="ln">218</span><span class="ln">219</span><span class="ln">220</span><span class="ln">221</span><span class="ln">222</span><span class="ln">223</span><span class="ln">224</span><span class="ln">225</span><span class="ln">226</span><span class="ln hl">227</span><span class="ln">228</span><span class="ln">229</span><span class="ln">230</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">        if PG.context_parallel_group().size() &gt; 1:
+            with cpu_timer.record(&quot;broadcast_input_metadata&quot;):
+                input_metadata_dict = {
+                    &quot;is_prompt&quot;: is_prompt,
+                    &quot;type&quot;: type(input_metadata),
+                    &quot;run_cuda_graph&quot;: run_cuda_graph,
+                    &quot;total_q&quot;: total_q,
+                    &quot;num_reqs&quot;: num_reqs,
+                }
+                if not run_cuda_graph:
+                    assert hasattr(input_metadata, &quot;is_prompt&quot;)
+                    input_metadata_dict.update(input_metadata.to_flatten_dict())
+                broadcast_tensor_dict(input_metadata_dict, src=0)
+
+        return input_metadata, total_q, run_cuda_graph, cuda_graph_used, graph_size
+
+    def _prepare_input_follower(self) -&gt; tuple[InputMetadata, int, bool, CudaGraphData | None, int]:
+        input_metadata_dict = broadcast_tensor_dict(src=0)
+        # 只 pop 非 InputMetadata 字段的 key；is_prompt/total_q/num_reqs 本身也是字段，留给 from_flatten_dict。
+        input_metadata_type: type[InputMetadata] = input_metadata_dict.pop(&quot;type&quot;)
+        run_cuda_graph: bool = input_metadata_dict.pop(&quot;run_cuda_graph&quot;)
+        total_q = input_metadata_dict[&quot;total_q&quot;]
+        num_reqs = input_metadata_dict[&quot;num_reqs&quot;]
+        if run_cuda_graph:
+            graph_size, cuda_graph_used = self.cuda_graph_runner.select(total_q)
+            input_metadata = self._graph_input_metadata(cuda_graph_used, num_reqs)
+        else:
+            input_metadata = input_metadata_type.from_flatten_dict(input_metadata_dict)
+            cuda_graph_used = None
+            graph_size = 0
+        return input_metadata, total_q, run_cuda_graph, cuda_graph_used, graph_size</code></pre></div></div></div></figure>
+<p><code>broadcast_tensor_dict</code> sends a list of keys, small values and <code>(dtype, size)</code> pairs through the shared-memory queue. Then it sends each tensor with a device broadcast from CP rank 0 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/communication_op.py#L51-L82" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/communication_op.py:51-82 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/communication_op.py:51-82</code></a>).</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-4-in-detail-shapes-on-engine-0" class="dd-title">Stop 4 in detail: shapes on engine 0</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Field</th><th>Value on rank 0 and, after the broadcast, on rank 1</th></tr></thead>
+  <tbody>
+    <tr><td><code>input_ids</code></td><td>int32 <code>[8]</code>, the 8 prompt tokens</td></tr>
+    <tr><td><code>positions</code></td><td><code>[8]</code>: 0 to 7</td></tr>
+    <tr><td><code>cu_seqlens_q</code>, <code>cu_seqlens_k</code></td><td>int32 <code>[2]</code>: <code>[0, 8]</code></td></tr>
+    <tr><td><code>total_q</code></td><td>8</td></tr>
+    <tr><td><code>cp_mirror_len</code></td><td><code>2 × ⌈8 / 4⌉ = 4</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_base.cpp#L146-L155" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_base.cpp:146-155 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_base.cpp:146-155</code></a>)</td></tr>
+  </tbody>
+</table>
+<p>On engine 1, the placeholder has <code>total_q = 1</code> and <code>cp_mirror_len = 2 × ⌈1 / 4⌉ = 2</code>. A second, smaller broadcast follows in stop 9, for the sampler inputs (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L250-L275" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:250-275 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:250-275</code></a>).</p>
+<p>The broadcast is CP-only: ranks 0 and 1 talk, and ranks 2 and 3 talk. Each CP group has its own queue and its own NCCL group.</p></div></details></section>
+
+<section class="stop" id="stop-5"><h2 id="5each-rank-takes-its-mirror-rows" class="stop-title"><span class="stop-num">5</span>Each rank takes its mirror rows<a class="h-anchor" href="#5each-rank-takes-its-mirror-rows" aria-label="Link to this section">#</a></h2><p>We are in <code>DeepseekModel.forward</code>, on all four ranks. Each rank embeds all tokens, computes the <a class="term" href="../reference/glossary.html#term-cp-mirror" data-term="CP mirror layout" data-def="The token order for context parallelism in prefill. Each sequence is cut into 2 × cp parts, and rank r takes part r and part 2·cp − 1 − r.">mirror</a> indices, and keeps only its own rows:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L161-L170" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/models/deepseek.py:161-170</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L161-L170" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">161</span><span class="ln">162</span><span class="ln">163</span><span class="ln">164</span><span class="ln">165</span><span class="ln">166</span><span class="ln">167</span><span class="ln hl">168</span><span class="ln hl">169</span><span class="ln hl">170</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-python">        if hidden_states is None:
+            hidden_states = self.embed_tokens(input_metadata.input_ids)
+
+        residual = None
+        # 跨层持有的运行时值 (shared_hidden / pre_rope_kv / topk): 逐层传同一引用，由各层原地写入。
+        cross_layer_runtime = CrossLayerRuntime()
+
+        if input_metadata.is_prompt and PG.context_parallel_group().size() &gt; 1:
+            input_metadata.prepare_for_mirror_cp()
+            hidden_states = gather(hidden_states, input_metadata.mirror_cp_index)</code></pre></div></div></div></figure>
+<p>A has 8 tokens and cp = 2, so it has 4 parts of 2 tokens. Rank 0 takes parts 0 and 3; rank 1 takes parts 1 and 2:</p>
+<table>
+  <thead><tr><th>Rank</th><th><code>mirror_cp_index</code></th><th>Hidden states after the gather</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td><code>[0, 1, 6, 7]</code></td><td><code>[4, H]</code></td></tr>
+    <tr><td>1</td><td><code>[2, 3, 4, 5]</code></td><td><code>[4, H]</code></td></tr>
+    <tr><td>2 (placeholder)</td><td><code>[0, −1]</code></td><td><code>[2, H]</code>, row 1 is zeros</td></tr>
+    <tr><td>3 (placeholder)</td><td><code>[−1, −1]</code></td><td><code>[2, H]</code>, all zeros</td></tr>
+  </tbody>
+</table>
+<p>The values come from the repository's reference function for the kernel (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/prepare_cp_mirror.py#L126-L157" target="_blank" rel="noopener" title="deepinfer/model_executor/layers/tilelang_ops/prepare_cp_mirror.py:126-157 at 9bd9cf2"><code>deepinfer/model_executor/layers/tilelang_ops/prepare_cp_mirror.py:126-157</code></a>). <code>valid_token_mask</code> is <code>mirror_cp_index != −1</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/input_metadata/input_metadata.py#L208" target="_blank" rel="noopener" title="deepinfer/model_executor/input_metadata/input_metadata.py:208 at 9bd9cf2"><code>deepinfer/model_executor/input_metadata/input_metadata.py:208</code></a>).</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-5-in-detail-the-reverse-index" class="dd-title">Stop 5 in detail: the reverse index</h3></summary><div class="dd-body"><p>The kernel also returns <code>mirror_cp_reverse_index</code>, one entry per token. For A it is <code>[0, 1, 4, 5, 6, 7, 2, 3]</code>. An all-gather makes the tensor <code>[rank 0 rows | rank 1 rows]</code>, and token 2 is row 4 of it. Stops 6 and 9 use it. The page <a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a> derives these numbers.</p>
+<p>Rank 3 has no real row. It still runs every layer, because its collectives must match the other ranks.</p></div></details></section>
+
+<section class="stop" id="stop-6"><h2 id="6attention-gathers-k-and-v-over-the-cp-group" class="stop-title"><span class="stop-num">6</span>Attention gathers K and V over the CP group<a class="h-anchor" href="#6attention-gathers-k-and-v-over-the-cp-group" aria-label="Link to this section">#</a></h2><p>We are in the attention layer (<code>v4_modules/attn.py</code>), inside each decoder layer, on all ranks. In a prefill step with CP, the layer opens a CP session and starts the all-gather of its projected K and V. It computes the queries while the data moves:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L766-L797" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/models/v4_modules/attn.py:766-797</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L766-L797" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">766</span><span class="ln">767</span><span class="ln">768</span><span class="ln">769</span><span class="ln">770</span><span class="ln">771</span><span class="ln">772</span><span class="ln">773</span><span class="ln">774</span><span class="ln">775</span><span class="ln">776</span><span class="ln">777</span><span class="ln">778</span><span class="ln">779</span><span class="ln">780</span><span class="ln">781</span><span class="ln hl">782</span><span class="ln">783</span><span class="ln">784</span><span class="ln hl">785</span><span class="ln">786</span><span class="ln">787</span><span class="ln">788</span><span class="ln">789</span><span class="ln">790</span><span class="ln">791</span><span class="ln hl">792</span><span class="ln hl">793</span><span class="ln hl">794</span><span class="ln hl">795</span><span class="ln hl">796</span><span class="ln hl">797</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><pre><code class="language-python">        use_cp = input_metadata.is_prompt and PG.context_parallel_group().size() &gt; 1
+        shared_hidden_bf16 = self._resolve_shared_hidden(hidden_states_bf16, shared_hidden_bf16)
+        projected_kv, index_weights = self._project_current_hidden_inputs(hidden_states_bf16)
+        yoco_full_kv_stored = cross_layer_runtime.consumer_full_metadata is not None
+        if yoco_full_kv_stored:
+            # YOCO compact prefill: the query has been trimmed, but the KV still has to cover the full context.
+            # Here the full shared hidden is used to generate and write the main/index KV, and the later main path skips the KV update.
+            # With CP &gt; 1 an inner cp session is opened here (before the main session below, with no nesting).
+            self._store_yoco_full_kv(cross_layer_runtime, kv_cache)
+        elif self.shared_hidden_kv_proj is not None:
+            # The full KV update path above was not taken and this layer needs to generate KV from the
+            # shared hidden (decode / non-compact prefill). Only the KV projection is done here; afterwards
+            # _compute_kv_ca_index calls _store_main_kv to do the compression and the write.
+            assert projected_kv is None and shared_hidden_bf16 is not None
+            projected_kv = self.shared_hidden_kv_proj(shared_hidden_bf16)
+
+        with userbuffer.cp_session(enabled=use_cp):
+            # CP: launch the all_gather of the compressor input first, overlapping it with the Q projection below.
+            # Under the yoco_full_kv_stored scenario the main branch does not update kv, so this communication step is not needed
+            wait_projected_kv = _make_cp_gather_getter(projected_kv, use_cp) if not yoco_full_kv_stored else None
+
+            q_a, kv_swa = self._project_q_and_swa(
+                hidden_states,
+                shared_hidden_bf16,
+            )
+            del hidden_states, hidden_states_bf16, shared_hidden_bf16
+            kv_swa, wait_kv_swa = self._prepare_swa_kv(
+                kv_swa,
+                kv_cache.swa_cache,
+                input_metadata,
+                use_cp,
+            )</code></pre></div></div></div></figure>
+<p>The all-gather runs through <code>CPManager</code> on a DeepEP <code>BucketBuffer</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/cp.py#L42-L51" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/cp.py:42-51 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/cp.py:42-51</code></a>). Each rank sends 4 rows and gets 8 rows: <code>[2 × 4, ...]</code>. The layer reorders them with <code>mirror_cp_reverse_index</code> back to token order (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L826-L829" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:826-829 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:826-829</code></a>). So rank 0 and rank 1 both store the K and V of all 8 tokens in their KV caches. Each rank computes attention only for its 4 query rows.</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-6-in-detail-who-talks-to-whom" class="dd-title">Stop 6 in detail: who talks to whom</h3></summary><div class="dd-body"><ul>
+  <li>Ranks 0 and 1 exchange the K and V of A. Ranks 2 and 3 each send 2 rows; of these 4 rows, only one is a real token.</li>
+  <li>The two CP groups do not talk to each other in this stop.</li>
+  <li>The CP buffer was sized at start-up from <code>max_num_prefilling_tokens = max_num_batched_tokens // cp_size</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/model_loader.py#L120" target="_blank" rel="noopener" title="deepinfer/model_executor/model_loader.py:120 at 9bd9cf2"><code>deepinfer/model_executor/model_loader.py:120</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/userbuffer.py#L97-L117" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/userbuffer.py:97-117 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/userbuffer.py:97-117</code></a>).</li>
+  <li>Gathered tensors alias the buffer. The next session overwrites them, so the layer copies what it keeps (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/cp.py#L10-L14" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/cp.py:10-14 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/cp.py:10-14</code></a>).</li>
+</ul></div></details></section>
+
+<section class="stop" id="stop-7"><h2 id="7moe-dispatch-and-combine-across-both-engines" class="stop-title"><span class="stop-num">7</span>MoE: dispatch and combine across both engines<a class="h-anchor" href="#7moe-dispatch-and-combine-across-both-engines" aria-label="Link to this section">#</a></h2><p>We are in <code>DeepseekMoE.forward</code> (<code>v4_modules/mlp.py</code>), after the attention of each layer. This is the stop where the two engines meet. The EP group holds all 4 ranks. So a token of A can go to an expert on rank 2 or rank 3, which belong to engine 1:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L565-L610" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/models/v4_modules/mlp.py:565-610</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L565-L610" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">565</span><span class="ln">566</span><span class="ln">567</span><span class="ln">568</span><span class="ln">569</span><span class="ln">570</span><span class="ln">571</span><span class="ln">572</span><span class="ln">573</span><span class="ln hl">574</span><span class="ln">575</span><span class="ln">576</span><span class="ln">577</span><span class="ln hl">578</span><span class="ln hl">579</span><span class="ln hl">580</span><span class="ln hl">581</span><span class="ln hl">582</span><span class="ln hl">583</span><span class="ln hl">584</span><span class="ln hl">585</span><span class="ln">586</span><span class="ln">587</span><span class="ln">588</span><span class="ln">589</span><span class="ln">590</span><span class="ln">591</span><span class="ln">592</span><span class="ln">593</span><span class="ln">594</span><span class="ln">595</span><span class="ln">596</span><span class="ln">597</span><span class="ln">598</span><span class="ln">599</span><span class="ln">600</span><span class="ln">601</span><span class="ln">602</span><span class="ln">603</span><span class="ln hl">604</span><span class="ln hl">605</span><span class="ln hl">606</span><span class="ln hl">607</span><span class="ln hl">608</span><span class="ln hl">609</span><span class="ln hl">610</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><pre><code class="language-python">    def forward(
+        self,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        hidden_states_bf16: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -&gt; torch.Tensor:
+        if self.use_mega_moe:
+            return self.mega_moe_forward(hidden_states, hidden_states_bf16, input_metadata)
+
+        topk_idx, topk_weights = self.gate_forward(hidden_states_bf16, input_metadata)
+
+        try:
+            # Dispatch
+            event_overlap = self.dispatch(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                input_metadata,
+                None,
+            )
+            moe_in_hidden, _dispatched_topk_idx, dispatched_topk_weights, handle = event_overlap.current_stream_wait()
+
+            # MoE compute
+            with cuda_graph_timer.record(
+                &quot;routed_experts&quot;,
+                enabled=(self.layer_idx == 1 and not input_metadata.is_prompt),
+                scale=eplb.current().num_moe_layers,
+            ):
+                moe_out_hidden = self.routed_experts_forward(
+                    moe_in_hidden,
+                    dispatched_topk_weights,
+                    handle.psum_num_recv_tokens_per_expert,
+                    expected_m=None,
+                )
+
+            # Combine
+            combine_pre_evt = self.ep_buffer.capture()
+            with limit_num_sms(envs.DEEPINFER_USERBUFFER_COMM_SMS, enabled=PLATFORM.is_gpu):
+                shared_out = self.shared_forward(hidden_states)
+            event_overlap = self.combine(
+                moe_out_hidden,
+                shared_out,
+                handle,
+                combine_pre_evt,
+            )
+            moe_combined_hidden, _combined_topk_weights = event_overlap.current_stream_wait()</code></pre></div></div></div></figure>
+<p>Each rank routes its own rows: 4 rows on ranks 0 and 1, 2 rows on ranks 2 and 3. The gate masks the rows with <code>valid_token_mask = False</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L387" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mlp.py:387 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mlp.py:387</code></a>). After the combine, each rank again has its own rows, <code>[4, H]</code> or <code>[2, H]</code>.</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-7-in-detail-why-engine-1-must-take-part" class="dd-title">Stop 7 in detail: why engine 1 must take part</h3></summary><div class="dd-body"><p>Dispatch and combine are collectives over the EP group. Ranks 2 and 3 have no real token, but the experts on their devices can receive tokens of A. Assume that engine 1 ran a decode step now. It would call dispatch with the decode token limit, and it would run other layers (the draft model) after the forward pass (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L476" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mlp.py:476 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mlp.py:476</code></a>). The vote in stop 1 prevents this.</p>
+<p>The page shows the DeepEP path. If the EP group fits in one <a class="term" href="../reference/glossary.html#term-nvlink-domain" data-term="NVLink domain" data-def="A group of NVIDIA GPUs that connect directly through NVLink, so each GPU can read and write the memory of the others. DeepEP reports its size.">NVLink domain</a>, the layer can use mega-MoE instead, with the same group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L184-L188" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mlp.py:184-188 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mlp.py:184-188</code></a>, <a href="../concepts/mega-moe.html">Mega-MoE: the whole MoE layer in one call</a>). This site does not explain DeepEP internals.</p></div></details></section>
+
+<section class="stop" id="stop-8"><h2 id="8eplb-counts-the-tokens-per-expert" class="stop-title"><span class="stop-num">8</span>EPLB counts the tokens per expert<a class="h-anchor" href="#8eplb-counts-the-tokens-per-expert" aria-label="Link to this section">#</a></h2><p>The dispatch call also passes a counter: <code>cumulative_local_expert_recv_stats=self._eplb_layer().expert_count</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L474" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mlp.py:474 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mlp.py:474</code></a>). It adds the number of tokens that each local expert slot receives in this layer. After the forward pass, the sampler step calls the load balancer:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L402-L409" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/models/deepseek.py:402-409</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L402-L409" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">402</span><span class="ln">403</span><span class="ln hl">404</span><span class="ln">405</span><span class="ln">406</span><span class="ln">407</span><span class="ln">408</span><span class="ln">409</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><pre><code class="language-python">        expert_lb = eplb.current()
+        if expert_lb is not None:  # dense 模型没有 EPLB
+            expert_lb.step(input_metadata.is_prompt)
+
+            def _moe_lb_post_func():
+                sampler_output.moe_load_balance_ratio = expert_lb.take_moe_load_balance_ratio()
+
+            sampler_output.post_funcs.append(_moe_lb_post_func)</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/eplb/__init__.py#L131-L138" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/eplb/__init__.py:131-138</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/eplb/__init__.py#L131-L138" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">131</span><span class="ln">132</span><span class="ln hl">133</span><span class="ln">134</span><span class="ln">135</span><span class="ln hl">136</span><span class="ln hl">137</span><span class="ln hl">138</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><pre><code class="language-python">    def step(self, is_prompt: bool) -&gt; None:
+        &quot;&quot;&quot;由 DeepseekForCausalLM.sample 每 step 调用，更新重排与负载统计。&quot;&quot;&quot;
+        if self._ep_group.size() &lt;= 1:
+            return
+
+        self._update_rearrangement(is_prompt)
+        self._update_load_balance_stats()
+        self.expert_count.zero_()</code></pre></div></div></div></figure>
+<p>With EP above 1, <code>step</code> updates the rearrangement window, but only if rearrangement is on. Then it adds the token counts of the step to the statistics and sets the counters back to zero.</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-8-in-detail-the-ep-all-gather-every-128-steps" class="dd-title">Stop 8 in detail: the EP all-gather every 128 steps</h3></summary><div class="dd-body"><p><code>_update_load_balance_stats</code> stores the token sum per layer for this step. Every <code>DEEPINFER_MOE_LB_STAT_INTERVAL</code> steps (default 128), it all-gathers the window over the EP group and computes the mean and the maximum per rank (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/eplb/__init__.py#L167-L192" target="_blank" rel="noopener" title="deepinfer/model_executor/eplb/__init__.py:167-192 at 9bd9cf2"><code>deepinfer/model_executor/eplb/__init__.py:167-192</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L118" target="_blank" rel="noopener" title="deepinfer/environ.py:118 at 9bd9cf2"><code>deepinfer/environ.py:118</code></a>). This all-gather is one more reason why all 4 ranks must run the same number of steps, also the placeholder ranks. Shape of the counter: <code>[num_moe_layers, num_local_physical_experts]</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/eplb/__init__.py#L49" target="_blank" rel="noopener" title="deepinfer/model_executor/eplb/__init__.py:49 at 9bd9cf2"><code>deepinfer/model_executor/eplb/__init__.py:49</code></a>). See <a href="../concepts/eplb.html">Expert load balancing (EPLB)</a>.</p></div></details></section>
+
+<section class="stop" id="stop-9"><h2 id="9the-last-all-gather-and-only-the-drivers-sample" class="stop-title"><span class="stop-num">9</span>The last all-gather, and only the drivers sample<a class="h-anchor" href="#9the-last-all-gather-and-only-the-drivers-sample" aria-label="Link to this section">#</a></h2><p>After the last layer, each CP group gathers the output rows and puts them back in token order. Every rank of engine 0 now has the hidden states of all 8 tokens, <code>[8, H]</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L241-L244" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/models/deepseek.py:241-244</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L241-L244" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">241</span><span class="ln">242</span><span class="ln">243</span><span class="ln">244</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        if input_metadata.is_prompt and PG.context_parallel_group().size() &gt; 1:
+            with userbuffer.cp_session():
+                gathered_hidden_states = userbuffer.cp.all_gather(hidden_states)()
+                hidden_states = gather(gathered_hidden_states, input_metadata.mirror_cp_reverse_index)</code></pre></div></div></div></figure>
+<p>Then the worker calls the sampler on all ranks. The driver sends the sampler inputs (row 7 for A: the last prompt token) with a second <code>broadcast_tensor_dict</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L250-L261" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:250-261 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:250-261</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/prepare_sample.cpp#L197" target="_blank" rel="noopener" title="csrc/engine/prepare_sample.cpp:197 at 9bd9cf2"><code>csrc/engine/prepare_sample.cpp:197</code></a>). A follower makes <code>SamplerInputs</code> with no driver part (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L271-L275" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:271-275 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:271-275</code></a>). In the sampler, it computes the logits and returns an empty output:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler.py#L142-L161" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/layers/sampler.py:142-161</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler.py#L142-L161" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">142</span><span class="ln">143</span><span class="ln">144</span><span class="ln hl">145</span><span class="ln">146</span><span class="ln">147</span><span class="ln">148</span><span class="ln">149</span><span class="ln">150</span><span class="ln">151</span><span class="ln">152</span><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span><span class="ln">156</span><span class="ln">157</span><span class="ln">158</span><span class="ln">159</span><span class="ln">160</span><span class="ln hl">161</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><pre><code class="language-python">        logits = get_logits(hidden_states, embedding, self.vocab_size)
+        del hidden_states
+
+        if driver_inputs is None:
+            if need_prompt_logprobs:
+                # 结果只在 driver 上有效；follower 只参与 embedding gather 集合通信。
+                compute_prompt_logprobs(
+                    prompt_hidden_states,
+                    embedding,
+                    None,
+                    vocab_size=self.vocab_size,
+                    force_topk=self.force_topk,
+                )
+            if self.max_MTP_value &gt; 0 and not is_prompt:
+                mtp_module.decode_forward(
+                    main_input_metadata=main_input_metadata,
+                    nextn_kv_caches=nextn_kv_caches,
+                    decode_input=MTPDecodeInput(first_token_positions=decode_inputs.mtp_first_token_positions, driver=None),
+                )
+            return SamplerOutput(post_funcs=[])</code></pre></div></div></div></figure>
+<p>So rank 0 samples the first output token of A. Rank 2 samples a token for the placeholder; the engine ignores it in stop 10.</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-9-in-detail-shapes-in-the-sampler" class="dd-title">Stop 9 in detail: shapes in the sampler</h3></summary><div class="dd-body"><ul>
+  <li>Hidden states: <code>[8, H]</code> on ranks 0 and 1. On ranks 2 and 3 they are <code>[1, H]</code>, because the placeholder has one token (<code>total_q = 1</code>).</li>
+  <li><code>selected_token_indices = [7]</code> on engine 0: one row goes to the logits, fp32 <code>[1, vocab]</code>.</li>
+  <li>A prefill step runs no draft model. In a decode step, the followers would also run the draft layers (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler.py#L155-L160" target="_blank" rel="noopener" title="deepinfer/model_executor/layers/sampler.py:155-160 at 9bd9cf2"><code>deepinfer/model_executor/layers/sampler.py:155-160</code></a>). The code gives no reason; our reading is that the draft MoE collectives need every rank.</li>
+</ul></div></details></section>
+
+<section class="stop" id="stop-10"><h2 id="10outputs" class="stop-title"><span class="stop-num">10</span>Outputs<a class="h-anchor" href="#10outputs" aria-label="Link to this section">#</a></h2><p>We are back in <code>Worker.execute_model_step</code>. A prompt step is post-processed at once, also with ZOS (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L182-L187" target="_blank" rel="noopener" title="deepinfer/worker/worker.py:182-187 at 9bd9cf2"><code>deepinfer/worker/worker.py:182-187</code></a>). Only the driver calls the engine's callback and gets request outputs:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L262-L272" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/worker/worker.py:262-272</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L262-L272" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">262</span><span class="ln">263</span><span class="ln">264</span><span class="ln">265</span><span class="ln">266</span><span class="ln">267</span><span class="ln hl">268</span><span class="ln">269</span><span class="ln hl">270</span><span class="ln hl">271</span><span class="ln">272</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-python">        with cpu_timer.record(&quot;worker.post_process.sync&quot;):
+            step_state.sample_end_evt.synchronize()
+        with cpu_timer.record(&quot;worker.post_process.graph_timer_flush&quot;):
+            # flush the time of completed graph, no effect on the running graph.
+            cuda_graph_timer.flush_out()
+        with cpu_timer.record(&quot;worker.post_process.do_process&quot;):
+            self.model_runner.post_process(step_state.seq_metadata_list, step_state.sampler_output, step_state.is_prompt)
+            request_outputs = np.empty(0, dtype=np.uint64)
+            if self.is_driver_worker:
+                request_outputs = self.engine_callbacks.post_process_fn(step_state)
+        return request_outputs</code></pre></div></div></div></figure>
+<p>On rank 0, <code>LLMEngine.post_process</code> gives the token of A to the scheduler and builds a <code>RequestOutput</code>. On rank 2, the step is a placeholder, so the engine uses no sampler output (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L987" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:987 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:987</code></a>). Ranks 1 and 3 return an empty array and wait for the next method call.</p>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="stop-10-in-detail-what-the-next-step-looks-like" class="dd-title">Stop 10 in detail: what the next step looks like</h3></summary><div class="dd-body"><p>The prompt step sets <code>decode_step = 0</code> on both engines (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L676-L677" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:676-677 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:676-677</code></a>). That is an ALL point. Engine 1 still has no work, so vote 1 fails, and both engines run decode steps. In a decode step:</p>
+<ul>
+  <li>No mirror layout and no CP all-gather: both checks need <code>is_prompt</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L168" target="_blank" rel="noopener" title="deepinfer/model_executor/models/deepseek.py:168 at 9bd9cf2"><code>deepinfer/model_executor/models/deepseek.py:168</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L766" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:766 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:766</code></a>). Ranks 0 and 1 both run A's decode tokens, with the full KV cache that stop 6 stored.</li>
+  <li>With a CUDA graph, the driver sends only five small values; the graph broadcasts the metadata tensors itself (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L202-L209" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:202-209 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:202-209</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cuda_graph_runner.py#L61-L65" target="_blank" rel="noopener" title="deepinfer/worker/cuda_graph_runner.py:61-65 at 9bd9cf2"><code>deepinfer/worker/cuda_graph_runner.py:61-65</code></a>).</li>
+  <li>Engine 1 runs placeholder decode steps until it gets work.</li>
+</ul></div></details></section>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<aside class="callout callout-warning"><p class="callout-title">All ranks must reach every collective</p><div class="callout-body"><p>A collective finishes only when every rank of its group calls it. If one rank of the EP group does not reach the dispatch of a layer, the other three wait. <code>DEEPINFER_GLOO_TIMEOUT</code> (14400 s) applies only to the default Gloo group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L334-L340" target="_blank" rel="noopener" title="deepinfer/worker/base.py:334-340 at 9bd9cf2"><code>deepinfer/worker/base.py:334-340</code></a>). The split groups get no time-out argument, so the PyTorch defaults apply (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L34" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:34 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:34</code></a>).</p></div></aside>
+<ul>
+  <li><strong>A follower dies.</strong> The driver waits in the next CP broadcast or all-gather. If the driver dies, the followers get <code>SIGKILL</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L129-L130" target="_blank" rel="noopener" title="deepinfer/worker/base.py:129-130 at 9bd9cf2"><code>deepinfer/worker/base.py:129-130</code></a>).</li>
+  <li><strong>One idle engine slows the other.</strong> Engine 1 runs placeholder steps with full passes through all layers. Its empty ALL votes delay the next prefill of engine 0 (<a href="../concepts/dp-step-votes.html">Data parallelism and step votes</a>).</li>
+  <li><strong>A CP group across hosts.</strong> The shared-memory queue assumes one host per CP group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L442" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:442 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:442</code></a>).</li>
+  <li><strong>Wrong device order.</strong> Each engine sees <code>cp_size</code> devices from <code>CUDA_VISIBLE_DEVICES</code>. A follower uses <code>local_rank = cp_rank % ngpus</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L384" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:384 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:384</code></a>). If the variable lists fewer devices than <code>cp_size</code>, two ranks share a device.</li>
+</ul>
+<p><strong>Why it matters.</strong> This step shows the three kinds of communication in DeepInfer. The DP group only votes. The CP group moves the inputs and the keys and values inside one engine. The EP group ties all engines together in every MoE layer. Most of the rules of the multi-GPU code follow from the last point.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>In this tour, which ranks run a scheduler, and which ranks sample?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Ranks 0 and 2, the drivers of the two engines. The followers (ranks 1 and 3) have no scheduler and return before sampling (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler.py#L145-L161" target="_blank" rel="noopener" title="deepinfer/model_executor/layers/sampler.py:145-161 at 9bd9cf2"><code>deepinfer/model_executor/layers/sampler.py:145-161</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Through which channel does rank 1 learn that the next method is <code>execute_model_step</code>?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Through the shared-memory MessageQueue of the CP group: <code>run_workers</code> calls <code>cp_broadcast_object((method, kwargs))</code>, and the follower loop dequeues it (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L300" target="_blank" rel="noopener" title="deepinfer/worker/base.py:300 at 9bd9cf2"><code>deepinfer/worker/base.py:300</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L132" target="_blank" rel="noopener" title="deepinfer/worker/base.py:132 at 9bd9cf2"><code>deepinfer/worker/base.py:132</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>Which stop is the first in which ranks of engine 0 and ranks of engine 1 exchange device data?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Stop 7, the MoE dispatch. The votes in stop 1 exchange one-element CPU tensors over the Gloo group, between the drivers only. Stops 3, 4, 6 and 9 stay inside one CP group. The EP group is the world group <code>[0, 1, 2, 3]</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L102-L103" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:102-103 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:102-103</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>How many rows does rank 1 send in each attention all-gather of this step, and how many rows does it get back?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>It sends its <code>cp_mirror_len = 4</code> rows and gets <code>2 × 4 = 8</code> rows: the all-gather result has shape <code>[cp_size × rows, ...]</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/cp.py#L42-L51" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/cp.py:42-51 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/cp.py:42-51</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>Rank 3 has no real token in this step. Name three collectives that it must still call, and the group of each.</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>(1) The broadcasts of the input metadata and the sampler inputs from rank 2, in the CP group <code>[2, 3]</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L217" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:217 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:217</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L261" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:261 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:261</code></a>). (2) The CP all-gathers in every attention layer and after the last layer, also in <code>[2, 3]</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek.py#L241-L244" target="_blank" rel="noopener" title="deepinfer/model_executor/models/deepseek.py:241-244 at 9bd9cf2"><code>deepinfer/model_executor/models/deepseek.py:241-244</code></a>). (3) The MoE dispatch and combine in every layer, in the EP group <code>[0, 1, 2, 3]</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L578-L610" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mlp.py:578-610 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mlp.py:578-610</code></a>). Every 128 steps, also the EPLB all-gather in the EP group.</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/dp-step-votes.html">Data parallelism and step votes</a><span class="rel-sum">Each data-parallel replica is a separate engine process with its own requests. All replicas must run the same kind of step at the same time, so they vote with all-reduces over the DP group.</span></li><li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a><span class="rel-sum">With context parallelism, the devices of one engine share the tokens of a long prefill. A mirrored token order gives each device the same amount of causal attention work.</span></li><li><a href="../concepts/expert-parallelism.html">Expert parallelism: dispatch, grouped GEMM, combine</a><span class="rel-sum">DeepInfer splits the expert slots of every MoE layer evenly over the EP ranks. DeepEP dispatch sends each token to the ranks of its experts, DeepGEMM runs grouped GEMMs there, and DeepEP combine brings the results back.</span></li><li><a href="../concepts/eplb.html">Expert load balancing (EPLB)</a><span class="rel-sum">EPLB counts the tokens of every expert slot in every step. Every N steps it gives busy experts extra copies, places all copies so that the EP ranks get about the same work, and moves the expert weights in place.</span></li><li><a href="../code/parallel-state.html">parallel_utils/parallel_state.py: the process groups</a><span class="rel-sum">parallel_state.py makes all torch.distributed process groups of one rank (world, local, DP, CP, EP, EP-in-DP, Engram and three Gloo copies), the shared-memory queue of the CP group, and the global PG object that the rest of the code reads.</span></li><li><a href="../code/shm-broadcast.html">distributed/shm_broadcast.py: MessageQueue</a><span class="rel-sum">MessageQueue sends pickled Python objects from one writer process to several reader processes through a ring buffer in shared memory. DeepInfer uses it inside each context-parallel group, from the driver to the followers.</span></li><li><a href="../code/model-runner.html">worker/model_runner.py: the ModelRunner class</a><span class="rel-sum">ModelRunner owns the model object on one rank. It builds the input metadata, runs the forward pass (eager or as a CUDA graph replay), prepares the sampler inputs, runs the memory profile and captures the graphs.</span></li><li><a href="../code/v4-mlp.html">v4_modules/mlp.py: the DeepseekMoE layer</a><span class="rel-sum">DeepseekMoE is the runtime MoE layer of DeepInfer. It converts the moe.py containers into the runtime layout, runs the gate, and then either DeepEP dispatch, grouped GEMMs and combine, or one mega-MoE call.</span></li><li><a href="../tours/engine-step.html">Tour: One engine step</a><span class="rel-sum">Follow one decode step of three requests through LLMEngine.step() and Worker.execute_model_step in 11 stops, and see which step&#x27;s data each phase touches (N or N-1), with ZOS on and off.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../tours/spec-decode-round.html"><span class="pn-dir">← Previous</span><span class="pn-title">Tour: One speculative decoding round</span></a><a class="pn pn-next" href="../code/index.html"><span class="pn-dir">Next →</span><span class="pn-title">Code map: the folder tree</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener"><code class="foot-sha">9bd9cf243fc53ef9afbf8f04d391d989117d6ab9</code></a> · 2026-10-21 12:55:43 +0800 · “Bump DeepEP to f6aa38fe and drop the SSH-&gt;HTTPS rewrite (#157)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/deepseek-ai/DeepInfer" target="_blank" rel="noopener">deepseek-ai/DeepInfer</a> · Built 2026-10-22 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#1the-engines-vote-for-a-prefill-step">1The engines vote for a prefill step</a></li><li class="toc-l3"><a href="#stop-1-in-detail-the-other-two-all-reduces">Stop 1 in detail: the other two all-reduces</a></li><li class="toc-l2"><a href="#2each-engine-schedules-its-batch">2Each engine schedules its batch</a></li><li class="toc-l3"><a href="#stop-2-in-detail-the-data-on-each-engine">Stop 2 in detail: the data on each engine</a></li><li class="toc-l2"><a href="#3the-driver-sends-the-method-call-to-its-follower">3The driver sends the method call to its follower</a></li><li class="toc-l3"><a href="#stop-3-in-detail-what-the-follower-gets">Stop 3 in detail: what the follower gets</a></li><li class="toc-l2"><a href="#4the-driver-sends-the-input-metadata">4The driver sends the input metadata</a></li><li class="toc-l3"><a href="#stop-4-in-detail-shapes-on-engine-0">Stop 4 in detail: shapes on engine 0</a></li><li class="toc-l2"><a href="#5each-rank-takes-its-mirror-rows">5Each rank takes its mirror rows</a></li><li class="toc-l3"><a href="#stop-5-in-detail-the-reverse-index">Stop 5 in detail: the reverse index</a></li><li class="toc-l2"><a href="#6attention-gathers-k-and-v-over-the-cp-group">6Attention gathers K and V over the CP group</a></li><li class="toc-l3"><a href="#stop-6-in-detail-who-talks-to-whom">Stop 6 in detail: who talks to whom</a></li><li class="toc-l2"><a href="#7moe-dispatch-and-combine-across-both-engines">7MoE: dispatch and combine across both engines</a></li><li class="toc-l3"><a href="#stop-7-in-detail-why-engine-1-must-take-part">Stop 7 in detail: why engine 1 must take part</a></li><li class="toc-l2"><a href="#8eplb-counts-the-tokens-per-expert">8EPLB counts the tokens per expert</a></li><li class="toc-l3"><a href="#stop-8-in-detail-the-ep-all-gather-every-128-steps">Stop 8 in detail: the EP all-gather every 128 steps</a></li><li class="toc-l2"><a href="#9the-last-all-gather-and-only-the-drivers-sample">9The last all-gather, and only the drivers sample</a></li><li class="toc-l3"><a href="#stop-9-in-detail-shapes-in-the-sampler">Stop 9 in detail: shapes in the sampler</a></li><li class="toc-l2"><a href="#10outputs">10Outputs</a></li><li class="toc-l3"><a href="#stop-10-in-detail-what-the-next-step-looks-like">Stop 10 in detail: what the next step looks like</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+</body>
+</html>

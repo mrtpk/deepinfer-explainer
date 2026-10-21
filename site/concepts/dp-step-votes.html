@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data parallelism and step votes · DeepInfer Explained</title>
+<meta name="description" content="Each data-parallel replica is a separate engine process with its own requests. All replicas must run the same kind of step at the same time, so they vote with all-reduces over the DP group.">
+<script>try{var t=localStorage.getItem("di-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/dp-step-votes">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">DI</span><span class="brand-name">DeepInfer Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/what-an-llm-does.html">What an LLM does</a></li>
+<li><a href="../learn/tokens.html">Tokens and tokenizers</a></li>
+<li><a href="../learn/transformer.html">Inside a transformer</a></li>
+<li><a href="../learn/attention.html">Attention, step by step</a></li>
+<li><a href="../learn/prefill-decode.html">Prefill and decode</a></li>
+<li><a href="../learn/kv-cache.html">The KV cache</a></li>
+<li><a href="../learn/sampling.html">Sampling</a></li>
+<li><a href="../learn/batching.html">Batching</a></li>
+<li><a href="../learn/gpus-kernels.html">GPUs, kernels, and speed</a></li>
+<li><a href="../learn/parallelism.html">Parallelism basics</a></li>
+<li><a href="../learn/moe.html">Mixture of Experts (MoE)</a></li>
+<li><a href="../learn/number-formats.html">Number formats</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">DeepInfer concepts</span><span class="nav-count" title="33 of 34 pages written">33/34</span></summary>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../concepts/engine-step-loop.html">Offline API and the step loop</a></li>
+<li><a href="../concepts/request-lifecycle.html">Request and sequence lifecycle</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/paged-kv-cache.html">Paged KV cache and block manager</a></li>
+<li><a href="../concepts/input-metadata.html">Input metadata</a></li>
+<li><a href="../concepts/cuda-graphs.html">CUDA graphs</a></li>
+<li><a href="../concepts/zero-overhead-scheduling.html">Zero-overhead scheduling</a></li>
+</ul>
+<p class="nav-group">Model (V4.1)</p>
+<ul>
+<li><a href="../concepts/model-map.html">Model map</a></li>
+<li><a href="../concepts/mla-attention.html">MLA attention</a></li>
+<li><a href="../concepts/sparse-attention-indexer.html">Sparse attention indexer</a></li>
+<li><a href="../concepts/sliding-window-attention.html">Sliding-window attention</a></li>
+<li><a href="../concepts/kv-compression.html">KV compression</a></li>
+<li><a href="../concepts/cross-layer-kv-sharing.html">Cross-layer KV sharing</a></li>
+<li><a href="../concepts/yoco-swa-replay.html">YOCO and SWA bounded replay</a></li>
+<li><a href="../concepts/mhc-residual.html">mHC residual mixing</a></li>
+<li><a href="../concepts/moe-routing.html">MoE routing</a></li>
+<li><a href="../concepts/mega-moe.html">Mega-MoE</a></li>
+<li><a href="../concepts/engram.html">Engram n-gram memory</a></li>
+<li><a href="../concepts/vision-encoder.html">Vision encoder (VL)</a></li>
+</ul>
+<p class="nav-group">Decoding</p>
+<ul>
+<li><a href="../concepts/sampler.html">The sampler</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/dspark.html">DSpark confidence scheduling</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/determinism.html">Determinism</a></li>
+</ul>
+<p class="nav-group">Scale</p>
+<ul>
+<li><a class="current" aria-current="page" href="../concepts/dp-step-votes.html">DP and step votes</a></li>
+<li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a></li>
+<li><a href="../concepts/expert-parallelism.html">Expert parallelism (dispatch/combine)</a></li>
+<li><a href="../concepts/eplb.html">Expert load balancing (EPLB)</a></li>
+<li><a href="../concepts/hardware-discovery.html">Hardware discovery</a></li>
+</ul>
+<p class="nav-group">Platform</p>
+<ul>
+<li><a href="../concepts/hardware-platforms.html">NVIDIA and Ascend</a></li>
+<li class="soon"><span>TileLang kernels</span><span class="soon-tag">soon</span></li>
+<li><a href="../concepts/python-cpp-boundary.html">Python and C++</a></li>
+<li><a href="../concepts/low-precision-formats.html">Low-precision formats</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="6 of 6 pages written">6/6</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-request.html">Life of a request</a></li>
+<li><a href="../tours/startup.html">Start-up</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/decoder-layer.html">Inside one decoder layer</a></li>
+<li><a href="../tours/spec-decode-round.html">One speculative decoding round</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step on many GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="49 of 50 pages written">49/50</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">User API and engine</p>
+<ul>
+<li><a href="../code/entrypoints-llm.html">entrypoints/llm.py</a></li>
+<li><a href="../code/sampling-params.html">sampling_params.py</a></li>
+<li><a href="../code/llm-engine.html">engine/llm_engine.py</a></li>
+<li><a href="../code/sequence.html">sequence.py</a></li>
+<li><a href="../code/config.html">config.py</a></li>
+<li><a href="../code/environ.html">environ.py</a></li>
+<li><a href="../code/stats-logger.html">engine/stats_logger.py</a></li>
+</ul>
+<p class="nav-group">C++ engine (csrc/engine/)</p>
+<ul>
+<li><a href="../code/engine-pyi.html">_C/engine.pyi</a></li>
+<li><a href="../code/sequence-hpp.html">sequence.hpp</a></li>
+<li><a href="../code/block-manager-hpp.html">block_manager.hpp</a></li>
+<li><a href="../code/scheduler-hpp.html">scheduler.hpp</a></li>
+<li><a href="../code/zos-cpp.html">zos.cpp</a></li>
+<li><a href="../code/prepare-tensor-input-v4.html">prepare_tensor_input_v4.cpp</a></li>
+<li><a href="../code/prepare-sample-cpp.html">prepare_sample.cpp</a></li>
+<li><a href="../code/outputs-hpp.html">outputs.hpp</a></li>
+</ul>
+<p class="nav-group">Worker</p>
+<ul>
+<li><a href="../code/worker-base.html">worker/base.py</a></li>
+<li><a href="../code/worker.html">worker/worker.py</a></li>
+<li><a href="../code/model-runner.html">worker/model_runner.py</a></li>
+<li><a href="../code/input-metadata.html">input_metadata/</a></li>
+<li><a href="../code/cache-engine.html">worker/cache_engine.py</a></li>
+<li><a href="../code/cuda-graph-runner.html">worker/cuda_graph_runner.py</a></li>
+</ul>
+<p class="nav-group">Model (models/)</p>
+<ul>
+<li><a href="../code/deepseek.html">deepseek.py</a></li>
+<li><a href="../code/decoder-layer.html">decoder_layer.py</a></li>
+<li><a href="../code/v4-hc.html">v4_modules/hc.py</a></li>
+<li><a href="../code/v4-attn.html">v4_modules/attn.py</a></li>
+<li><a href="../code/v4-mla-attn.html">v4_modules/mla_attn.py</a></li>
+<li><a href="../code/v4-index-attn.html">v4_modules/index_attn.py</a></li>
+<li><a href="../code/v4-compress.html">v4_modules/compress.py</a></li>
+<li><a href="../code/v4-cross-layer.html">v4_modules/cross_layer.py</a></li>
+<li><a href="../code/v4-mlp.html">v4_modules/mlp.py</a></li>
+<li><a href="../code/v4-engram.html">v4_modules/engram.py</a></li>
+<li><a href="../code/dflash.html">mtp/dflash.py</a></li>
+<li><a href="../code/deepseek-vl.html">deepseek_vl.py</a></li>
+<li><a href="../code/vit.html">vision_encoder/vit.py</a></li>
+</ul>
+<p class="nav-group">Layers and kernels (layers/)</p>
+<ul>
+<li><a href="../code/sampler.html">sampler.py</a></li>
+<li><a href="../code/linear.html">linear.py</a></li>
+<li class="soon"><span>tilelang_ops/</span><span class="soon-tag">soon</span></li>
+</ul>
+<p class="nav-group">Parallelism and memory</p>
+<ul>
+<li><a href="../code/parallel-state.html">parallel_state.py</a></li>
+<li><a href="../code/shm-broadcast.html">distributed/shm_broadcast.py</a></li>
+<li><a href="../code/shared-memory.html">shared_memory.py</a></li>
+<li><a href="../code/userbuffer.html">userbuffer.py</a></li>
+<li><a href="../code/eplb.html">eplb/</a></li>
+</ul>
+<p class="nav-group">Loading, platform, other</p>
+<ul>
+<li><a href="../code/model-loader.html">model_loader.py</a></li>
+<li><a href="../code/hf-weights.html">hugging_face/weights.py</a></li>
+<li><a href="../code/platform.html">platform.py</a></li>
+<li><a href="../code/npu-ops.html">npu_ops/</a></li>
+<li><a href="../code/deep-cluster.html">deep_cluster/</a></li>
+<li><a href="../code/structure-output.html">structure_output/</a></li>
+<li><a href="../code/ve.html">ve/ (images)</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="5 of 5 pages written">5/5</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/cpp-engine-api.html">C++ engine API</a></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li><a href="../reference/faq.html">FAQ</a></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>DeepInfer concepts</span><span class="sep">›</span><span>Scale</span><span class="sep">›</span><span aria-current="page">DP and step votes</span></nav>
+<h1 class="page-title">Data parallelism and step votes</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">DeepInfer concepts</span><span class="meta-time">about 11 min read + 5 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: DeepInfer @ <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener" title="9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"><code>9bd9cf2</code></a> · 2026-10-21</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/parallelism.html">Parallelism basics</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../learn/prefill-decode.html">Prefill and decode</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../concepts/scheduler.html">The scheduler</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">Each data-parallel replica is its own engine process, but the MoE layers connect them. So the replicas vote with all-reduces, and then all run a prefill step or all run a decode step.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>DeepInfer uses <a class="term" href="../reference/glossary.html#term-data-parallelism" data-term="data parallelism" data-def="DP. Several devices run the same model part, and each device works on different requests.">data parallelism</a> (DP) for attention. One DP replica is one engine: one Python process with its own <code>LLMEngine</code>, its own scheduler, its own requests and its own KV cache. Replicas do not share requests. The docs say "attention uses data parallelism (#DP = #EP)" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L33" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:33 at 9bd9cf2"><code>doc/inference_deployment_qa.md:33</code></a>).</p>
+<p>The replicas are not independent, because of the MoE layers. With <a class="term" href="../reference/glossary.html#term-expert-parallelism" data-term="expert parallelism" data-def="EP. The experts of an MoE layer are split across devices. Tokens go to the devices that hold their experts, and the results come back.">expert parallelism</a>, each rank holds only some experts. In each MoE layer, DeepEP sends tokens to the ranks of their experts and back. These are <a class="term" href="../reference/glossary.html#term-collective" data-term="collective operation" data-def="A communication step in which all ranks of a group take part, for example all-reduce, all-gather or all-to-all.">collectives</a>: every rank of the EP group must call them, also a rank with no tokens.</p>
+<p>So the replicas must keep in step. Three rules make this true:</p>
+<ol>
+  <li><strong>The same number of steps.</strong> A replica keeps calling <code>step()</code> while <em>any</em> replica has work.</li>
+  <li><strong>The same kind of step.</strong> At a prefill <a class="term" href="../reference/glossary.html#term-attempt-point" data-term="attempt point" data-def="A step in which the scheduler may start a prefill. With the defaults, every 70th decode step (ALL point) and every 100th decode step (ANY point). The step right after a prefill step (decode_step 0) is also an ALL point.">attempt point</a>, the replicas vote. Then all run a prefill step, or all run a decode step.</li>
+  <li><strong>A step with no work is still a step.</strong> A replica with nothing to do runs a <a class="term" href="../reference/glossary.html#term-placeholder-step" data-term="placeholder step" data-def="An engine step with no real sequence. The worker runs the model on one dummy sequence, so that all data-parallel ranks keep the same order of collective calls.">placeholder step</a>: the model runs on one dummy sequence.</li>
+</ol>
+<p>Each vote is an <a class="term" href="../reference/glossary.html#term-all-reduce" data-term="all-reduce" data-def="A collective: each rank gives a tensor, and each rank gets the element-wise sum (or max, min) of all of them.">all-reduce</a> over the DP group. We call it a <a class="term" href="../reference/glossary.html#term-step-vote" data-term="step vote" data-def="An all-reduce over the data-parallel group. With it, all DP replicas agree to run a prefill step or a decode step, so that their collectives match.">step vote</a>.</p>
+<p><strong>An everyday comparison.</strong> Think of rowers in one boat. Each rower has an own oar and own strength, like a replica with its own requests. The boat moves well only if all rowers pull at the same time. Before a change of stroke, the crew agrees on the new stroke. A rower with no strength left still moves the oar with the others. The analogy stops at the vote: DeepInfer replicas do not vote before every step, only at attempt points. Between attempt points, all replicas run decode steps without a vote.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8_dp_votes"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: a grid of steps for four replicas at decode_step 69, 70 (ALL point), 71, 99, 100 (ANY point) and 0 (ALL point). Replicas 0 to 2 run decode steps; replica 3 runs empty decode steps. At 70 the ALL vote fails because replica 3 has no work. At 100 the ANY vote succeeds: replicas 0 to 2 prefill and replica 3 runs an empty prefill step. At 0 the ALL vote fails again. Panel 2: two lists of the device collectives of a prefill step and of a decode step, which differ, and a rule that a collective finishes only when every rank calls it."><svg role="img" aria-label="Panel 1: a grid of steps for four replicas at decode_step 69, 70 (ALL point), 71, 99, 100 (ANY point) and 0 (ALL point). Replicas 0 to 2 run decode steps; replica 3 runs empty decode steps. At 70 the ALL vote fails because replica 3 has no work. At 100 the ANY vote succeeds: replicas 0 to 2 prefill and replica 3 runs an empty prefill step. At 0 the ALL vote fails again. Panel 2: two lists of the device collectives of a prefill step and of a decode step, which differ, and a rule that a collective finishes only when every rank calls it." xmlns="http://www.w3.org/2000/svg" width="1100" height="1000" viewBox="0 0 1100 1000">
+<defs></defs>
+<rect width="1100" height="1000" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DP replicas vote, then all run the same kind of step</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">NORMAL engine  ·  4 data-parallel replicas (--ep 4 --cp 1)  ·  default attempt intervals  ·  commit 9bd9cf2</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ALL point: decode_step % 70 == 0   ANY point: decode_step % 100 == 0 (not 0)   vote = all-reduce MIN over the DP group</text>
+<rect x="20.0" y="112.0" width="1060.0" height="416.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="138.0" r="13" fill="#111827"/>
+<text x="46.0" y="142.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="143.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does each replica run?</text>
+<text x="68.0" y="162.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Replicas 0-2 run sequences and have waiting requests. Replica 3 has no work. Each column is one step, on all replicas.</text>
+<text x="46.0" y="190.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">decode_step</text>
+<text x="46.0" y="210.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">point</text>
+<text x="262.0" y="190.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">69</text>
+<text x="374.0" y="190.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">70</text>
+<rect x="350.0" y="196.0" width="48.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="374.0" y="209.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">ALL</text>
+<text x="486.0" y="190.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">71</text>
+<text x="542.0" y="190.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">...</text>
+<text x="598.0" y="190.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">99</text>
+<text x="710.0" y="190.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">100</text>
+<rect x="686.0" y="196.0" width="48.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="710.0" y="209.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">ANY</text>
+<text x="822.0" y="190.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">0</text>
+<rect x="798.0" y="196.0" width="48.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="822.0" y="209.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">ALL</text>
+<text x="46.0" y="249.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">replica 0 (rank 0)</text>
+<rect x="210.0" y="224.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="262.0" y="249.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="322.0" y="224.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="374.0" y="249.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="434.0" y="224.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="486.0" y="249.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="546.0" y="224.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="598.0" y="249.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="658.0" y="224.0" width="104.0" height="40.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="710.0" y="249.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">prefill</text>
+<rect x="770.0" y="224.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="822.0" y="249.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<text x="46.0" y="297.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">replica 1 (rank 1)</text>
+<rect x="210.0" y="272.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="262.0" y="297.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="322.0" y="272.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="374.0" y="297.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="434.0" y="272.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="486.0" y="297.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="546.0" y="272.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="598.0" y="297.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="658.0" y="272.0" width="104.0" height="40.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="710.0" y="297.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">prefill</text>
+<rect x="770.0" y="272.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="822.0" y="297.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<text x="46.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">replica 2 (rank 2)</text>
+<rect x="210.0" y="320.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="262.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="322.0" y="320.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="374.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="434.0" y="320.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="486.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="546.0" y="320.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="598.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<rect x="658.0" y="320.0" width="104.0" height="40.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="710.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">prefill</text>
+<rect x="770.0" y="320.0" width="104.0" height="40.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="822.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">decode</text>
+<text x="46.0" y="393.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">replica 3 (rank 3)</text>
+<rect x="210.0" y="368.0" width="104.0" height="40.0" rx="6" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="262.0" y="393.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">empty decode</text>
+<rect x="322.0" y="368.0" width="104.0" height="40.0" rx="6" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="374.0" y="393.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">empty decode</text>
+<rect x="434.0" y="368.0" width="104.0" height="40.0" rx="6" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="486.0" y="393.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">empty decode</text>
+<rect x="546.0" y="368.0" width="104.0" height="40.0" rx="6" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="598.0" y="393.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">empty decode</text>
+<rect x="658.0" y="368.0" width="104.0" height="40.0" rx="6" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="710.0" y="393.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">empty prefill</text>
+<rect x="770.0" y="368.0" width="104.0" height="40.0" rx="6" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="822.0" y="393.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">empty decode</text>
+<text x="46.0" y="444.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">70 (ALL): replicas 0-2 send 1, replica 3 sends 0. MIN = 0, so nobody prefills.</text>
+<text x="46.0" y="464.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">100 (ANY): replicas 0-2 send 0, replica 3 sends 1. MIN = 0, so all prefill; replica 3 runs an empty prompt step.</text>
+<text x="46.0" y="484.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">0 (ALL, right after a prefill): replica 0 still has work, the others do not. Vote 1 fails, so all decode.</text>
+<text x="46.0" y="504.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre" font-style="italic">Grey dashed cell: a placeholder step (one dummy sequence). The replica still runs every collective.</text>
+<rect x="20.0" y="548.0" width="1060.0" height="328.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="574.0" r="13" fill="#111827"/>
+<text x="46.0" y="578.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="579.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Why must the step type match?</text>
+<text x="68.0" y="598.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The EP group holds all 4 replicas. The two step types call different device collectives.</text>
+<rect x="46.0" y="620.0" width="494.0" height="196.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="60.0" y="644.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">prefill step (is_prompt = True)</text>
+<text x="60.0" y="670.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">per MoE layer: dispatch + combine (EP)</text>
+<text x="60.0" y="690.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  token limit max_num_prefilling_tokens</text>
+<text x="60.0" y="710.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">with CP &gt; 1: CP all-gathers per layer</text>
+<text x="60.0" y="730.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no draft model</text>
+<text x="60.0" y="750.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">eager forward (no CUDA graph)</text>
+<text x="60.0" y="770.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sampler: prefill path</text>
+<text x="60.0" y="790.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">EPLB step(is_prompt=True)</text>
+<rect x="560.0" y="620.0" width="494.0" height="196.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="574.0" y="644.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">decode step (is_prompt = False)</text>
+<text x="574.0" y="670.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">per MoE layer: dispatch + combine (EP)</text>
+<text x="574.0" y="690.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  token limit max_num_decoding_tokens</text>
+<text x="574.0" y="710.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no CP all-gather</text>
+<text x="574.0" y="730.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">draft model: more MoE layers (DFlash)</text>
+<text x="574.0" y="750.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CUDA graph replay when graphs exist</text>
+<text x="574.0" y="770.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sampler: verification path</text>
+<text x="574.0" y="790.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">EPLB step(is_prompt=False)</text>
+<rect x="46.0" y="830.0" width="1008.0" height="34.0" rx="8" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="60.0" y="851.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Rule:</text>
+<text x="98.5" y="851.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">a collective finishes only when every rank of the group calls it. Different call lists on two replicas make them wait.</text>
+<text x="30.0" y="909.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="898.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="909.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">decode step</text>
+<rect x="211.5" y="898.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="232.5" y="909.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prefill step</text>
+<rect x="323.8" y="898.0" width="14.0" height="14.0" rx="3" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.4"/>
+<text x="344.8" y="909.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">placeholder step</text>
+<rect x="464.3" y="898.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="485.3" y="909.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ALL point</text>
+<rect x="567.0" y="898.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="588.0" y="909.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ANY point</text>
+<text x="30.0" y="936.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Vote 2 (did any replica schedule a batch?) and the per-step MAX vote of has_unfinished_requests are not drawn.</text>
+<text x="30.0" y="954.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">With ZOS on (the default), the votes use the Gloo copy of the DP group, on the CPU (llm_engine.py:313).</text>
+<text x="30.0" y="972.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Panel 2 lists differences in the code (mlp.py:476, sampler.py:156 and 237, model_runner.py:182). The rule is general collective behaviour.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: what four replicas run around two attempt points (panel 1), and why one step type for all replicas is necessary (panel 2). Click to zoom.</figcaption><a class="diagram-open" href="../diagrams/b8_dp_votes.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read panel 1 column by column. A column is one engine step, the same step on all four replicas. Grey dashed cells are placeholder steps. Panel 2 lists the differences between the two step types. A replica in a prefill step and a replica in a decode step call different collectives, so they would wait for each other.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-one-process-per-replica">Step 1: one process per replica<a class="h-anchor" href="#step-1-one-process-per-replica" aria-label="Link to this section">#</a></h3>
+<p>The example launcher starts one process per DP rank. It uses the <code>spawn</code> method and waits for all of them:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/_launch.py#L26-L50" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">examples/_launch.py:26-50</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/_launch.py#L26-L50" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span><span class="ln">35</span><span class="ln">36</span><span class="ln">37</span><span class="ln hl">38</span><span class="ln hl">39</span><span class="ln hl">40</span><span class="ln">41</span><span class="ln">42</span><span class="ln">43</span><span class="ln">44</span><span class="ln">45</span><span class="ln">46</span><span class="ln">47</span><span class="ln">48</span><span class="ln">49</span><span class="ln">50</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><pre><code class="language-python">def run_dp(main_fn: Callable[[int, int], None], dp_size: int) -&gt; None:
+    &quot;&quot;&quot;按 RANK/WORLD_SIZE 将 main_fn 分发到本节点负责的各全局 data-parallel rank。
+
+    dp_size == 1 时直接在当前进程运行 main_fn(dp_size, 0)。
+    &quot;&quot;&quot;
+    node_rank = int(os.environ[&quot;RANK&quot;])
+    num_nodes = int(os.environ[&quot;WORLD_SIZE&quot;])
+    assert dp_size % num_nodes == 0
+
+    if dp_size &gt; 1:
+        ctx = get_context(&quot;spawn&quot;)
+        procs: list[BaseProcess] = []
+        for dp_rank in range(dp_size):
+            if dp_rank // (dp_size // num_nodes) == node_rank:
+                procs.append(ctx.Process(target=main_fn, args=(dp_size, dp_rank), daemon=False))
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join()
+
+        failed_procs = [i for i, p in enumerate(procs) if p.exitcode != 0]
+        if failed_procs:
+            raise RuntimeError(f&quot;Some processes failed: {failed_procs}&quot;)
+    else:
+        main_fn(dp_size, 0)</code></pre></div></div></div><figcaption class="code-caption">With RANK and WORLD_SIZE (number of hosts), each host starts only its own DP ranks. With dp_size 1, the function runs in the current process.</figcaption></figure>
+<p>Each process makes its own <code>LLM</code> with <code>engine_rank = dp_rank</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/offline_inference.py#L45-L51" target="_blank" rel="noopener" title="examples/offline_inference.py:45-51 at 9bd9cf2"><code>examples/offline_inference.py:45-51</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/_config.py#L113-L117" target="_blank" rel="noopener" title="examples/_config.py:113-117 at 9bd9cf2"><code>examples/_config.py:113-117</code></a>). <code>ParallelConfig</code> stores <code>data_parallel_rank = engine_rank % data_parallel_size</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/config.py#L167" target="_blank" rel="noopener" title="deepinfer/config.py:167 at 9bd9cf2"><code>deepinfer/config.py:167</code></a>). The <a class="term" href="../reference/glossary.html#term-engine-rank" data-term="engine rank" data-def="The index of one engine process (one DP replica). The global rank of a device process is engine_rank × cp_size + cp_rank.">engine rank</a> also sets the global rank: <code>engine_rank × cp_size + cp_rank</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L329" target="_blank" rel="noopener" title="deepinfer/worker/base.py:329 at 9bd9cf2"><code>deepinfer/worker/base.py:329</code></a>).</p>
+<p>The example gives the replicas different work on purpose: replica <em>r</em> gets <code>r + 1</code> copies of the test prompts (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/_prompts.py#L100" target="_blank" rel="noopener" title="examples/_prompts.py:100 at 9bd9cf2"><code>examples/_prompts.py:100</code></a>). So replica 0 finishes first and then runs placeholder steps until the last replica is done.</p>
+
+<h3 id="step-2-the-dp-group">Step 2: the DP group<a class="h-anchor" href="#step-2-the-dp-group" aria-label="Link to this section">#</a></h3>
+<p><code>create_process_groups</code> makes the DP group and a Gloo (CPU) copy of it:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L91-L94" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/parallel_utils/parallel_state.py:91-94</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L91-L94" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">91</span><span class="ln">92</span><span class="ln">93</span><span class="ln">94</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        # DP group
+        dp_ranks = rearrange(ranks, &quot;(replica dp cp) -&gt; (replica cp) dp&quot;, dp=dp_size, cp=cp_size)
+        self.dp = _split_group(dp_ranks.tolist(), backend=backend, pg_options=options)
+        self.cpu_dp_group = _split_group(dp_ranks.tolist(), backend=&quot;gloo&quot;)</code></pre></div></div></div></figure>
+<p>The rearrange puts ranks with the same <code>cp_rank</code> into one group. With CP size 1, the DP group is all engines. With CP size 2 and 4 engines, the DP groups are <code>[0, 2, 4, 6]</code> and <code>[1, 3, 5, 7]</code>. The scheduler runs only in the engine process (CP rank 0), so only the group <code>[0, 2, 4, 6]</code> votes.</p>
+<p>The engine gives the scheduler the Gloo copy when <a class="term" href="../reference/glossary.html#term-zos" data-term="ZOS" data-def="Zero-overhead scheduling. The CPU prepares and post-processes one step while the device runs the next, so the CPU work does not stop the device.">ZOS</a> is on (the default for a NORMAL engine), else the device group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L313" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:313 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:313</code></a>). The scheduler stores the choice and puts its vote tensor on the CPU or on the device (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L109-L111" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:109-111 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:109-111</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L170-L182" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:170-182 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:170-182</code></a>).</p>
+
+<h3 id="step-3-the-same-number-of-steps">Step 3: the same number of steps<a class="h-anchor" href="#step-3-the-same-number-of-steps" aria-label="Link to this section">#</a></h3>
+<p><code>LLM._run_engine</code> calls <code>step()</code> while <code>has_unfinished_requests()</code> is true (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/entrypoints/llm.py#L176-L178" target="_blank" rel="noopener" title="deepinfer/entrypoints/llm.py:176-178 at 9bd9cf2"><code>deepinfer/entrypoints/llm.py:176-178</code></a>). That function takes the maximum over the DP group:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L665-L679" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/engine/llm_engine.py:665-679</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L665-L679" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">665</span><span class="ln">666</span><span class="ln">667</span><span class="ln">668</span><span class="ln">669</span><span class="ln">670</span><span class="ln">671</span><span class="ln">672</span><span class="ln hl">673</span><span class="ln hl">674</span><span class="ln hl">675</span><span class="ln hl">676</span><span class="ln hl">677</span><span class="ln hl">678</span><span class="ln">679</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><pre><code class="language-python">    def has_unfinished_requests(self) -&gt; bool:
+        &quot;&quot;&quot;Returns True if there are unfinished requests.&quot;&quot;&quot;
+        if envs.DEEPINFER_ZERO_OVERHEAD_SCHEDULING:
+            dp_group = PG.cpu_data_parallel_group()
+            device = &quot;cpu&quot;
+        else:
+            dp_group = PG.data_parallel_group()
+            device = &quot;cuda&quot;
+        unfinished = self.scheduler.has_unfinished_seqs()
+        unfinished = unfinished or self.so_builder_has_pending()
+        if dp_group.size() &gt; 1:
+            unfinished = torch.full((1,), unfinished, dtype=torch.int64, device=device)
+            dist.all_reduce(unfinished, op=dist.ReduceOp.MAX, group=dp_group)
+            unfinished = unfinished.item() &gt; 0
+        return unfinished</code></pre></div></div></div></figure>
+<p>So the loop ends on all replicas in the same call. A replica with no requests keeps calling <code>step()</code> until the busiest replica is done.</p>
+
+<h3 id="step-4-the-same-kind-of-step">Step 4: the same kind of step<a class="h-anchor" href="#step-4-the-same-kind-of-step" aria-label="Link to this section">#</a></h3>
+<p>The C++ scheduler makes the decision in <code>_schedule</code>, in the branch for the NORMAL engine:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L295-L341" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/scheduler.hpp:295-341</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L295-L341" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">295</span><span class="ln">296</span><span class="ln">297</span><span class="ln">298</span><span class="ln">299</span><span class="ln">300</span><span class="ln">301</span><span class="ln">302</span><span class="ln">303</span><span class="ln">304</span><span class="ln">305</span><span class="ln">306</span><span class="ln">307</span><span class="ln hl">308</span><span class="ln hl">309</span><span class="ln">310</span><span class="ln">311</span><span class="ln">312</span><span class="ln hl">313</span><span class="ln">314</span><span class="ln">315</span><span class="ln hl">316</span><span class="ln">317</span><span class="ln hl">318</span><span class="ln">319</span><span class="ln">320</span><span class="ln">321</span><span class="ln">322</span><span class="ln">323</span><span class="ln">324</span><span class="ln">325</span><span class="ln">326</span><span class="ln">327</span><span class="ln">328</span><span class="ln">329</span><span class="ln">330</span><span class="ln">331</span><span class="ln hl">332</span><span class="ln">333</span><span class="ln">334</span><span class="ln">335</span><span class="ln">336</span><span class="ln">337</span><span class="ln">338</span><span class="ln">339</span><span class="ln hl">340</span><span class="ln">341</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><pre><code class="language-cpp">        case EngineType::NORMAL: {
+            // NORMAL 引擎：决定这一步全组做 prompt 还是 decode。dp 内必须同型，靠投票统一。
+            //
+            // 两类尝试点：
+            //   ALL 点（每 prefill_attempt_interval 个 decode step）：全员都有 prefill 活才做，
+            //     防止一个 rank 干活、其余 rank 陪跑空 prompt step。
+            //   ANY 点（每 prefill_any_attempt_interval 个 decode step）：一个 rank 有活就一起做，
+            //     给孤立 rank 兜底——它的 prefill 最多等这么多个 decode step。
+            //   两类点重合时按 ANY 算。
+            //
+            // prompt step 会把 decode_step 清零（见 schedule()），所以刚做完 prefill 的下一步
+            // decode_step==0，又落在 ALL 点上：想连着 prefill 同样要全员有活。
+            // decode_step 各 rank 一致，投票的次数和语义全组对得上，不会卡在 allreduce。
+            bool is_any_point = (decode_step != 0) &amp;&amp; (decode_step % prefill_any_attempt_interval == 0);
+            bool is_all_point = (decode_step % prefill_attempt_interval == 0);
+            if (!is_any_point &amp;&amp; !is_all_point) {
+                return _schedule_decode(acquire);
+            }
+            bool want = (get_gpu_cache_usage() &lt;= GPU_CACHE_PREFILL_WATERMARK) &amp;&amp; _has_prefill_waiting();
+            bool do_prefill;
+            if (is_any_point) {
+                do_prefill = (_dp_allreduce(want ? 0 : 1, c10d::ReduceOp::MIN) == 0); // ANY：任一 rank 想做即触发
+            } else {
+                do_prefill = (_dp_allreduce(want ? 1 : 0, c10d::ReduceOp::MIN) == 1); // ALL：全员想做才触发
+            }
+            if (!do_prefill) {
+                return _schedule_decode(acquire);
+            }
+            std::unique_ptr&lt;SchedulerOutputs&gt; outputs;
+            if (want) {
+                outputs = _schedule_prefill(acquire);
+            }
+
+            // 第二轮投票：确认这轮真有 rank 排出了 prefill。want 只看了 waiting 非空，
+            // 但 _schedule_prefill 仍可能空手（slot 满、KV 块不够）。
+            // 全组都空手时必须转 decode：硬做空 prompt step 会把 decode_step 清零，
+            // 下一步接着投票、接着空手——running 满 + waiting 非空就死循环了。
+            bool any_scheduled = (_dp_allreduce(outputs ? 0 : 1, c10d::ReduceOp::MIN) == 0);
+            if (!any_scheduled) {
+                return _schedule_decode(acquire);
+            }
+            if (outputs) {
+                return outputs;
+            }
+            // 组内确有 rank 在做 prompt：本 rank 陪跑空 prompt step 保持步型一致
+            return _make_outputs({}, true, 0, {}, {}, {}, 0);
+        }</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">296</span> NORMAL engine: decide whether the whole group runs a prompt step or a decode step in this step. Inside DP, the type must be the same; a vote makes it the same.</li><li><span class="tr-line">299-300</span> ALL point (every prefill_attempt_interval decode steps): prefill only if all ranks have prefill work. This prevents steps where one rank works and the other ranks run empty prompt steps with it.</li><li><span class="tr-line">301-303</span> ANY point (every prefill_any_attempt_interval decode steps): prefill together if one rank has work. This is the safety net for an isolated rank: its prefill waits at most this many decode steps. If both kinds of point fall on the same step, it counts as ANY.</li><li><span class="tr-line">305-307</span> A prompt step sets decode_step to 0 (see schedule()). So the step right after a prefill has decode_step == 0 and is an ALL point again: to prefill again, all ranks must have work. decode_step is the same on every rank, so the number and the meaning of the votes match in the group, and the all-reduce does not hang.</li><li><span class="tr-line">328-331</span> Second vote: confirm that some rank really scheduled a prefill. "want" looked only at a non-empty waiting queue, but _schedule_prefill can still come back empty (slots full, not enough KV blocks). If the whole group comes back empty, the step must be a decode step. A forced empty prompt step would set decode_step to 0; the next step would vote and come back empty again; with running full and waiting not empty, this is an endless loop.</li><li><span class="tr-line">339</span> Some rank in the group really runs a prompt step: this rank runs an empty prompt step with it, so that the step type stays the same.</li></ul></div></figure>
+<ol>
+  <li>Lines 308-312: if <code>decode_step</code> is not an attempt point, the step is a decode step. No vote runs.</li>
+  <li>Line 313: this replica "wants" a prefill if the KV cache use is 90 % or less and the front of <code>waiting</code> is schedulable.</li>
+  <li>Lines 315-319: vote 1, an all-reduce MIN. The encoding makes MIN mean "any" at an ANY point and "all" at an ALL point.</li>
+  <li>Lines 324-326: only a replica that wants a prefill tries to schedule one.</li>
+  <li>Line 332: vote 2. If no replica got a batch, all run a decode step.</li>
+  <li>Line 340: a replica with no batch returns an empty prompt step. The engine turns it into a placeholder step.</li>
+</ol>
+<p><code>decode_step</code> is set to 0 after a prompt step and goes up by 1 after a decode step (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L676-L680" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:676-680 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:676-680</code></a>). All replicas run the same step types, so the counter has the same value on all of them. The page <a href="../concepts/scheduler.html">The scheduler</a> explains the intervals and the watermark in full.</p>
+
+<h3 id="step-5-placeholder-steps">Step 5: placeholder steps<a class="h-anchor" href="#step-5-placeholder-steps" aria-label="Link to this section">#</a></h3>
+<p>The engine marks a step with no scheduled sequence as a placeholder (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L972" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:972 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:972</code></a>). The worker then runs the model on one dummy sequence:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L121-L127" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/worker/worker.py:121-127</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L121-L127" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">121</span><span class="ln">122</span><span class="ln">123</span><span class="ln">124</span><span class="ln hl">125</span><span class="ln hl">126</span><span class="ln hl">127</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><pre><code class="language-python">        if not is_placeholder:
+            main_model_output = self.model_runner.execute_main_model(
+                seq_metadata_list, self.gpu_cache, metadata_zos=metadata_zos, total_q=total_q
+            )
+        else:
+            seq_metadata_list = [self.model_runner._placeholder_seq_metadata(is_prompt)]
+            main_model_output = self.model_runner.execute_main_model(seq_metadata_list, self.gpu_cache, metadata_zos=metadata_zos)</code></pre></div></div></div></figure>
+<p>The dummy sequence has one token with id 0, block table <code>[0]</code> and greedy sampling (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L386-L403" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:386-403 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:386-403</code></a>). The free list of the block manager starts at block 1, so block 0 is never given to a real sequence (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/block_manager.hpp#L27-L30" target="_blank" rel="noopener" title="csrc/engine/block_manager.hpp:27-30 at 9bd9cf2"><code>csrc/engine/block_manager.hpp:27-30</code></a>). So the dummy step does not change the data of real sequences. The model still runs every layer, so every MoE collective runs. The engine ignores the sampler output of a placeholder step (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L987" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:987 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:987</code></a>).</p>
+
+<h3 id="step-6-why-one-step-type">Step 6: why one step type<a class="h-anchor" href="#step-6-why-one-step-type" aria-label="Link to this section">#</a></h3>
+<p>The source comment states the rule (line 296 above) but not the reason. The code shows these collectives in a step:</p>
+<ul>
+  <li><strong>MoE dispatch and combine</strong> over the EP group, in every MoE layer (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L565-L616" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mlp.py:565-616 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mlp.py:565-616</code></a>). The EP group is a block of <code>ep_size</code> neighbour ranks, or the world group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L101-L106" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:101-106 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:101-106</code></a>). So it holds the ranks of several replicas. The dispatch passes a different token limit in a prefill step and in a decode step (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mlp.py#L476" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mlp.py:476 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mlp.py:476</code></a>).</li>
+  <li><strong>The draft model</strong> runs only in decode steps, and its layers have MoE blocks (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler.py#L236-L248" target="_blank" rel="noopener" title="deepinfer/model_executor/layers/sampler.py:236-248 at 9bd9cf2"><code>deepinfer/model_executor/layers/sampler.py:236-248</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/mtp/dflash.py#L389-L392" target="_blank" rel="noopener" title="deepinfer/model_executor/models/mtp/dflash.py:389-392 at 9bd9cf2"><code>deepinfer/model_executor/models/mtp/dflash.py:389-392</code></a>).</li>
+  <li><strong>CP all-gathers</strong> run only in prefill steps (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L766" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:766 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:766</code></a>).</li>
+  <li><strong>The EPLB statistics</strong> run an all-gather over the EP group once every 128 steps (<code>DEEPINFER_MOE_LB_STAT_INTERVAL</code>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L118" target="_blank" rel="noopener" title="deepinfer/environ.py:118 at 9bd9cf2"><code>deepinfer/environ.py:118</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/eplb/__init__.py#L167-L190" target="_blank" rel="noopener" title="deepinfer/model_executor/eplb/__init__.py:167-190 at 9bd9cf2"><code>deepinfer/model_executor/eplb/__init__.py:167-190</code></a>). This needs the same number of steps on all ranks.</li>
+</ul>
+<p>A collective finishes only when every rank of the group calls it. If two ranks call different collectives, or the same collective with different arguments, they can wait for each other with no end. (This is general behaviour of collectives, not a DeepInfer rule.)</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="all-the-all-reduces-of-one-step" class="dd-title">All the all-reduces of one step</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>When</th><th>Value sent by each replica</th><th>Op</th><th>Meaning of the result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>every loop check</td><td><code>1</code> if it has unfinished work</td><td>MAX</td><td><code>1</code>: some replica has work, keep stepping</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L673-L678" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:673-678 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:673-678</code></a></td></tr>
+    <tr><td>ANY point, vote 1</td><td><code>0</code> if it wants a prefill, else <code>1</code></td><td>MIN</td><td><code>0</code>: at least one wants</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L316" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:316 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:316</code></a></td></tr>
+    <tr><td>ALL point, vote 1</td><td><code>1</code> if it wants a prefill, else <code>0</code></td><td>MIN</td><td><code>1</code>: all want</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L318" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:318 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:318</code></a></td></tr>
+    <tr><td>vote 2 (only after vote 1 passes)</td><td><code>0</code> if it has a batch, else <code>1</code></td><td>MIN</td><td><code>0</code>: at least one has a batch</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L332" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:332 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:332</code></a></td></tr>
+  </tbody>
+</table>
+<p>So a normal decode step has one all-reduce: the loop check. An attempt point has two or three. The vote tensors are one int32 value (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L170-L182" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:170-182 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:170-182</code></a>). The loop check uses one int64 value (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L676" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:676 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:676</code></a>).</p>
+<p><strong>Device or CPU.</strong> With ZOS on, both use the Gloo group and CPU tensors (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L667-L669" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:667-669 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:667-669</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L313" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:313 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:313</code></a>). A device all-reduce followed by <code>.item()</code> waits for the device. A CPU vote does not. With ZOS off, both use the device group.</p>
+<p><strong>A detail with one replica.</strong> The comment above <code>_dp_allreduce</code> says that it communicates also when <code>dp_size == 1</code>, and the caller must skip it (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L169" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:169 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:169</code></a>). <code>_schedule</code> does not skip it. With one replica, the vote is an all-reduce over a group of one rank. The loop check in Python does skip it (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L675" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:675 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:675</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="a-worked-example-with-four-replicas" class="dd-title">A worked example with four replicas</h3></summary><div class="dd-body"><p>Setting: <code>--ep 4</code>, so 4 replicas and an EP group of 4 ranks (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/offline_inference.py#L24-L28" target="_blank" rel="noopener" title="examples/offline_inference.py:24-28 at 9bd9cf2"><code>examples/offline_inference.py:24-28</code></a>). Default intervals: ALL every 70, ANY every 100 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L174-L177" target="_blank" rel="noopener" title="deepinfer/environ.py:174-177 at 9bd9cf2"><code>deepinfer/environ.py:174-177</code></a>). Replicas 0-2 have running sequences. Replica 3 has none.</p>
+<ol>
+  <li><code>decode_step</code> 1 to 69: decode steps, no vote. Replica 3 runs placeholder decode steps.</li>
+  <li><code>decode_step = 70</code> (ALL): one new request has arrived at each of replicas 0, 1 and 2. Vote 1: <code>MIN(1, 1, 1, 0) = 0</code>. No prefill. All decode.</li>
+  <li>71 to 99: decode steps, no vote. The new requests wait.</li>
+  <li>100 (ANY): vote 1: <code>MIN(0, 0, 0, 1) = 0</code>, so a prefill step. Replicas 0-2 schedule their prompts. Vote 2: <code>MIN(0, 0, 0, 1) = 0</code>. Replica 3 returns an empty prompt step and runs a placeholder prefill. <code>decode_step</code> becomes 0 on all replicas.</li>
+  <li>Next step, <code>decode_step = 0</code> (ALL): replica 0 has a second chunk to prefill. Replica 3 has nothing, so vote 1 fails. All decode, and <code>decode_step</code> becomes 1. The second chunk waits until step 70 (ALL, fails again if replica 3 is still empty) or step 100 (ANY).</li>
+</ol>
+<p>The result: the new requests waited 30 decode steps for their first prefill. Without the idle replica 3, they would have started at step 70. The ANY points bound the wait: a prefill waits at most about 100 decode steps, the comment says (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L301-L302" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:301-302 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:301-302</code></a>).</p>
+<p>Where the 90 % watermark comes in: a replica with a full KV cache does not want a prefill (line 313). At an ALL point it blocks the others. At an ANY point the others prefill without it.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-parallel-load-balancing-in-the-docs-not-in-this-release" class="dd-title">Data-parallel load balancing: in the docs, not in this release</h3></summary><div class="dd-body"><p>In this release, nothing moves requests between replicas. Each process gets its own requests from its caller. The README lists "Load balancing across data-parallel replicas for both prefill and decode" under "Required for a complete inference service (not included in this release)" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/README.md#L38-L42" target="_blank" rel="noopener" title="README.md:38-42 at 9bd9cf2"><code>README.md:38-42</code></a>).</p>
+<p>The deployment Q&amp;A describes the production balancers in its section "Data-parallel load balancing" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L105-L127" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:105-127 at 9bd9cf2"><code>doc/inference_deployment_qa.md:105-127</code></a>):</p>
+<ul>
+  <li><strong>Prefill.</strong> Requests go into 4 tiers by total context length: under 16K, 16-64K, 64-256K and 256K or more. Engines pull work by their remaining compute quota. Inside a DP group, each request goes to the DP rank with the lowest quota load (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L109-L113" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:109-113 at 9bd9cf2"><code>doc/inference_deployment_qa.md:109-113</code></a>).</li>
+  <li><strong>Inside one GPU.</strong> FIFO, with a chunk size from a time budget and a fitted quadratic cost model, at most 32,768 tokens. "The budget itself is further reduced by an all-reduce MIN within the DP group" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L115" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:115 at 9bd9cf2"><code>doc/inference_deployment_qa.md:115</code></a>).</li>
+  <li><strong>Decode.</strong> Uniform routing over all GPUs of all decode instances, which balances the request count and the total KV length (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L119" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:119 at 9bd9cf2"><code>doc/inference_deployment_qa.md:119</code></a>).</li>
+  <li><strong>Result.</strong> "roughly 80% of a perfectly balanced offline benchmark" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L127" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:127 at 9bd9cf2"><code>doc/inference_deployment_qa.md:127</code></a>).</li>
+</ul>
+<p>The code of this release does not have the compute quota or the cost model in its scheduler. The step votes are the only coordination between replicas in this release.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="how-the-dp-group-is-built-with-the-replica-dimension" class="dd-title">How the DP group is built, with the replica dimension</h3></summary><div class="dd-body"><p>The rank list is <code>arange(max(enp_size, dp_size × cp_size))</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L80" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:80 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:80</code></a>). The DP rearrange is <code>"(replica dp cp) -&gt; (replica cp) dp"</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L92" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:92 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:92</code></a>). The <code>replica</code> axis is not 1 only when the Engram group is larger than <code>dp × cp</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/config.py#L172-L173" target="_blank" rel="noopener" title="deepinfer/config.py:172-173 at 9bd9cf2"><code>deepinfer/config.py:172-173</code></a>).</p>
+<table>
+  <thead><tr><th>Run</th><th>dp, cp</th><th>World</th><th>DP groups</th><th>EP groups</th></tr></thead>
+  <tbody>
+    <tr><td><code>--ep 8</code></td><td>8, 1</td><td>8</td><td><code>[0..7]</code></td><td><code>[0..7]</code> (world)</td></tr>
+    <tr><td><code>--ep 2 --dp 8</code></td><td>8, 1</td><td>8</td><td><code>[0..7]</code></td><td><code>[0,1] [2,3] [4,5] [6,7]</code></td></tr>
+    <tr><td><code>--ep 4 --cp 2</code></td><td>2, 2</td><td>4</td><td><code>[0,2] [1,3]</code></td><td><code>[0..3]</code> (world)</td></tr>
+    <tr><td><code>--ep 2 --cp 8</code></td><td>1, 8</td><td>8</td><td>one rank each</td><td><code>[0,1] [2,3] [4,5] [6,7]</code></td></tr>
+  </tbody>
+</table>
+<p>Sources: the example sizes (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/offline_inference.py#L24-L28" target="_blank" rel="noopener" title="examples/offline_inference.py:24-28 at 9bd9cf2"><code>examples/offline_inference.py:24-28</code></a>), the three example commands (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/README.md#L6-L8" target="_blank" rel="noopener" title="examples/README.md:6-8 at 9bd9cf2"><code>examples/README.md:6-8</code></a>) and the EP rearrange (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L101-L106" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:101-106 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:101-106</code></a>). In the second row, an EP group holds 2 replicas, but the vote still runs over all 8. In the last row there is one replica, and each EP group is inside its CP group.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="settings" class="dd-title">Settings</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code></td><td>70</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L174" target="_blank" rel="noopener" title="deepinfer/environ.py:174 at 9bd9cf2"><code>deepinfer/environ.py:174</code></a></td><td>Distance between ALL points. Must be 1 or more (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L105-L106" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:105-106 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:105-106</code></a>).</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code></td><td>100</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L177" target="_blank" rel="noopener" title="deepinfer/environ.py:177 at 9bd9cf2"><code>deepinfer/environ.py:177</code></a></td><td>Distance between ANY points (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L107-L108" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:107-108 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:107-108</code></a>).</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>on for a NORMAL engine</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/arg_utils.py#L51-L55" target="_blank" rel="noopener" title="deepinfer/engine/arg_utils.py:51-55 at 9bd9cf2"><code>deepinfer/engine/arg_utils.py:51-55</code></a></td><td>Votes on the Gloo (CPU) DP group.</td></tr>
+    <tr><td><code>DEEPINFER_MOE_LB_STAT_INTERVAL</code></td><td>128</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L118" target="_blank" rel="noopener" title="deepinfer/environ.py:118 at 9bd9cf2"><code>deepinfer/environ.py:118</code></a></td><td>Steps between the EPLB statistics all-gathers.</td></tr>
+    <tr><td><code>DEEPINFER_GLOO_TIMEOUT</code></td><td>14400 s</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L110" target="_blank" rel="noopener" title="deepinfer/environ.py:110 at 9bd9cf2"><code>deepinfer/environ.py:110</code></a></td><td>Time-out of the default Gloo process group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L334-L340" target="_blank" rel="noopener" title="deepinfer/worker/base.py:334-340 at 9bd9cf2"><code>deepinfer/worker/base.py:334-340</code></a>).</td></tr>
+    <tr><td><code>--dp</code>, <code>--ep</code>, <code>--cp</code></td><td>auto, 8, 1</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/offline_inference.py#L13-L15" target="_blank" rel="noopener" title="examples/offline_inference.py:13-15 at 9bd9cf2"><code>examples/offline_inference.py:13-15</code></a></td><td>The number of replicas: <code>max(ep // cp, 1)</code> if <code>--dp</code> is not given.</td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<aside class="callout callout-warning"><p class="callout-title">Do not call step() on only some replicas</p><div class="callout-body"><p>Every replica must call <code>step()</code> the same number of times. <code>LLM.generate</code> does this with the MAX vote. Code that drives the engine directly, such as a benchmark, must keep this rule too. A replica that stops early leaves the others waiting in a collective.</p></div></aside>
+<ul>
+  <li><strong>Slow first tokens with uneven load.</strong> One replica with no waiting request makes every ALL vote fail. New requests on the other replicas then wait for the next ANY point, up to about 100 decode steps (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L301-L302" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:301-302 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:301-302</code></a>).</li>
+  <li><strong>Wasted device time.</strong> A replica with no work runs placeholder steps, each with a full pass through all layers. The example launcher makes this visible: replica 0 has the fewest prompts (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/_prompts.py#L100" target="_blank" rel="noopener" title="examples/_prompts.py:100 at 9bd9cf2"><code>examples/_prompts.py:100</code></a>).</li>
+  <li><strong>Finished requests in the queue.</strong> Without a clean-up, an aborted request that stays in <code>waiting</code> would block the ALL votes of the group for ever. The source comment gives this reason, and the decode branch removes such requests (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L564-L577" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:564-577 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:564-577</code></a>).</li>
+  <li><strong>A hang, not an error.</strong> If the replicas disagree on a collective, nothing raises at once. The ranks wait. <code>DEEPINFER_GLOO_TIMEOUT</code> (4 hours) applies only to the default group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L334-L340" target="_blank" rel="noopener" title="deepinfer/worker/base.py:334-340 at 9bd9cf2"><code>deepinfer/worker/base.py:334-340</code></a>). The DP groups come from <code>new_group</code> with no time-out argument, so the PyTorch default applies (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L34" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:34 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:34</code></a>).</li>
+</ul>
+<p><strong>Why it matters.</strong> DP for attention needs no communication in the attention layers, but MoE with EP ties all replicas together. The votes are the price: one replica with no work, or with a full cache, can delay the prefills of all replicas. A production system needs a load balancer in front of the replicas. This release does not have one.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Is one DP replica a thread, a process or a device group?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>A process. <code>run_dp</code> starts one process per DP rank with the <code>spawn</code> method (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/_launch.py#L35-L44" target="_blank" rel="noopener" title="examples/_launch.py:35-44 at 9bd9cf2"><code>examples/_launch.py:35-44</code></a>). Each process makes its own <code>LLM</code> and engine. With CP above 1, the replica also starts CP follower processes.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Replica 2 has no requests, but replica 0 still has three. Does replica 2 call <code>step()</code>?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Yes. <code>has_unfinished_requests()</code> takes the MAX over the DP group, so it is true on every replica (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L673-L678" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:673-678 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:673-678</code></a>). Replica 2 runs placeholder steps (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/worker.py#L125-L127" target="_blank" rel="noopener" title="deepinfer/worker/worker.py:125-127 at 9bd9cf2"><code>deepinfer/worker/worker.py:125-127</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>At an ANY point, replica 1 wants a prefill, but its <code>_schedule_prefill</code> returns nothing because all slots are full. The other replicas do not want a prefill. What kind of step runs?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>A decode step on all replicas. Vote 1 passes (replica 1 sent 0). Vote 2 fails: every replica sends 1 because no replica has a batch, and <code>MIN = 1</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L332-L335" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:332-335 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:332-335</code></a>). The comment explains why: an empty prompt step would reset <code>decode_step</code> and could loop for ever.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>Why does the vote use MIN for both ALL and ANY points?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Only the encoding changes. For ALL, "wants" is 1, so MIN is 1 only if all send 1. For ANY, "wants" is 0, so MIN is 0 if one sends 0 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L315-L319" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:315-319 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:315-319</code></a>). One reduce op serves both.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>You run <code>--ep 2 --dp 8</code>. Replicas 0 and 1 share an EP group. Could replicas 0-1 and replicas 2-3 safely run different step types? What does the code do?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>From the MoE side, perhaps: their EP groups are disjoint (<code>[0,1]</code> and <code>[2,3]</code>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L101-L106" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:101-106 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:101-106</code></a>). But the code does not make this choice. The scheduler votes over the whole DP group of 8 replicas (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L91-L93" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:91-93 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:91-93</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L170-L182" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:170-182 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:170-182</code></a>). So all 8 run the same step type. One empty replica can make the ALL votes of all 8 fail.</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/scheduler.html">The scheduler</a><span class="rel-sum">In every engine step, the C++ scheduler runs either a prefill batch or a decode batch. It starts prefills only at attempt points, cuts long prompts into chunks, gives KV blocks, and preempts sequences when the blocks run out.</span></li><li><a href="../concepts/engine-step-loop.html">Offline API and the step loop</a><span class="rel-sum">LLM.generate() adds all requests, then calls LLMEngine.step() until no request is left. Each step schedules one batch, runs the model once, and returns handles to the new outputs. With ZOS, a decode step returns the tokens of the step before it.</span></li><li><a href="../concepts/expert-parallelism.html">Expert parallelism: dispatch, grouped GEMM, combine</a><span class="rel-sum">DeepInfer splits the expert slots of every MoE layer evenly over the EP ranks. DeepEP dispatch sends each token to the ranks of its experts, DeepGEMM runs grouped GEMMs there, and DeepEP combine brings the results back.</span></li><li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a><span class="rel-sum">With context parallelism, the devices of one engine share the tokens of a long prefill. A mirrored token order gives each device the same amount of causal attention work.</span></li><li><a href="../concepts/eplb.html">Expert load balancing (EPLB)</a><span class="rel-sum">EPLB counts the tokens of every expert slot in every step. Every N steps it gives busy experts extra copies, places all copies so that the EP ranks get about the same work, and moves the expert weights in place.</span></li><li><a href="../tours/multi-gpu-step.html">Tour: One step on many GPUs</a><span class="rel-sum">Follow one prefill step on 4 GPUs (2 data-parallel engines, each with 2 context-parallel ranks) in 10 stops, from the step vote to the outputs, with the rank, the group and the tensor shapes at each stop.</span></li><li><a href="../code/scheduler-hpp.html">csrc/engine/scheduler.hpp: the C++ Scheduler</a><span class="rel-sum">scheduler.hpp holds the C++ Scheduler: the waiting and running queues, the choice between prefill and decode, block allocation, preemption, and the bookkeeping after each step. It also defines SchedulerOutputs and three free functions.</span></li><li><a href="../code/llm-engine.html">engine/llm_engine.py: the LLMEngine class</a><span class="rel-sum">LLMEngine starts the workers, sizes the KV cache, owns the C++ scheduler, and runs one engine step each time LLM calls step().</span></li><li><a href="../code/parallel-state.html">parallel_utils/parallel_state.py: the process groups</a><span class="rel-sum">parallel_state.py makes all torch.distributed process groups of one rank (world, local, DP, CP, EP, EP-in-DP, Engram and three Gloo copies), the shared-memory queue of the CP group, and the global PG object that the rest of the code reads.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/determinism.html"><span class="pn-dir">← Previous</span><span class="pn-title">Determinism and batch invariance</span></a><a class="pn pn-next" href="../concepts/context-parallelism.html"><span class="pn-dir">Next →</span><span class="pn-title">Context parallelism (mirror CP)</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener"><code class="foot-sha">9bd9cf243fc53ef9afbf8f04d391d989117d6ab9</code></a> · 2026-10-21 12:55:43 +0800 · “Bump DeepEP to f6aa38fe and drop the SSH-&gt;HTTPS rewrite (#157)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/deepseek-ai/DeepInfer" target="_blank" rel="noopener">deepseek-ai/DeepInfer</a> · Built 2026-10-22 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-one-process-per-replica">Step 1: one process per replica</a></li><li class="toc-l3"><a href="#step-2-the-dp-group">Step 2: the DP group</a></li><li class="toc-l3"><a href="#step-3-the-same-number-of-steps">Step 3: the same number of steps</a></li><li class="toc-l3"><a href="#step-4-the-same-kind-of-step">Step 4: the same kind of step</a></li><li class="toc-l3"><a href="#step-5-placeholder-steps">Step 5: placeholder steps</a></li><li class="toc-l3"><a href="#step-6-why-one-step-type">Step 6: why one step type</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#all-the-all-reduces-of-one-step">All the all-reduces of one step</a></li><li class="toc-l3"><a href="#a-worked-example-with-four-replicas">A worked example with four replicas</a></li><li class="toc-l3"><a href="#data-parallel-load-balancing-in-the-docs-not-in-this-release">Data-parallel load balancing: in the docs, not in this release</a></li><li class="toc-l3"><a href="#how-the-dp-group-is-built-with-the-replica-dimension">How the DP group is built, with the replica dimension</a></li><li class="toc-l3"><a href="#settings">Settings</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+</body>
+</html>

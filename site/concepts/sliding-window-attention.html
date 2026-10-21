@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sliding-window attention · DeepInfer Explained</title>
+<meta name="description" content="Every attention layer of DeepSeek-V4.1-Flash reads the most recent tokens (a window of 128 in the docs) from a ring of 134 slots per sequence and layer. This page shows the ring, the decode and prefill index paths, and how the window joins the compressed keys.">
+<script>try{var t=localStorage.getItem("di-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/sliding-window-attention">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">DI</span><span class="brand-name">DeepInfer Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/what-an-llm-does.html">What an LLM does</a></li>
+<li><a href="../learn/tokens.html">Tokens and tokenizers</a></li>
+<li><a href="../learn/transformer.html">Inside a transformer</a></li>
+<li><a href="../learn/attention.html">Attention, step by step</a></li>
+<li><a href="../learn/prefill-decode.html">Prefill and decode</a></li>
+<li><a href="../learn/kv-cache.html">The KV cache</a></li>
+<li><a href="../learn/sampling.html">Sampling</a></li>
+<li><a href="../learn/batching.html">Batching</a></li>
+<li><a href="../learn/gpus-kernels.html">GPUs, kernels, and speed</a></li>
+<li><a href="../learn/parallelism.html">Parallelism basics</a></li>
+<li><a href="../learn/moe.html">Mixture of Experts (MoE)</a></li>
+<li><a href="../learn/number-formats.html">Number formats</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">DeepInfer concepts</span><span class="nav-count" title="33 of 34 pages written">33/34</span></summary>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../concepts/engine-step-loop.html">Offline API and the step loop</a></li>
+<li><a href="../concepts/request-lifecycle.html">Request and sequence lifecycle</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/paged-kv-cache.html">Paged KV cache and block manager</a></li>
+<li><a href="../concepts/input-metadata.html">Input metadata</a></li>
+<li><a href="../concepts/cuda-graphs.html">CUDA graphs</a></li>
+<li><a href="../concepts/zero-overhead-scheduling.html">Zero-overhead scheduling</a></li>
+</ul>
+<p class="nav-group">Model (V4.1)</p>
+<ul>
+<li><a href="../concepts/model-map.html">Model map</a></li>
+<li><a href="../concepts/mla-attention.html">MLA attention</a></li>
+<li><a href="../concepts/sparse-attention-indexer.html">Sparse attention indexer</a></li>
+<li><a class="current" aria-current="page" href="../concepts/sliding-window-attention.html">Sliding-window attention</a></li>
+<li><a href="../concepts/kv-compression.html">KV compression</a></li>
+<li><a href="../concepts/cross-layer-kv-sharing.html">Cross-layer KV sharing</a></li>
+<li><a href="../concepts/yoco-swa-replay.html">YOCO and SWA bounded replay</a></li>
+<li><a href="../concepts/mhc-residual.html">mHC residual mixing</a></li>
+<li><a href="../concepts/moe-routing.html">MoE routing</a></li>
+<li><a href="../concepts/mega-moe.html">Mega-MoE</a></li>
+<li><a href="../concepts/engram.html">Engram n-gram memory</a></li>
+<li><a href="../concepts/vision-encoder.html">Vision encoder (VL)</a></li>
+</ul>
+<p class="nav-group">Decoding</p>
+<ul>
+<li><a href="../concepts/sampler.html">The sampler</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/dspark.html">DSpark confidence scheduling</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/determinism.html">Determinism</a></li>
+</ul>
+<p class="nav-group">Scale</p>
+<ul>
+<li><a href="../concepts/dp-step-votes.html">DP and step votes</a></li>
+<li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a></li>
+<li><a href="../concepts/expert-parallelism.html">Expert parallelism (dispatch/combine)</a></li>
+<li><a href="../concepts/eplb.html">Expert load balancing (EPLB)</a></li>
+<li><a href="../concepts/hardware-discovery.html">Hardware discovery</a></li>
+</ul>
+<p class="nav-group">Platform</p>
+<ul>
+<li><a href="../concepts/hardware-platforms.html">NVIDIA and Ascend</a></li>
+<li class="soon"><span>TileLang kernels</span><span class="soon-tag">soon</span></li>
+<li><a href="../concepts/python-cpp-boundary.html">Python and C++</a></li>
+<li><a href="../concepts/low-precision-formats.html">Low-precision formats</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="6 of 6 pages written">6/6</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-request.html">Life of a request</a></li>
+<li><a href="../tours/startup.html">Start-up</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/decoder-layer.html">Inside one decoder layer</a></li>
+<li><a href="../tours/spec-decode-round.html">One speculative decoding round</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step on many GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="49 of 50 pages written">49/50</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">User API and engine</p>
+<ul>
+<li><a href="../code/entrypoints-llm.html">entrypoints/llm.py</a></li>
+<li><a href="../code/sampling-params.html">sampling_params.py</a></li>
+<li><a href="../code/llm-engine.html">engine/llm_engine.py</a></li>
+<li><a href="../code/sequence.html">sequence.py</a></li>
+<li><a href="../code/config.html">config.py</a></li>
+<li><a href="../code/environ.html">environ.py</a></li>
+<li><a href="../code/stats-logger.html">engine/stats_logger.py</a></li>
+</ul>
+<p class="nav-group">C++ engine (csrc/engine/)</p>
+<ul>
+<li><a href="../code/engine-pyi.html">_C/engine.pyi</a></li>
+<li><a href="../code/sequence-hpp.html">sequence.hpp</a></li>
+<li><a href="../code/block-manager-hpp.html">block_manager.hpp</a></li>
+<li><a href="../code/scheduler-hpp.html">scheduler.hpp</a></li>
+<li><a href="../code/zos-cpp.html">zos.cpp</a></li>
+<li><a href="../code/prepare-tensor-input-v4.html">prepare_tensor_input_v4.cpp</a></li>
+<li><a href="../code/prepare-sample-cpp.html">prepare_sample.cpp</a></li>
+<li><a href="../code/outputs-hpp.html">outputs.hpp</a></li>
+</ul>
+<p class="nav-group">Worker</p>
+<ul>
+<li><a href="../code/worker-base.html">worker/base.py</a></li>
+<li><a href="../code/worker.html">worker/worker.py</a></li>
+<li><a href="../code/model-runner.html">worker/model_runner.py</a></li>
+<li><a href="../code/input-metadata.html">input_metadata/</a></li>
+<li><a href="../code/cache-engine.html">worker/cache_engine.py</a></li>
+<li><a href="../code/cuda-graph-runner.html">worker/cuda_graph_runner.py</a></li>
+</ul>
+<p class="nav-group">Model (models/)</p>
+<ul>
+<li><a href="../code/deepseek.html">deepseek.py</a></li>
+<li><a href="../code/decoder-layer.html">decoder_layer.py</a></li>
+<li><a href="../code/v4-hc.html">v4_modules/hc.py</a></li>
+<li><a href="../code/v4-attn.html">v4_modules/attn.py</a></li>
+<li><a href="../code/v4-mla-attn.html">v4_modules/mla_attn.py</a></li>
+<li><a href="../code/v4-index-attn.html">v4_modules/index_attn.py</a></li>
+<li><a href="../code/v4-compress.html">v4_modules/compress.py</a></li>
+<li><a href="../code/v4-cross-layer.html">v4_modules/cross_layer.py</a></li>
+<li><a href="../code/v4-mlp.html">v4_modules/mlp.py</a></li>
+<li><a href="../code/v4-engram.html">v4_modules/engram.py</a></li>
+<li><a href="../code/dflash.html">mtp/dflash.py</a></li>
+<li><a href="../code/deepseek-vl.html">deepseek_vl.py</a></li>
+<li><a href="../code/vit.html">vision_encoder/vit.py</a></li>
+</ul>
+<p class="nav-group">Layers and kernels (layers/)</p>
+<ul>
+<li><a href="../code/sampler.html">sampler.py</a></li>
+<li><a href="../code/linear.html">linear.py</a></li>
+<li class="soon"><span>tilelang_ops/</span><span class="soon-tag">soon</span></li>
+</ul>
+<p class="nav-group">Parallelism and memory</p>
+<ul>
+<li><a href="../code/parallel-state.html">parallel_state.py</a></li>
+<li><a href="../code/shm-broadcast.html">distributed/shm_broadcast.py</a></li>
+<li><a href="../code/shared-memory.html">shared_memory.py</a></li>
+<li><a href="../code/userbuffer.html">userbuffer.py</a></li>
+<li><a href="../code/eplb.html">eplb/</a></li>
+</ul>
+<p class="nav-group">Loading, platform, other</p>
+<ul>
+<li><a href="../code/model-loader.html">model_loader.py</a></li>
+<li><a href="../code/hf-weights.html">hugging_face/weights.py</a></li>
+<li><a href="../code/platform.html">platform.py</a></li>
+<li><a href="../code/npu-ops.html">npu_ops/</a></li>
+<li><a href="../code/deep-cluster.html">deep_cluster/</a></li>
+<li><a href="../code/structure-output.html">structure_output/</a></li>
+<li><a href="../code/ve.html">ve/ (images)</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="5 of 5 pages written">5/5</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/cpp-engine-api.html">C++ engine API</a></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li><a href="../reference/faq.html">FAQ</a></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>DeepInfer concepts</span><span class="sep">›</span><span>Model (V4.1)</span><span class="sep">›</span><span aria-current="page">Sliding-window attention</span></nav>
+<h1 class="page-title">Sliding-window attention</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">DeepInfer concepts</span><span class="meta-time">about 8 min read + 8 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: DeepInfer @ <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener" title="9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"><code>9bd9cf2</code></a> · 2026-10-21</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/attention.html">Attention, step by step</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../learn/kv-cache.html">The KV cache</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../concepts/mla-attention.html">MLA attention: one latent vector per token</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">Each layer reads the last 128 tokens exactly, from a per-sequence ring of 134 slots; compressed layers add selected older keys.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>In normal <a class="term" href="../reference/glossary.html#term-attention" data-term="attention" data-def="The layer step where each token looks at the earlier tokens. It compares its query with their keys and makes a weighted sum of their values.">attention</a>, a new token reads the keys of <em>all</em> earlier tokens. The cost and the <a class="term" href="../reference/glossary.html#term-kv-cache" data-term="KV cache" data-def="Device memory that keeps the keys and values of earlier tokens, so that each new token does not compute them again.">KV cache</a> then grow with the length of the sequence. <a class="term" href="../reference/glossary.html#term-sliding-window-attention" data-term="sliding-window attention" data-def="Attention that looks only at the most recent W tokens (the window), not at all earlier tokens. Its cache has a fixed size per sequence.">Sliding-window attention</a> (SWA) reads only the last <em>W</em> tokens: the window. Its cache has a fixed size for each sequence, whatever the length.</p>
+<p>In DeepInfer every attention layer has a window. The config key <code>sliding_window</code> gives <em>W</em> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L284" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:284 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:284</code></a>). The repo does not contain the value; the deployment notes use 128 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L191" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:191 at 9bd9cf2"><code>doc/inference_deployment_qa.md:191</code></a>). This page uses 128 as the example value.</p>
+<p>A window alone forgets old tokens. So most layers also read <a href="../concepts/kv-compression.html">compressed keys</a> that cover the whole history. A layer with <a class="term" href="../reference/glossary.html#term-compress-ratio" data-term="compress ratio" data-def="kv_compress_ratio of a layer: 0 means the layer has only sliding-window KV, 1 (C1) one compressed entry per token, 2 (C2) one entry per 2 tokens.">compress ratio</a> 0 is "SWA only": it reads the window and nothing else.</p>
+<p>The window lives in a <a class="term" href="../reference/glossary.html#term-ring-buffer" data-term="ring buffer" data-def="A fixed number of slots that the code uses again in a circle. Position p goes to slot p % size, so a new entry replaces the oldest one.">ring buffer</a> of 134 slots per sequence and layer: 128 for the window plus 6 <a class="term" href="../reference/glossary.html#term-backtracking-tokens" data-term="backtracking tokens" data-def="Extra ring slots for the tokens that one decode step can add and later take back (draft tokens). Default: DEEPINFER_USE_NEXTN_DECODE + 1 = 6.">backtracking tokens</a>. Position <em>p</em> always goes to slot <em>p</em> % 134. A new token replaces the token that is 134 positions older.</p>
+<p><strong>An everyday comparison.</strong> Think of a round table with 134 numbered seats. Guest number <em>p</em> sits on seat <em>p</em> % 134 and sends the earlier guest on that seat away. To talk to "the last 128 guests", you walk around the table from one seat. The comparison stops here: a real guest leaves for ever, but a compressed copy of each token stays in the main cache.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b5b_swa_ring"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: a position axis from 0 to 1000. The query at position 1000 reads the window 873 to 1000 and some compressed entries spread over the whole history. Panel 2: two rows of 67 cells show the 134 ring slots. Slots 69 to 133 and 0 to 62 hold the window of the query at 1000; slot 62 is the query itself; slots 63 to 67 hold the 5 draft tokens 1001 to 1005; slot 68 still holds position 872, which no query of the step needs. Panel 3: a prefill buffer with a history section (positions 1920 to 2047) and a new-token section (2048 to 2347). Query 2048 reads 127 history keys and 1 new key; query 2248 reads 128 new keys."><svg role="img" aria-label="Panel 1: a position axis from 0 to 1000. The query at position 1000 reads the window 873 to 1000 and some compressed entries spread over the whole history. Panel 2: two rows of 67 cells show the 134 ring slots. Slots 69 to 133 and 0 to 62 hold the window of the query at 1000; slot 62 is the query itself; slots 63 to 67 hold the 5 draft tokens 1001 to 1005; slot 68 still holds position 872, which no query of the step needs. Panel 3: a prefill buffer with a history section (positions 1920 to 2047) and a new-token section (2048 to 2347). Query 2048 reads 127 history keys and 1 new key; query 2248 reads 128 new keys." xmlns="http://www.w3.org/2000/svg" width="1100" height="1060" viewBox="0 0 1100 1060">
+<defs></defs>
+<rect width="1100" height="1060" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Sliding-window attention: the window, the ring and the prefill index</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One sequence  ·  default settings (5 draft tokens)  ·  window 128 is the value in the docs, not in the repo</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">window W = 128   ring = W + 6 = 134 slots   one slot = 528 B (FP8 + scales)   per layer, per sequence</text>
+<rect x="20.0" y="112.0" width="1060.0" height="222.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="138.0" r="13" fill="#111827"/>
+<text x="46.0" y="142.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="143.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which keys does one decode query read?</text>
+<text x="68.0" y="162.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The last 128 positions from the ring, plus compressed entries from the whole history.</text>
+<line x1="70.0" y1="240.0" x2="1030.0" y2="240.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="903.1" y="220.0" width="122.1" height="40.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="964.2" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">window</text>
+<circle cx="104.4" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="182.6" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="289.5" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="357.2" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="446.9" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="501.3" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="585.3" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="653.1" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="739.9" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="800.0" cy="240.0" r="5" fill="#7c3aed"/>
+<circle cx="852.5" cy="240.0" r="5" fill="#7c3aed"/>
+<text x="1024.3" y="194.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">▼ query</text>
+<line x1="70.0" y1="261.0" x2="70.0" y2="267.0" stroke="#6b7280" stroke-width="1"/>
+<text x="70.0" y="282.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">0</text>
+<line x1="547.1" y1="261.0" x2="547.1" y2="267.0" stroke="#6b7280" stroke-width="1"/>
+<text x="547.1" y="282.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">500</text>
+<line x1="903.1" y1="261.0" x2="903.1" y2="267.0" stroke="#6b7280" stroke-width="1"/>
+<text x="903.1" y="282.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">873</text>
+<line x1="1024.3" y1="261.0" x2="1024.3" y2="267.0" stroke="#6b7280" stroke-width="1"/>
+<text x="1024.3" y="282.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1000</text>
+<text x="70.0" y="306.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Query at position 1000 reads positions 873..1000 (128 keys, itself included) from the window.</text>
+<text x="70.0" y="324.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A compressed layer also reads compressed entries (dots: an example top-k choice of a sparse layer).</text>
+<rect x="20.0" y="354.0" width="1060.0" height="300.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="380.0" r="13" fill="#111827"/>
+<text x="46.0" y="384.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="385.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Where does the window live? In a ring of 134 slots</text>
+<text x="68.0" y="404.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Decode step at positions 1000..1005 (1 token + 5 drafts). slot = state_id × 134 + position % 134.</text>
+<text x="60.0" y="442.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">ring slots 0..66</text>
+<rect x="60.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="66.5" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">0</text>
+<rect x="74.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="89.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="103.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="118.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="132.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="147.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="161.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="176.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="190.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="205.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="211.5" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">10</text>
+<rect x="219.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="234.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="248.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="263.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="277.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="292.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="306.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="321.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="335.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="350.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="356.5" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">20</text>
+<rect x="364.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="379.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="393.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="408.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="422.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="437.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="451.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="466.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="480.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="495.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="501.5" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">30</text>
+<rect x="509.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="524.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="538.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="553.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="567.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="582.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="596.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="611.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="625.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="640.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="646.5" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">40</text>
+<rect x="654.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="669.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="683.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="698.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="712.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="727.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="741.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="756.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="770.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="785.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="791.5" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">50</text>
+<rect x="799.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="814.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="828.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="843.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="857.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="872.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="886.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="901.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="915.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="930.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="936.5" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">60</text>
+<rect x="944.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="959.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="2.4"/>
+<rect x="973.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.2"/>
+<rect x="988.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.2"/>
+<rect x="1002.5" y="454.0" width="13.0" height="13.0" rx="2" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.2"/>
+<rect x="1017.0" y="454.0" width="13.0" height="13.0" rx="2" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.2"/>
+<text x="60.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">ring slots 67..133</text>
+<rect x="60.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.2"/>
+<text x="66.5" y="560.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">67</text>
+<rect x="74.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.2"/>
+<rect x="89.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="103.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="118.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="132.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="147.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="161.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="176.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="190.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="205.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="211.5" y="560.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">77</text>
+<rect x="219.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="234.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="248.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="263.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="277.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="292.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="306.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="321.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="335.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="350.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="356.5" y="560.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">87</text>
+<rect x="364.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="379.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="393.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="408.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="422.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="437.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="451.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="466.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="480.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="495.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="501.5" y="560.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">97</text>
+<rect x="509.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="524.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="538.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="553.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="567.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="582.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="596.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="611.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="625.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="640.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="646.5" y="560.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">107</text>
+<rect x="654.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="669.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="683.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="698.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="712.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="727.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="741.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="756.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="770.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="785.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="791.5" y="560.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">117</text>
+<rect x="799.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="814.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="828.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="843.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="857.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="872.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="886.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="901.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="915.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="930.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="936.5" y="560.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">127</text>
+<rect x="944.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="959.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="973.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="988.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="1002.5" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<rect x="1017.0" y="532.0" width="13.0" height="13.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="0.9"/>
+<text x="945.5" y="424.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="end" xml:space="preserve" style="white-space:pre">62 = pos 1000</text>
+<line x1="949.5" y1="420.0" x2="965.5" y2="452.0" stroke="#d97706" stroke-width="1"/>
+<text x="60.0" y="584.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Blue: window of the query at 1000 = positions 873..1000 (slots 69..133, then 0..62, the ring wraps).</text>
+<text x="60.0" y="603.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Pink: drafts 1001..1005 in slots 63..67. Grey: slot 68 still holds position 872, which no query of this step needs.</text>
+<text x="60.0" y="622.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Example: state_id 3, position 1000 → 3 × 134 + 62 = slot 464 of swa_cache.   (prepare_tensor_input_v4.cpp:104)</text>
+<rect x="20.0" y="674.0" width="1060.0" height="284.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="700.0" r="13" fill="#111827"/>
+<text x="46.0" y="704.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="705.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Prefill: how does a query find its window?</text>
+<text x="68.0" y="724.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One sequence: 2,048 cached tokens, 300 new tokens. Keys come from two sections of one gathered buffer.</text>
+<text x="46.0" y="771.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">buffer</text>
+<rect x="230.0" y="756.0" width="243.2" height="22.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.2"/>
+<text x="351.6" y="771.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">section 1: history 1920..2047</text>
+<rect x="487.2" y="756.0" width="570.0" height="22.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.2"/>
+<text x="772.2" y="771.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">section 2: new tokens 2048..2347 (this chunk)</text>
+<text x="46.0" y="809.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">query 2048</text>
+<rect x="230.0" y="796.0" width="243.2" height="18.0" rx="2" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="0.8"/>
+<rect x="487.2" y="796.0" width="570.0" height="18.0" rx="2" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="0.8"/>
+<rect x="231.9" y="796.0" width="241.3" height="18.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<rect x="487.2" y="796.0" width="1.9" height="18.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="1057.2" y="832.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">127 history keys + 1 new key (itself)</text>
+<text x="46.0" y="869.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">query 2248</text>
+<rect x="230.0" y="856.0" width="243.2" height="18.0" rx="2" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="0.8"/>
+<rect x="487.2" y="856.0" width="570.0" height="18.0" rx="2" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="0.8"/>
+<rect x="625.9" y="856.0" width="243.2" height="18.0" rx="2" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="1057.2" y="892.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">0 history keys + 128 new keys (2121..2248)</text>
+<text x="46.0" y="924.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">C++ writes 4 numbers per query (pivots: start and length in each section). The TileLang kernel</text>
+<text x="46.0" y="942.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">expand_swa_index turns them into int32 [T, 128] key indices, with −1 for unused columns.</text>
+<text x="30.0" y="991.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="980.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">window keys</text>
+<rect x="216.5" y="980.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="237.5" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">query token</text>
+<rect x="330.7" y="980.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="351.7" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">draft tokens</text>
+<rect x="451.2" y="980.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="472.2" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">history / compressed</text>
+<rect x="621.0" y="980.0" width="14.0" height="14.0" rx="3" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.4"/>
+<text x="642.0" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">not needed</text>
+<text x="30.0" y="1014.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Simplified: one layer and one sequence. Every layer has its own ring in the sequence&#x27;s state slot; the ring is 134 slots</text>
+<text x="30.0" y="1032.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  only with the defaults (DEEPINFER_PREFILL_STORE_EXTRA_STATE off, DEEPINFER_USE_NEXTN_DECODE = 5).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the window, the ring and the prefill index for one sequence and one layer. Look at panel 2: the window wraps around the end of the ring. Click to zoom.</figcaption><a class="diagram-open" href="../diagrams/b5b_swa_ring.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Panel 1 shows what one decode query reads. Panel 2 shows where those keys are: the ring wraps, so the window of position 1000 starts at slot 69 and ends at slot 62. Panel 3 shows the prefill case, where the keys come from a gathered buffer with two sections.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-every-layer-gets-a-ring">Step 1: every layer gets a ring<a class="h-anchor" href="#step-1-every-layer-gets-a-ring" aria-label="Link to this section">#</a></h3>
+<p>The Hugging Face loader gives every layer kind <code>sink_mode="swa"</code>: the SWA-only spec, the compressed spec and the DFlash spec (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L99-L108" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:99-108 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:99-108</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L111-L116" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:111-116 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:111-116</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L136-L143" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:136-143 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:136-143</code></a>). The cache engine allocates a ring for each layer with that mode:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L682-L687" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/worker/cache_engine.py:682-687</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L682-L687" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">682</span><span class="ln">683</span><span class="ln">684</span><span class="ln">685</span><span class="ln">686</span><span class="ln hl">687</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><pre><code class="language-python">    @staticmethod
+    def _has_SWA(cfg: dict | None) -&gt; bool:
+        # 有意不检查 use_swa：use_swa=False 的层（packed-KV/YoCo consumer）也占一个从不读写的 SWA slot。
+        if cfg is None:
+            return False
+        return cfg.cfg.get(&quot;sink_mode&quot;, &quot;&quot;) == &quot;swa&quot;</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">684</span> Intentionally does not check use_swa: a use_swa=False layer (packed-KV / YoCo consumer) also takes an SWA slot that is never read or written.</li></ul></div></figure>
+<p>With the default settings, the ring size is the window plus the backtracking count:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L88-L93" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/worker/cache_engine.py:88-93</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L88-L93" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">88</span><span class="ln">89</span><span class="ln">90</span><span class="ln">91</span><span class="ln">92</span><span class="ln hl">93</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><pre><code class="language-python">def get_inference_swa_block_size(window_size: int) -&gt; int:
+    &quot;&quot;&quot;swa_block_size 等于 window_size 加上为回退功能额外存的部分。
+    如果 config 里 window_size &lt; 0，说明这个模型没有 swa 层，直接返回 0
+    nextn 需要回退 n 个 token。此外还支持直接指定最大回退个数。
+    &quot;&quot;&quot;
+    return (window_size + envs.DEEPINFER_MAX_BACKTRACKING_TOKENS) if window_size &gt; 0 else 0</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">89-92</span> swa_block_size is window_size plus the part stored extra for rollback. If window_size &lt; 0 in the config, the model has no SWA layer: return 0. NextN must roll back n tokens. A maximum rollback count can also be set directly.</li></ul></div></figure>
+<p><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> is never below <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L132" target="_blank" rel="noopener" title="deepinfer/environ.py:132 at 9bd9cf2"><code>deepinfer/environ.py:132</code></a>). The default draft count is 5 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L129" target="_blank" rel="noopener" title="deepinfer/environ.py:129 at 9bd9cf2"><code>deepinfer/environ.py:129</code></a>), so the ring has 128 + 6 = 134 slots. Each slot holds one <a class="term" href="../reference/glossary.html#term-latent-kv" data-term="latent KV vector" data-def="The one vector per token that MLA keeps instead of separate keys and values. In DeepInfer it has 512 values: kv_lora_rank values without position, then qk_rope_head_dim values with RoPE.">latent KV vector</a> vector of 512 values in FP8 with one UE8M0 scale per 32 values: 512 + 16 = 528 bytes (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L261-L263" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:261-263 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:261-263</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/cache_common.py#L109-L118" target="_blank" rel="noopener" title="deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-118 at 9bd9cf2"><code>deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-118</code></a>). The ring is in the sequence's <a class="term" href="../reference/glossary.html#term-state-slot" data-term="state slot" data-def="A fixed-size area of device memory per running sequence in DeepInfer. It holds the sliding-window cache and the compression state of that sequence.">state slot</a>, not in the paged blocks.</p>
+
+<h3 id="step-2-decode-writes-the-new-tokens-into-the-ring">Step 2: decode writes the new tokens into the ring<a class="h-anchor" href="#step-2-decode-writes-the-new-tokens-into-the-ring" aria-label="Link to this section">#</a></h3>
+<p>Before each step, the input preparation computes one ring slot for each new token. The C++ code shows the rule:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L98-L108" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:98-108</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L98-L108" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">98</span><span class="ln">99</span><span class="ln">100</span><span class="ln">101</span><span class="ln">102</span><span class="ln hl">103</span><span class="ln hl">104</span><span class="ln hl">105</span><span class="ln hl">106</span><span class="ln">107</span><span class="ln">108</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-cpp">    auto slot_mapping_store_swa = get_or_create_tensor(result, has_out, &quot;slot_mapping_store_swa&quot;, {total_q}, torch::kInt32);
+    auto p_slot_mapping_store_swa = slot_mapping_store_swa.mutable_data_ptr&lt;int32_t&gt;();
+    int32_t i_q = 0;
+    for (auto p_seq : seq_metadata_list) {
+        for (int32_t j = 0; j &lt; p_seq-&gt;seqlen_q; ++j, ++i_q) {
+            if (p_seq-&gt;seqlen_q - j &lt;= swa_block_size)
+                p_slot_mapping_store_swa[i_q] = p_seq-&gt;state_id * swa_block_size + (p_seq-&gt;seqlen_k - p_seq-&gt;seqlen_q + j) % swa_block_size;
+            else
+                p_slot_mapping_store_swa[i_q] = -1;
+        }
+    }</code></pre></div></div></div></figure>
+<p>The slot is <code>state_id × 134 + position % 134</code>. In decode, every query token gets a slot. In a prefill, only the last 134 tokens of the chunk get one. Older tokens get −1 (no write), because no window can reach them again. In decode, the fused kernel writes the FP8 vector straight into <code>swa_cache</code> through this <a class="term" href="../reference/glossary.html#term-slot-mapping" data-term="slot mapping" data-def="An int32 tensor with one entry per new cache entry. Each value is the row in the paged cache where a kernel writes that entry, or -1 for no write.">slot mapping</a> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L421-L432" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:421-432 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:421-432</code></a>).</p>
+<aside class="callout callout-note"><p class="callout-title">Decode with zero-overhead scheduling</p><div class="callout-body"><p>With zero-overhead scheduling, which a NORMAL engine uses by default, the C++ function is not used for decode. The device kernel <code>prepare_v4_decode_metadata</code> fills the same fields, with the same window and ring size (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/model_metadata_utils.py#L143" target="_blank" rel="noopener" title="deepinfer/model_executor/model_metadata_utils.py:143 at 9bd9cf2"><code>deepinfer/model_executor/model_metadata_utils.py:143</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py#L336-L367" target="_blank" rel="noopener" title="deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367 at 9bd9cf2"><code>deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367</code></a>). Prefill always uses C++.</p></div></aside>
+
+<h3 id="step-3-decode-reads-the-window">Step 3: decode reads the window<a class="h-anchor" href="#step-3-decode-reads-the-window" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L639-L651" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:639-651</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L639-L651" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">639</span><span class="ln">640</span><span class="ln">641</span><span class="ln">642</span><span class="ln">643</span><span class="ln">644</span><span class="ln">645</span><span class="ln hl">646</span><span class="ln hl">647</span><span class="ln hl">648</span><span class="ln hl">649</span><span class="ln">650</span><span class="ln">651</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><pre><code class="language-cpp">    auto kv_swa_index_offset_len = get_or_create_tensor(result, has_out, &quot;kv_swa_index_offset_len&quot;, {total_q, 2}, torch::kInt32);
+    auto p_kv_swa_index_offset_len = kv_swa_index_offset_len.mutable_data_ptr&lt;int32_t&gt;();
+    i_q = 0;
+    for (auto p_seq : seq_metadata_list) {
+        for (int j = 0; j &lt; p_seq-&gt;seqlen_q; ++j, ++i_q) {
+            int current_offset = p_seq-&gt;seqlen_k - p_seq-&gt;seqlen_q + j;
+            // 长度为 window_size，但不超过可用的 token 数量
+            int real_window_size = std::min(current_offset + 1, window_size);
+            p_kv_swa_index_offset_len[i_q * 2 + 0] =
+                p_seq-&gt;state_id * swa_block_size + (current_offset - real_window_size + 1) % swa_block_size;
+            p_kv_swa_index_offset_len[i_q * 2 + 1] = real_window_size;
+        }
+    }</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">645</span> Length is window_size, but not more than the number of available tokens.</li></ul></div></figure>
+<p>The <a href="../code/prepare-tensor-input-v4.html">C++ input builder page</a> explains this file. C++ sends only two numbers per query: the slot of the oldest window key and the length. A TileLang kernel expands them on the device into <code>kv_swa_index</code>, int32 <code>[T, 128]</code>. The reference code shows the rule:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py#L85-L93" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:85-93</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py#L85-L93" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">85</span><span class="ln">86</span><span class="ln">87</span><span class="ln">88</span><span class="ln">89</span><span class="ln">90</span><span class="ln hl">91</span><span class="ln">92</span><span class="ln">93</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><pre><code class="language-python">    kv_swa_index = torch.full((kv_swa_index_offset_len.shape[0], window_size), -1, dtype=torch.int32, device=&quot;cuda&quot;)
+    offset = kv_swa_index_offset_len[:, 0].unsqueeze(1)
+    length = kv_swa_index_offset_len[:, 1].unsqueeze(1)
+    arange = torch.arange(kv_swa_index.shape[1], dtype=torch.int32, device=&quot;cuda&quot;).unsqueeze(0)
+    kv_swa_index = torch.where(
+        arange &lt; length,
+        offset // swa_block_size * swa_block_size + (offset + arange) % swa_block_size,
+        kv_swa_index,
+    )</code></pre></div></div></div></figure>
+<p>Line 91 keeps the ring base (<code>offset // 134 × 134</code>) and wraps the slot with <code>% 134</code>. Unused columns stay −1. The call site is <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/input_metadata/input_metadata.py#L372-L376" target="_blank" rel="noopener" title="deepinfer/model_executor/input_metadata/input_metadata.py:372-376 at 9bd9cf2"><code>deepinfer/model_executor/input_metadata/input_metadata.py:372-376</code></a>.</p>
+
+<h3 id="step-4-prefill-builds-one-buffer-and-a-two-part-index">Step 4: prefill builds one buffer and a two-part index<a class="h-anchor" href="#step-4-prefill-builds-one-buffer-and-a-two-part-index" aria-label="Link to this section">#</a></h3>
+<p>A prefill does not read the ring directly. It copies the history window of each sequence into a BF16 buffer, then appends the SWA KV of the new tokens:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L844-L857" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/models/v4_modules/attn.py:844-857</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L844-L857" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">844</span><span class="ln">845</span><span class="ln">846</span><span class="ln hl">847</span><span class="ln hl">848</span><span class="ln hl">849</span><span class="ln hl">850</span><span class="ln hl">851</span><span class="ln hl">852</span><span class="ln">853</span><span class="ln">854</span><span class="ln hl">855</span><span class="ln">856</span><span class="ln">857</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><pre><code class="language-python">        # Prepare for SWA
+        if self.use_swa:
+            if input_metadata.is_prompt:
+                load_paged_kv_cache(
+                    kv_cache.swa_cache,
+                    input_metadata.load_segments_swa,
+                    total_k_swa_cached,
+                    out=kv[:total_k_swa_cached],
+                )  # [num_seqs * window_size, 1, qk_head_dim]
+                kv_swa_full_index = input_metadata.kv_swa_full_index  # [total_q, window_size]
+                # The SWA store slots may overlap the ranges loaded above, so prefill must store only after the cache load.
+                store_kv_cache(kv_swa, kv_cache.swa_cache, input_metadata.slot_mapping_store_swa)
+            else:
+                kv_swa_index = input_metadata.kv_swa_index  # [total_q, window_size]</code></pre></div></div></div></figure>
+<p>The comment on line 854 says: the store slots can overlap the loaded range, so the store must come after the load. For each query, C++ gives four numbers, the <a class="term" href="../reference/glossary.html#term-swa-pivots" data-term="SWA pivots" data-def="Four int32 numbers per prefill query: start and length of its window keys in the history section, then in the new-token section of one gathered buffer.">SWA pivots</a>: start and length in the history section, then start and length in the new-token section (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L478-L527" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:478-527 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:478-527</code></a>). The kernel <code>expand_swa_index</code> turns them into <code>kv_swa_full_index</code>, int32 <code>[T, 128]</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/swa_index.py#L10-L32" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/layers/tilelang_ops/swa_index.py:10-32</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/swa_index.py#L10-L32" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">10</span><span class="ln">11</span><span class="ln">12</span><span class="ln">13</span><span class="ln">14</span><span class="ln">15</span><span class="ln">16</span><span class="ln">17</span><span class="ln">18</span><span class="ln">19</span><span class="ln">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln hl">31</span><span class="ln">32</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><pre><code class="language-python">def expand_swa_index(pivots: torch.Tensor, width: int, out: torch.Tensor | None = None) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Expand two KV segments per token into dense prefill SWA indices.
+
+    Args:
+        pivots: Contiguous int32 [num_tokens, 4], containing first offset,
+            first length, second offset, second length. Lengths are nonnegative.
+        width: Positive output window width; longer segments are clipped.
+        out: Optional contiguous int32 [num_tokens, width] on the same device.
+
+    Returns:
+        Int32 [num_tokens, width] indices into the gathered KV buffer, with
+        unoccupied columns set to -1. CP reordering is applied by the caller.
+    &quot;&quot;&quot;
+    assert pivots.dtype == torch.int32 and pivots.ndim == 2 and pivots.shape[1] == 4
+    assert pivots.is_contiguous() and width &gt; 0
+    if out is not None:
+        assert out.shape == (pivots.shape[0], width) and out.is_contiguous()
+        assert out.dtype == torch.int32 and out.device == pivots.device
+    if out is None:
+        out = torch.empty((pivots.shape[0], width), device=pivots.device, dtype=torch.int32)
+    if pivots.shape[0]:
+        ops.expand_swa_index_tl(width)(pivots, out)
+    return out</code></pre></div></div></div></figure>
+
+<h3 id="step-5-the-window-joins-the-compressed-keys">Step 5: the window joins the compressed keys<a class="h-anchor" href="#step-5-the-window-joins-the-compressed-keys" aria-label="Link to this section">#</a></h3>
+<p>A compressed layer reads two key lists. In prefill, <code>kv_index_cat</code> joins the window list and the compressed list into one row of <code>window + topk</code> indices (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L603-L612" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:603-612 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:603-612</code></a>). In decode, the kernel gets the two caches as two arguments:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L640-L653" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/model_executor/models/v4_modules/attn.py:640-653</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L640-L653" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">640</span><span class="ln">641</span><span class="ln hl">642</span><span class="ln hl">643</span><span class="ln hl">644</span><span class="ln hl">645</span><span class="ln hl">646</span><span class="ln">647</span><span class="ln">648</span><span class="ln">649</span><span class="ln hl">650</span><span class="ln">651</span><span class="ln">652</span><span class="ln">653</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><pre><code class="language-python">        if self.use_swa:
+            attn_kv_args = dict(
+                key_cache=kv_cache.swa_cache,
+                indices_in_kvcache=kv_swa_index,
+                key_cache_extra=kv_cache.ca_cache,
+                indices_in_kvcache_extra=kv_ca_index,
+                index_length_extra=dense_index_len,
+            )
+        else:
+            attn_kv_args = dict(
+                key_cache=kv_cache.ca_cache,
+                indices_in_kvcache=kv_ca_index,
+                index_length=dense_index_len,
+            )</code></pre></div></div></div></figure>
+<p>An SWA-only layer has no <code>ca_cache</code>, so <code>key_cache_extra</code> is <code>None</code> and the layer reads only the window. Both kernels also get the <a class="term" href="../reference/glossary.html#term-attention-sink" data-term="attention sink" data-def="One learned score per attention head that takes part in the softmax but has no value vector. A head can give part of its attention to it, that is, to nothing.">attention sink</a> values of the layer (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L622" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:622 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:622</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L665" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:665 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:665</code></a>). The page <a href="../concepts/mla-attention.html">MLA attention: one latent vector per token</a> explains the sinks.</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="why-134-slots-not-128" class="dd-title">Why 134 slots, not 128</h3></summary><div class="dd-body"><p>A decode step writes all its new SWA vectors first, then runs attention. With the default 5 draft tokens, one step has 6 query tokens per sequence: positions <em>p</em> to <em>p</em> + 5 (see <a href="../concepts/speculative-decoding.html">Speculative decoding</a>). The rule is in <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L103-L104" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:103-104 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:103-104</code></a> and <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L421-L432" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:421-432 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:421-432</code></a>.</p>
+<ol>
+  <li>The first query (position <em>p</em>) needs positions <em>p</em> − 127 to <em>p</em>.</li>
+  <li>The step also writes positions <em>p</em> + 1 to <em>p</em> + 5.</li>
+  <li>So the ring must hold positions <em>p</em> − 127 to <em>p</em> + 5 at the same time: 133 positions.</li>
+  <li>With 128 slots, the draft at <em>p</em> + 1 would overwrite position <em>p</em> − 127, which the first query still reads.</li>
+</ol>
+<p>The code reserves <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> = 6 extra slots, so the ring has 134 slots: one more than this count needs. The docs give two reasons for the extra slots. The hit policy calls them "6 tokens of speculative backtracking" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L191" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:191 at 9bd9cf2"><code>doc/inference_deployment_qa.md:191</code></a>). The store copy "can overshoot the boundary by at most 5 tokens, which is absorbed by the 6 extra positions" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L165" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:165 at 9bd9cf2"><code>doc/inference_deployment_qa.md:165</code></a>).</p>
+<p><strong>Rejected drafts.</strong> A rejected draft is never deleted. The next step starts at the first rejected position and writes the same positions again, into the same slots. Then the ring holds the correct tokens again.</p>
+<p>The compression state uses the same rule with its own numbers: its ring must hold <code>ratio + tokens per step − 1</code> entries (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/compress.py#L98-L100" target="_blank" rel="noopener" title="deepinfer/model_executor/layers/tilelang_ops/compress.py:98-100 at 9bd9cf2"><code>deepinfer/model_executor/layers/tilelang_ops/compress.py:98-100</code></a>). See <a href="../concepts/kv-compression.html">KV compression (C1 and C2)</a>.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="ring-size-bytes-and-settings" class="dd-title">Ring size, bytes and settings</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect on the ring</th></tr></thead>
+  <tbody>
+    <tr><td><code>sliding_window</code> (config.json)</td><td>not in the repo (128 in the docs)</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L284" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:284 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:284</code></a></td><td>The window <em>W</em>. Every layer must use the model value (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L243" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:243 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:243</code></a>).</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L129" target="_blank" rel="noopener" title="deepinfer/environ.py:129 at 9bd9cf2"><code>deepinfer/environ.py:129</code></a></td><td>Raises the backtracking count to at least 6.</td></tr>
+    <tr><td><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td>0, raised to nextn + 1</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L132" target="_blank" rel="noopener" title="deepinfer/environ.py:132 at 9bd9cf2"><code>deepinfer/environ.py:132</code></a></td><td>Ring = <em>W</em> + this value (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L93" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:93 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:93</code></a>).</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code></td><td>off</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L163" target="_blank" rel="noopener" title="deepinfer/environ.py:163 at 9bd9cf2"><code>deepinfer/environ.py:163</code></a></td><td>On: the ring grows by <code>DEEPINFER_PREFILL_STORE_EXTRA_SIZE</code> (default 128), plus <code>KEEP_TOKENS</code> when YOCO truncation is on (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L96-L110" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:96-110 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:96-110</code></a>).</td></tr>
+  </tbody>
+</table>
+<p><strong>Bytes.</strong> One ring per layer and sequence: 134 × 528 B = 70,752 B. The code pads each layer to 32 bytes; 70,752 is already a multiple of 32 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L274-L277" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:274-277 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:274-277</code></a>). The SWA format is always MXFP8, also when the main cache uses FP4: <code>use_fp4=False</code> for SWA (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L261-L263" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:261-263 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:261-263</code></a>).</p>
+<p><strong>Tensor view.</strong> <code>swa_cache</code> is uint8 <code>[num_state_slots, 134, 1, 528]</code>. The row stride is the size of the whole state slot, so one row index (<code>state_id</code>) selects one sequence (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L419-L422" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:419-422 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:419-422</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L216-L218" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:216-218 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:216-218</code></a>).</p>
+<p><strong>Where in the slot.</strong> The slot starts with the "stored" SWA rings of the producer layers. Then come the "dropped" SWA rings of the YOCO consumer layers, and the compression state (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L221-L241" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:221-241 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:221-241</code></a>). Only the stored part goes to the external KV store. The deployment notes give its size: "20 layers × 134 tokens × 528 B = 1,415,040 B per sequence" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L169" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:169 at 9bd9cf2"><code>doc/inference_deployment_qa.md:169</code></a>). The number 20 comes from the docs, not from the code. See <a href="../concepts/yoco-swa-replay.html">YOCO and SWA bounded replay</a>.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="decode-index-worked-example" class="dd-title">Decode index, worked example</h3></summary><div class="dd-body"><p>Sequence with <code>state_id</code> 3, decode query at position 1,000, window 128, ring 134 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L644-L649" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:644-649 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:644-649</code></a>):</p>
+<ol>
+  <li><code>real_window_size</code> = min(1,000 + 1, 128) = 128.</li>
+  <li>The oldest key is 1,000 − 128 + 1 = 873. 873 % 134 = 69, so <code>offset</code> = 3 × 134 + 69 = 471.</li>
+  <li>The kernel makes 128 slots: 402 + (69 + <em>j</em>) % 134 for <em>j</em> = 0 … 127 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py#L91" target="_blank" rel="noopener" title="deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:91 at 9bd9cf2"><code>deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:91</code></a>).</li>
+  <li><em>j</em> = 0 … 64 give slots 471 … 535 (positions 873 … 937). <em>j</em> = 65 … 127 wrap and give slots 402 … 464 (positions 938 … 1,000).</li>
+  <li>Slot 464 = 3 × 134 + 1,000 % 134 = 402 + 62: the query's own key, written in the same step (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L104" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:104 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:104</code></a>).</li>
+</ol>
+<p>A short sequence at position 50 gets <code>real_window_size</code> = 51, so columns 51 … 127 are −1.</p>
+<p>Shapes: <code>kv_swa_index_offset_len</code> int32 <code>[T, 2]</code>; <code>kv_swa_index</code> int32 <code>[T, 128]</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/input_metadata/input_metadata.py#L313-L317" target="_blank" rel="noopener" title="deepinfer/model_executor/input_metadata/input_metadata.py:313-317 at 9bd9cf2"><code>deepinfer/model_executor/input_metadata/input_metadata.py:313-317</code></a>). With zero-overhead scheduling, the device kernel <code>prepare_v4_decode_metadata</code> builds the offsets (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py#L326-L367" target="_blank" rel="noopener" title="deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:326-367 at 9bd9cf2"><code>deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:326-367</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="prefill-load-plan-pivots-and-store-line-by-line" class="dd-title">Prefill: load plan, pivots and store, line by line</h3></summary><div class="dd-body"><p><strong>The load plan.</strong> C++ copies each sequence's history window from its ring into the first section of the buffer:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L372-L388" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:372-388</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L372-L388" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">372</span><span class="ln">373</span><span class="ln">374</span><span class="ln">375</span><span class="ln">376</span><span class="ln">377</span><span class="ln hl">378</span><span class="ln hl">379</span><span class="ln hl">380</span><span class="ln hl">381</span><span class="ln hl">382</span><span class="ln hl">383</span><span class="ln">384</span><span class="ln">385</span><span class="ln">386</span><span class="ln">387</span><span class="ln">388</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><pre><code class="language-cpp">    for (auto p_seq : args.seq_metadata_list) {
+        TORCH_CHECK(p_seq != nullptr);
+        TORCH_CHECK_GE(p_seq-&gt;seqlen_q, 0);
+        TORCH_CHECK_GE(p_seq-&gt;seqlen_k, p_seq-&gt;seqlen_q);
+        TORCH_CHECK_GE(p_seq-&gt;swa_valid_start, 0);
+
+        const int32_t history_end = p_seq-&gt;seqlen_k - p_seq-&gt;seqlen_q;
+        const int32_t history_begin = history_end - window_size;
+        const int32_t padding_len = std::clamp(p_seq-&gt;swa_valid_start - history_begin, 0, window_size);
+        const int32_t valid_begin = history_begin + padding_len;
+        builder.append_zero_fill(padding_len);
+        builder.append_ring_range(p_seq-&gt;state_id, valid_begin, history_end);
+    }
+
+    auto result = builder.build();
+    TORCH_CHECK_EQ(result.total_k, static_cast&lt;int64_t&gt;(args.seq_metadata_list.size()) * window_size);
+    return result;</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 378-379.</strong> The history window is positions <code>q_start − W</code> to <code>q_start − 1</code>: the <em>W</em> tokens before the chunk.</li>
+  <li><strong>Lines 380-382.</strong> Positions before 0 (or before <code>swa_valid_start</code>) become zero rows: a segment with <code>src_block_id = −1</code>.</li>
+  <li><strong>Line 383.</strong> The rest is a ring range. The builder splits it where the ring wraps, so one sequence has at most three segments (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/block_load_plan.cpp#L37-L46" target="_blank" rel="noopener" title="csrc/engine/input_metadata/block_load_plan.cpp:37-46 at 9bd9cf2"><code>csrc/engine/input_metadata/block_load_plan.cpp:37-46</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/input_metadata/input_metadata.py#L268-L271" target="_blank" rel="noopener" title="deepinfer/model_executor/input_metadata/input_metadata.py:268-271 at 9bd9cf2"><code>deepinfer/model_executor/input_metadata/input_metadata.py:268-271</code></a>).</li>
+  <li><strong>Line 387.</strong> The section always has <code>num_seqs × W</code> rows.</li>
+</ol>
+<p>Example: 2,048 cached tokens, so the history is 1,920 … 2,047. 1,920 % 134 = 44. The plan has two segments: ring rows 44 … 133 (90 tokens), then rows 0 … 37 (38 tokens). A new prompt (<code>q_start</code> = 0) gets one zero segment of 128 rows.</p>
+<p><strong>The pivots.</strong></p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L490-L524" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:490-524</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L490-L524" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">490</span><span class="ln">491</span><span class="ln">492</span><span class="ln">493</span><span class="ln">494</span><span class="ln">495</span><span class="ln">496</span><span class="ln">497</span><span class="ln">498</span><span class="ln">499</span><span class="ln">500</span><span class="ln">501</span><span class="ln">502</span><span class="ln">503</span><span class="ln">504</span><span class="ln">505</span><span class="ln">506</span><span class="ln hl">507</span><span class="ln">508</span><span class="ln">509</span><span class="ln">510</span><span class="ln">511</span><span class="ln hl">512</span><span class="ln hl">513</span><span class="ln hl">514</span><span class="ln hl">515</span><span class="ln hl">516</span><span class="ln hl">517</span><span class="ln">518</span><span class="ln">519</span><span class="ln hl">520</span><span class="ln hl">521</span><span class="ln hl">522</span><span class="ln hl">523</span><span class="ln">524</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><pre><code class="language-cpp">    for (int i_seq = 0; i_seq &lt; n_seq; ++i_seq) {
+        auto p_seq = seq_metadata_list[i_seq];
+
+        int32_t sec1_start = i_seq * window_size;
+        int32_t sec2_start = n_seq * window_size + i_q;
+
+        int32_t q_end = p_seq-&gt;seqlen_k;
+        int32_t q_len = p_seq-&gt;seqlen_q;
+        int32_t q_start = q_end - q_len;
+        // zero-state 重算：[0, valid_start) 的 swa state 被清零，可见窗口左边界 clamp 到 valid_start，
+        // 避免 attend 到清零 slot。valid_start=0（正常路径）时与原式 start_in_win = min(W, max(j+1, W - q_start)) 完全等价。
+        int32_t valid_start = p_seq-&gt;swa_valid_start;
+        // 下面的代码假设了 valid_start &lt;= q_start。当前能保证可见范围一定比输入范围大。
+        TORCH_CHECK_LE(valid_start, q_start);
+        for (int32_t j = 0; j &lt; q_len; ++j, ++i_q) {
+            int32_t pos = q_start + j; // 该 query token 的绝对位置
+            // 可见 key 的绝对位置下界：滑窗下界与 state 有效下界取 max，再 clamp 到 &gt;= 0
+            int32_t abs_lo = std::max(pos - window_size + 1, valid_start);
+            if (abs_lo &lt; 0)
+                abs_lo = 0;
+
+            // section1（历史，从 state buffer 读）：可见区间 [min(abs_lo, q_start), q_start)
+            int32_t sec1_lo_abs = std::min(abs_lo, q_start);
+            int32_t start_slot = sec1_lo_abs - (q_start - window_size);
+            TORCH_CHECK_GE(start_slot, 0) &lt;&lt; &quot;swa start_slot out of range&quot;;
+            TORCH_CHECK_LE(start_slot, window_size) &lt;&lt; &quot;swa start_slot out of range&quot;;
+            p_kv_swa_full_index_pivots[i_q * 4 + 0] = sec1_start + start_slot;
+            p_kv_swa_full_index_pivots[i_q * 4 + 1] = window_size - start_slot;
+
+            // section2（本 chunk 新增）：可见区间 [max(abs_lo, q_start), pos]
+            int32_t k_lo = std::max(0, abs_lo - q_start);
+            TORCH_CHECK_LE(k_lo, j) &lt;&lt; &quot;swa section2 empty: query token sees nothing (valid_start too large?)&quot;;
+            p_kv_swa_full_index_pivots[i_q * 4 + 2] = sec2_start + k_lo;
+            p_kv_swa_full_index_pivots[i_q * 4 + 3] = j - k_lo + 1;
+        }</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">499-500</span> Zero-state recompute: the SWA state of [0, valid_start) is cleared, so the left edge of the visible window is clamped to valid_start, to avoid attention to cleared slots. With valid_start = 0 (normal path) this is the same as the original start_in_win = min(W, max(j+1, W − q_start)).</li><li><span class="tr-line">502</span> The code below assumes valid_start &lt;= q_start. The visible range is always larger than the input range.</li><li><span class="tr-line">506</span> Lower bound of the absolute position of a visible key: the max of the window bound and the valid-state bound, clamped to &gt;= 0.</li><li><span class="tr-line">511</span> Section 1 (history, read from the state buffer): visible range [min(abs_lo, q_start), q_start).</li><li><span class="tr-line">519</span> Section 2 (new in this chunk): visible range [max(abs_lo, q_start), pos].</li></ul></div></figure>
+<ol>
+  <li><strong>Line 507.</strong> The oldest visible key is <code>pos − W + 1</code>, not below <code>valid_start</code> and 0.</li>
+  <li><strong>Lines 512-517.</strong> Section 1: the history part. <code>start_slot</code> is the first visible row of this sequence's 128 history rows; the length is <code>W − start_slot</code>.</li>
+  <li><strong>Lines 520-523.</strong> Section 2: the new part, from <code>k_lo</code> to the query itself.</li>
+</ol>
+<p>Example, same sequence (2,048 cached, 300 new). Query <em>j</em> = 0 (position 2,048): <code>abs_lo</code> = 1,921, <code>start_slot</code> = 1, so 127 history keys and 1 new key. Query <em>j</em> = 200 (position 2,248): <code>abs_lo</code> = 2,121, <code>start_slot</code> = 128 (empty history part), <code>k_lo</code> = 73, so 128 new keys.</p>
+<p><strong>The store.</strong> After the load, <code>store_kv_cache</code> writes the last 134 new vectors into the ring (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L855" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:855 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:855</code></a>). The prefill vectors went through an FP8 round trip (<code>cast_back=True</code>). So attention in the prefill sees the same numbers that decode later reads from the ring (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L412-L419" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:412-419 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:412-419</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="where-swa-sits-among-the-layer-kinds" class="dd-title">Where SWA sits among the layer kinds</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Layer kind</th><th>Window</th><th>Compressed keys</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td>Ratio 0 (SWA only)</td><td>yes</td><td>no</td><td><code>_win_spec</code>, <code>sparse_stage=0</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L99-L108" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:99-108 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:99-108</code></a>)</td></tr>
+    <tr><td>Ratio 1 or 2, sparse</td><td>yes (must be: <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L95-L96" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:95-96 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:95-96</code></a>)</td><td>top-k of the indexer</td><td><code>_compress_spec</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L111-L133" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:111-133 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:111-133</code></a>)</td></tr>
+    <tr><td>Ratio 1 or 2, dense (<code>index_topk</code> = 0)</td><td>yes</td><td>all</td><td>supported by the code, not made by the HF loader</td></tr>
+    <tr><td><code>use_swa=False</code></td><td>no</td><td>yes (must be: <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L94" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:94 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:94</code></a>)</td><td>no HF key sets it; the default is <code>True</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L93" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:93 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:93</code></a>)</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li><strong>RoPE.</strong> A compressed layer builds its rotary table with <code>compress_rope_theta</code>; an SWA-only layer uses <code>rope_theta</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/mla_attn.py#L275-L280" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/mla_attn.py:275-280 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/mla_attn.py:275-280</code></a>). The SWA keys of a layer use that layer's table.</li>
+  <li><strong>Projection.</strong> The SWA vector comes from the same merged GEMM as the query latent (<code>q_a_kv_swa_proj</code>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L280-L288" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:280-288 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:280-288</code></a>).</li>
+  <li><strong>Sharing.</strong> Cross-layer sharing never shares the ring. Each layer stores its own SWA KV (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L406-L422" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:406-422 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:406-422</code></a>). See <a href="../concepts/cross-layer-kv-sharing.html">Cross-layer KV sharing</a>.</li>
+  <li><strong>Draft model.</strong> The DFlash layers also have <code>sink_mode="swa"</code> and their own rings (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/hugging_face/config.py#L136-L143" target="_blank" rel="noopener" title="deepinfer/hugging_face/config.py:136-143 at 9bd9cf2"><code>deepinfer/hugging_face/config.py:136-143</code></a>).</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="zero-state-recompute-swa-valid-start" class="dd-title">Zero-state recompute: swa_valid_start</h3></summary><div class="dd-body"><p>Each sequence has a field <code>swa_valid_start</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/sequence.hpp#L205" target="_blank" rel="noopener" title="csrc/engine/sequence.hpp:205 at 9bd9cf2"><code>csrc/engine/sequence.hpp:205</code></a>). The C++ code treats ring positions before it as missing: the load plan zero-fills them and the pivots do not point at them (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L380-L382" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:380-382 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:380-382</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L501-L509" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:501-509 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:501-509</code></a>).</p>
+<p>In this release, no code sets the field above 0. <code>reset_for_recompute</code> sets it to 0 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/sequence.hpp#L223-L227" target="_blank" rel="noopener" title="csrc/engine/sequence.hpp:223-227 at 9bd9cf2"><code>csrc/engine/sequence.hpp:223-227</code></a>), and pybind exposes it to Python as a read-write property (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_sequence.cpp#L132" target="_blank" rel="noopener" title="csrc/engine/pybind_sequence.cpp:132 at 9bd9cf2"><code>csrc/engine/pybind_sequence.cpp:132</code></a>), but no Python code writes it. The field is a hook for the "encoder SWA bounded replay" of the docs. After a prefix-cache hit without SWA state, that design recomputes only the last 128 tokens (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L183-L185" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:183-185 at 9bd9cf2"><code>doc/inference_deployment_qa.md:183-185</code></a>). The KV cache system that would use it is not in this release (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/README.md#L40" target="_blank" rel="noopener" title="README.md:40 at 9bd9cf2"><code>README.md:40</code></a>).</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>A layer with another window.</strong> <code>V4Attention</code> asserts that the layer window equals the model window, and names the layer (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L243" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:243 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:243</code></a>).</li>
+  <li><strong>A sparse layer without SWA.</strong> <code>use_swa=False</code> with an indexer fails an assert (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L95-L96" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:95-96 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:95-96</code></a>).</li>
+  <li><strong>Ring smaller than the window.</strong> The C++ load plan checks <code>swa_block_size ≥ window_size</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L369" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:369 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:369</code></a>).</li>
+  <li><strong>A query with no visible key.</strong> A <code>swa_valid_start</code> that is too large makes section 2 empty. C++ stops with "query token sees nothing" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L521" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:521 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:521</code></a>).</li>
+  <li><strong>A low backtracking value has no effect.</strong> A value below <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> is raised with no message (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L132" target="_blank" rel="noopener" title="deepinfer/environ.py:132 at 9bd9cf2"><code>deepinfer/environ.py:132</code></a>). A higher value makes every ring larger.</li>
+  <li><strong>Memory per sequence.</strong> The ring is per layer and per sequence, also for short requests. With N main layers, a sequence always takes at least N × 70,752 B of state, whatever its length.</li>
+</ul>
+<p><strong>Why it matters.</strong> The window gives every layer exact attention to recent tokens, with a cache whose size does not grow. Most memory questions about long sequences then go to the compressed cache. Most correctness questions about speculative decoding go to the ring: the 6 extra slots make draft tokens safe.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Where does DeepInfer store the sliding-window KV: in the paged KV blocks or somewhere else?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>In the sequence's state slot, as a ring of 134 slots per layer. The paged blocks hold only the compressed KV and the indexer keys (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L406-L422" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:406-422 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:406-422</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L216-L218" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:216-218 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:216-218</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>A sequence has <code>state_id</code> 3. In which slot of <code>swa_cache</code> does the token at position 1,000 go?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>3 × 134 + 1,000 % 134 = 402 + 62 = 464 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L104" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:104 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:104</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>A prefill chunk has 1,000 new tokens. How many of them does the code write into the ring, and why not all?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The last 134. Line 103 gives −1 to every token with <code>seqlen_q − j &gt; swa_block_size</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L103-L106" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:103-106 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:103-106</code></a>). Older tokens are outside every future window, and the ring would overwrite them anyway.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>Why does a ring of exactly 128 slots fail when <code>DEEPINFER_USE_NEXTN_DECODE</code> is 5?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>A decode step writes the SWA KV of positions <em>p</em> … <em>p</em> + 5 before attention (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/attn.py#L421-L432" target="_blank" rel="noopener" title="deepinfer/model_executor/models/v4_modules/attn.py:421-432 at 9bd9cf2"><code>deepinfer/model_executor/models/v4_modules/attn.py:421-432</code></a>). The query at <em>p</em> still needs <em>p</em> − 127. With 128 slots, position <em>p</em> + 1 goes to the slot of <em>p</em> − 127 and destroys it. The code adds at least nextn + 1 = 6 slots (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L132" target="_blank" rel="noopener" title="deepinfer/environ.py:132 at 9bd9cf2"><code>deepinfer/environ.py:132</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L93" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:93 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:93</code></a>). See the deep dive "Why 134 slots, not 128".</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>In a prefill with 2,048 cached tokens, how many history keys and how many new keys does the query at position 2,048 read?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>127 history keys (1,921 … 2,047) and 1 new key (itself). <code>abs_lo</code> = 2,048 − 127 = 1,921, so <code>start_slot</code> = 1,921 − 1,920 = 1 and the section-1 length is 127 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/input_metadata/prepare_tensor_input_v4.cpp#L507-L523" target="_blank" rel="noopener" title="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:507-523 at 9bd9cf2"><code>csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:507-523</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/kv-compression.html">KV compression (C1 and C2)</a><span class="rel-sum">A compressed layer stores one 512-value cache entry per token (C1) or per 2 tokens (C2). C2 mixes the two tokens with a learned softmax gate and keeps the score and latent of the most recent tokens in a small fp32 state ring. Entries are FP4 (288 B) by default, or FP8 (528 B).</span></li><li><a href="../concepts/sparse-attention-indexer.html">Sparse attention with an indexer</a><span class="rel-sum">In a sparse layer, a small indexer scores all compressed keys for each query and keeps the best index_topk. The main attention then reads only those keys plus the sliding window.</span></li><li><a href="../concepts/yoco-swa-replay.html">YOCO and SWA bounded replay</a><span class="rel-sum">YOCO splits the main layers into producer and consumer layers. Consumer layers project their compressed KV from one shared hidden state. With the optional prefill truncation (README feature &quot;Decoder SWA bounded replay&quot;), a prefill computes the consumer layers only for the last KEEP_TOKENS prompt tokens (140 in the README), with the window cut at that range. Only their compressed KV still covers every token.</span></li><li><a href="../concepts/speculative-decoding.html">Speculative decoding</a><span class="rel-sum">A small draft model guesses the next 5 tokens. In the next decode step, the main model checks all 5 at the same time, keeps a prefix with rejection sampling, and samples one more token. The output distribution stays within a very small, proven bound of the target distribution (a 5e-5 penalty).</span></li><li><a href="../concepts/paged-kv-cache.html">Paged KV cache and block manager</a><span class="rel-sum">The engine side of the paged KV cache. Two C++ BlockManager objects hand out KV blocks and state slots, the scheduler decides when, and C++ code turns block tables into index tensors for the kernels.</span></li><li><a href="../code/v4-attn.html">v4_modules/attn.py: the MLA attention runtime</a><span class="rel-sum">attn.py turns the MLA weight container into runtime weights and runs one attention layer per call: projections, sliding-window and compressed KV stores, the indexer, the FlashMLA kernel and the output projection. It also holds the DFlash draft attention.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/sparse-attention-indexer.html"><span class="pn-dir">← Previous</span><span class="pn-title">Sparse attention with an indexer</span></a><a class="pn pn-next" href="../concepts/kv-compression.html"><span class="pn-dir">Next →</span><span class="pn-title">KV compression (C1 and C2)</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener"><code class="foot-sha">9bd9cf243fc53ef9afbf8f04d391d989117d6ab9</code></a> · 2026-10-21 12:55:43 +0800 · “Bump DeepEP to f6aa38fe and drop the SSH-&gt;HTTPS rewrite (#157)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/deepseek-ai/DeepInfer" target="_blank" rel="noopener">deepseek-ai/DeepInfer</a> · Built 2026-10-22 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-every-layer-gets-a-ring">Step 1: every layer gets a ring</a></li><li class="toc-l3"><a href="#step-2-decode-writes-the-new-tokens-into-the-ring">Step 2: decode writes the new tokens into the ring</a></li><li class="toc-l3"><a href="#step-3-decode-reads-the-window">Step 3: decode reads the window</a></li><li class="toc-l3"><a href="#step-4-prefill-builds-one-buffer-and-a-two-part-index">Step 4: prefill builds one buffer and a two-part index</a></li><li class="toc-l3"><a href="#step-5-the-window-joins-the-compressed-keys">Step 5: the window joins the compressed keys</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#why-134-slots-not-128">Why 134 slots, not 128</a></li><li class="toc-l3"><a href="#ring-size-bytes-and-settings">Ring size, bytes and settings</a></li><li class="toc-l3"><a href="#decode-index-worked-example">Decode index, worked example</a></li><li class="toc-l3"><a href="#prefill-load-plan-pivots-and-store-line-by-line">Prefill: load plan, pivots and store, line by line</a></li><li class="toc-l3"><a href="#where-swa-sits-among-the-layer-kinds">Where SWA sits among the layer kinds</a></li><li class="toc-l3"><a href="#zero-state-recompute-swa-valid-start">Zero-state recompute: swa_valid_start</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+</body>
+</html>

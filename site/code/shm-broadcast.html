@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>distributed/shm_broadcast.py: MessageQueue · DeepInfer Explained</title>
+<meta name="description" content="MessageQueue sends pickled Python objects from one writer process to several reader processes through a ring buffer in shared memory. DeepInfer uses it inside each context-parallel group, from the driver to the followers.">
+<script>try{var t=localStorage.getItem("di-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/shm-broadcast">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">DI</span><span class="brand-name">DeepInfer Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/what-an-llm-does.html">What an LLM does</a></li>
+<li><a href="../learn/tokens.html">Tokens and tokenizers</a></li>
+<li><a href="../learn/transformer.html">Inside a transformer</a></li>
+<li><a href="../learn/attention.html">Attention, step by step</a></li>
+<li><a href="../learn/prefill-decode.html">Prefill and decode</a></li>
+<li><a href="../learn/kv-cache.html">The KV cache</a></li>
+<li><a href="../learn/sampling.html">Sampling</a></li>
+<li><a href="../learn/batching.html">Batching</a></li>
+<li><a href="../learn/gpus-kernels.html">GPUs, kernels, and speed</a></li>
+<li><a href="../learn/parallelism.html">Parallelism basics</a></li>
+<li><a href="../learn/moe.html">Mixture of Experts (MoE)</a></li>
+<li><a href="../learn/number-formats.html">Number formats</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">DeepInfer concepts</span><span class="nav-count" title="33 of 34 pages written">33/34</span></summary>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../concepts/engine-step-loop.html">Offline API and the step loop</a></li>
+<li><a href="../concepts/request-lifecycle.html">Request and sequence lifecycle</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/paged-kv-cache.html">Paged KV cache and block manager</a></li>
+<li><a href="../concepts/input-metadata.html">Input metadata</a></li>
+<li><a href="../concepts/cuda-graphs.html">CUDA graphs</a></li>
+<li><a href="../concepts/zero-overhead-scheduling.html">Zero-overhead scheduling</a></li>
+</ul>
+<p class="nav-group">Model (V4.1)</p>
+<ul>
+<li><a href="../concepts/model-map.html">Model map</a></li>
+<li><a href="../concepts/mla-attention.html">MLA attention</a></li>
+<li><a href="../concepts/sparse-attention-indexer.html">Sparse attention indexer</a></li>
+<li><a href="../concepts/sliding-window-attention.html">Sliding-window attention</a></li>
+<li><a href="../concepts/kv-compression.html">KV compression</a></li>
+<li><a href="../concepts/cross-layer-kv-sharing.html">Cross-layer KV sharing</a></li>
+<li><a href="../concepts/yoco-swa-replay.html">YOCO and SWA bounded replay</a></li>
+<li><a href="../concepts/mhc-residual.html">mHC residual mixing</a></li>
+<li><a href="../concepts/moe-routing.html">MoE routing</a></li>
+<li><a href="../concepts/mega-moe.html">Mega-MoE</a></li>
+<li><a href="../concepts/engram.html">Engram n-gram memory</a></li>
+<li><a href="../concepts/vision-encoder.html">Vision encoder (VL)</a></li>
+</ul>
+<p class="nav-group">Decoding</p>
+<ul>
+<li><a href="../concepts/sampler.html">The sampler</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/dspark.html">DSpark confidence scheduling</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/determinism.html">Determinism</a></li>
+</ul>
+<p class="nav-group">Scale</p>
+<ul>
+<li><a href="../concepts/dp-step-votes.html">DP and step votes</a></li>
+<li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a></li>
+<li><a href="../concepts/expert-parallelism.html">Expert parallelism (dispatch/combine)</a></li>
+<li><a href="../concepts/eplb.html">Expert load balancing (EPLB)</a></li>
+<li><a href="../concepts/hardware-discovery.html">Hardware discovery</a></li>
+</ul>
+<p class="nav-group">Platform</p>
+<ul>
+<li><a href="../concepts/hardware-platforms.html">NVIDIA and Ascend</a></li>
+<li class="soon"><span>TileLang kernels</span><span class="soon-tag">soon</span></li>
+<li><a href="../concepts/python-cpp-boundary.html">Python and C++</a></li>
+<li><a href="../concepts/low-precision-formats.html">Low-precision formats</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="6 of 6 pages written">6/6</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-request.html">Life of a request</a></li>
+<li><a href="../tours/startup.html">Start-up</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/decoder-layer.html">Inside one decoder layer</a></li>
+<li><a href="../tours/spec-decode-round.html">One speculative decoding round</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step on many GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="49 of 50 pages written">49/50</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">User API and engine</p>
+<ul>
+<li><a href="../code/entrypoints-llm.html">entrypoints/llm.py</a></li>
+<li><a href="../code/sampling-params.html">sampling_params.py</a></li>
+<li><a href="../code/llm-engine.html">engine/llm_engine.py</a></li>
+<li><a href="../code/sequence.html">sequence.py</a></li>
+<li><a href="../code/config.html">config.py</a></li>
+<li><a href="../code/environ.html">environ.py</a></li>
+<li><a href="../code/stats-logger.html">engine/stats_logger.py</a></li>
+</ul>
+<p class="nav-group">C++ engine (csrc/engine/)</p>
+<ul>
+<li><a href="../code/engine-pyi.html">_C/engine.pyi</a></li>
+<li><a href="../code/sequence-hpp.html">sequence.hpp</a></li>
+<li><a href="../code/block-manager-hpp.html">block_manager.hpp</a></li>
+<li><a href="../code/scheduler-hpp.html">scheduler.hpp</a></li>
+<li><a href="../code/zos-cpp.html">zos.cpp</a></li>
+<li><a href="../code/prepare-tensor-input-v4.html">prepare_tensor_input_v4.cpp</a></li>
+<li><a href="../code/prepare-sample-cpp.html">prepare_sample.cpp</a></li>
+<li><a href="../code/outputs-hpp.html">outputs.hpp</a></li>
+</ul>
+<p class="nav-group">Worker</p>
+<ul>
+<li><a href="../code/worker-base.html">worker/base.py</a></li>
+<li><a href="../code/worker.html">worker/worker.py</a></li>
+<li><a href="../code/model-runner.html">worker/model_runner.py</a></li>
+<li><a href="../code/input-metadata.html">input_metadata/</a></li>
+<li><a href="../code/cache-engine.html">worker/cache_engine.py</a></li>
+<li><a href="../code/cuda-graph-runner.html">worker/cuda_graph_runner.py</a></li>
+</ul>
+<p class="nav-group">Model (models/)</p>
+<ul>
+<li><a href="../code/deepseek.html">deepseek.py</a></li>
+<li><a href="../code/decoder-layer.html">decoder_layer.py</a></li>
+<li><a href="../code/v4-hc.html">v4_modules/hc.py</a></li>
+<li><a href="../code/v4-attn.html">v4_modules/attn.py</a></li>
+<li><a href="../code/v4-mla-attn.html">v4_modules/mla_attn.py</a></li>
+<li><a href="../code/v4-index-attn.html">v4_modules/index_attn.py</a></li>
+<li><a href="../code/v4-compress.html">v4_modules/compress.py</a></li>
+<li><a href="../code/v4-cross-layer.html">v4_modules/cross_layer.py</a></li>
+<li><a href="../code/v4-mlp.html">v4_modules/mlp.py</a></li>
+<li><a href="../code/v4-engram.html">v4_modules/engram.py</a></li>
+<li><a href="../code/dflash.html">mtp/dflash.py</a></li>
+<li><a href="../code/deepseek-vl.html">deepseek_vl.py</a></li>
+<li><a href="../code/vit.html">vision_encoder/vit.py</a></li>
+</ul>
+<p class="nav-group">Layers and kernels (layers/)</p>
+<ul>
+<li><a href="../code/sampler.html">sampler.py</a></li>
+<li><a href="../code/linear.html">linear.py</a></li>
+<li class="soon"><span>tilelang_ops/</span><span class="soon-tag">soon</span></li>
+</ul>
+<p class="nav-group">Parallelism and memory</p>
+<ul>
+<li><a href="../code/parallel-state.html">parallel_state.py</a></li>
+<li><a class="current" aria-current="page" href="../code/shm-broadcast.html">distributed/shm_broadcast.py</a></li>
+<li><a href="../code/shared-memory.html">shared_memory.py</a></li>
+<li><a href="../code/userbuffer.html">userbuffer.py</a></li>
+<li><a href="../code/eplb.html">eplb/</a></li>
+</ul>
+<p class="nav-group">Loading, platform, other</p>
+<ul>
+<li><a href="../code/model-loader.html">model_loader.py</a></li>
+<li><a href="../code/hf-weights.html">hugging_face/weights.py</a></li>
+<li><a href="../code/platform.html">platform.py</a></li>
+<li><a href="../code/npu-ops.html">npu_ops/</a></li>
+<li><a href="../code/deep-cluster.html">deep_cluster/</a></li>
+<li><a href="../code/structure-output.html">structure_output/</a></li>
+<li><a href="../code/ve.html">ve/ (images)</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="5 of 5 pages written">5/5</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/cpp-engine-api.html">C++ engine API</a></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li><a href="../reference/faq.html">FAQ</a></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Parallelism and memory</span><span class="sep">›</span><span aria-current="page">distributed/shm_broadcast.py</span></nav>
+<h1 class="page-title">distributed/shm_broadcast.py: MessageQueue</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 9 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: DeepInfer @ <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener" title="9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"><code>9bd9cf2</code></a> · 2026-10-21</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../code/parallel-state.html">parallel_utils/parallel_state.py: the process groups</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>shm_broadcast.py</code> sends Python objects from one process to several processes on the same host, through a ring buffer in <a class="term" href="../reference/glossary.html#term-posix-shm" data-term="shared memory (POSIX)" data-def="Operating-system memory that several processes on one host can map at the same time, by name (on Linux, files in /dev/shm). Not the same as GPU shared memory (SMEM).">shared memory</a>, with <a class="term" href="../reference/glossary.html#term-zeromq" data-term="ZeroMQ" data-def="A message library for sockets (Python package zmq). MessageQueue uses its publish-subscribe sockets for start-up handshakes and for objects that are too large for a shared-memory chunk.">ZeroMQ</a> sockets for set-up and for large objects.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/distributed/shm_broadcast.py</code>, 461 lines of Python. "Derived from vLLM; modified by DeepSeek." (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L1-L2" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:1-2 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:1-2</code></a>). <code>deepinfer/distributed/__init__.py</code> is empty.</td></tr>
+    <tr><th>Main classes</th><td><code>ShmRingBuffer</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L33" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:33 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:33</code></a>), <code>Handle</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L152-L159" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:152-159 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:152-159</code></a>), <code>MessageQueue</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L162" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:162 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:162</code></a>).</td></tr>
+    <tr><th>Runs in</th><td>The CPU side of every rank of a CP group with more than one rank: the writer in the engine process (CP rank 0), a reader in each CP follower process. No device code.</td></tr>
+    <tr><th>Called by</th><td><code>ParallelProcessGroup.create_process_groups</code> (set-up) and <code>cp_broadcast_object</code> (every message), both in <code>parallel_state.py</code>.</td></tr>
+    <tr><th>Calls</th><td><code>multiprocessing.shared_memory</code>, <code>pickle</code>, <code>zmq</code>, <code>torch.distributed.broadcast_object_list</code> (one time, for the handle).</td></tr>
+    <tr><th>Not in this file</th><td>Tensor data. Device tensors go through NCCL or HCCL broadcasts in <code>communication_op.py</code>. The pinned memory pool for images is a different module: <a href="../code/shared-memory.html">shared_memory.py: the pinned memory pool for images</a>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8_shm_ring"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: the shared memory holds ten 1 MiB data chunks and then ten 4-byte flag rows; a data chunk has an overflow byte and the pickled object; a flag row has the written flag and one flag per reader. Panel 2: four states of a chunk&#x27;s flags: 0??? not written, 1000 just written, 1101 read by two readers, 1111 read by all; the writer can write in the first and last state. Panel 3: four steps: pickle on CP rank 0, acquire_write spins until the chunk is free, small objects go into the chunk and large ones over a ZeroMQ socket, and each follower dequeues."><svg role="img" aria-label="Panel 1: the shared memory holds ten 1 MiB data chunks and then ten 4-byte flag rows; a data chunk has an overflow byte and the pickled object; a flag row has the written flag and one flag per reader. Panel 2: four states of a chunk&#x27;s flags: 0??? not written, 1000 just written, 1101 read by two readers, 1111 read by all; the writer can write in the first and last state. Panel 3: four steps: pickle on CP rank 0, acquire_write spins until the chunk is free, small objects go into the chunk and large ones over a ZeroMQ socket, and each follower dequeues." xmlns="http://www.w3.org/2000/svg" width="1100" height="1064" viewBox="0 0 1100 1064">
+<defs><marker id="dg-b8_shm_ring-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker><marker id="dg-b8_shm_ring-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b8_shm_ring-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b8_shm_ring-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+<rect width="1100" height="1064" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">MessageQueue: one writer, many readers, one shared buffer</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">deepinfer/distributed/shm_broadcast.py  ·  example: CP group of 4 ranks = 1 writer + 3 readers  ·  commit 9bd9cf2</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">max_chunk_bytes = 1 &lt;&lt; 20 (1 MiB)   max_chunks = 10   metadata = 1 + n_reader = 4 bytes per chunk</text>
+<rect x="20.0" y="112.0" width="1060.0" height="220.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="138.0" r="13" fill="#111827"/>
+<text x="46.0" y="142.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="143.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What is in the shared memory?</text>
+<text x="68.0" y="162.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">10 data chunks, then 10 small flag rows. Total (1 MiB + 4 B) x 10 = 10,485,800 bytes.</text>
+<rect x="46.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="84.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 0</text>
+<text x="84.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="124.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="162.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 1</text>
+<text x="162.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="202.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="240.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 2</text>
+<text x="240.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="280.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="318.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 3</text>
+<text x="318.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="358.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="396.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 4</text>
+<text x="396.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="436.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="474.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 5</text>
+<text x="474.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="514.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="552.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 6</text>
+<text x="552.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="592.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="630.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 7</text>
+<text x="630.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="670.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="708.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 8</text>
+<text x="708.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="748.0" y="188.0" width="76.0" height="46.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="786.0" y="208.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 9</text>
+<text x="786.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">1 MiB</text>
+<rect x="836.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="855.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="874.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="893.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="912.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="931.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="950.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="969.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="988.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<rect x="1007.0" y="188.0" width="18.0" height="46.0" rx="2" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="931.0" y="252.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">10 x 4 B</text>
+<text x="46.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">data_offset = 0</text>
+<text x="826.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">metadata_offset = max_chunk_bytes x max_chunks -&gt;</text>
+<rect x="46.0" y="272.0" width="210.0" height="30.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.2"/>
+<text x="56.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">byte 0: overflow flag</text>
+<rect x="258.0" y="272.0" width="420.0" height="30.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="268.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">bytes 1..: pickled object (if it fits)</text>
+<rect x="700.0" y="272.0" width="354.0" height="30.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.2"/>
+<text x="710.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">flags: [written, r0, r1, r2]</text>
+<rect x="20.0" y="352.0" width="1060.0" height="256.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="378.0" r="13" fill="#111827"/>
+<text x="46.0" y="382.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="383.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">When may the writer and a reader use a chunk?</text>
+<text x="68.0" y="402.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Readers only set their own flag 0 -&gt; 1. The writer resets the reader flags first, then sets written = 1.</text>
+<rect x="46.0" y="424.0" width="236.0" height="92.0" rx="8" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.5"/>
+<text x="60.0" y="450.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">0 ? ? ?</text>
+<text x="60.0" y="474.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">not written</text>
+<text x="60.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">write: yes   read: no</text>
+<line x1="282.0" y1="470.0" x2="301.0" y2="470.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b8_shm_ring-m0)"/>
+<rect x="303.0" y="424.0" width="236.0" height="92.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="317.0" y="450.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1 0 0 0</text>
+<text x="317.0" y="474.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">just written</text>
+<text x="317.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">write: no   read: yes</text>
+<line x1="539.0" y1="470.0" x2="558.0" y2="470.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b8_shm_ring-m0)"/>
+<rect x="560.0" y="424.0" width="236.0" height="92.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="574.0" y="450.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1 1 0 1</text>
+<text x="574.0" y="474.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">read by r0, r2</text>
+<text x="574.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">r1 may read; write: no</text>
+<line x1="796.0" y1="470.0" x2="815.0" y2="470.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b8_shm_ring-m0)"/>
+<rect x="817.0" y="424.0" width="236.0" height="92.0" rx="8" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.5"/>
+<text x="831.0" y="450.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1 1 1 1</text>
+<text x="831.0" y="474.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">read by all</text>
+<text x="831.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">write: yes   read: no</text>
+<path d="M 935.0,516.0 L 935.0,546.0 L 164.0,546.0 L 164.0,518.0" fill="none" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dg-b8_shm_ring-m1)"/>
+<text x="560.0" y="568.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">writer: written = 0, write data, readers = 0, written = 1, current_idx = (idx + 1) % 10</text>
+<rect x="20.0" y="628.0" width="1060.0" height="330.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="654.0" r="13" fill="#111827"/>
+<text x="46.0" y="658.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="659.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What happens for one object?</text>
+<text x="68.0" y="678.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Small objects travel in shared memory. Large ones use the chunk only as a ticket.</text>
+<rect x="46.0" y="700.0" width="1008.0" height="50.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="46.0" y="700.0" width="6.0" height="50.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="717.0" r="10" fill="#2563eb"/>
+<text x="70.0" y="721.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="88.0" y="722.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">enqueue(obj) on cp_rank 0</text>
+<text x="88.0" y="740.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">pickle.dumps(obj, HIGHEST_PROTOCOL) -&gt; n bytes</text>
+<rect x="971.0" y="708.0" width="73.0" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="1007.5" y="721.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">line 392</text>
+<line x1="70.0" y1="750.0" x2="70.0" y2="760.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b8_shm_ring-m2)"/>
+<rect x="46.0" y="762.0" width="1008.0" height="50.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="46.0" y="762.0" width="6.0" height="50.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="779.0" r="10" fill="#7c3aed"/>
+<text x="70.0" y="783.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="88.0" y="784.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">acquire_write: spin until chunk idx is free</text>
+<text x="88.0" y="802.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">os.sched_yield(); debug log every 60 s; optional timeout</text>
+<rect x="937.9" y="770.0" width="106.1" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="991.0" y="783.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">lines 320-357</text>
+<line x1="70.0" y1="812.0" x2="70.0" y2="822.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b8_shm_ring-m1)"/>
+<rect x="46.0" y="824.0" width="1008.0" height="50.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="46.0" y="824.0" width="6.0" height="50.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="841.0" r="10" fill="#d97706"/>
+<text x="70.0" y="845.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="88.0" y="846.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">n &lt; 1 MiB: byte 0 = 0, bytes 1..n = data</text>
+<text x="88.0" y="864.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">else byte 0 = 1, and the data goes over a ZeroMQ PUB socket</text>
+<rect x="937.9" y="832.0" width="106.1" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="991.0" y="845.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">lines 396-402</text>
+<line x1="70.0" y1="874.0" x2="70.0" y2="884.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b8_shm_ring-m3)"/>
+<rect x="46.0" y="886.0" width="1008.0" height="50.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<rect x="46.0" y="886.0" width="6.0" height="50.0" rx="3" fill="#059669" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="903.0" r="10" fill="#059669"/>
+<text x="70.0" y="907.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<text x="88.0" y="908.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">dequeue() on each follower</text>
+<text x="88.0" y="926.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">acquire_read on its own idx; pickle.loads; set own flag</text>
+<rect x="937.9" y="894.0" width="106.1" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1"/>
+<text x="991.0" y="907.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">lines 406-422</text>
+<text x="30.0" y="991.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="980.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">data</text>
+<rect x="169.8" y="980.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="190.8" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">flags / writer</text>
+<rect x="298.6" y="980.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="319.6" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">overflow path</text>
+<rect x="426.6" y="980.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="447.6" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">readable chunk</text>
+<rect x="557.1" y="980.0" width="14.0" height="14.0" rx="3" fill="#e5e7eb" fill-opacity="1.0" stroke="#9ca3af" stroke-width="1.4"/>
+<text x="578.1" y="991.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">writable chunk</text>
+<text x="30.0" y="1018.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Line numbers refer to shm_broadcast.py. Remote readers (another host) use only the ZeroMQ socket; the CP group has none.</text>
+<text x="30.0" y="1036.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Simplified: the flag bytes are plain memory; the code relies on the write order shown in panel 2 (lines 80-85).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the ring buffer of one CP group with 4 ranks (panel 1), the life of one chunk (panel 2), and the path of one object (panel 3). Click to zoom.</figcaption><a class="diagram-open" href="../diagrams/b8_shm_ring.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read panel 2 from left to right. The dashed arrow is the writer that comes back to the same chunk 10 messages later. Panel 3 is the path of every call from the CP driver to its followers.</p>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><strong>Set-up.</strong> <code>create_process_groups</code> makes one queue per CP group, with 1 MiB chunks and 10 chunks, only if <code>cp_size &gt; 1</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L122-L124" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:122-124 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:122-124</code></a>).</li>
+  <li><strong>Every message.</strong> <code>cp_broadcast_object</code> calls <code>enqueue</code> on the writer and <code>dequeue</code> on a reader (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L17-L23" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:17-23 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:17-23</code></a>). Three kinds of callers use it:
+    <ul>
+      <li>method calls of the worker: <code>run_workers</code> on the driver, the slave loop on the followers (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L296-L300" target="_blank" rel="noopener" title="deepinfer/worker/base.py:296-300 at 9bd9cf2"><code>deepinfer/worker/base.py:296-300</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L129-L133" target="_blank" rel="noopener" title="deepinfer/worker/base.py:129-133 at 9bd9cf2"><code>deepinfer/worker/base.py:129-133</code></a>);</li>
+      <li>the non-tensor part of <code>broadcast_tensor_dict</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/communication_op.py#L72-L75" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/communication_op.py:72-75 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/communication_op.py:72-75</code></a>);</li>
+      <li>the non-tensor fields of <code>InputMetadata.broadcast</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/input_metadata/input_metadata.py#L153-L156" target="_blank" rel="noopener" title="deepinfer/model_executor/input_metadata/input_metadata.py:153-156 at 9bd9cf2"><code>deepinfer/model_executor/input_metadata/input_metadata.py:153-156</code></a>).</li>
+    </ul></li>
+  <li><strong>Shut-down.</strong> <code>cleanup_shm_broadcast</code> closes and unlinks the buffer (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L161-L169" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:161-169 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:161-169</code></a>).</li>
+  <li><strong>Test.</strong> <code>tests/distributed/test_shm_broadcast.py</code> sends 10,000 random arrays (about 400 MB) from rank 2 of 4 processes, with 40 KiB chunks, so that many arrays use the overflow path (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/tests/distributed/test_shm_broadcast.py#L108-L136" target="_blank" rel="noopener" title="tests/distributed/test_shm_broadcast.py:108-136 at 9bd9cf2"><code>tests/distributed/test_shm_broadcast.py:108-136</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>multiprocessing.shared_memory.SharedMemory</code> to make or open the buffer (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L100-L121" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:100-121 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:100-121</code></a>).</li>
+  <li><code>zmq</code> XPUB and SUB sockets on <code>127.0.0.1</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L193-L201" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:193-201 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:193-201</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L260-L264" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:260-264 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:260-264</code></a>).</li>
+  <li><code>dist.broadcast_object_list</code> on the Gloo CP group, to send the handle to the readers (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L454-L458" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:454-458 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:454-458</code></a>).</li>
+  <li><code>deepinfer.utils.get_open_port</code> and <code>get_ip</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/utils.py#L40-L49" target="_blank" rel="noopener" title="deepinfer/utils.py:40-49 at 9bd9cf2"><code>deepinfer/utils.py:40-49</code></a>).</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>ShmRingBuffer.__init__</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L34-L121" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:34-121 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:34-121</code></a></td><td>Makes (writer) or opens (reader) the shared memory; the docstring describes the layout and the flag protocol.</td></tr>
+    <tr><td><code>handle</code>, <code>__reduce__</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L123-L127" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:123-127 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:123-127</code></a></td><td>Pickles as <code>(n_reader, max_chunk_bytes, max_chunks, name)</code>, so another process opens the same memory.</td></tr>
+    <tr><td><code>__del__</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L129-L135" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:129-135 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:129-135</code></a></td><td>Closes; the creator also unlinks.</td></tr>
+    <tr><td><code>get_data</code>, <code>get_metadata</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L137-L149" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:137-149 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:137-149</code></a></td><td>Memory views of one chunk and of its flag row.</td></tr>
+    <tr><td><code>Handle</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L152-L159" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:152-159 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:152-159</code></a></td><td>Dataclass that a reader needs: IP, local reader ranks, buffer handle, ports.</td></tr>
+    <tr><td><code>MessageQueue.__init__</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L163-L239" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:163-239 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:163-239</code></a></td><td>Writer side: the ring buffer, an XPUB socket for local readers, another for remote readers.</td></tr>
+    <tr><td><code>create_from_handle</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L244-L284" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:244-284 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:244-284</code></a></td><td>Reader side: opens the buffer and connects a SUB socket.</td></tr>
+    <tr><td><code>wait_until_ready</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L286-L306" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:286-306 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:286-306</code></a></td><td>Handshake: the writer waits for all subscriptions, then sends <code>b"READY"</code>.</td></tr>
+    <tr><td><code>_spin_wait</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L308-L318" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:308-318 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:308-318</code></a></td><td>One wait turn: yield the CPU, log now and then, raise on time-out.</td></tr>
+    <tr><td><code>acquire_write</code>, <code>acquire_read</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L320-L387" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:320-387 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:320-387</code></a></td><td>Context managers that wait for a usable chunk and update its flags.</td></tr>
+    <tr><td><code>enqueue</code>, <code>dequeue</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L389-L422" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:389-422 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:389-422</code></a></td><td>Pickle and write; read and unpickle. Large objects go over the socket.</td></tr>
+    <tr><td><code>broadcast_object</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L424-L429" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:424-429 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:424-429</code></a></td><td>Writer enqueues, reader dequeues. DeepInfer uses its own copy of this logic in <code>cp_broadcast_object</code>; only the test calls this method.</td></tr>
+    <tr><td><code>create_from_process_group</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L431-L461" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:431-461 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:431-461</code></a></td><td>Collective set-up over a process group: writer makes, readers open, all wait until ready.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="create-from-process-group-set-up-over-a-group"><code>create_from_process_group</code>: set-up over a group<a class="h-anchor" href="#create-from-process-group-set-up-over-a-group" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L431-L461" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/distributed/shm_broadcast.py:431-461</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L431-L461" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">431</span><span class="ln">432</span><span class="ln">433</span><span class="ln">434</span><span class="ln">435</span><span class="ln">436</span><span class="ln">437</span><span class="ln">438</span><span class="ln">439</span><span class="ln">440</span><span class="ln">441</span><span class="ln hl">442</span><span class="ln hl">443</span><span class="ln hl">444</span><span class="ln">445</span><span class="ln hl">446</span><span class="ln hl">447</span><span class="ln hl">448</span><span class="ln hl">449</span><span class="ln hl">450</span><span class="ln hl">451</span><span class="ln hl">452</span><span class="ln hl">453</span><span class="ln hl">454</span><span class="ln">455</span><span class="ln">456</span><span class="ln hl">457</span><span class="ln hl">458</span><span class="ln hl">459</span><span class="ln hl">460</span><span class="ln">461</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><pre><code class="language-python">    @staticmethod
+    def create_from_process_group(
+        pg: ProcessGroup,
+        max_chunk_bytes: int,
+        max_chunks: int,
+        writer_rank: int = 0,
+    ) -&gt; &quot;MessageQueue&quot;:
+        group_rank = dist.get_rank(pg)
+        group_world_size = dist.get_world_size(pg)
+        global_ranks = dist.get_process_group_ranks(pg)
+
+        # assume the group does not cross nodes, so every reader is a local reader
+        n_reader = group_world_size - 1
+        local_reader_ranks = [i for i in range(group_world_size) if i != writer_rank]
+        buffer_io: MessageQueue
+        if group_rank == writer_rank:
+            buffer_io = MessageQueue(
+                n_reader=n_reader,
+                n_local_reader=n_reader,
+                local_reader_ranks=local_reader_ranks,
+                max_chunk_bytes=max_chunk_bytes,
+                max_chunks=max_chunks,
+            )
+            dist.broadcast_object_list([buffer_io.export_handle()], src=global_ranks[writer_rank], group=pg)
+        else:
+            recv = [None]
+            dist.broadcast_object_list(recv, src=global_ranks[writer_rank], group=pg)
+            handle = recv[0]  # type: ignore
+            buffer_io = MessageQueue.create_from_handle(handle, group_rank)
+        buffer_io.wait_until_ready()
+        return buffer_io</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 442: the comment states the assumption. Every reader is a local (shared-memory) reader. So the group must be on one host.</li>
+  <li>Lines 446-454: the writer (group rank 0 by default) makes the queue and broadcasts its <code>Handle</code> with <code>broadcast_object_list</code>. This is a Gloo collective on the CPU CP group.</li>
+  <li>Lines 455-459: the readers get the handle and open the queue.</li>
+  <li>Line 460: all ranks call <code>wait_until_ready</code>.</li>
+</ol>
+
+<h3 id="messagequeue-init-and-create-from-handle-the-two-sides"><code>MessageQueue.__init__</code> and <code>create_from_handle</code>: the two sides<a class="h-anchor" href="#messagequeue-init-and-create-from-handle-the-two-sides" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L184-L209" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/distributed/shm_broadcast.py:184-209</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L184-L209" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">184</span><span class="ln">185</span><span class="ln">186</span><span class="ln">187</span><span class="ln hl">188</span><span class="ln">189</span><span class="ln">190</span><span class="ln">191</span><span class="ln">192</span><span class="ln hl">193</span><span class="ln">194</span><span class="ln">195</span><span class="ln">196</span><span class="ln hl">197</span><span class="ln hl">198</span><span class="ln hl">199</span><span class="ln hl">200</span><span class="ln hl">201</span><span class="ln">202</span><span class="ln hl">203</span><span class="ln">204</span><span class="ln">205</span><span class="ln">206</span><span class="ln">207</span><span class="ln">208</span><span class="ln">209</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><pre><code class="language-python">        if n_local_reader &gt; 0:
+            # for local readers, we will:
+            # 1. create a shared memory ring buffer to communicate small data
+            # 2. create a publish-subscribe socket to communicate large data
+            self.buffer = ShmRingBuffer(n_local_reader, max_chunk_bytes, max_chunks)
+
+            # XPUB is very similar to PUB,
+            # except that it can receive subscription messages
+            # to confirm the number of subscribers
+            self.local_socket = context.socket(XPUB)
+            # set the verbose option so that we can receive every subscription
+            # message. otherwise, we will only receive the first subscription
+            # see http://api.zeromq.org/3-3:zmq-setsockopt for more details
+            self.local_socket.setsockopt(XPUB_VERBOSE, True)
+            local_subscribe_port = get_open_port()
+            socket_addr = f&quot;tcp://127.0.0.1:{local_subscribe_port}&quot;
+            logger.debug(&quot;Binding to %s&quot;, socket_addr)
+            self.local_socket.bind(socket_addr)
+
+            self.current_idx = 0
+
+        else:
+            self.buffer = None  # type: ignore
+            local_subscribe_port = None
+            self.local_socket = None
+            self.current_idx = -1</code></pre></div></div></div></figure>
+<p>The writer makes a <code>ShmRingBuffer</code> with one flag per local reader, and binds an XPUB socket on a free local port. <code>XPUB_VERBOSE</code> makes the socket pass every subscription message to the writer, so the writer can count the readers (the comment on lines 194-196). A reader opens the same buffer from the handle and connects a SUB socket that accepts all messages (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L252-L264" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:252-264 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:252-264</code></a>). The reader's position in <code>local_reader_ranks</code> is its flag number (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L256" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:256 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:256</code></a>).</p>
+<p>When a reader opens the buffer, the code patches <code>multiprocessing.resource_tracker.register</code> to do nothing. The comment explains: "Python incorrectly tracks shared memory even if it is not created by the process" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L110-L115" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:110-115 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:110-115</code></a>).</p>
+
+<h3 id="acquire-write-wait-for-a-free-chunk"><code>acquire_write</code>: wait for a free chunk<a class="h-anchor" href="#acquire-write-wait-for-a-free-chunk" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L320-L357" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/distributed/shm_broadcast.py:320-357</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L320-L357" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">320</span><span class="ln">321</span><span class="ln">322</span><span class="ln">323</span><span class="ln">324</span><span class="ln">325</span><span class="ln">326</span><span class="ln hl">327</span><span class="ln hl">328</span><span class="ln hl">329</span><span class="ln hl">330</span><span class="ln hl">331</span><span class="ln hl">332</span><span class="ln hl">333</span><span class="ln hl">334</span><span class="ln hl">335</span><span class="ln">336</span><span class="ln">337</span><span class="ln">338</span><span class="ln">339</span><span class="ln">340</span><span class="ln hl">341</span><span class="ln">342</span><span class="ln hl">343</span><span class="ln hl">344</span><span class="ln">345</span><span class="ln">346</span><span class="ln">347</span><span class="ln">348</span><span class="ln">349</span><span class="ln">350</span><span class="ln hl">351</span><span class="ln hl">352</span><span class="ln hl">353</span><span class="ln hl">354</span><span class="ln hl">355</span><span class="ln hl">356</span><span class="ln">357</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><pre><code class="language-python">    @contextmanager
+    def acquire_write(self, timeout: float | None = None) -&gt; Generator[memoryview, None, None]:
+        assert self._is_writer, &quot;Only writers can acquire write&quot;
+        start_time = time.monotonic()
+        n_warning = 1
+        while True:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                read_count = sum(metadata_buffer[1:])
+                written_flag = metadata_buffer[0]
+                if written_flag and read_count != self.buffer.n_reader:
+                    # this block is written and not read by all readers
+                    # for writers, `self.current_idx` is the next block to write
+                    # if this block is not ready to write,
+                    # we need to wait until it is read by all readers
+                    n_warning = self._spin_wait(start_time, n_warning, timeout)
+                    continue
+                # found a block that is either
+                # (1) not written
+                # (2) read by all readers
+
+                # mark the block as not written
+                metadata_buffer[0] = 0
+                # let caller write to the buffer
+                with self.buffer.get_data(self.current_idx) as buf:
+                    yield buf
+
+                # caller has written to the buffer
+                # NOTE: order is important here
+                # first set the read flags to 0
+                # then set the written flag to 1
+                # otherwise, the readers may think they already read the block
+                for i in range(1, self.buffer.n_reader + 1):
+                    # set read flag to 0, meaning it is not read yet
+                    metadata_buffer[i] = 0
+                # mark the block as written
+                metadata_buffer[0] = 1
+                self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
+                break</code></pre></div></div></div></figure>
+<ol>
+  <li>Lines 326-335: look at the flag row of chunk <code>current_idx</code>. If it is written and not read by all readers, wait one turn and look again.</li>
+  <li>Line 341: set <code>written = 0</code>. The chunk is now "not written" for all readers.</li>
+  <li>Lines 343-344: give the chunk to the caller, which writes the data.</li>
+  <li>Lines 351-355: set all reader flags to 0, then set <code>written = 1</code>. The comment on lines 347-350 says the order is important: with the other order, a reader could see "written and already read" for a short time.</li>
+  <li>Line 356: the next write uses the next chunk, modulo 10.</li>
+</ol>
+
+<h3 id="acquire-read-wait-for-a-new-chunk"><code>acquire_read</code>: wait for a new chunk<a class="h-anchor" href="#acquire-read-wait-for-a-new-chunk" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L359-L387" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/distributed/shm_broadcast.py:359-387</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L359-L387" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">359</span><span class="ln">360</span><span class="ln">361</span><span class="ln">362</span><span class="ln">363</span><span class="ln">364</span><span class="ln">365</span><span class="ln hl">366</span><span class="ln hl">367</span><span class="ln hl">368</span><span class="ln">369</span><span class="ln">370</span><span class="ln">371</span><span class="ln">372</span><span class="ln">373</span><span class="ln">374</span><span class="ln">375</span><span class="ln hl">376</span><span class="ln">377</span><span class="ln">378</span><span class="ln">379</span><span class="ln hl">380</span><span class="ln hl">381</span><span class="ln">382</span><span class="ln">383</span><span class="ln">384</span><span class="ln hl">385</span><span class="ln hl">386</span><span class="ln">387</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">    @contextmanager
+    def acquire_read(self, timeout: float | None = None) -&gt; Generator[memoryview, None, None]:
+        assert self._is_local_reader, &quot;Only readers can acquire read&quot;
+        start_time = time.monotonic()
+        n_warning = 1
+        while True:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                read_flag = metadata_buffer[self.local_reader_rank + 1]
+                written_flag = metadata_buffer[0]
+                if not written_flag or read_flag:
+                    # this block is either
+                    # (1) not written
+                    # (2) already read by this reader
+
+                    # for readers, `self.current_idx` is the next block to read
+                    # if this block is not ready,
+                    # we need to wait until it is written
+                    n_warning = self._spin_wait(start_time, n_warning, timeout)
+                    continue
+                # found a block that is not read by this reader
+                # let caller read from the buffer
+                with self.buffer.get_data(self.current_idx) as buf:
+                    yield buf
+
+                # caller has read from the buffer
+                # set the read flag
+                metadata_buffer[self.local_reader_rank + 1] = 1
+                self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
+                break</code></pre></div></div></div></figure>
+<p>Each reader keeps its own <code>current_idx</code>. It waits until its chunk is written and its own flag is 0. After the caller has read the data, it sets its own flag to 1 and moves to the next chunk. Readers never touch the <code>written</code> flag.</p>
+
+<h3 id="enqueue-and-dequeue-the-object-path"><code>enqueue</code> and <code>dequeue</code>: the object path<a class="h-anchor" href="#enqueue-and-dequeue-the-object-path" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L389-L422" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/distributed/shm_broadcast.py:389-422</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L389-L422" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">389</span><span class="ln">390</span><span class="ln">391</span><span class="ln hl">392</span><span class="ln">393</span><span class="ln">394</span><span class="ln">395</span><span class="ln hl">396</span><span class="ln hl">397</span><span class="ln hl">398</span><span class="ln hl">399</span><span class="ln hl">400</span><span class="ln hl">401</span><span class="ln hl">402</span><span class="ln">403</span><span class="ln">404</span><span class="ln">405</span><span class="ln">406</span><span class="ln">407</span><span class="ln">408</span><span class="ln">409</span><span class="ln hl">410</span><span class="ln hl">411</span><span class="ln hl">412</span><span class="ln hl">413</span><span class="ln hl">414</span><span class="ln hl">415</span><span class="ln hl">416</span><span class="ln hl">417</span><span class="ln">418</span><span class="ln">419</span><span class="ln">420</span><span class="ln">421</span><span class="ln">422</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><pre><code class="language-python">    def enqueue(self, obj: Any, timeout: float | None = None) -&gt; None:
+        &quot;&quot;&quot;Write to message queue with optional timeout (in seconds)&quot;&quot;&quot;
+        assert self._is_writer, &quot;Only writers can enqueue&quot;
+        serialized_obj = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        if self.n_local_reader &gt; 0:
+            # first byte of the chunk is the overflow flag; the payload is stored
+            # inline if it fits, otherwise it is sent through the local socket
+            overflow = len(serialized_obj) &gt;= self.buffer.max_chunk_bytes
+            with self.acquire_write(timeout) as buf:
+                buf[0] = overflow
+                if not overflow:
+                    buf[1 : len(serialized_obj) + 1] = serialized_obj
+            if overflow:
+                self.local_socket.send(serialized_obj)
+        if self.n_remote_reader &gt; 0:
+            self.remote_socket.send(serialized_obj)
+
+    def dequeue(self, timeout: float | None = None) -&gt; Any:
+        &quot;&quot;&quot;Read from message queue with optional timeout (in seconds)&quot;&quot;&quot;
+        if self._is_local_reader:
+            with self.acquire_read(timeout) as buf:
+                overflow = buf[0] == 1
+                if not overflow:
+                    # no need to know the size of serialized object
+                    # pickle format contains the size information internally
+                    # see https://docs.python.org/3/library/pickle.html
+                    obj = pickle.loads(buf[1:])
+            if overflow:
+                obj = pickle.loads(self.local_socket.recv())
+        elif self._is_remote_reader:
+            obj = pickle.loads(self.remote_socket.recv())
+        else:
+            raise RuntimeError(&quot;Only readers can dequeue&quot;)
+        return obj</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 392: pickle the object with the highest protocol.</li>
+  <li>Line 396: the object "overflows" if its pickle has <code>max_chunk_bytes</code> bytes or more (1 MiB in the CP queue).</li>
+  <li>Lines 397-400: byte 0 of the chunk is the overflow flag. A small object goes into bytes 1 and up.</li>
+  <li>Lines 401-402: a large object goes over the local XPUB socket. The chunk still goes through the ring, as a ticket.</li>
+  <li>Lines 410-417: the reader reads byte 0. For a small object, <code>pickle.loads(buf[1:])</code> reads the object; pickle knows its own length (comment, lines 412-414). For a large object, the reader reads one message from its SUB socket.</li>
+</ol>
+<aside class="callout callout-note"><p class="callout-title">Why the order of messages is safe</p><div class="callout-body"><p>The ring and the socket are two channels. A reader always takes the chunk first, and reads the socket only when byte 0 says "overflow". The writer sends a large object over the socket in the same order as the chunks. So the k-th socket message belongs to the k-th overflow chunk.</p></div></aside>
+
+<h3 id="wait-until-ready-and-spin-wait"><code>wait_until_ready</code> and <code>_spin_wait</code><a class="h-anchor" href="#wait-until-ready-and-spin-wait" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L286-L318" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/distributed/shm_broadcast.py:286-318</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L286-L318" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">286</span><span class="ln">287</span><span class="ln">288</span><span class="ln">289</span><span class="ln">290</span><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln">295</span><span class="ln">296</span><span class="ln hl">297</span><span class="ln hl">298</span><span class="ln hl">299</span><span class="ln hl">300</span><span class="ln">301</span><span class="ln">302</span><span class="ln hl">303</span><span class="ln">304</span><span class="ln">305</span><span class="ln">306</span><span class="ln">307</span><span class="ln">308</span><span class="ln">309</span><span class="ln">310</span><span class="ln hl">311</span><span class="ln">312</span><span class="ln hl">313</span><span class="ln hl">314</span><span class="ln hl">315</span><span class="ln hl">316</span><span class="ln hl">317</span><span class="ln">318</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><pre><code class="language-python">    def wait_until_ready(self) -&gt; None:
+        &quot;&quot;&quot;This is a collective operation. All processes (including the
+        readers and the writer) should call this function.
+        &quot;&quot;&quot;
+        if self._is_writer:
+            # wait for subscription messages from all readers, then send a
+            # message to confirm the publish channel is working
+            for n_reader, socket in (
+                (self.n_local_reader, self.local_socket),
+                (self.n_remote_reader, self.remote_socket),
+            ):
+                for _ in range(n_reader):
+                    socket.recv()
+                if n_reader &gt; 0:
+                    socket.send(b&quot;READY&quot;)
+        elif self._is_local_reader:
+            # wait for the writer to send a message
+            assert self.local_socket.recv() == b&quot;READY&quot;
+        elif self._is_remote_reader:
+            # wait for the writer to send a message
+            assert self.remote_socket.recv() == b&quot;READY&quot;
+
+    @staticmethod
+    def _spin_wait(start_time: float, n_warning: int, timeout: float | None = None) -&gt; int:
+        &quot;&quot;&quot;自旋等待一轮：让出 CPU、按间隔打 debug 日志、超时抛 TimeoutError。返回更新后的 n_warning。&quot;&quot;&quot;
+        os.sched_yield()
+        elapsed = time.monotonic() - start_time
+        if elapsed &gt; envs.DEEPINFER_RINGBUFFER_WARNING_INTERVAL * n_warning:
+            logger.debug(&quot;No available shared memory block after %.1f seconds&quot;, elapsed)
+            n_warning += 1
+        if timeout is not None and elapsed &gt; timeout:
+            raise TimeoutError
+        return n_warning</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">310</span> Spin-wait for one turn: give up the CPU, write a debug log at intervals, raise TimeoutError on time-out. Returns the updated n_warning.</li></ul></div></figure>
+<p>The handshake (lines 290-306) makes sure that every SUB socket is connected before the first large object goes out. A ZeroMQ publisher drops messages for subscribers that are not connected yet (general ZeroMQ behaviour). The wait loop (lines 308-318) calls <code>os.sched_yield()</code> on each turn. It does not sleep.</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-flow-what-goes-through-the-queue-in-one-step" class="dd-title">Data flow: what goes through the queue in one step</h3></summary><div class="dd-body"><p>With CP above 1, each prefill step sends these objects from the driver, in this order (the first three come from <code>run_workers</code>, <code>_prepare_input_driver</code> and <code>prepare_sampler_inputs</code>):</p>
+<table>
+  <thead><tr><th>#</th><th>Object</th><th>Typical size</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>("execute_model_step", {"is_prompt": True, "is_placeholder": False})</code></td><td>tens of bytes</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/base.py#L300" target="_blank" rel="noopener" title="deepinfer/worker/base.py:300 at 9bd9cf2"><code>deepinfer/worker/base.py:300</code></a></td></tr>
+    <tr><td>2</td><td>list of <code>(key, value)</code>: the input metadata, with a <code>TensorMetadata(dtype, size)</code> for each tensor</td><td>a few KiB</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/communication_op.py#L64-L72" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/communication_op.py:64-72 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/communication_op.py:64-72</code></a></td></tr>
+    <tr><td>3</td><td>the sampler metadata dict, the same way</td><td>small</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L252-L259" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:252-259 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:252-259</code></a></td></tr>
+  </tbody>
+</table>
+<p>The tensor data does not go through the queue. After each metadata list, <code>cp_broadcast_multi_tensor</code> sends the tensors with one device broadcast per tensor (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/communication_op.py#L36-L43" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/communication_op.py:36-43 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/communication_op.py:36-43</code></a>). So the 1 MiB chunk is large enough for normal steps, and the overflow path is rare. (Sizes in the table are estimates, not measured.)</p>
+<p><strong>Types.</strong> Any picklable object can go. The input metadata dict contains a class object (<code>"type": type(input_metadata)</code>), which pickle stores by name (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L204" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:204 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:204</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="processes-threads-and-cpu-use" class="dd-title">Processes, threads and CPU use</h3></summary><div class="dd-body"><ul>
+  <li><strong>Writer:</strong> the engine process, on the thread that runs <code>step()</code>. <code>enqueue</code> spins only if the reader is 10 messages behind.</li>
+  <li><strong>Readers:</strong> each CP follower process, in <code>start_slave_worker_loop</code>. Between steps, the follower sits in <code>acquire_read</code>. That loop calls <code>os.sched_yield()</code> and checks the flag again, with no sleep (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L308-L318" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:308-318 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:308-318</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L364-L377" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:364-377 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:364-377</code></a>). So an idle follower keeps one CPU core busy.</li>
+  <li><strong>ZeroMQ context:</strong> <code>Context.instance()</code> is one context per process (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L182" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:182 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:182</code></a>).</li>
+  <li><strong>The slow-reader log.</strong> After 60 s of waiting (<code>DEEPINFER_RINGBUFFER_WARNING_INTERVAL</code>), the waiter writes a debug log "No available shared memory block after ... seconds", then again after 120 s, and so on (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L184" target="_blank" rel="noopener" title="deepinfer/environ.py:184 at 9bd9cf2"><code>deepinfer/environ.py:184</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L312-L315" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:312-315 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:312-315</code></a>). At the default log level, a debug log may not show.</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-chunk-numbers-over-12-messages" class="dd-title">Worked example: chunk numbers over 12 messages</h3></summary><div class="dd-body"><p>CP group of 4: writer W, readers R0, R1, R2, 10 chunks. W sends messages m0 to m11.</p>
+<ol>
+  <li>m0 to m9 go into chunks 0 to 9. Each chunk becomes <code>1 0 0 0</code>.</li>
+  <li>R0 and R2 are fast. They read m0 to m9; the rows become <code>1 1 0 1</code>. R1 is slow and has read only m0 to m3: chunks 0-3 are <code>1 1 1 1</code>.</li>
+  <li>m10 goes to chunk 0 (<code>10 % 10</code>). Chunk 0 is <code>1 1 1 1</code>, so W can write at once.</li>
+  <li>m11 goes to chunk 1, also free.</li>
+  <li>m14 would go to chunk 4. Chunk 4 is <code>1 1 0 1</code>, so W waits until R1 reads m4.</li>
+</ol>
+<p>So the writer can be at most 10 messages ahead of the slowest reader. In DeepInfer, each step sends 3 messages (the method call, the input metadata and the sampler metadata), so the driver CPU can be about 3 steps ahead before it waits.</p>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>The count of 3 comes from the code paths in the first deep dive. A decode step that replays a CUDA graph also sends 3: its input metadata message holds only the five small values (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/model_runner.py#L202-L212" target="_blank" rel="noopener" title="deepinfer/worker/model_runner.py:202-212 at 9bd9cf2"><code>deepinfer/worker/model_runner.py:202-212</code></a>). <code>InputMetadata.broadcast</code> uses the queue only while the graph is captured; a replay does not run that Python code. Other worker methods, such as start-up calls, add their own messages.</p></div></aside></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths" class="dd-title">Error paths</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>enqueue</code> on a reader, <code>acquire_read</code> on the writer</td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L322" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:322 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:322</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L361" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:361 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:361</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L391" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:391 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:391</code></a></td></tr>
+    <tr><td><code>dequeue</code> on the writer</td><td><code>RuntimeError("Only readers can dequeue")</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L420-L421" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:420-421 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:420-421</code></a></td></tr>
+    <tr><td>Time-out passed and reached</td><td><code>TimeoutError</code>. DeepInfer passes no time-out, so it waits for ever.</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L316-L317" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:316-317 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:316-317</code></a></td></tr>
+    <tr><td>A reader on another host</td><td>The buffer does not exist there; <code>FileNotFoundError</code> is suppressed, and the object has no <code>shared_memory</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L117-L121" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:117-121 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:117-121</code></a></td></tr>
+    <tr><td>Buffer size differs from the handle</td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L116" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:116 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:116</code></a></td></tr>
+    <tr><td>Handshake message is not <code>b"READY"</code></td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L303" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:303 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:303</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L306" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:306 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:306</code></a></td></tr>
+    <tr><td>Buffer already unlinked at <code>__del__</code></td><td>suppressed</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L133-L135" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:133-135 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:133-135</code></a></td></tr>
+  </tbody>
+</table>
+<p><strong>Settings.</strong> The only environment variable in this file is <code>DEEPINFER_RINGBUFFER_WARNING_INTERVAL</code> (default 60, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L184" target="_blank" rel="noopener" title="deepinfer/environ.py:184 at 9bd9cf2"><code>deepinfer/environ.py:184</code></a>). The chunk size and count come from the caller: 1 MiB and 10 for the CP queue (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L124" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:124 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:124</code></a>). The defaults of the class are 10 MiB and 10 (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L168-L169" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:168-169 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:168-169</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="remote-readers-in-the-code-not-used-by-deepinfer" class="dd-title">Remote readers: in the code, not used by DeepInfer</h3></summary><div class="dd-body"><p>The class can also serve readers on other hosts. For them, the writer binds a second XPUB socket on <code>tcp://*:&lt;port&gt;</code>, and <code>enqueue</code> sends every object over it (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L211-L220" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:211-220 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:211-220</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L403-L404" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:403-404 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:403-404</code></a>). The writer's IP comes from <code>get_ip()</code>, which opens a UDP socket toward <code>8.8.8.8</code> to learn the local address; no packet is needed (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/utils.py#L40-L43" target="_blank" rel="noopener" title="deepinfer/utils.py:40-43 at 9bd9cf2"><code>deepinfer/utils.py:40-43</code></a>). IPv6 addresses set the <code>IPV6</code> socket option.</p>
+<p><code>create_from_process_group</code> always sets <code>n_local_reader = n_reader</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L443-L453" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:443-453 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:443-453</code></a>), so in DeepInfer the remote path stays unused.</p></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a>: why the CP driver sends method calls and metadata to the followers.</li>
+  <li><a href="../code/parallel-state.html">parallel_utils/parallel_state.py: the process groups</a>: where the queue is made, and <code>cp_broadcast_object</code>.</li>
+  <li><a href="../code/model-runner.html">worker/model_runner.py: the ModelRunner class</a>: the driver and follower paths of <code>_prepare_input</code>.</li>
+  <li><a href="../code/shared-memory.html">shared_memory.py: the pinned memory pool for images</a>: the other shared-memory module, for image tensors.</li>
+  <li><a href="../tours/multi-gpu-step.html">Tour: One step on many GPUs</a>: the queue in one step on many GPUs.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which process writes to the CP queue, and which processes read from it?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>CP rank 0 (the engine process with the driver worker) writes. Each CP follower reads. The writer is <code>writer_rank = 0</code> of the CPU CP group (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L436" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:436 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:436</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/parallel_state.py#L124" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/parallel_state.py:124 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/parallel_state.py:124</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Does the queue carry the tensor data of the input metadata?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>No. It carries the keys, the small values and a <code>TensorMetadata(dtype, size)</code> for each tensor. The tensors go with device broadcasts (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/parallel_utils/communication_op.py#L64-L81" target="_blank" rel="noopener" title="deepinfer/model_executor/parallel_utils/communication_op.py:64-81 at 9bd9cf2"><code>deepinfer/model_executor/parallel_utils/communication_op.py:64-81</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>A pickled object has exactly 1,048,576 bytes (1 MiB). Which path does it take in the CP queue?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The overflow path. <code>overflow = len(serialized_obj) &gt;= max_chunk_bytes</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L396" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:396 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:396</code></a>), and 1 MiB is not smaller than 1 MiB. Byte 0 of the chunk becomes 1, and the bytes go over the local ZeroMQ socket. (The chunk also needs byte 0 for the flag, so an inline object can have at most <code>max_chunk_bytes − 1</code> bytes.)</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>Why does <code>acquire_write</code> reset the reader flags before it sets <code>written = 1</code>, and not after?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>With the other order, the row would go from <code>0 1 1 1</code> to <code>1 1 1 1</code> and <code>1 0 1 1</code> before it reaches <code>1 0 0 0</code>. These intermediate rows say "written and already read" for a message that nobody has read. The docstring calls this intermediate case 3 "not correct" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L80-L85" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:80-85 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:80-85</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L347-L355" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:347-355 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:347-355</code></a>). The reset-first order keeps the row in a valid state at every moment. (Our reading of <code>acquire_read</code>: a reader that sees its own flag still at 1 does not skip the chunk. It waits one more turn, because it moves to the next chunk only after it reads, lines 365-377.)</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>A follower is idle for an hour between two requests. What does its CPU do, and what appears in the logs?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>It spins in <code>acquire_read</code>: each turn reads the flag row and calls <code>os.sched_yield()</code>, with no sleep, so one core stays busy (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L364-L377" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:364-377 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:364-377</code></a>). Every 60 s it writes a debug line "No available shared memory block after ... seconds" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/distributed/shm_broadcast.py#L312-L315" target="_blank" rel="noopener" title="deepinfer/distributed/shm_broadcast.py:312-315 at 9bd9cf2"><code>deepinfer/distributed/shm_broadcast.py:312-315</code></a>). Note: with <code>LLM.generate</code>, the driver keeps calling <code>step()</code> while there is work. When it stops, the follower waits.</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../code/parallel-state.html">parallel_utils/parallel_state.py: the process groups</a><span class="rel-sum">parallel_state.py makes all torch.distributed process groups of one rank (world, local, DP, CP, EP, EP-in-DP, Engram and three Gloo copies), the shared-memory queue of the CP group, and the global PG object that the rest of the code reads.</span></li><li><a href="../code/shared-memory.html">shared_memory.py: the pinned memory pool for images</a><span class="rel-sum">shared_memory.py has SharedTorchMemoryPool, a pool of pinned host memory that the image worker process and the engine process share. The image worker writes preprocessed image tensors into it, and the engine copies them to the device with no extra copy. The file also has an unused SharedMemory class.</span></li><li><a href="../code/worker-base.html">worker/base.py: WorkerBase, the resource layer of a worker</a><span class="rel-sum">WorkerBase sets up one device for one rank - torch settings, NUMA and CPU binding, process groups, the model, the memory profile, the KV cache and the CUDA graphs - and runs the call loop of the context-parallel followers.</span></li><li><a href="../code/model-runner.html">worker/model_runner.py: the ModelRunner class</a><span class="rel-sum">ModelRunner owns the model object on one rank. It builds the input metadata, runs the forward pass (eager or as a CUDA graph replay), prepares the sampler inputs, runs the memory profile and captures the graphs.</span></li><li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a><span class="rel-sum">With context parallelism, the devices of one engine share the tokens of a long prefill. A mirrored token order gives each device the same amount of causal attention work.</span></li><li><a href="../tours/multi-gpu-step.html">Tour: One step on many GPUs</a><span class="rel-sum">Follow one prefill step on 4 GPUs (2 data-parallel engines, each with 2 context-parallel ranks) in 10 stops, from the step vote to the outputs, with the rank, the group and the tensor shapes at each stop.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/parallel-state.html"><span class="pn-dir">← Previous</span><span class="pn-title">parallel_utils/parallel_state.py: the process groups</span></a><a class="pn pn-next" href="../code/shared-memory.html"><span class="pn-dir">Next →</span><span class="pn-title">shared_memory.py: the pinned memory pool for images</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener"><code class="foot-sha">9bd9cf243fc53ef9afbf8f04d391d989117d6ab9</code></a> · 2026-10-21 12:55:43 +0800 · “Bump DeepEP to f6aa38fe and drop the SSH-&gt;HTTPS rewrite (#157)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/deepseek-ai/DeepInfer" target="_blank" rel="noopener">deepseek-ai/DeepInfer</a> · Built 2026-10-22 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#create-from-process-group-set-up-over-a-group">create_from_process_group: set-up over a group</a></li><li class="toc-l3"><a href="#messagequeue-init-and-create-from-handle-the-two-sides">MessageQueue.__init__ and create_from_handle: the two sides</a></li><li class="toc-l3"><a href="#acquire-write-wait-for-a-free-chunk">acquire_write: wait for a free chunk</a></li><li class="toc-l3"><a href="#acquire-read-wait-for-a-new-chunk">acquire_read: wait for a new chunk</a></li><li class="toc-l3"><a href="#enqueue-and-dequeue-the-object-path">enqueue and dequeue: the object path</a></li><li class="toc-l3"><a href="#wait-until-ready-and-spin-wait">wait_until_ready and _spin_wait</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#data-flow-what-goes-through-the-queue-in-one-step">Data flow: what goes through the queue in one step</a></li><li class="toc-l3"><a href="#processes-threads-and-cpu-use">Processes, threads and CPU use</a></li><li class="toc-l3"><a href="#worked-example-chunk-numbers-over-12-messages">Worked example: chunk numbers over 12 messages</a></li><li class="toc-l3"><a href="#error-paths">Error paths</a></li><li class="toc-l3"><a href="#remote-readers-in-the-code-not-used-by-deepinfer">Remote readers: in the code, not used by DeepInfer</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Python and C++ boundary · DeepInfer Explained</title>
+<meta name="description" content="DeepInfer runs the scheduler and the step bookkeeping in C++. One pybind11 module, deepinfer._C, connects that code to Python. This page explains the build, the three submodules, the GIL and lock rules, and the memory that crosses the boundary.">
+<script>try{var t=localStorage.getItem("di-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/python-cpp-boundary">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">DI</span><span class="brand-name">DeepInfer Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/what-an-llm-does.html">What an LLM does</a></li>
+<li><a href="../learn/tokens.html">Tokens and tokenizers</a></li>
+<li><a href="../learn/transformer.html">Inside a transformer</a></li>
+<li><a href="../learn/attention.html">Attention, step by step</a></li>
+<li><a href="../learn/prefill-decode.html">Prefill and decode</a></li>
+<li><a href="../learn/kv-cache.html">The KV cache</a></li>
+<li><a href="../learn/sampling.html">Sampling</a></li>
+<li><a href="../learn/batching.html">Batching</a></li>
+<li><a href="../learn/gpus-kernels.html">GPUs, kernels, and speed</a></li>
+<li><a href="../learn/parallelism.html">Parallelism basics</a></li>
+<li><a href="../learn/moe.html">Mixture of Experts (MoE)</a></li>
+<li><a href="../learn/number-formats.html">Number formats</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">DeepInfer concepts</span><span class="nav-count" title="33 of 34 pages written">33/34</span></summary>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../concepts/engine-step-loop.html">Offline API and the step loop</a></li>
+<li><a href="../concepts/request-lifecycle.html">Request and sequence lifecycle</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/paged-kv-cache.html">Paged KV cache and block manager</a></li>
+<li><a href="../concepts/input-metadata.html">Input metadata</a></li>
+<li><a href="../concepts/cuda-graphs.html">CUDA graphs</a></li>
+<li><a href="../concepts/zero-overhead-scheduling.html">Zero-overhead scheduling</a></li>
+</ul>
+<p class="nav-group">Model (V4.1)</p>
+<ul>
+<li><a href="../concepts/model-map.html">Model map</a></li>
+<li><a href="../concepts/mla-attention.html">MLA attention</a></li>
+<li><a href="../concepts/sparse-attention-indexer.html">Sparse attention indexer</a></li>
+<li><a href="../concepts/sliding-window-attention.html">Sliding-window attention</a></li>
+<li><a href="../concepts/kv-compression.html">KV compression</a></li>
+<li><a href="../concepts/cross-layer-kv-sharing.html">Cross-layer KV sharing</a></li>
+<li><a href="../concepts/yoco-swa-replay.html">YOCO and SWA bounded replay</a></li>
+<li><a href="../concepts/mhc-residual.html">mHC residual mixing</a></li>
+<li><a href="../concepts/moe-routing.html">MoE routing</a></li>
+<li><a href="../concepts/mega-moe.html">Mega-MoE</a></li>
+<li><a href="../concepts/engram.html">Engram n-gram memory</a></li>
+<li><a href="../concepts/vision-encoder.html">Vision encoder (VL)</a></li>
+</ul>
+<p class="nav-group">Decoding</p>
+<ul>
+<li><a href="../concepts/sampler.html">The sampler</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/dspark.html">DSpark confidence scheduling</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/determinism.html">Determinism</a></li>
+</ul>
+<p class="nav-group">Scale</p>
+<ul>
+<li><a href="../concepts/dp-step-votes.html">DP and step votes</a></li>
+<li><a href="../concepts/context-parallelism.html">Context parallelism (mirror CP)</a></li>
+<li><a href="../concepts/expert-parallelism.html">Expert parallelism (dispatch/combine)</a></li>
+<li><a href="../concepts/eplb.html">Expert load balancing (EPLB)</a></li>
+<li><a href="../concepts/hardware-discovery.html">Hardware discovery</a></li>
+</ul>
+<p class="nav-group">Platform</p>
+<ul>
+<li><a href="../concepts/hardware-platforms.html">NVIDIA and Ascend</a></li>
+<li class="soon"><span>TileLang kernels</span><span class="soon-tag">soon</span></li>
+<li><a class="current" aria-current="page" href="../concepts/python-cpp-boundary.html">Python and C++</a></li>
+<li><a href="../concepts/low-precision-formats.html">Low-precision formats</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="6 of 6 pages written">6/6</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-request.html">Life of a request</a></li>
+<li><a href="../tours/startup.html">Start-up</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/decoder-layer.html">Inside one decoder layer</a></li>
+<li><a href="../tours/spec-decode-round.html">One speculative decoding round</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step on many GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="49 of 50 pages written">49/50</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">User API and engine</p>
+<ul>
+<li><a href="../code/entrypoints-llm.html">entrypoints/llm.py</a></li>
+<li><a href="../code/sampling-params.html">sampling_params.py</a></li>
+<li><a href="../code/llm-engine.html">engine/llm_engine.py</a></li>
+<li><a href="../code/sequence.html">sequence.py</a></li>
+<li><a href="../code/config.html">config.py</a></li>
+<li><a href="../code/environ.html">environ.py</a></li>
+<li><a href="../code/stats-logger.html">engine/stats_logger.py</a></li>
+</ul>
+<p class="nav-group">C++ engine (csrc/engine/)</p>
+<ul>
+<li><a href="../code/engine-pyi.html">_C/engine.pyi</a></li>
+<li><a href="../code/sequence-hpp.html">sequence.hpp</a></li>
+<li><a href="../code/block-manager-hpp.html">block_manager.hpp</a></li>
+<li><a href="../code/scheduler-hpp.html">scheduler.hpp</a></li>
+<li><a href="../code/zos-cpp.html">zos.cpp</a></li>
+<li><a href="../code/prepare-tensor-input-v4.html">prepare_tensor_input_v4.cpp</a></li>
+<li><a href="../code/prepare-sample-cpp.html">prepare_sample.cpp</a></li>
+<li><a href="../code/outputs-hpp.html">outputs.hpp</a></li>
+</ul>
+<p class="nav-group">Worker</p>
+<ul>
+<li><a href="../code/worker-base.html">worker/base.py</a></li>
+<li><a href="../code/worker.html">worker/worker.py</a></li>
+<li><a href="../code/model-runner.html">worker/model_runner.py</a></li>
+<li><a href="../code/input-metadata.html">input_metadata/</a></li>
+<li><a href="../code/cache-engine.html">worker/cache_engine.py</a></li>
+<li><a href="../code/cuda-graph-runner.html">worker/cuda_graph_runner.py</a></li>
+</ul>
+<p class="nav-group">Model (models/)</p>
+<ul>
+<li><a href="../code/deepseek.html">deepseek.py</a></li>
+<li><a href="../code/decoder-layer.html">decoder_layer.py</a></li>
+<li><a href="../code/v4-hc.html">v4_modules/hc.py</a></li>
+<li><a href="../code/v4-attn.html">v4_modules/attn.py</a></li>
+<li><a href="../code/v4-mla-attn.html">v4_modules/mla_attn.py</a></li>
+<li><a href="../code/v4-index-attn.html">v4_modules/index_attn.py</a></li>
+<li><a href="../code/v4-compress.html">v4_modules/compress.py</a></li>
+<li><a href="../code/v4-cross-layer.html">v4_modules/cross_layer.py</a></li>
+<li><a href="../code/v4-mlp.html">v4_modules/mlp.py</a></li>
+<li><a href="../code/v4-engram.html">v4_modules/engram.py</a></li>
+<li><a href="../code/dflash.html">mtp/dflash.py</a></li>
+<li><a href="../code/deepseek-vl.html">deepseek_vl.py</a></li>
+<li><a href="../code/vit.html">vision_encoder/vit.py</a></li>
+</ul>
+<p class="nav-group">Layers and kernels (layers/)</p>
+<ul>
+<li><a href="../code/sampler.html">sampler.py</a></li>
+<li><a href="../code/linear.html">linear.py</a></li>
+<li class="soon"><span>tilelang_ops/</span><span class="soon-tag">soon</span></li>
+</ul>
+<p class="nav-group">Parallelism and memory</p>
+<ul>
+<li><a href="../code/parallel-state.html">parallel_state.py</a></li>
+<li><a href="../code/shm-broadcast.html">distributed/shm_broadcast.py</a></li>
+<li><a href="../code/shared-memory.html">shared_memory.py</a></li>
+<li><a href="../code/userbuffer.html">userbuffer.py</a></li>
+<li><a href="../code/eplb.html">eplb/</a></li>
+</ul>
+<p class="nav-group">Loading, platform, other</p>
+<ul>
+<li><a href="../code/model-loader.html">model_loader.py</a></li>
+<li><a href="../code/hf-weights.html">hugging_face/weights.py</a></li>
+<li><a href="../code/platform.html">platform.py</a></li>
+<li><a href="../code/npu-ops.html">npu_ops/</a></li>
+<li><a href="../code/deep-cluster.html">deep_cluster/</a></li>
+<li><a href="../code/structure-output.html">structure_output/</a></li>
+<li><a href="../code/ve.html">ve/ (images)</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="5 of 5 pages written">5/5</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/cpp-engine-api.html">C++ engine API</a></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li><a href="../reference/faq.html">FAQ</a></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>DeepInfer concepts</span><span class="sep">›</span><span>Platform</span><span class="sep">›</span><span aria-current="page">Python and C++</span></nav>
+<h1 class="page-title">The Python and C++ boundary</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">DeepInfer concepts</span><span class="meta-time">about 9 min read + 8 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: DeepInfer @ <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener" title="9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"><code>9bd9cf2</code></a> · 2026-10-21</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/engine-step-loop.html">Offline API and the step loop</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/scheduler.html">The scheduler</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">DeepInfer runs the scheduler and the step bookkeeping in C++. Python reaches that code through one compiled <a class="term" href="../reference/glossary.html#term-pybind11" data-term="pybind11" data-def="A C++ library that makes C++ functions and classes callable from Python. DeepInfer uses it to build deepinfer._C.">pybind11</a> module, <code>deepinfer._C</code>.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>Most of DeepInfer is Python. The entry point, the engine, the workers and the model forward pass are Python code that calls PyTorch and device <a class="term" href="../reference/glossary.html#term-kernel" data-term="kernel" data-def="A small program that runs on the GPU or NPU. One kernel does one operation, for example a matrix multiply, on many values in parallel.">kernels</a>. One part is C++: the code that decides what each engine <a class="term" href="../reference/glossary.html#term-engine-step" data-term="engine step" data-def="One call of LLMEngine.step(): schedule a batch, run the model once on the device, sample, and update the requests. Generation is a loop of steps.">step</a> does, and the code that prepares the inputs for that step. This C++ code is in the folder <code>csrc/</code>.</p>
+<p>The C++ code is compiled into one <a class="term" href="../reference/glossary.html#term-extension-module" data-term="extension module" data-def="A compiled library (a .so file) that Python imports like a normal module. deepinfer._C is DeepInfer&#x27;s C++ extension module.">extension module</a>: a <code>.so</code> file that Python imports like a normal module. Its name is <code>deepinfer._C</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/setup.py#L59-L60" target="_blank" rel="noopener" title="setup.py:59-60 at 9bd9cf2"><code>setup.py:59-60</code></a>). It has three submodules:</p>
+<ul>
+  <li><code>_C.engine</code>: the <a class="term" href="../reference/glossary.html#term-scheduler" data-term="scheduler" data-def="The C++ object that decides, in each engine step, which sequences run, how many tokens each one sends, and which KV blocks each one gets.">scheduler</a>, the <a class="term" href="../reference/glossary.html#term-block-manager" data-term="BlockManager" data-def="The C++ object that owns the free list of KV cache blocks. It gives blocks to sequences and takes them back.">block managers</a>, sequences, output objects, and the functions that prepare model and sampler inputs. This is the largest part: 34 names.</li>
+  <li><code>_C.cuda_utils</code>: three functions for raw device memory and for memory that another process opens.</li>
+  <li><code>_C.graph_timer</code>: three classes that time regions inside a captured <a class="term" href="../reference/glossary.html#term-cuda-graph" data-term="CUDA graph" data-def="A recording of all kernel launches of one forward pass for a fixed batch size. A replay starts all kernels with one call, so the CPU cost is small.">CUDA graph</a>.</li>
+</ul>
+<p><strong>Why C++?</strong> The code and the docs do not give a direct reason. The deployment doc gives the context: in a decode step, <code>schedule</code> and <code>post-process</code> are "pure CPU logic", and the device sits idle while they run (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L270" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:270 at 9bd9cf2"><code>doc/inference_deployment_qa.md:270</code></a>). <a class="term" href="../reference/glossary.html#term-zos" data-term="ZOS" data-def="Zero-overhead scheduling. The CPU prepares and post-processes one step while the device runs the next, so the CPU work does not stop the device.">Zero-overhead scheduling</a> hides this CPU time behind device work (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L274" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:274 at 9bd9cf2"><code>doc/inference_deployment_qa.md:274</code></a>). So the CPU time of each step matters. This site does not claim more than that.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a shop with a front desk and a stock room. Customers talk only to the front desk (Python). The stock room (C++) keeps the stock lists and counts fast. Items go between the two through one window (the pybind11 module). The comparison stops here: sometimes the stock room lends its own shelf to the front desk instead of a copy of the items. The front desk must finish with that shelf before the next step, because the stock room then uses it again. On this page, such a shelf is a <a class="term" href="../reference/glossary.html#term-borrowed-view" data-term="borrowed view" data-def="A NumPy array or tensor that points at memory that C++ owns. Python gets no copy. The data is valid only until C++ uses that memory again.">borrowed view</a>.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b10b_cpp_boundary"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: setup.py compiles 11 common C++ files plus two platform files into deepinfer._C; scripts/build.sh builds into build/tag and links each .so into deepinfer/_so/tag; import deepinfer adds that folder to the package path. Panel 2: three submodules, cuda_utils with 3 functions, engine with 34 names, graph_timer with 3 classes, and the Python files that use them. Panel 3: one call to schedule: Python calls the binding, pybind11 converts the argument, C++ releases the GIL and locks the block managers, and the result returns with arrays that borrow C++ memory."><svg role="img" aria-label="Panel 1: setup.py compiles 11 common C++ files plus two platform files into deepinfer._C; scripts/build.sh builds into build/tag and links each .so into deepinfer/_so/tag; import deepinfer adds that folder to the package path. Panel 2: three submodules, cuda_utils with 3 functions, engine with 34 names, graph_timer with 3 classes, and the Python files that use them. Panel 3: one call to schedule: Python calls the binding, pybind11 converts the argument, C++ releases the GIL and locks the block managers, and the result returns with arrays that borrow C++ memory." xmlns="http://www.w3.org/2000/svg" width="1100" height="1080" viewBox="0 0 1100 1080">
+<defs><marker id="dg-b10b_cpp_boundary-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker><marker id="dg-b10b_cpp_boundary-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b10b_cpp_boundary-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b10b_cpp_boundary-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker></defs>
+<rect width="1100" height="1080" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Python and C++: build, contents, and one call</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">csrc/ -&gt; deepinfer._C (pybind11)  ·  one .so per platform  ·  commit 9bd9cf2</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tag = &lt;DEEPINFER_ACCELERATOR&gt;-&lt;uname -m&gt;, for example nvidia-x86_64 or ascend-aarch64</text>
+<rect x="20.0" y="112.0" width="1060.0" height="246.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="138.0" r="13" fill="#111827"/>
+<text x="46.0" y="142.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="143.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How does csrc/ become an importable module?</text>
+<text x="68.0" y="162.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One build per platform. Each build goes to its own folder, so NVIDIA and Ascend builds can share one source tree.</text>
+<rect x="46.0" y="184.0" width="316.0" height="150.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="60.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1. setup.py</text>
+<text x="60.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">11 COMMON_SOURCES</text>
+<text x="60.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">+ cuda_utils.cpp, graph_timer_cuda.cpp</text>
+<text x="60.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  or asc_utils.cpp, graph_timer_asc.cpp</text>
+<text x="60.0" y="283.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CUDAExtension | NpuExtension</text>
+<text x="60.0" y="300.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  name=&quot;deepinfer._C&quot;</text>
+<text x="60.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">setup.py:22-72</text>
+<line x1="362.0" y1="259.0" x2="390.0" y2="259.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b10b_cpp_boundary-m0)"/>
+<rect x="392.0" y="184.0" width="316.0" height="150.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="406.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">2. scripts/build.sh</text>
+<text x="406.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">python setup.py build</text>
+<text x="406.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  --build-base build/&lt;tag&gt;</text>
+<text x="406.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ln -fs each *.so into</text>
+<text x="406.0" y="283.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  deepinfer/_so/&lt;tag&gt;/</text>
+<text x="406.0" y="300.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no .so linked -&gt; exit 1</text>
+<text x="406.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">build.sh:11-30</text>
+<line x1="708.0" y1="259.0" x2="736.0" y2="259.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b10b_cpp_boundary-m0)"/>
+<rect x="738.0" y="184.0" width="316.0" height="150.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="752.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">3. import deepinfer</text>
+<text x="752.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">_so_platform_tag() -&gt; &lt;tag&gt;</text>
+<text x="752.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">__path__.append(_so/&lt;tag&gt;)</text>
+<text x="752.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">import deepinfer._C finds</text>
+<text x="752.0" y="283.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  _C.&lt;soabi&gt;.so in that folder</text>
+<text x="752.0" y="300.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">never imports torch here</text>
+<text x="752.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">__init__.py:9-32</text>
+<rect x="20.0" y="378.0" width="1060.0" height="246.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="404.0" r="13" fill="#111827"/>
+<text x="46.0" y="408.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="409.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What is inside deepinfer._C?</text>
+<text x="68.0" y="428.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">csrc/pybind.cpp makes three submodules. Each has a type stub in deepinfer/_C/.</text>
+<rect x="46.0" y="450.0" width="316.0" height="150.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="60.0" y="474.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">_C.cuda_utils (3 names)</text>
+<text x="60.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">alloc_tensor(size)</text>
+<text x="60.0" y="515.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">export_ipc_tensor(ptr, nbytes)</text>
+<text x="60.0" y="532.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">import_ipc_tensor(data)</text>
+<text x="60.0" y="549.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">users: cache_engine.py,</text>
+<text x="60.0" y="566.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  utils.CudaIPCWrapper</text>
+<text x="60.0" y="583.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">cuda_utils.cpp | asc_utils.cpp</text>
+<rect x="392.0" y="450.0" width="316.0" height="150.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="406.0" y="474.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">_C.engine (34 names)</text>
+<text x="406.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Scheduler, BlockManager,</text>
+<text x="406.0" y="515.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Sequence, SequenceMetadata,</text>
+<text x="406.0" y="532.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">RequestOutputPool, prepare_*</text>
+<text x="406.0" y="549.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">users: llm_engine.py,</text>
+<text x="406.0" y="566.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  worker/, sequence.py ...</text>
+<text x="406.0" y="583.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">csrc/engine/pybind_*.cpp</text>
+<rect x="738.0" y="450.0" width="316.0" height="150.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="752.0" y="474.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">_C.graph_timer (3 names)</text>
+<text x="752.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">EventHandle</text>
+<text x="752.0" y="515.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">EventRecordNodeHandle</text>
+<text x="752.0" y="532.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">GraphHandle</text>
+<text x="752.0" y="549.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">users: timer.py,</text>
+<text x="752.0" y="566.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  cuda_graph_runner.py</text>
+<text x="752.0" y="583.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">graph_timer/pybind.cpp</text>
+<rect x="20.0" y="644.0" width="1060.0" height="330.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="670.0" r="13" fill="#111827"/>
+<text x="46.0" y="674.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="675.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What happens during one call?</text>
+<text x="68.0" y="694.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Other Python threads can run while C++ plans the step. Some results are views into C++ memory, not copies.</text>
+<rect x="46.0" y="716.0" width="1008.0" height="50.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="46.0" y="716.0" width="6.0" height="50.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="733.0" r="10" fill="#2563eb"/>
+<text x="70.0" y="737.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="88.0" y="738.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Python: the engine calls the scheduler</text>
+<text x="88.0" y="756.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">self.scheduler.schedule(self.sequence_metadata_pool)</text>
+<rect x="884.9" y="724.0" width="159.1" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="964.5" y="737.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">llm_engine.py:885-887</text>
+<line x1="70.0" y1="766.0" x2="70.0" y2="776.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b10b_cpp_boundary-m1)"/>
+<rect x="46.0" y="778.0" width="1008.0" height="50.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="46.0" y="778.0" width="6.0" height="50.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="795.0" r="10" fill="#7c3aed"/>
+<text x="70.0" y="799.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="88.0" y="800.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">pybind11: find the C++ method, convert the argument</text>
+<text x="88.0" y="818.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">.def(&quot;schedule&quot;, &amp;Scheduler::schedule, ...)</text>
+<rect x="851.8" y="786.0" width="192.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="947.9" y="799.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">pybind_scheduler.cpp:97-99</text>
+<line x1="70.0" y1="828.0" x2="70.0" y2="838.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b10b_cpp_boundary-m2)"/>
+<rect x="46.0" y="840.0" width="1008.0" height="50.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.4"/>
+<rect x="46.0" y="840.0" width="6.0" height="50.0" rx="3" fill="#0d9488" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="857.0" r="10" fill="#0d9488"/>
+<text x="70.0" y="861.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="88.0" y="862.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">C++: release the GIL, then lock the block managers</text>
+<text x="88.0" y="880.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">py::gil_scoped_release; BlockManagerMutexAcquire</text>
+<rect x="884.9" y="848.0" width="159.1" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#0d9488" stroke-width="1"/>
+<text x="964.5" y="861.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0d9488" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">scheduler.hpp:276-277</text>
+<line x1="70.0" y1="890.0" x2="70.0" y2="900.0" stroke="#0d9488" stroke-width="1.6" marker-end="url(#dg-b10b_cpp_boundary-m3)"/>
+<rect x="46.0" y="902.0" width="1008.0" height="50.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="46.0" y="902.0" width="6.0" height="50.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="70.0" cy="919.0" r="10" fill="#d97706"/>
+<text x="70.0" y="923.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<text x="88.0" y="924.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">C++ -&gt; Python: return (list, SchedulerOutputs)</text>
+<text x="88.0" y="942.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">metadata from the pool; clone_* and zero_states arrays borrow C++ memory</text>
+<rect x="851.8" y="910.0" width="192.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="947.9" y="923.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">pybind_scheduler.cpp:31-62</text>
+<text x="30.0" y="1007.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="996.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="118.3" y="1007.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">build / binding</text>
+<rect x="223.2" y="996.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="244.2" y="1007.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Python</text>
+<rect x="309.7" y="996.0" width="14.0" height="14.0" rx="3" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.4"/>
+<text x="330.7" y="1007.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">C++ code in deepinfer._C</text>
+<rect x="495.4" y="996.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="516.4" y="1007.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">results that borrow C++ memory</text>
+<text x="30.0" y="1034.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">11 common sources = csrc/pybind.cpp, 9 files in csrc/engine/ and csrc/graph_timer/pybind.cpp (setup.py:22-34).</text>
+<text x="30.0" y="1052.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: the 34 engine names one by one (see the engine.pyi page) and the CUDA/ACL calls inside cuda_utils.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: how <code>csrc/</code> becomes <code>deepinfer._C</code> (panel 1), what is inside it (panel 2), and what happens during one call (panel 3). Click to zoom.</figcaption><a class="diagram-open" href="../diagrams/b10b_cpp_boundary.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the panels from top to bottom. Panel 1 happens once, at build time. Panel 2 is the result. Panel 3 happens in every engine step. The amber card in panel 3 marks results that are not copies: they point into C++ memory.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-compile-csrc-into-one-extension-module">Step 1: compile csrc/ into one extension module<a class="h-anchor" href="#step-1-compile-csrc-into-one-extension-module" aria-label="Link to this section">#</a></h3>
+<p><code>setup.py</code> lists the C++ files that both platforms compile:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/setup.py#L22-L34" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">setup.py:22-34</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/setup.py#L22-L34" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">COMMON_SOURCES = [
+    &quot;csrc/pybind.cpp&quot;,
+    &quot;csrc/engine/pybind.cpp&quot;,
+    &quot;csrc/engine/pybind_sequence.cpp&quot;,
+    &quot;csrc/engine/pybind_scheduler.cpp&quot;,
+    &quot;csrc/engine/pybind_output.cpp&quot;,
+    &quot;csrc/engine/zos.cpp&quot;,
+    &quot;csrc/engine/input_metadata/block_load_plan.cpp&quot;,
+    &quot;csrc/engine/input_metadata/prepare_tensor_input_base.cpp&quot;,
+    &quot;csrc/engine/input_metadata/prepare_tensor_input_v4.cpp&quot;,
+    &quot;csrc/engine/prepare_sample.cpp&quot;,
+    &quot;csrc/graph_timer/pybind.cpp&quot;,
+]</code></pre></div></div></div><figcaption class="code-caption">Eleven common files: the top-level binding, nine engine files and the graph-timer binding.</figcaption></figure>
+<p>Each platform adds two files. On NVIDIA, the build uses <code>CUDAExtension</code> with <code>csrc/cuda_utils.cpp</code> and <code>graph_timer_cuda.cpp</code>. On Ascend, it uses <code>NpuExtension</code> from torch_npu with <code>csrc/asc_utils.cpp</code> and <code>graph_timer_asc.cpp</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/setup.py#L38-L72" target="_blank" rel="noopener" title="setup.py:38-72 at 9bd9cf2"><code>setup.py:38-72</code></a>). The page <a href="../concepts/hardware-platforms.html">Hardware platforms: NVIDIA and Ascend</a> compares the two branches.</p>
+
+<h3 id="step-2-one-build-folder-per-platform">Step 2: one build folder per platform<a class="h-anchor" href="#step-2-one-build-folder-per-platform" aria-label="Link to this section">#</a></h3>
+<p>Do not run <code>setup.py</code> directly. The script <code>scripts/build.sh</code> runs it and puts the result in a folder for one platform:</p>
+<figure class="code-excerpt" data-lang="bash"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L11-L28" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">scripts/build.sh:11-28</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L11-L28" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">11</span><span class="ln hl">12</span><span class="ln hl">13</span><span class="ln hl">14</span><span class="ln">15</span><span class="ln">16</span><span class="ln">17</span><span class="ln hl">18</span><span class="ln">19</span><span class="ln">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln hl">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln hl">28</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><pre><code class="language-bash">PY_BUILDTAG=$(python -c &quot;import sys, sysconfig; print(f&#x27;{sysconfig.get_platform()}-{sys.implementation.cache_tag}&#x27;)&quot;)
+PLATFORM_TAG=&quot;${DEEPINFER_ACCELERATOR:-nvidia}-$(uname -m)&quot;
+BUILD_BASE=&quot;build/$PLATFORM_TAG&quot;
+SO_DST=&quot;deepinfer/_so/$PLATFORM_TAG&quot;
+
+_build() {
+  set_max_jobs
+  python setup.py build --build-base &quot;$BUILD_BASE&quot;
+  (
+    set +e
+    set -x
+    shopt -s failglob
+    mkdir -p &quot;$SO_DST&quot;
+    for so in &quot;${BUILD_BASE}/lib.${PY_BUILDTAG}/deepinfer/&quot;*.so; do
+      ln -fs &quot;$(realpath --relative-to=&quot;$SO_DST&quot; &quot;$so&quot;)&quot; &quot;$SO_DST/&quot;
+    done
+  )
+  [ -n &quot;$(ls -A &quot;$SO_DST&quot;)&quot; ] || { echo &quot;No .so was linked into $SO_DST&quot; &gt;&amp;2; exit 1; }</code></pre></div></div></div><figcaption class="code-caption">The <a class="term" href="../reference/glossary.html#term-platform-tag" data-term="platform tag" data-def="The name &lt;accelerator&gt;-&lt;arch&gt; (for example nvidia-x86_64). The build links the compiled .so files into deepinfer/_so/&lt;tag&gt;/, and the package imports from that folder.">platform tag</a> is <code><DEEPINFER_ACCELERATOR>-<uname -m></code>, for example <code>nvidia-x86_64</code>.</figcaption></figure>
+<p>At import time, <code>deepinfer/__init__.py</code> computes the same tag and adds <code>deepinfer/_so/&lt;tag&gt;/</code> to the package search path (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/__init__.py#L30-L32" target="_blank" rel="noopener" title="deepinfer/__init__.py:30-32 at 9bd9cf2"><code>deepinfer/__init__.py:30-32</code></a>). Then <code>import deepinfer._C</code> finds the <code>.so</code> of this platform. The <code>Makefile</code> has one target per platform: <code>make build-nvidia</code> and <code>make build-ascend</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/Makefile#L3-L11" target="_blank" rel="noopener" title="Makefile:3-11 at 9bd9cf2"><code>Makefile:3-11</code></a>).</p>
+
+<h3 id="step-3-three-submodules">Step 3: three submodules<a class="h-anchor" href="#step-3-three-submodules" aria-label="Link to this section">#</a></h3>
+<p>One C++ function makes the module and its three submodules:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/pybind.cpp#L7-L17" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/pybind.cpp:7-17</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/pybind.cpp#L7-L17" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">7</span><span class="ln">8</span><span class="ln hl">9</span><span class="ln">10</span><span class="ln">11</span><span class="ln hl">12</span><span class="ln">13</span><span class="ln">14</span><span class="ln hl">15</span><span class="ln">16</span><span class="ln">17</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-cpp">PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // Cuda utils
+    pybind11::module cuda_utils = m.def_submodule(&quot;cuda_utils&quot;, &quot;DeepInfer cuda utils&quot;);
+    deepinfer::cuda::utils::pymodule_init(cuda_utils);
+    // Engine
+    pybind11::module engine = m.def_submodule(&quot;engine&quot;);
+    deepinfer::engine::pymodule_init(engine);
+    // CUDA graph 内探针计时
+    pybind11::module graph_timer = m.def_submodule(&quot;graph_timer&quot;, &quot;CUDA graph timer&quot;);
+    deepinfer::graph_timer::pymodule_init(graph_timer);
+}</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">14</span> Probe timing inside a CUDA graph.</li></ul></div></figure>
+<p>Each submodule has a <a class="term" href="../reference/glossary.html#term-type-stub" data-term="type stub (.pyi)" data-def="A Python file that lists the classes and functions of a module, with types, but no code. Editors and type checkers read it. DeepInfer has one for each C++ submodule.">type stub (.pyi)</a> in <code>deepinfer/_C/</code>: <code>cuda_utils.pyi</code>, <code>engine.pyi</code> and <code>graph_timer.pyi</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/_C/__init__.pyi#L1-L5" target="_blank" rel="noopener" title="deepinfer/_C/__init__.pyi:1-5 at 9bd9cf2"><code>deepinfer/_C/__init__.pyi:1-5</code></a>). Python never imports these <code>.pyi</code> files. Editors and type checkers read them. The page <a href="../code/engine-pyi.html">deepinfer/_C/engine.pyi: the C++ engine API, as seen from Python</a> lists all 34 names of <code>_C.engine</code>.</p>
+
+<h3 id="step-4-one-call-crosses-the-boundary">Step 4: one call crosses the boundary<a class="h-anchor" href="#step-4-one-call-crosses-the-boundary" aria-label="Link to this section">#</a></h3>
+<p>In each step, the engine asks the C++ scheduler for a plan:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L884-L887" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">deepinfer/engine/llm_engine.py:884-887</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L884-L887" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">884</span><span class="ln">885</span><span class="ln">886</span><span class="ln">887</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">            with cpu_timer.record(&quot;schedule:cpp&quot;):
+                seq_metadata_list, scheduler_outputs = self.scheduler.schedule(
+                    self.sequence_metadata_pool
+                )  # Will also free the finished sequence groups.</code></pre></div></div></div></figure>
+<p>The binding connects the Python name <code>schedule</code> to the C++ method. pybind11 converts the argument and the return value:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L97-L99" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/pybind_scheduler.cpp:97-99</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L97-L99" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">97</span><span class="ln">98</span><span class="ln">99</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-cpp">        .def(&quot;schedule&quot;, &amp;Scheduler::schedule, py::arg(&quot;sequence_metadata_pool&quot;),
+            &quot;调度一个 step，返回 (seq_metadata_list, scheduler_outputs)。&quot;
+            &quot;seq_metadata_list 中的 SequenceMetadata 从 pool 分配，用完后须经 pool.release 归还。&quot;)</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">98-99</span> Schedule one step. Returns (seq_metadata_list, scheduler_outputs). The SequenceMetadata objects in seq_metadata_list come from the pool. Give them back with pool.release after use.</li></ul></div></figure>
+<p>The first two lines of the C++ body are the rules of the boundary:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L275-L284" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/scheduler.hpp:275-284</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L275-L284" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">275</span><span class="ln hl">276</span><span class="ln hl">277</span><span class="ln">278</span><span class="ln">279</span><span class="ln">280</span><span class="ln">281</span><span class="ln hl">282</span><span class="ln hl">283</span><span class="ln hl">284</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-cpp">    std::unique_ptr&lt;SchedulerOutputs&gt; _schedule() {
+        py::gil_scoped_release release; // otherwise other python threads would be blocked
+        BlockManagerMutexAcquire acquire{block_manager, state_manager};
+
+        // 上一个 step 的 SchedulerOutputs 借用这三个 vector 的存储（见 pybind 的
+        // clone_states/clone_blocks/zero_states property），Python 侧必须在下一次
+        // schedule 前消费完，这里 clear 后复用。
+        clone_states.clear();
+        zero_states.clear();
+        clone_blocks.clear();</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">279-281</span> The SchedulerOutputs of the previous step borrow the storage of these three vectors (see the clone_states/clone_blocks/zero_states properties in pybind). Python must use them up before the next schedule. Here we clear them and use them again.</li></ul></div></figure>
+<ol>
+  <li>Line 276 releases the <a class="term" href="../reference/glossary.html#term-gil" data-term="GIL" data-def="Global Interpreter Lock: only one thread at a time runs Python code. C++ code can release it while it works, so other Python threads can run.">GIL</a>. The comment says why: "otherwise other python threads would be blocked".</li>
+  <li>Line 277 locks the two block managers: KV blocks and state slots. Each one is a <a class="term" href="../reference/glossary.html#term-mutex" data-term="mutex" data-def="A lock that only one thread can hold at a time. Other threads that want it wait until the holder releases it.">mutex</a>.</li>
+  <li>Lines 282-284 clear the vectors that the previous result lent to Python.</li>
+</ol>
+
+<h3 id="step-5-memory-that-crosses-the-boundary">Step 5: memory that crosses the boundary<a class="h-anchor" href="#step-5-memory-that-crosses-the-boundary" aria-label="Link to this section">#</a></h3>
+<p>Data can cross the boundary in three ways. Each way has a different owner.</p>
+<p><strong>C++ lends memory to Python.</strong> Some results are borrowed views. The property <code>clone_blocks</code> makes a NumPy array on the scheduler's own vector, with an empty capsule as owner:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L41-L50" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/engine/pybind_scheduler.cpp:41-50</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L41-L50" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">41</span><span class="ln">42</span><span class="ln">43</span><span class="ln">44</span><span class="ln">45</span><span class="ln">46</span><span class="ln hl">47</span><span class="ln">48</span><span class="ln">49</span><span class="ln">50</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><pre><code class="language-cpp">        .def_property_readonly(
+            &quot;clone_blocks&quot;,
+            [](const SchedulerOutputs &amp;self) {
+                return self.clone_blocks.empty()
+                           ? py::array_t&lt;int&gt;(std::vector&lt;ssize_t&gt;{0, 2})
+                           : py::array_t&lt;int&gt;({ssize_t(self.clone_blocks.size() / 2), ssize_t(2)},
+                                 {ssize_t(2 * sizeof(int)), ssize_t(sizeof(int))}, self.clone_blocks.data(), py::capsule([]() {}));
+            },
+            &quot;[n, 2] int32 的 (src, dst) block 克隆对，dst=0 表示只归还 src、不做拷贝。零拷贝借用 Scheduler 的内部存储，&quot;
+            &quot;下一次 schedule() 会清空复用：须在此之前消费完，禁止跨 step 持有。&quot;)</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">49-50</span> [n, 2] int32 (src, dst) block clone pairs; dst = 0 means only give back src, with no copy. Zero-copy borrow of the Scheduler's internal storage. The next schedule() clears it and uses it again: use it up before that, never keep it across steps.</li></ul></div></figure>
+<p><strong>Python gives data to C++.</strong> The <code>Sequence</code> constructor copies the prompt token ids into C++ storage. The binding accepts only a C-contiguous int32 NumPy array, with no conversion (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_sequence.cpp#L93-L105" target="_blank" rel="noopener" title="csrc/engine/pybind_sequence.cpp:93-105 at 9bd9cf2"><code>csrc/engine/pybind_sequence.cpp:93-105</code></a>). Its docstring says, translated: <em>"The caller guarantees that the token ids are valid; this constructor only copies the data."</em></p>
+<p><strong>C++ allocates device memory for Python.</strong> <code>cuda_utils.alloc_tensor</code> calls the CUDA driver directly and wraps the pointer in a tensor with a deleter:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L77-L89" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/cuda_utils.cpp:77-89</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L77-L89" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">77</span><span class="ln">78</span><span class="ln hl">79</span><span class="ln">80</span><span class="ln">81</span><span class="ln hl">82</span><span class="ln">83</span><span class="ln">84</span><span class="ln">85</span><span class="ln">86</span><span class="ln">87</span><span class="ln">88</span><span class="ln">89</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><pre><code class="language-cpp">std::optional&lt;torch::Tensor&gt; alloc_tensor(ssize_t size) {
+    void *ptr = NULL;
+    CUresult result = cuMemAlloc((CUdeviceptr *)&amp;ptr, round_up_page_size(size));
+    if (result == CUDA_SUCCESS) {
+        LOG_INFO(&quot;cuMemAlloc: allocated CUDA memory of size {} at {}&quot;, size, ptr);
+        return {make_from_blob(ptr, {size}, direct_cuda_free, at::TensorOptions().device(torch::kCUDA).dtype(torch::kByte))};
+    } else {
+        const char *es = NULL;
+        cuGetErrorString(result, &amp;es);
+        LOG_ERROR(&quot;cuMemAlloc: failed to allocate CUDA memory of size {}: {}&quot;, size, es);
+        return std::nullopt;
+    }
+}</code></pre></div></div></div><figcaption class="code-caption">The tensor owns the memory. When the last reference goes away, the deleter calls <code>cuMemFree</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L66-L75" target="_blank" rel="noopener" title="csrc/cuda_utils.cpp:66-75 at 9bd9cf2"><code>csrc/cuda_utils.cpp:66-75</code></a>).</figcaption></figure>
+<p>The KV cache uses this function for its large buffers: the KV blocks and the state slots (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L911-L916" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:911-916 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:911-916</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L937" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:937 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:937</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L956" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:956 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:956</code></a>). So these buffers do not come from the PyTorch caching allocator. On Ascend, <code>asc_utils.cpp</code> does the same with <code>aclrtMalloc</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/asc_utils.cpp#L88-L97" target="_blank" rel="noopener" title="csrc/asc_utils.cpp:88-97 at 9bd9cf2"><code>csrc/asc_utils.cpp:88-97</code></a>).</p>
+
+<h3 id="step-6-rebuild-the-stubs-after-a-c-change">Step 6: rebuild the stubs after a C++ change<a class="h-anchor" href="#step-6-rebuild-the-stubs-after-a-c-change" aria-label="Link to this section">#</a></h3>
+<p><code>make stubgen</code> runs <code>scripts/gen_stub.sh</code>. The script imports the built module with <code>pybind11_stubgen</code> and writes the <code>.pyi</code> files (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/Makefile#L27-L28" target="_blank" rel="noopener" title="Makefile:27-28 at 9bd9cf2"><code>Makefile:27-28</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/gen_stub.sh#L11-L13" target="_blank" rel="noopener" title="scripts/gen_stub.sh:11-13 at 9bd9cf2"><code>scripts/gen_stub.sh:11-13</code></a>). The build does not do this for you. The page <a href="../code/engine-pyi.html">deepinfer/_C/engine.pyi: the C++ engine API, as seen from Python</a> gives the steps.</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="the-gil-and-the-block-manager-locks" class="dd-title">The GIL and the block-manager locks</h3></summary><div class="dd-body"><p>Two kinds of lock meet at the boundary: the Python <a class="term" href="../reference/glossary.html#term-gil" data-term="GIL" data-def="Global Interpreter Lock: only one thread at a time runs Python code. C++ code can release it while it works, so other Python threads can run.">GIL</a> and the C++ mutex of each <code>BlockManager</code>. The base class <code>Lockable</code> has one strict rule:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/utils/lockable.hpp#L13-L36" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/utils/lockable.hpp:13-36</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/utils/lockable.hpp#L13-L36" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">13</span><span class="ln">14</span><span class="ln">15</span><span class="ln hl">16</span><span class="ln hl">17</span><span class="ln">18</span><span class="ln">19</span><span class="ln">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln hl">25</span><span class="ln hl">26</span><span class="ln hl">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span><span class="ln hl">35</span><span class="ln">36</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><pre><code class="language-cpp">class Lockable {
+protected:
+    void lock_() {
+        TORCH_CHECK(PyGILState_Check() == 0, &quot;调用本函数时禁止持有 GIL 以避免死锁!&quot;);
+        if (pthread_mutex_trylock(&amp;mutex_) == 0) { // 快速路径
+            return;
+        }
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_MONOTONIC, &amp;deadline) == -1) {
+            perror(&quot;clock_gettime&quot;);
+            abort();
+        }
+        deadline.tv_sec += 20;
+        int ret = pthread_mutex_clocklock(&amp;mutex_, CLOCK_MONOTONIC, &amp;deadline);
+        TORCH_CHECK(ret == 0, &quot;failed to lock mutex: &quot;, strerror(ret));
+    }
+    void unlock_() {
+        int ret = pthread_mutex_unlock(&amp;mutex_);
+        TORCH_CHECK(ret == 0, &quot;failed to unlock mutex: &quot;, strerror(ret));
+    }
+
+private:
+    pthread_mutex_t mutex_ = PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP;
+};</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">16</span> Holding the GIL when you call this function is forbidden, to avoid a deadlock!</li><li><span class="tr-line">17</span> Fast path.</li></ul></div></figure>
+<ol>
+  <li>Line 16: if the calling thread holds the GIL, <code>TORCH_CHECK</code> fails. Python sees a <code>RuntimeError</code>.</li>
+  <li>Line 17: the fast path tries the lock without a wait.</li>
+  <li>Lines 20-27: else it waits for at most 20 seconds (<code>CLOCK_MONOTONIC</code>). After that, <code>TORCH_CHECK</code> fails with "failed to lock mutex".</li>
+  <li>Line 35: the mutex is an error-check mutex. A second lock from the same thread gives an error, not a hang.</li>
+</ol>
+<p><strong>Why no GIL while you lock.</strong> The code comment gives only "to avoid a deadlock". The general case is this: thread A holds the GIL and waits for the mutex. Thread B holds the mutex and waits for the GIL. Neither can continue. When every caller first releases the GIL, this cannot happen.</p>
+<p><strong>Lock order.</strong> <code>BlockManagerMutexAcquire</code> locks the state manager first, then the block manager. It unlocks in the opposite order (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/block_manager.hpp#L189-L204" target="_blank" rel="noopener" title="csrc/engine/block_manager.hpp:189-204 at 9bd9cf2"><code>csrc/engine/block_manager.hpp:189-204</code></a>). A fixed order prevents a second kind of deadlock between two threads that both want both locks.</p>
+<p><strong>How the code releases the GIL.</strong> There are three patterns:</p>
+<ul>
+  <li>Inside the C++ function: <code>py::gil_scoped_release</code> as the first line, as in <code>_schedule</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L276" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:276 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:276</code></a>) and <code>prepare_sampler_inputs</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/prepare_sample.cpp#L42" target="_blank" rel="noopener" title="csrc/engine/prepare_sample.cpp:42 at 9bd9cf2"><code>csrc/engine/prepare_sample.cpp:42</code></a>).</li>
+  <li>In the binding: <code>py::call_guard&lt;py::gil_scoped_release&gt;()</code>, for example for <code>BlockManager.lock</code> and <code>free_seq</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L67-L71" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:67-71 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:67-71</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L100-L102" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:100-102 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:100-102</code></a>).</li>
+  <li>Release, work, then get the GIL again to build a Python result. <code>build_request_outputs</code> reads its NumPy input pointers first, releases the GIL (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/outputs.hpp#L102-L104" target="_blank" rel="noopener" title="csrc/engine/outputs.hpp:102-104 at 9bd9cf2"><code>csrc/engine/outputs.hpp:102-104</code></a>), and gets it back before it makes the result array (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/outputs.hpp#L306-L307" target="_blank" rel="noopener" title="csrc/engine/outputs.hpp:306-307 at 9bd9cf2"><code>csrc/engine/outputs.hpp:306-307</code></a>).</li>
+</ul>
+<p>One call must keep the GIL: <code>update_metadata_for_sampling_zos</code> assigns a Python object (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L51-L53" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:51-53 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:51-53</code></a>). The page <a href="../code/engine-pyi.html">deepinfer/_C/engine.pyi: the C++ engine API, as seen from Python</a> lists every call that releases the GIL.</p>
+<p><strong>Which other Python threads run.</strong> The released GIL helps these threads in the engine process:</p>
+<ul>
+  <li>the structured-output compile pool (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/structure_output/so_matcher_builder.py#L45" target="_blank" rel="noopener" title="deepinfer/structure_output/so_matcher_builder.py:45 at 9bd9cf2"><code>deepinfer/structure_output/so_matcher_builder.py:45</code></a>);</li>
+  <li>the statistics log thread (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/stats_logger.py#L186" target="_blank" rel="noopener" title="deepinfer/engine/stats_logger.py:186 at 9bd9cf2"><code>deepinfer/engine/stats_logger.py:186</code></a>);</li>
+  <li>the image-processing pool of the VL model (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/deepseek_vl.py#L84" target="_blank" rel="noopener" title="deepinfer/model_executor/models/deepseek_vl.py:84 at 9bd9cf2"><code>deepinfer/model_executor/models/deepseek_vl.py:84</code></a>);</li>
+  <li>the optional profiling HTTP server (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/profile_server.py#L157" target="_blank" rel="noopener" title="deepinfer/engine/profile_server.py:157 at 9bd9cf2"><code>deepinfer/engine/profile_server.py:157</code></a>).</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="memory-across-the-boundary-owners-and-lifetimes" class="dd-title">Memory across the boundary: owners and lifetimes</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>What</th><th>Direction</th><th>Owner</th><th>Valid until</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>clone_states</code>, <code>clone_blocks</code> (int32 <code>[n, 2]</code>), <code>zero_states</code> (int32 <code>[n]</code>)</td><td>C++ → Python, borrowed</td><td>scheduler vectors</td><td>next <code>schedule()</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L31-L62" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:31-62 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:31-62</code></a></td></tr>
+    <tr><td>result of <code>process_outputs</code> (float64 <code>[n]</code>, int32 <code>[n]</code>)</td><td>C++ → Python, borrowed</td><td>static buffers</td><td>next <code>process_outputs</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L109-L112" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:109-112 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:109-112</code></a></td></tr>
+    <tr><td><code>SequenceMetadata</code> objects</td><td>C++ → Python</td><td><code>SequenceMetadataPool</code></td><td><code>pool.release</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L97-L99" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:97-99 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:97-99</code></a></td></tr>
+    <tr><td>prompt token ids</td><td>Python → C++, copied</td><td>the C++ <code>Sequence</code></td><td>life of the sequence</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_sequence.cpp#L93-L105" target="_blank" rel="noopener" title="csrc/engine/pybind_sequence.cpp:93-105 at 9bd9cf2"><code>csrc/engine/pybind_sequence.cpp:93-105</code></a></td></tr>
+    <tr><td>vector fields, for example <code>chunk_checkpoints</code></td><td>C++ → Python, copied</td><td>a new Python list on each read</td><td>always (it is a copy)</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/sampling_inputs.py#L7-L9" target="_blank" rel="noopener" title="deepinfer/model_executor/sampling_inputs.py:7-9 at 9bd9cf2"><code>deepinfer/model_executor/sampling_inputs.py:7-9</code></a></td></tr>
+    <tr><td>device buffer from <code>alloc_tensor</code> (uint8 <code>[size]</code>)</td><td>C++ → Python, owned</td><td>the tensor; its deleter frees</td><td>last reference</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L77-L89" target="_blank" rel="noopener" title="csrc/cuda_utils.cpp:77-89 at 9bd9cf2"><code>csrc/cuda_utils.cpp:77-89</code></a></td></tr>
+    <tr><td><a class="term" href="../reference/glossary.html#term-ipc-handle" data-term="IPC handle" data-def="A small block of bytes that lets another process open the same device memory. DeepInfer exports one with cuda_utils.export_ipc_tensor and opens it with import_ipc_tensor.">IPC handle</a> bytes</td><td>process → process</td><td>the exporting process</td><td>while the export lives</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L34-L64" target="_blank" rel="noopener" title="csrc/cuda_utils.cpp:34-64 at 9bd9cf2"><code>csrc/cuda_utils.cpp:34-64</code></a></td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example: one borrowed array.</strong> A forked sequence moves into the running queue. It has 130 tokens and the block size is 64 (an example value), so it uses 3 KV blocks. The scheduler gives it one new block for its last, part-full block and pushes the pair (old last block, new block) (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L606-L611" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:606-611 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:606-611</code></a>). Each extra block after the last used block adds a pair (block, 0), which gives the block back with no copy (lines 612-615). Here there is no extra block, so <code>clone_blocks</code> holds 2 ints. The property returns a NumPy array of shape <code>(1, 2)</code>. Its strides are <code>(8, 4)</code> bytes, that is <code>2 × sizeof(int)</code> and <code>sizeof(int)</code>. Its data pointer is <code>clone_blocks.data()</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L46-L47" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:46-47 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:46-47</code></a>). The empty capsule <code>py::capsule([]() {})</code> tells NumPy that it does not own the memory. When the next <code>schedule()</code> calls <code>clone_blocks.clear()</code>, the array points at stale or reused memory. With no fork, the property returns a new empty array of shape <code>(0, 2)</code> (line 45). The engine does not keep the three arrays. It uses them at once, in the same step. It gives them to the worker, which clones and zeroes the blocks and states on the device (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/engine/llm_engine.py#L889-L903" target="_blank" rel="noopener" title="deepinfer/engine/llm_engine.py:889-903 at 9bd9cf2"><code>deepinfer/engine/llm_engine.py:889-903</code></a>).</p>
+<p><strong>The device buffer.</strong> <code>alloc_tensor</code> rounds the size up to a multiple of 4096 bytes for <code>cuMemAlloc</code>, but the tensor shape keeps the requested size (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L24-L27" target="_blank" rel="noopener" title="csrc/cuda_utils.cpp:24-27 at 9bd9cf2"><code>csrc/cuda_utils.cpp:24-27</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L79-L82" target="_blank" rel="noopener" title="csrc/cuda_utils.cpp:79-82 at 9bd9cf2"><code>csrc/cuda_utils.cpp:79-82</code></a>). If the allocation fails, the function logs an error and returns <code>None</code>. The cache engine asserts the type and stops with a message (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cache_engine.py#L914-L915" target="_blank" rel="noopener" title="deepinfer/worker/cache_engine.py:914-915 at 9bd9cf2"><code>deepinfer/worker/cache_engine.py:914-915</code></a>).</p>
+<p><strong>IPC handles.</strong> <code>export_ipc_tensor(ptr, nbytes)</code> returns a byte string that holds a <code>cudaIpcMemHandle_t</code> and the size. <code>import_ipc_tensor</code> opens it in another process (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L43-L47" target="_blank" rel="noopener" title="csrc/cuda_utils.cpp:43-47 at 9bd9cf2"><code>csrc/cuda_utils.cpp:43-47</code></a>). The deleter of the tensor closes the handle when the tensor dies (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.cpp#L15-L22" target="_blank" rel="noopener" title="csrc/cuda_utils.cpp:15-22 at 9bd9cf2"><code>csrc/cuda_utils.cpp:15-22</code></a>). In the package, only <code>utils.CudaIPCWrapper</code> uses these calls (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/utils.py#L52-L69" target="_blank" rel="noopener" title="deepinfer/utils.py:52-69 at 9bd9cf2"><code>deepinfer/utils.py:52-69</code></a>), and only a test uses that class (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/tests/distributed/test_expert_shuffle.py#L89" target="_blank" rel="noopener" title="tests/distributed/test_expert_shuffle.py:89 at 9bd9cf2"><code>tests/distributed/test_expert_shuffle.py:89</code></a>). On Ascend, the export needs a 2 MB-aligned address:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/asc_utils.cpp#L56-L64" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/asc_utils.cpp:56-64</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/asc_utils.cpp#L56-L64" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">56</span><span class="ln">57</span><span class="ln">58</span><span class="ln">59</span><span class="ln hl">60</span><span class="ln">61</span><span class="ln">62</span><span class="ln">63</span><span class="ln hl">64</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-cpp">py::bytes export_ipc_tensor(size_t ptr, ssize_t nbytes) {
+    // ACL 要求被导出的地址 2MB 对齐，否则 aclrtIpcMemGetExportKey 返回
+    // ACL_ERROR_RT_DRV_INTERNAL_ERROR(507899)，且不区分大小写仅看地址。
+    // 生产环境 KV cache 均为大块分配，天然对齐；这里显式校验以便快速定位。
+    TORCH_CHECK(ptr % (2 * 1024 * 1024) == 0, &quot;NPU IPC export requires a 2MB-aligned address, got &quot;, (void *)ptr);
+    ipc_mem_handle_info info = {};
+    info.nbytes = nbytes;
+    // 默认 export 带 PID 白名单校验，跨进程 import 直接失败（507899）。
+    aclError ret = aclrtIpcMemGetExportKey((void *)ptr, nbytes, info.key, kIpcKeyLen, ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION);</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">57-59</span> ACL needs the exported address to be 2 MB aligned. Else aclrtIpcMemGetExportKey returns ACL_ERROR_RT_DRV_INTERNAL_ERROR (507899); it checks only the address, not the size. In production the KV cache is one large allocation and is aligned. This explicit check makes the cause easy to find.</li><li><span class="tr-line">63</span> By default the export has a PID allow-list check, and a cross-process import fails at once (507899).</li></ul></div></figure></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="what-c-reads-from-python-and-when" class="dd-title">What C++ reads from Python, and when</h3></summary><div class="dd-body"><p><strong>Config objects.</strong> The <code>Scheduler</code> constructor takes <code>scheduler_config</code> as a plain <code>py::object</code>. It reads nine attributes by name, once, and keeps C++ copies (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L94-L108" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:94-108 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:94-108</code></a>). A later change to the Python object has no effect on the scheduler. A missing attribute raises an error at construction.</p>
+<p><strong>Process groups.</strong> The scheduler gets the data-parallel group as a <code>c10d::ProcessGroup</code> and runs its all-reduce votes from C++ (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L169-L182" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:169-182 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:169-182</code></a>). A Gloo group keeps the vote tensor on the CPU; any other backend puts it on the device (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp#L109" target="_blank" rel="noopener" title="csrc/engine/scheduler.hpp:109 at 9bd9cf2"><code>csrc/engine/scheduler.hpp:109</code></a>).</p>
+<p><strong>Environment variables.</strong> C++ reads two variables itself with <code>getenv</code>:</p>
+<table>
+  <thead><tr><th>Variable</th><th>Default in C++</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5</td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/utils.hpp#L36-L40" target="_blank" rel="noopener" title="csrc/engine/utils.hpp:36-40 at 9bd9cf2"><code>csrc/engine/utils.hpp:36-40</code></a></td><td>Number of draft tokens. The comment asks to keep the default equal to <code>environ.py</code>.</td></tr>
+    <tr><td><code>DEEPINFER_CPP_LOG_LEVEL</code></td><td><code>info</code></td><td><a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/utils/log.hpp#L19-L31" target="_blank" rel="noopener" title="csrc/utils/log.hpp:19-31 at 9bd9cf2"><code>csrc/utils/log.hpp:19-31</code></a></td><td>C++ log level: <code>off</code>, <code>error</code>, <code>warn</code> or <code>info</code>. Read once (a <code>static</code>). An unknown value gives <code>info</code>.</td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="build-and-import-step-by-step" class="dd-title">Build and import, step by step</h3></summary><div class="dd-body"><ol>
+  <li><code>DEEPINFER_ACCELERATOR=nvidia ./build.sh</code> first checks that the variable is <code>nvidia</code> or <code>ascend</code>. Then it installs <code>requirements-&lt;accelerator&gt;.txt</code> and, on NVIDIA, NCCL 2.32.3. Last, it builds the vendor libraries and runs <code>scripts/build.sh build</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/build.sh#L5-L25" target="_blank" rel="noopener" title="build.sh:5-25 at 9bd9cf2"><code>build.sh:5-25</code></a>).</li>
+  <li><code>scripts/build.sh</code> computes <code>PY_BUILDTAG</code> (for example <code>linux-x86_64-cpython-312</code>; an example, not from the repo) and the platform tag. The tag uses <code>nvidia</code> when the variable is not set (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L11-L14" target="_blank" rel="noopener" title="scripts/build.sh:11-14 at 9bd9cf2"><code>scripts/build.sh:11-14</code></a>).</li>
+  <li>It sets <code>MAX_JOBS</code> to 16 unless you set it (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L6-L9" target="_blank" rel="noopener" title="scripts/build.sh:6-9 at 9bd9cf2"><code>scripts/build.sh:6-9</code></a>), and runs <code>python setup.py build --build-base build/&lt;tag&gt;</code>.</li>
+  <li><code>setup.py</code> picks the extension type from <code>accelerator_kind()</code>, that is, from the device files of the build machine (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/setup.py#L10-L12" target="_blank" rel="noopener" title="setup.py:10-12 at 9bd9cf2"><code>setup.py:10-12</code></a>). It needs the C++11 ABI of PyTorch (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/setup.py#L18-L19" target="_blank" rel="noopener" title="setup.py:18-19 at 9bd9cf2"><code>setup.py:18-19</code></a>). The CUDA branch needs a conda env or a virtualenv (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/setup.py#L55-L57" target="_blank" rel="noopener" title="setup.py:55-57 at 9bd9cf2"><code>setup.py:55-57</code></a>).</li>
+  <li>The script links every <code>.so</code> into <code>deepinfer/_so/&lt;tag&gt;/</code> with a relative symlink. If no file was linked, it exits with an error. Then it byte-compiles the package (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L23-L29" target="_blank" rel="noopener" title="scripts/build.sh:23-29 at 9bd9cf2"><code>scripts/build.sh:23-29</code></a>).</li>
+  <li>At run time, <code>import deepinfer</code> computes the tag from <code>DEEPINFER_ACCELERATOR</code> (default <code>"nvidia"</code>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/environ.py#L101" target="_blank" rel="noopener" title="deepinfer/environ.py:101 at 9bd9cf2"><code>deepinfer/environ.py:101</code></a>) and appends the folder to <code>__path__</code> if it exists (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/__init__.py#L9-L32" target="_blank" rel="noopener" title="deepinfer/__init__.py:9-32 at 9bd9cf2"><code>deepinfer/__init__.py:9-32</code></a>).</li>
+  <li>Import <code>torch</code> before <code>deepinfer._C</code>. The extension links against the PyTorch libraries, and the package files do this in order (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/sampling_inputs.py#L16" target="_blank" rel="noopener" title="deepinfer/model_executor/sampling_inputs.py:16 at 9bd9cf2"><code>deepinfer/model_executor/sampling_inputs.py:16</code></a>).</li>
+</ol>
+<aside class="callout callout-warning"><p class="callout-title">Two different signals choose the platform</p><div class="callout-body"><p><code>setup.py</code> uses the device files of the machine. The folder tag uses the environment variable. On an Ascend host, a build with the variable not set compiles the NPU extension into <code>_so/nvidia-aarch64/</code>. An import with the variable not set also looks there, so it works. But an import with <code>DEEPINFER_ACCELERATOR=ascend</code> looks in <code>_so/ascend-aarch64/</code> and does not find it. (We derived this from the code; we did not run it.) Use <code>make build-ascend</code>, which sets the variable (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/Makefile#L8-L11" target="_blank" rel="noopener" title="Makefile:8-11 at 9bd9cf2"><code>Makefile:8-11</code></a>).</p></div></aside>
+<p><strong>Clean.</strong> <code>scripts/build.sh clean</code> removes <code>build/&lt;tag&gt;</code>, <code>deepinfer/_so/&lt;tag&gt;</code>, old <code>deepinfer/*.so</code> files and all <code>__pycache__</code> folders (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L32-L38" target="_blank" rel="noopener" title="scripts/build.sh:32-38 at 9bd9cf2"><code>scripts/build.sh:32-38</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="the-two-small-submodules" class="dd-title">The two small submodules</h3></summary><div class="dd-body"><p><strong><code>_C.cuda_utils</code></strong> has three functions (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/_C/cuda_utils.pyi#L1-L18" target="_blank" rel="noopener" title="deepinfer/_C/cuda_utils.pyi:1-18 at 9bd9cf2"><code>deepinfer/_C/cuda_utils.pyi:1-18</code></a>). The header declares two more that only C++ uses: <code>cuda_copy_async</code> and <code>get_current_stream</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.hpp#L18-L25" target="_blank" rel="noopener" title="csrc/cuda_utils.hpp:18-25 at 9bd9cf2"><code>csrc/cuda_utils.hpp:18-25</code></a>). The helper <code>make_from_blob</code> wraps a device pointer in a tensor. On Ascend it must use the torch_npu version:</p>
+<figure class="code-excerpt" data-lang="cpp"><div class="code-head"><a class="code-path" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.hpp#L35-L45" target="_blank" rel="noopener" title="Open on GitHub at commit 9bd9cf2">csrc/cuda_utils.hpp:35-45</a><span class="code-actions"><a class="code-gh" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/cuda_utils.hpp#L35-L45" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">35</span><span class="ln">36</span><span class="ln">37</span><span class="ln">38</span><span class="ln">39</span><span class="ln hl">40</span><span class="ln hl">41</span><span class="ln hl">42</span><span class="ln hl">43</span><span class="ln hl">44</span><span class="ln">45</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-cpp">// 包设备裸指针为 tensor 的唯一入口。NPU 上 torch::from_blob 会破坏 dtype 元数据
+// （at::from_blob 的 dtype 推断在 PrivateUse1 上失效），必须走 at_npu::native::from_blob；
+// GPU 走 torch::from_blob。仅用于设备内存视图；CPU tensor 仍直接 torch::from_blob。
+template &lt;typename Deleter&gt;
+inline torch::Tensor make_from_blob(void *ptr, at::IntArrayRef sizes, Deleter deleter, const at::TensorOptions &amp;options) {
+#ifdef WITH_NPU
+    return at_npu::native::from_blob(ptr, sizes, std::move(deleter), options);
+#else
+    return torch::from_blob(ptr, sizes, std::move(deleter), options);
+#endif
+}</code></pre></div></div></div><div class="code-tr"><p class="code-tr-title">Translated comments (Chinese → English)</p><ul><li><span class="tr-line">35-37</span> The only way to wrap a raw device pointer as a tensor. On NPU, torch::from_blob breaks the dtype metadata (the dtype inference of at::from_blob fails on PrivateUse1), so it must use at_npu::native::from_blob; GPU uses torch::from_blob. Only for device memory views; CPU tensors still use torch::from_blob directly.</li></ul></div></figure>
+<p><strong><code>_C.graph_timer</code></strong> has <code>EventHandle</code>, <code>EventRecordNodeHandle</code> and <code>GraphHandle</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/graph_timer/pybind.cpp#L5-L29" target="_blank" rel="noopener" title="csrc/graph_timer/pybind.cpp:5-29 at 9bd9cf2"><code>csrc/graph_timer/pybind.cpp:5-29</code></a>). <code>EventHandle.synchronize</code> releases the GIL while it waits (line 10). <code>deepinfer/timer.py</code> and <code>worker/cuda_graph_runner.py</code> use it (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/timer.py#L118" target="_blank" rel="noopener" title="deepinfer/timer.py:118 at 9bd9cf2"><code>deepinfer/timer.py:118</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/worker/cuda_graph_runner.py#L11" target="_blank" rel="noopener" title="deepinfer/worker/cuda_graph_runner.py:11 at 9bd9cf2"><code>deepinfer/worker/cuda_graph_runner.py:11</code></a>). See <a class="term" href="../reference/glossary.html#term-graph-timer" data-term="graph timer" data-def="CUDAGraphTimer: it measures regions inside a replayed CUDA graph with two sets of events, and it swaps the sets before each replay.">graph timer</a>.</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<aside class="callout callout-warning"><p class="callout-title">Do not keep borrowed arrays</p><div class="callout-body"><p>Copy <code>clone_states</code>, <code>clone_blocks</code>, <code>zero_states</code> and the result of <code>process_outputs</code> before the next call (for example with <code>np.array(x)</code>). A saved view shows the data of a later step, or freed memory. Nothing raises an error.</p></div></aside>
+<ul>
+  <li><strong>Import order.</strong> If <code>deepinfer._C</code> loads before <code>torch</code>, the import fails. A script comment says, translated: <em>"Load libtorch first, or deepinfer._C reports libc10.so not found"</em> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/yoco/yoco_equiv.py#L200" target="_blank" rel="noopener" title="examples/yoco/yoco_equiv.py:200 at 9bd9cf2"><code>examples/yoco/yoco_equiv.py:200</code></a>).</li>
+  <li><strong>Wrong <code>.so</code> folder.</strong> If the tag at run time differs from the tag at build time, the import finds no module or an old one. See the deep dive "Build and import".</li>
+  <li><strong>Lock with the GIL held.</strong> New C++ code that locks a block manager without releasing the GIL fails the check in <code>Lockable::lock_</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/utils/lockable.hpp#L16" target="_blank" rel="noopener" title="csrc/utils/lockable.hpp:16 at 9bd9cf2"><code>csrc/utils/lockable.hpp:16</code></a>).</li>
+  <li><strong>Lock time-out.</strong> If another thread holds a block manager for more than 20 seconds, the call fails with "failed to lock mutex" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/utils/lockable.hpp#L25-L27" target="_blank" rel="noopener" title="csrc/utils/lockable.hpp:25-27 at 9bd9cf2"><code>csrc/utils/lockable.hpp:25-27</code></a>).</li>
+  <li><strong>Wrong argument type.</strong> <code>Sequence(...)</code> with a Python list for <code>prompt_token_ids</code> raises <code>TypeError</code>, because of <code>noconvert()</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_sequence.cpp#L103" target="_blank" rel="noopener" title="csrc/engine/pybind_sequence.cpp:103 at 9bd9cf2"><code>csrc/engine/pybind_sequence.cpp:103</code></a>).</li>
+  <li><strong>Old stub.</strong> After a binding change, the <code>.pyi</code> files are wrong until you run <code>make stubgen</code>.</li>
+  <li><strong>Default drift.</strong> C++ has its own default for <code>DEEPINFER_USE_NEXTN_DECODE</code> (5). A change in <code>environ.py</code> alone makes the two sides disagree (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/utils.hpp#L38-L39" target="_blank" rel="noopener" title="csrc/engine/utils.hpp:38-39 at 9bd9cf2"><code>csrc/engine/utils.hpp:38-39</code></a>).</li>
+</ul>
+<p><strong>Why it matters.</strong> The scheduler, the block managers and the input preparation run in C++. So many engine bugs show up at this boundary. Examples are data that a later step changed, a lock that waits, and a module from the wrong build. When you know who owns each buffer and which call releases the GIL, you can find these bugs fast.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>How many submodules does <code>deepinfer._C</code> have, and what are their names?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Three: <code>cuda_utils</code>, <code>engine</code> and <code>graph_timer</code>. <code>csrc/pybind.cpp</code> makes them with <code>def_submodule</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/pybind.cpp#L9-L16" target="_blank" rel="noopener" title="csrc/pybind.cpp:9-16 at 9bd9cf2"><code>csrc/pybind.cpp:9-16</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Does the repository say why the scheduler is in C++?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>No. The deployment doc only says that schedule and post-process are pure CPU work and that the device is idle during them without asynchronous scheduling (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md#L270" target="_blank" rel="noopener" title="doc/inference_deployment_qa.md:270 at 9bd9cf2"><code>doc/inference_deployment_qa.md:270</code></a>). The code gives no reason.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>On an NVIDIA x86 machine, you run <code>make build-nvidia</code>. Where does the <code>.so</code> go, and how does <code>import deepinfer._C</code> find it?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The build writes to <code>build/nvidia-x86_64</code> and links each <code>.so</code> into <code>deepinfer/_so/nvidia-x86_64/</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L12-L14" target="_blank" rel="noopener" title="scripts/build.sh:12-14 at 9bd9cf2"><code>scripts/build.sh:12-14</code></a>, <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/scripts/build.sh#L23-L26" target="_blank" rel="noopener" title="scripts/build.sh:23-26 at 9bd9cf2"><code>scripts/build.sh:23-26</code></a>). <code>deepinfer/__init__.py</code> computes the same tag and appends that folder to the package <code>__path__</code> (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/__init__.py#L30-L32" target="_blank" rel="noopener" title="deepinfer/__init__.py:30-32 at 9bd9cf2"><code>deepinfer/__init__.py:30-32</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A new Python thread calls <code>scheduler.try_allocate_seq(seq)</code> while the main thread is inside <code>schedule()</code>. What happens?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The binding releases the GIL and then waits for the block-manager locks (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/pybind_scheduler.cpp#L87-L90" target="_blank" rel="noopener" title="csrc/engine/pybind_scheduler.cpp:87-90 at 9bd9cf2"><code>csrc/engine/pybind_scheduler.cpp:87-90</code></a>). The main thread holds them during <code>_schedule()</code>, so the new thread waits. If it waits more than 20 seconds, the lock fails with "failed to lock mutex" (<a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/utils/lockable.hpp#L25-L27" target="_blank" rel="noopener" title="csrc/utils/lockable.hpp:25-27 at 9bd9cf2"><code>csrc/utils/lockable.hpp:25-27</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>Why does <code>Lockable::lock_</code> refuse to run when the thread holds the GIL, and why does <code>BlockManagerMutexAcquire</code> always lock the state manager first?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Both rules prevent deadlocks. A thread can hold the GIL and wait for a mutex. If the mutex holder needs the GIL to finish, both threads stop. So the check at <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/utils/lockable.hpp#L16" target="_blank" rel="noopener" title="csrc/utils/lockable.hpp:16 at 9bd9cf2"><code>csrc/utils/lockable.hpp:16</code></a> makes every caller release the GIL first. A fixed lock order (state manager, then block manager; <a class="cite" href="https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/block_manager.hpp#L190-L196" target="_blank" rel="noopener" title="csrc/engine/block_manager.hpp:190-196 at 9bd9cf2"><code>csrc/engine/block_manager.hpp:190-196</code></a>) prevents two threads from each holding one lock and waiting for the other. This is the deep dive "The GIL and the block-manager locks".</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../code/engine-pyi.html">deepinfer/_C/engine.pyi: the C++ engine API, as seen from Python</a><span class="rel-sum">engine.pyi is the generated type stub of deepinfer._C.engine. This page maps its 34 names in five groups to the Python files that use them and to the C++ files that bind and implement them, with the rules for borrowed memory and the GIL.</span></li><li><a href="../reference/cpp-engine-api.html">C++ engine API (deepinfer._C)</a><span class="rel-sum">A lookup table of all 40 names that the compiled extension deepinfer._C gives to Python, in its three submodules engine, cuda_utils and graph_timer, with a one-line purpose, the stub line and the page that explains each name.</span></li><li><a href="../code/scheduler-hpp.html">csrc/engine/scheduler.hpp: the C++ Scheduler</a><span class="rel-sum">scheduler.hpp holds the C++ Scheduler: the waiting and running queues, the choice between prefill and decode, block allocation, preemption, and the bookkeeping after each step. It also defines SchedulerOutputs and three free functions.</span></li><li><a href="../code/block-manager-hpp.html">csrc/engine/block_manager.hpp: BlockManager and the free list</a><span class="rel-sum">block_manager.hpp holds the C++ free list of KV blocks with reference counts, the BlockManager class with its mutex, and the helper that allocates blocks and a state slot for one sequence.</span></li><li><a href="../code/llm-engine.html">engine/llm_engine.py: the LLMEngine class</a><span class="rel-sum">LLMEngine starts the workers, sizes the KV cache, owns the C++ scheduler, and runs one engine step each time LLM calls step().</span></li><li><a href="../concepts/zero-overhead-scheduling.html">Zero-overhead scheduling (ZOS)</a><span class="rel-sum">With ZOS, the CPU schedules and prepares step N+1 while the device runs step N. The device corrects the lengths and inputs that the CPU cannot know yet, and step() returns the tokens one step late.</span></li><li><a href="../concepts/hardware-platforms.html">Hardware platforms: NVIDIA and Ascend</a><span class="rel-sum">DeepInfer runs on NVIDIA GPUs and on Huawei Ascend NPUs. At start-up it makes one Platform object, and the shared code reads all hardware choices from it.</span></li><li><a href="../code/platform.html">deepinfer/platform.py: the Platform classes and get_platform()</a><span class="rel-sum">platform.py defines the Platform base class, PlatformGPU and PlatformNPU, and get_platform(), which makes one of them per process from the device files. The package exposes it as deepinfer.PLATFORM, made on first use.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/hardware-platforms.html"><span class="pn-dir">← Previous</span><span class="pn-title">Hardware platforms: NVIDIA and Ascend</span></a><a class="pn pn-next" href="../concepts/low-precision-formats.html"><span class="pn-dir">Next →</span><span class="pn-title">Low-precision formats in DeepInfer</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9" target="_blank" rel="noopener"><code class="foot-sha">9bd9cf243fc53ef9afbf8f04d391d989117d6ab9</code></a> · 2026-10-21 12:55:43 +0800 · “Bump DeepEP to f6aa38fe and drop the SSH-&gt;HTTPS rewrite (#157)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/deepseek-ai/DeepInfer" target="_blank" rel="noopener">deepseek-ai/DeepInfer</a> · Built 2026-10-22 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-compile-csrc-into-one-extension-module">Step 1: compile csrc/ into one extension module</a></li><li class="toc-l3"><a href="#step-2-one-build-folder-per-platform">Step 2: one build folder per platform</a></li><li class="toc-l3"><a href="#step-3-three-submodules">Step 3: three submodules</a></li><li class="toc-l3"><a href="#step-4-one-call-crosses-the-boundary">Step 4: one call crosses the boundary</a></li><li class="toc-l3"><a href="#step-5-memory-that-crosses-the-boundary">Step 5: memory that crosses the boundary</a></li><li class="toc-l3"><a href="#step-6-rebuild-the-stubs-after-a-c-change">Step 6: rebuild the stubs after a C++ change</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#the-gil-and-the-block-manager-locks">The GIL and the block-manager locks</a></li><li class="toc-l3"><a href="#memory-across-the-boundary-owners-and-lifetimes">Memory across the boundary: owners and lifetimes</a></li><li class="toc-l3"><a href="#what-c-reads-from-python-and-when">What C++ reads from Python, and when</a></li><li class="toc-l3"><a href="#build-and-import-step-by-step">Build and import, step by step</a></li><li class="toc-l3"><a href="#the-two-small-submodules">The two small submodules</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+</body>
+</html>
