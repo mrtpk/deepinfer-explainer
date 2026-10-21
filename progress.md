@@ -18,7 +18,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B1 Basics I | done | done (23 defects fixed) | yes |
 | B2 Basics II | done | done (16 defects fixed) | yes |
 | B3a Engine + scheduler | done | done (26 defects fixed) | yes |
-| B3b API + cache | done | running | — |
+| B3b API + cache | done | done (16 defects fixed) | yes |
 | B4a Inputs + graphs | running | — | — |
 | B4b Worker + ZOS | running | — | — |
 | B5a Attention I | done | done (43 defects fixed) | yes |
@@ -28,7 +28,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B7 MoE + EP | done | done (40 defects fixed) | yes |
 | B8 Scale | running | — | — |
 | B9 Decoding | done | done (25 defects fixed) | yes |
-| B10a SO + precision | wave 3 | — | — |
+| B10a SO + precision | running | — | — |
 | B10b Kernels + loading | wave 3 | — | — |
 | B11 Start-up + reference | wave 3 | — | — |
 | D Diagrams to 1100 | done | n/a | yes |

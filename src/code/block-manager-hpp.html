@@ -1,0 +1,231 @@
+---
+title: csrc/engine/block_manager.hpp: BlockManager and the free list
+nav_title: block_manager.hpp
+level: Intermediate
+prerequisites: learn/kv-cache, concepts/paged-kv-cache
+related: concepts/paged-kv-cache, code/scheduler-hpp, code/sequence-hpp, code/engine-pyi, code/llm-engine, learn/kv-cache
+summary: block_manager.hpp holds the C++ free list of KV blocks with reference counts, the BlockManager class with its mutex, and the helper that allocates blocks and a state slot for one sequence.
+---
+<h2>Purpose</h2>
+<p><code>block_manager.hpp</code> counts and hands out numbered entries of a pool: KV blocks, or state slots. It does not decide <em>who</em> gets them; the scheduler does.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>csrc/engine/block_manager.hpp</code>, 243 lines of C++, header only. No license header and no vLLM note.</td></tr>
+    <tr><th>Main classes</th><td><code>Blocks</code>: the {{term free-list}} with reference counts ({{cite csrc/engine/block_manager.hpp:27}}). <code>BlockManager</code>: a <code>Blocks</code> plus a mutex ({{cite csrc/engine/block_manager.hpp:119}}). <code>BlockManagerMutexAcquire</code>: locks two managers and allocates for one sequence ({{cite csrc/engine/block_manager.hpp:189}}). The enum <code>AllocStatus</code> ({{cite csrc/engine/block_manager.hpp:14-18}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process of each data-parallel rank, on the main thread. CPU only: it never touches device memory.</td></tr>
+    <tr><th>Called by</th><td>The C++ <code>Scheduler</code> in <code>scheduler.hpp</code>; Python through the bindings in <code>pybind_scheduler.cpp</code>.</td></tr>
+    <tr><th>Calls</th><td>Only the C++ standard library, <code>TORCH_CHECK</code>, and the mutex of <code>deepinfer::Lockable</code> ({{cite csrc/utils/lockable.hpp:13-36}}).</td></tr>
+    <tr><th>Not in this file</th><td>The memory itself (that is <code>CacheEngine</code>), the block table (that is <code>Sequence.cache.block_table</code>), the preemption policy (that is the scheduler), and block copies for forks (that is <code>clone_and_zero_states_and_blocks</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b3b_free_list" alt="Panel 1: three states of a Blocks(6) vector. After the constructor, entries 1 to 5 are linked 1 to 5; head 1, tail 5. After two allocate calls, entries 1 and 2 are in use with ref count 1, and the list is 3, 4, 5. After free(1), entry 1 is at the tail: 3, 4, 5, 1. Panel 2: pin_block(2) raises the count of block 2 to 2; one free leaves it in use; a second free puts it at the tail." caption="Figure: the free list inside <code>Blocks</code>, with a toy size of 6. Green entries are in the list, amber entries are in use. Click to zoom." />
+<p>The figure shows the only data structure of the file. Each entry has three integers. The value 0 means "no block", so entry 0 is never given out. The page {{link concepts/paged-kv-cache}} shows how the scheduler uses these calls during a run.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The engine makes two managers:</strong> one for KV blocks and, if the model has per-sequence state, one for {{term state-slot | state slots}} ({{cite deepinfer/engine/llm_engine.py:265-266}}).</li>
+  <li><strong>The scheduler</strong> holds both managers as <code>shared_ptr</code> ({{cite csrc/engine/scheduler.hpp:1164-1165}}). It locks them for each <code>schedule()</code> ({{cite csrc/engine/scheduler.hpp:277}}), checks space ({{cite csrc/engine/scheduler.hpp:195-201}}), allocates ({{cite csrc/engine/scheduler.hpp:519}}, {{cite csrc/engine/scheduler.hpp:820}}), pins for forks ({{cite csrc/engine/scheduler.hpp:1110-1113}}) and frees ({{cite csrc/engine/scheduler.hpp:738-745}}).</li>
+  <li><strong><code>DeferredRelease</code></strong> in Python calls <code>unpin_blocks</code> after a fork copy ({{cite deepinfer/engine/llm_engine.py:113-116}}).</li>
+  <li><strong>Statistics</strong> read the free counts of both pools ({{cite deepinfer/engine/stats_logger.py:410-414}}).</li>
+  <li><strong><code>examples/benchmark.py</code></strong> calls <code>Scheduler.try_allocate_seq</code> to give blocks to its requests before the first step ({{cite examples/benchmark.py:314-315}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>lock_()</code> and <code>unlock_()</code> of <code>Lockable</code>: a POSIX error-check mutex with a 20-second wait limit ({{cite csrc/utils/lockable.hpp:15-35}}).</li>
+  <li><code>Sequence::get_num_blocks()</code> and the fields <code>seq.cache.block_table</code> and <code>seq.cache.state_id</code> ({{cite csrc/engine/sequence.hpp:200-207}}, {{cite csrc/engine/sequence.hpp:291-293}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>AllocStatus</code></td><td>{{cite csrc/engine/block_manager.hpp:14}}</td><td><code>OK</code>, <code>LATER</code> or <code>NEVER</code>: the answer of a space check.</td></tr>
+    <tr><td><code>get_timestamp_ms</code></td><td>{{cite csrc/engine/block_manager.hpp:20}}</td><td>Wall-clock time in ms. The scheduler uses it for arrival times; it is not about blocks.</td></tr>
+    <tr><td><code>Blocks::Blocks(n)</code></td><td>{{cite csrc/engine/block_manager.hpp:28}}</td><td>Links entries 1 … n−1 into the free list.</td></tr>
+    <tr><td><code>Blocks::_push_back</code>, <code>_erase</code>, <code>_pop_front</code></td><td>{{cite csrc/engine/block_manager.hpp:39-78}}</td><td>The list operations.</td></tr>
+    <tr><td><code>Blocks::allocate</code></td><td>{{cite csrc/engine/block_manager.hpp:82}}</td><td>Takes the head; <code>ref_count</code> becomes 1.</td></tr>
+    <tr><td><code>Blocks::pin_block</code></td><td>{{cite csrc/engine/block_manager.hpp:88}}</td><td>Adds one owner to a block in use.</td></tr>
+    <tr><td><code>Blocks::free</code></td><td>{{cite csrc/engine/block_manager.hpp:95}}</td><td>Removes one owner; at 0, appends to the tail.</td></tr>
+    <tr><td><code>BlockManager::can_allocate_nolock</code></td><td>{{cite csrc/engine/block_manager.hpp:128}}</td><td>The space check for <em>n</em> entries.</td></tr>
+    <tr><td><code>BlockManager::allocate_nolock</code></td><td>{{cite csrc/engine/block_manager.hpp:138}}</td><td>Returns <em>n</em> new entries as a vector (a new block table).</td></tr>
+    <tr><td><code>BlockManager::free_blocks[_nolock]</code></td><td>{{cite csrc/engine/block_manager.hpp:147-155}}</td><td>Frees a list of entries in reverse order.</td></tr>
+    <tr><td><code>BlockManager::pin_blocks[_nolock]</code>, <code>pin_block</code></td><td>{{cite csrc/engine/block_manager.hpp:157-173}}</td><td>Adds an owner to each entry.</td></tr>
+    <tr><td><code>can_allocate_single_nolock</code>, <code>allocate_single_nolock</code>, <code>get_num_free_blocks</code></td><td>{{cite csrc/engine/block_manager.hpp:175-179}}</td><td>One-entry shortcuts and the free count.</td></tr>
+    <tr><td><code>BlockManagerMutexAcquire</code></td><td>{{cite csrc/engine/block_manager.hpp:189-204}}</td><td>Locks the state manager, then the block manager, for its lifetime.</td></tr>
+    <tr><td><code>allocate_seq</code>, <code>try_allocate_seq</code></td><td>{{cite csrc/engine/block_manager.hpp:206-239}}</td><td>Give one sequence its block table and its state slot.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The constructor: a list in a vector</h3>
+<x-code file="csrc/engine/block_manager.hpp" lines="27-35" highlight="28,30-34">
+<x-tr line="27">NOTE: GPU block 0 is not used, so 0 here means "empty".</x-tr>
+<x-tr line="29">"Too few GPU blocks: ".</x-tr>
+</x-code>
+<ol>
+  <li>Line 28: the vector has <code>n</code> entries. The head is 1, the tail is <code>n − 1</code>, and the size is <code>n − 1</code>.</li>
+  <li>Line 29: <code>n</code> must be 2 or more. With <code>n = 1</code> the pool would be empty.</li>
+  <li>Lines 30-34: entry <em>i</em> points back to <em>i − 1</em> and forward to <em>i + 1</em>. The last entry points forward to 0, the "none" value. Entry 1 points back to 0.</li>
+</ol>
+<p>The list costs no extra memory per operation. Each entry is a struct of three <code>int</code> fields ({{cite csrc/engine/block_manager.hpp:105-111}}): 12 bytes. A pool of 9,778 blocks needs about 117 KB of host memory for its list.</p>
+
+<h3>The list operations</h3>
+<x-code file="csrc/engine/block_manager.hpp" lines="39-78" highlight="43,44-50,57,68-70,74" />
+<ol>
+  <li>Lines 39-52, <code>_push_back</code>: the entry must not be linked (line 42) and must have no owner (line 43). It becomes the new tail. If the list was empty, it also becomes the head (line 48).</li>
+  <li>Lines 54-71, <code>_erase</code>: unlink an entry from anywhere in the list, in constant time. Lines 68-69 set its links to 0, which line 42 later checks.</li>
+  <li>Lines 73-78, <code>_pop_front</code>: erase the head. It raises if the list is empty.</li>
+</ol>
+<x-warning title="No size check before a pop">
+<p><code>allocate()</code> does not check if the list has an entry. It relies on <code>_pop_front</code>, which raises <code>"list is empty, but pop_front is called"</code> (line 74). Always call <code>can_allocate_nolock</code> or <code>can_allocate_single_nolock</code> first, as the scheduler does.</p>
+</x-warning>
+
+<h3><code>allocate</code>, <code>pin_block</code> and <code>free</code></h3>
+<x-code file="csrc/engine/block_manager.hpp" lines="82-103" highlight="84,92,98,100-101">
+<x-tr line="83">_erase has already checked ref_count == 0.</x-tr>
+</x-code>
+<ol>
+  <li>Line 84: a new block has exactly one owner.</li>
+  <li>Line 92: <code>pin_block</code> adds an owner. Line 91 refuses to pin a free block, because a free block is still in the list.</li>
+  <li>Lines 98-102: <code>free</code> removes one owner. Only the last owner puts the block back. So "free" and "unpin" are the same operation; the Python binding <code>unpin_blocks</code> calls <code>free_blocks</code> ({{cite csrc/engine/pybind_scheduler.cpp:68}}).</li>
+</ol>
+<p>Only forks make a {{term ref-count}} larger than 1 (deep dive "Reference counts in the scheduler").</p>
+
+<h3><code>BlockManager</code>: the space check and the list calls</h3>
+<x-code file="csrc/engine/block_manager.hpp" lines="128-149" highlight="129-131,132-134,148" />
+<ol>
+  <li>Lines 129-131: <code>NEVER</code> if the request is for <code>num_blocks</code> entries or more. The usable maximum is <code>num_blocks − 1</code>, because of entry 0. So the check is exact.</li>
+  <li>Lines 132-135: <code>OK</code> if enough entries are free now, else <code>LATER</code>.</li>
+  <li>Lines 138-145: <code>allocate_nolock</code> pops <em>n</em> heads in order. The result is the new block table.</li>
+  <li>Line 148: <code>free_blocks_nolock</code> walks the list <em>backwards</em>. The last block of a table is freed first, so the first block of the table ends at the tail.</li>
+</ol>
+<p>Methods with <code>_nolock</code> expect that the caller holds the lock. <code>free_blocks</code>, <code>pin_blocks</code>, <code>pin_block</code> and <code>reset</code> take the lock themselves ({{cite csrc/engine/block_manager.hpp:122-126}}, {{cite csrc/engine/block_manager.hpp:151-173}}).</p>
+
+<h3><code>BlockManagerMutexAcquire</code>: two locks and one sequence</h3>
+<x-code file="csrc/engine/block_manager.hpp" lines="189-239" highlight="192-195,199-203,208-213,227-233">
+<x-tr line="206">The caller must make sure that there are enough resources.</x-tr>
+<x-tr line="216">Try to allocate blocks and state at the same time.</x-tr>
+<x-tr line="231">If it can never be allocated in the future either, raise an error now.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 190-196: the constructor locks the state manager (if it exists), then the block manager. Lines 199-204: the destructor unlocks in the opposite order. A fixed order prevents a deadlock between two threads.</li>
+  <li>Lines 197-198: the object cannot be copied or moved, so it cannot unlock twice.</li>
+  <li>Lines 207-214, <code>allocate_seq</code>: takes <code>get_num_blocks()</code> blocks and, if there is a state manager, one state slot. It does not check space.</li>
+  <li>Lines 217-239, <code>try_allocate_seq</code>: checks that the sequence is <code>WAITING</code>, has no blocks and no slot (lines 218-222). Then it checks blocks and slot together. On <code>NEVER</code> it raises (line 232). On <code>LATER</code> it returns <code>false</code>. On <code>OK</code> it allocates.</li>
+</ol>
+<p>The scheduler uses <code>allocate_seq</code> directly, after its own check ({{cite csrc/engine/scheduler.hpp:386-397}}, {{cite csrc/engine/scheduler.hpp:518-520}}). Only the Python binding <code>Scheduler.try_allocate_seq</code> uses <code>try_allocate_seq</code> ({{cite csrc/engine/pybind_scheduler.cpp:85-92}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data: types and sizes">
+<table>
+  <thead><tr><th>Object</th><th>C++ type</th><th>Size</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>Blocks::_blocks</code></td><td><code>std::vector&lt;block&gt;</code>, <code>block = {int ref_count, next, prev}</code></td><td><code>num_blocks</code> entries</td><td>{{cite csrc/engine/block_manager.hpp:105-113}}</td></tr>
+    <tr><td><code>_head</code>, <code>_tail</code>, <code>_size</code></td><td><code>int</code></td><td>-</td><td>0 means "no entry" ({{cite csrc/engine/block_manager.hpp:115-116}})</td></tr>
+    <tr><td>block table</td><td><code>std::vector&lt;int&gt;</code></td><td><code>get_num_blocks()</code></td><td>Owned by the sequence ({{cite csrc/engine/sequence.hpp:206}}). The scheduler reserves room for <code>prompt + max_tokens</code> tokens + 1 block ({{cite csrc/engine/scheduler.hpp:189-192}}).</td></tr>
+    <tr><td>state id</td><td><code>int</code></td><td>-</td><td><code>-1</code> = no slot ({{cite csrc/engine/sequence.hpp:207}})</td></tr>
+    <tr><td>Python <code>BlockManager</code></td><td><code>shared_ptr&lt;BlockManager&gt;</code> holder</td><td>-</td><td>Python and the scheduler share one object ({{cite csrc/engine/pybind_scheduler.cpp:65}})</td></tr>
+  </tbody>
+</table>
+<p><strong>Complexity.</strong> Every list operation is O(1). <code>allocate_nolock(n)</code> and <code>free_blocks_nolock</code> are O(n). Nothing scans the pool.</p>
+<p><strong>Python surface.</strong> The binding exposes <code>pin_blocks</code>, <code>unpin_blocks</code>, <code>lock</code>, <code>unlock</code>, <code>reset</code>, <code>allocate_nolock</code> and <code>get_num_free_blocks</code> ({{cite csrc/engine/pybind_scheduler.cpp:65-73}}). The stub file lists the same eight names with the constructor ({{cite deepinfer/_C/engine.pyi:9-25}}). The page {{link code/engine-pyi}} maps all bindings.</p>
+</x-deepdive>
+
+<x-deepdive title="Locks and the GIL">
+<p><code>lock()</code> refuses to run while the thread holds the Python {{term gil}}: <code>TORCH_CHECK(PyGILState_Check() == 0, ...)</code> ({{cite csrc/utils/lockable.hpp:16}}). The reason: the scheduler releases the GIL while it holds the block locks ({{cite csrc/engine/scheduler.hpp:276-277}}). If a second thread held the GIL and waited for a block lock, and the first thread needed the GIL, both would wait forever.</p>
+<p>So every binding that can lock releases the GIL first: <code>pin_blocks</code>, <code>unpin_blocks</code>, <code>lock</code>, <code>reset</code> ({{cite csrc/engine/pybind_scheduler.cpp:67-71}}), <code>Scheduler.try_allocate_seq</code> and <code>Scheduler.free_seq</code> ({{cite csrc/engine/pybind_scheduler.cpp:88}}, {{cite csrc/engine/pybind_scheduler.cpp:100-102}}). <code>unlock</code> keeps the GIL; it never waits.</p>
+<p>The wait has a limit of 20 seconds (<code>pthread_mutex_clocklock</code> with <code>CLOCK_MONOTONIC</code>). After that, <code>lock()</code> raises with the text of the error code ({{cite csrc/utils/lockable.hpp:20-27}}). The mutex type <code>PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP</code> makes a second lock from the same thread fail with an error, not hang ({{cite csrc/utils/lockable.hpp:35}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Reference counts in the scheduler">
+<p>The scheduler raises a count above 1 in one place only: <code>fork_seq</code> pins the whole parent table and the parent's state slot ({{cite csrc/engine/scheduler.hpp:1108-1114}}). Before the fork runs, the scheduler gives it a new state slot and a copy of the partly written last block. It also lists the old ids for release ({{cite csrc/engine/scheduler.hpp:602-618}}). After the device copy, Python unpins the old ids ({{cite deepinfer/engine/llm_engine.py:109-116}}).</p>
+<p><strong>Worked example.</strong> Parent table <code>[5, 6, 7]</code>, 300 cached tokens.</p>
+<ol>
+  <li><code>fork_seq</code>: <code>pin_blocks([5, 6, 7])</code>. All three counts become 2.</li>
+  <li>Admission: <code>ceil(300 / 128) = 3</code>, so block 7 (index 2) is the last used block. A new block, for example 9, gets a copy of block 7. The fork's table becomes <code>[5, 6, 9]</code>.</li>
+  <li><code>unpin_blocks([7])</code>: block 7 goes back to count 1.</li>
+  <li>The parent ends: <code>free_blocks([5, 6, 7])</code>. Block 7 reaches 0 and goes to the list. Blocks 6 and 5 go to 1.</li>
+  <li>The fork ends: <code>free_blocks([5, 6, 9])</code>. Blocks 9, 6, 5 reach 0, in this order, and go to the list.</li>
+</ol>
+<p>In this release, only <code>examples/benchmark.py</code> calls <code>fork_seq</code> ({{cite examples/benchmark.py:337-347}}). The page {{link concepts/paged-kv-cache}} has a longer example.</p>
+</x-deepdive>
+
+<x-deepdive title="Two meanings of &quot;usage&quot;">
+<p>Two places compute the cache usage, and they treat entry 0 differently:</p>
+<table>
+  <thead><tr><th>Where</th><th>Formula</th><th>Toy pool of 10, 1 free</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Scheduler (prefill watermark)</td><td><code>(num_blocks − free) / num_blocks</code></td><td>9 / 10 = 0.900</td><td>{{cite csrc/engine/scheduler.hpp:830-835}}</td></tr>
+    <tr><td>Statistics log</td><td><code>(num_gpu_blocks − 1 − free) / (num_gpu_blocks − 1)</code></td><td>8 / 9 = 0.889</td><td>{{cite deepinfer/engine/stats_logger.py:410-411}}</td></tr>
+  </tbody>
+</table>
+<p>The scheduler starts a prefill only at usage ≤ 0.9 ({{cite csrc/engine/scheduler.hpp:313}}). With a real pool of thousands of blocks, the difference is very small.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises">
+<p>Every check is a <code>TORCH_CHECK</code>. In Python, a failed check is a <code>RuntimeError</code> with the message.</p>
+<table>
+  <thead><tr><th>Situation</th><th>Message</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>BlockManager(n)</code> with <code>n ≤ 1</code></td><td>"GPU blocks 太少了" (too few GPU blocks)</td><td>{{cite csrc/engine/block_manager.hpp:29}}</td></tr>
+    <tr><td><code>reset()</code> while blocks are in use</td><td>"still some blocks in use when reset"</td><td>{{cite csrc/engine/block_manager.hpp:37}}</td></tr>
+    <tr><td>Index 0 or out of range</td><td>check without a message</td><td>{{cite csrc/engine/block_manager.hpp:40}}, {{cite csrc/engine/block_manager.hpp:89}}, {{cite csrc/engine/block_manager.hpp:96}}</td></tr>
+    <tr><td>Push of an entry that is still linked or owned</td><td>"only free block can call push_back"</td><td>{{cite csrc/engine/block_manager.hpp:42-43}}</td></tr>
+    <tr><td>Erase of an owned entry</td><td>"free block list corrupted: ref_count != 0"</td><td>{{cite csrc/engine/block_manager.hpp:57}}</td></tr>
+    <tr><td>Allocate from an empty list</td><td>"list is empty, but pop_front is called"</td><td>{{cite csrc/engine/block_manager.hpp:74}}</td></tr>
+    <tr><td>Pin of a free block</td><td>"try to pin free block"</td><td>{{cite csrc/engine/block_manager.hpp:91}}</td></tr>
+    <tr><td>Free below 0 (double free)</td><td>"ref_count corrupted: ref_count &lt; 0"</td><td>{{cite csrc/engine/block_manager.hpp:99}}</td></tr>
+    <tr><td><code>try_allocate_seq</code> on a sequence that is not new</td><td>"status N", "Block table not empty", "state already allocated"</td><td>{{cite csrc/engine/block_manager.hpp:218-222}}</td></tr>
+    <tr><td><code>try_allocate_seq</code>: too many blocks</td><td>"can never allocate N blocks"</td><td>{{cite csrc/engine/block_manager.hpp:232}}</td></tr>
+    <tr><td>Lock with the GIL held / wait over 20 s</td><td>"调用本函数时禁止持有 GIL 以避免死锁!" / "failed to lock mutex"</td><td>{{cite csrc/utils/lockable.hpp:16}}, {{cite csrc/utils/lockable.hpp:27}}</td></tr>
+  </tbody>
+</table>
+<x-note title="reset() does not reset">
+<p>The name suggests that <code>reset()</code> frees all blocks. It does not: it only checks that all blocks are already free (line 37). No code in the repository calls it.</p>
+</x-note>
+</x-deepdive>
+
+<x-deepdive title="Settings that change the pool sizes">
+<p>The file reads no environment variables. The pool sizes come from outside:</p>
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Effect</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>gpu_memory_utilization</code></td><td>0.90 (<code>LLM</code>: 0.9)</td><td>More memory gives more KV blocks.</td><td>{{cite deepinfer/engine/arg_utils.py:34}}, {{cite deepinfer/worker/base.py:235}}</td></tr>
+    <tr><td><code>max_num_seqs</code></td><td>256</td><td>Size of the state pool, and the dummy batch of the profile run.</td><td>{{cite deepinfer/engine/arg_utils.py:36}}, {{cite deepinfer/worker/model_runner.py:445-446}}</td></tr>
+    <tr><td><code>DEEPINFER_NUM_STATE_SLOTS_RATIO</code></td><td>1.2</td><td>State pool = <code>int(max_num_seqs × ratio) + 1</code>.</td><td>{{cite deepinfer/environ.py:162}}, {{cite deepinfer/worker/cache_engine.py:201-202}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/paged-kv-cache}}: when the scheduler calls each method, forks, and the index tensors.</li>
+  <li>{{link learn/kv-cache}}: blocks, block tables and preemption from the start.</li>
+  <li>{{link concepts/scheduler}}: the code that decides who gets blocks.</li>
+  <li>{{link code/engine-pyi}}: the Python names of these methods.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Why is block 0 never given out?
+    <x-a><p>The free list uses 0 as the "none" value for <code>next</code>, <code>prev</code>, <code>_head</code> and <code>_tail</code> ({{cite csrc/engine/block_manager.hpp:27}}). So index 0 cannot also be a real block. The constructor links only 1 … n−1 ({{cite csrc/engine/block_manager.hpp:30-34}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A pool has <code>num_blocks = 100</code> and all blocks are free. What does <code>can_allocate_nolock</code> return for 99 and for 100?
+    <x-a><p>99: <code>OK</code>, because 99 entries (1 … 99) are free. 100: <code>NEVER</code>, because <code>100 ≥ num_blocks</code> ({{cite csrc/engine/block_manager.hpp:129-134}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The free list is <code>8 → 9</code>. A sequence with the table <code>[2, 5, 7]</code> ends. What is the list after <code>free_blocks_nolock</code>?
+    <x-a><p><code>8 → 9 → 7 → 5 → 2</code>. The table is freed in reverse order, and each block goes to the tail ({{cite csrc/engine/block_manager.hpp:148}}, {{cite csrc/engine/block_manager.hpp:44-50}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Block 7 has <code>ref_count = 2</code> because of a fork. The parent calls <code>free(7)</code>. Is block 7 in the free list now? What happens if code calls <code>free(7)</code> two more times?
+    <x-a><p>No: the count goes to 1, and only a count of 0 puts the block back ({{cite csrc/engine/block_manager.hpp:98-102}}). The next <code>free(7)</code> puts it at the tail. The one after that makes the count −1 and raises "ref_count corrupted" (line 99). This needs the deep dive "Reference counts in the scheduler".</p></x-a>
+  </x-q>
+  <x-q level="hard">Python code calls <code>block_manager.lock()</code>. Why does the binding release the GIL first?
+    <x-a><p><code>Lockable::lock_()</code> raises if the thread holds the GIL ({{cite csrc/utils/lockable.hpp:16}}). The binding uses <code>py::call_guard&lt;py::gil_scoped_release&gt;</code> ({{cite csrc/engine/pybind_scheduler.cpp:69}}). This rule prevents a deadlock with the scheduler, which holds the block locks without the GIL ({{cite csrc/engine/scheduler.hpp:276-277}}).</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,217 @@
+---
+title: deepinfer/entrypoints/llm.py: the offline LLM class
+nav_title: entrypoints/llm.py
+level: Beginner
+prerequisites: learn/what-an-llm-does, concepts/engine-step-loop
+related: code/llm-engine, code/sampling-params, code/outputs-hpp, concepts/engine-step-loop, concepts/zero-overhead-scheduling, tours/life-of-a-request
+summary: LLM is DeepInfer's offline Python API. It makes one LLMEngine, adds every prompt as a request, calls step() until no data-parallel rank has work, clones the outputs, and returns token lists or decoded text.
+---
+<h2>Purpose</h2>
+<p><code>LLM</code> is the class that a user script calls. It turns a list of prompts into a list of results, and hides the engine step loop.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/entrypoints/llm.py</code>, 198 lines. The header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/entrypoints/llm.py:2}})</td></tr>
+    <tr><th>Main class</th><td><code>LLM</code> ({{cite deepinfer/entrypoints/llm.py:23}}). It is the only class in the file.</td></tr>
+    <tr><th>Runs in</th><td>The user's process. That process is also the engine process of one data-parallel rank, with the {{term driver-worker}} in it. The step loop runs on the calling thread, and <code>generate()</code> blocks until all requests end.</td></tr>
+    <tr><th>Called by</th><td>User scripts, <code>examples/_config.py</code> (<code>create_llm</code>), <code>eval/run_eval.py</code>.</td></tr>
+    <tr><th>Calls</th><td><code>EngineArgs</code>, <code>LLMEngine</code>, the Hugging Face tokenizer, <code>RequestOutput.clone</code>, <code>tqdm</code>.</td></tr>
+    <tr><th>Not in this file</th><td>Batching, scheduling, sampling (all in the engine). No streaming, no abort, no online server: the engine docstring says that this release has no online-serving wrapper ({{cite deepinfer/engine/llm_engine.py:140-141}}).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b3b_generate_loop" alt="Panel 1: generate checks the inputs and loops over the prompts; _add_request deep-copies the sampling parameters, takes the next request id, tokenizes the prompt or uses the given ids, converts them to int32, and calls LLMEngine.add_request with user_id 0, which puts a Sequence in the waiting queue or returns None for a bad token. Panel 2: the loop asks has_unfinished_requests, an all-reduce MAX over data-parallel ranks. Yes: step(). No: flush_inflight_reqs(). Both return uint64 handles; each handle is cloned and appended to outputs[request_id]; a dashed arrow goes back to the question after step. After the loop the ids are sorted as integers and decoded to text if decode_sequence is True." caption="Figure: <code>generate()</code> adds all requests first (panel 1), then runs the step loop and collects the outputs (panel 2). Click to zoom." />
+<p>Panel 1 runs once per prompt and does no device work. Panel 2 is the loop. The flush runs only once, at the end.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The examples</strong> make the object in <code>create_llm</code>, with <code>trust_remote_code=True</code>, <code>chunked_prefill=True</code>, <code>decode_sequence=False</code> and statistics on ({{cite examples/_config.py:110-125}}). <code>examples/offline_inference.py</code> then calls <code>generate</code> ({{cite examples/offline_inference.py:95}}).</li>
+  <li><strong>The eval script</strong> uses <code>decode_sequence=False</code> and passes token ids ({{cite eval/run_eval.py:189}}).</li>
+  <li><strong>The benchmark</strong> uses the private method <code>llm._add_request</code> and then calls <code>llm.llm_engine.step()</code> itself ({{cite examples/benchmark.py:304-309}}, {{cite examples/benchmark.py:369}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>EngineArgs(...)</code> and <code>LLMEngine.from_engine_args</code> ({{cite deepinfer/entrypoints/llm.py:70-84}}). See {{link code/llm-engine}}.</li>
+  <li><code>tokenizer.encode</code> and <code>tokenizer.decode</code> ({{cite deepinfer/entrypoints/llm.py:156}}, {{cite deepinfer/entrypoints/llm.py:190}}).</li>
+  <li><code>LLMEngine.add_request</code>, <code>has_unfinished_requests</code>, <code>step</code>, <code>flush_inflight_reqs</code>, <code>get_num_unfinished_requests</code> and <code>close</code>.</li>
+  <li><code>RequestOutput.clone</code> from the C++ extension ({{cite deepinfer/entrypoints/llm.py:15}}). See {{link code/outputs-hpp}}.</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>LLM.__init__</code></td><td>{{cite deepinfer/entrypoints/llm.py:54}}</td><td>Sets three defaults, makes <code>EngineArgs</code> and the engine.</td></tr>
+    <tr><td><code>get_tokenizer</code></td><td>{{cite deepinfer/entrypoints/llm.py:87}}</td><td>Returns the engine's tokenizer.</td></tr>
+    <tr><td><code>generate</code></td><td>{{cite deepinfer/entrypoints/llm.py:90}}</td><td>Checks the inputs, adds all requests, runs the loop.</td></tr>
+    <tr><td><code>_add_request</code></td><td>{{cite deepinfer/entrypoints/llm.py:144}}</td><td>Copies the settings, makes the id, tokenizes, calls <code>add_request</code>.</td></tr>
+    <tr><td><code>_run_engine</code></td><td>{{cite deepinfer/entrypoints/llm.py:168}}</td><td>The step loop: clone, group, sort, decode.</td></tr>
+    <tr><td><code>close</code></td><td>{{cite deepinfer/entrypoints/llm.py:197}}</td><td>Calls <code>LLMEngine.close()</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>: defaults that differ from the engine</h3>
+<x-code file="deepinfer/entrypoints/llm.py" lines="54-85" highlight="64,67-69,79,82" />
+<ol>
+  <li>Lines 56-64: nine named arguments. All other arguments go through <code>**kwargs</code> to <code>EngineArgs</code>, for example <code>max_model_len</code>, <code>max_num_seqs</code> or <code>chunked_prefill</code>. An unknown name raises <code>TypeError</code>, because <code>EngineArgs</code> is a dataclass.</li>
+  <li>Line 67: statistics logging is off, unless you pass <code>disable_log_stats=False</code>.</li>
+  <li>Line 68: <code>stop_preempted_request=False</code>. The <code>EngineArgs</code> default is <code>True</code> ({{cite deepinfer/engine/arg_utils.py:40}}). So with <code>LLM</code>, a preempted request is computed again, not stopped (see {{link learn/kv-cache}}).</li>
+  <li>Line 69: <code>TOKENIZERS_PARALLELISM=false</code>, unless the variable is already set.</li>
+  <li>Line 79: <code>offline_inference=True</code>. The engine stores it ({{cite deepinfer/engine/llm_engine.py:195}}); no other line in the release reads it.</li>
+  <li>Line 82: <code>decode_sequence</code> chooses the result type of <code>generate()</code> (text or outputs).</li>
+</ol>
+<p>The docstring has a note in Chinese. Translated: <em>"With CUDA graphs on, the error 'CUDA error: an illegal memory access was encountered' can mean that the CUDA graph ran out of memory. Lower gpu_memory_utilization and try again."</em> ({{cite deepinfer/entrypoints/llm.py:50-51}}).</p>
+
+<h3><code>generate</code>: the input rules</h3>
+<x-code file="deepinfer/entrypoints/llm.py" lines="117-142" highlight="117-118,119-122,123-124,125-127,138" />
+<ol>
+  <li>Lines 117-118: you must give <code>prompts</code>, <code>prompt_token_ids</code>, or both.</li>
+  <li>Lines 119-122: one string becomes a list of one. <code>multi_modal_data</code> is wrapped too, so pass one dict for one string.</li>
+  <li>Lines 123-124: if you give both lists, they must have the same length. Then the token ids win; <code>_add_request</code> tokenizes only when the ids are <code>None</code> ({{cite deepinfer/entrypoints/llm.py:153-156}}).</li>
+  <li>Lines 125-127: no settings means one <code>SamplingParams()</code> for all requests: temperature 1.0, 16 tokens ({{cite deepinfer/sampling_params.py:49-53}}).</li>
+  <li>Line 138: one object for all, or a list with one object per prompt. The comment says, translated: <em>"when the same SamplingParams is shared, no copy is needed here: _add_request does a deepcopy"</em> (line 137).</li>
+</ol>
+
+<h3><code>_add_request</code>: one request</h3>
+<x-code file="deepinfer/entrypoints/llm.py" lines="151-166" highlight="151,152,156,157,158-159,161">
+<x-tr line="161">HACK: add some user_id.</x-tr>
+</x-code>
+<ol>
+  <li>Line 151: a deep copy, because the engine changes the object (it sets <code>eos_id</code>, see {{link code/sampling-params}}).</li>
+  <li>Line 152: the request id is the next value of a counter that starts at 0, as a string. The counter lives in the <code>LLM</code> object, so a second <code>generate()</code> call goes on from the last id.</li>
+  <li>Line 156: text goes through <code>tokenizer.encode(prompt)</code>. With token ids, DeepInfer uses them as they are and adds no BOS token.</li>
+  <li>Line 157: the engine needs a 1-D <code>np.int32</code> array; the C++ <code>Sequence</code> refuses other types (see {{link code/engine-pyi}}).</li>
+  <li>Lines 158-159: if the engine has an image processor and you gave no image data, the request gets an empty image dict. The only registered model is a vision-language model, so the NORMAL engine always has that processor ({{cite deepinfer/model_executor/models/__init__.py:15-17}}, {{cite deepinfer/engine/llm_engine.py:209-221}}).</li>
+  <li>Line 160: the return value is a <code>Sequence</code>, or <code>None</code> for a dropped request. <code>generate()</code> ignores it.</li>
+</ol>
+
+<h3><code>_run_engine</code>: the loop</h3>
+<x-code file="deepinfer/entrypoints/llm.py" lines="168-195" highlight="171,177-178,181-182,185-186,187,189-190">
+<x-tr line="180">Clone step_outputs, because step_outputs will be released in the next step.</x-tr>
+</x-code>
+<ol>
+  <li>Line 171: the progress bar counts local unfinished requests at the start.</li>
+  <li>Line 177: <code>has_unfinished_requests()</code> asks all data-parallel ranks with an all-reduce MAX, when there is more than one rank ({{cite deepinfer/engine/llm_engine.py:665-679}}). So this rank goes on while <em>any</em> rank has work.</li>
+  <li>Line 178: work left: one engine step. No work left: one flush, which returns the outputs that the Worker still holds from the last ZOS decode step ({{cite deepinfer/worker/worker.py:274-283}}).</li>
+  <li>Lines 179-182: every handle is cloned at once. The engine releases the pool objects at the next <code>pre_sampler_sync</code> ({{cite deepinfer/engine/llm_engine.py:830-831}}).</li>
+  <li>Lines 185-186: the loop ends after the flush.</li>
+  <li>Line 187: the request ids are sorted as integers, so <code>"10"</code> comes after <code>"9"</code>.</li>
+  <li>Lines 189-190: with <code>decode_sequence=True</code>, each request becomes one string: the decode of all its output token ids.</li>
+</ol>
+<x-warning title="A dropped request moves the results">
+<p>The result list has one entry per request id <em>that produced an output</em> (line 188). <code>add_request</code> drops a request with a bad token id and returns <code>None</code> ({{cite deepinfer/engine/llm_engine.py:582-589}}). That request gets no output, so the list is shorter, and later results move up by one. The docstring promises "the same order as the input prompts" (lines 113-115). Check that <code>len(results) == len(prompts)</code>.</p>
+</x-warning>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types at each point">
+<table>
+  <thead><tr><th>Point</th><th>Type</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>prompts</code></td><td><code>str | list[str] | None</code></td><td>{{cite deepinfer/entrypoints/llm.py:92}}</td></tr>
+    <tr><td><code>prompt_token_ids</code></td><td><code>list[list[int]] | list[np.ndarray[np.int32]] | None</code></td><td>{{cite deepinfer/entrypoints/llm.py:94}}</td></tr>
+    <tr><td><code>multi_modal_data</code></td><td><code>dict | list[dict] | None</code>; keys such as <code>image_bytes</code>, <code>image_sizes</code></td><td>{{cite deepinfer/entrypoints/llm.py:96}}, {{cite deepinfer/entrypoints/llm.py:159}}</td></tr>
+    <tr><td>to the engine</td><td>1-D <code>np.int32</code> array, a <code>SamplingParams</code> copy, <code>request_id: str</code></td><td>{{cite deepinfer/entrypoints/llm.py:157-166}}</td></tr>
+    <tr><td><code>step()</code> result</td><td><code>np.ndarray[np.uint64]</code>: handles</td><td>{{cite deepinfer/engine/llm_engine.py:860}}</td></tr>
+    <tr><td><code>outputs</code></td><td><code>defaultdict(list)</code>: <code>request_id → list[RequestOutput]</code>, one per token</td><td>{{cite deepinfer/entrypoints/llm.py:175}}</td></tr>
+    <tr><td>result, <code>decode_sequence=False</code></td><td><code>list[list[RequestOutput]]</code></td><td>{{cite deepinfer/entrypoints/llm.py:188}}</td></tr>
+    <tr><td>result, <code>decode_sequence=True</code></td><td><code>list[str]</code></td><td>{{cite deepinfer/entrypoints/llm.py:190}}</td></tr>
+  </tbody>
+</table>
+<p>The return annotation says <code>list[list[RequestOutput] | str]</code> (line 97); the docstring says "a list of RequestOutput objects" (lines 113-115). The code returns one of the two list types above, never a mix.</p>
+<p><strong>One output per token.</strong> Each <code>RequestOutput</code> holds one token ({{term request-output}}). A decode step with accepted drafts gives several outputs for one request (see {{link code/outputs-hpp}}). To get the token ids of request <em>i</em>: <code>[o.token_id for o in results[i]]</code>, as line 190 does.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the calls of one generate()">
+<p>Two prompts, A and B, each with <code>max_tokens=3</code>. ZOS is on (the default for <code>LLM</code>). To keep the table short, assume that the sampler accepts no draft, so each decode step gives one token per request.</p>
+<table>
+  <thead><tr><th>Call</th><th>What the engine runs</th><th>Handles returned</th></tr></thead>
+  <tbody>
+    <tr><td>1 to 70: <code>step()</code></td><td>empty decode steps. A and B become schedulable only in the <code>fetch()</code> after the first schedule ({{cite deepinfer/engine/llm_engine.py:939-941}}). The next prefill attempt point is <code>decode_step = 70</code> ({{cite csrc/engine/scheduler.hpp:308-313}}). See {{link tours/life-of-a-request}}.</td><td>none</td></tr>
+    <tr><td>71: <code>step()</code></td><td>prefill A and B; a prefill step is post-processed in the same call ({{cite deepinfer/worker/worker.py:183-185}})</td><td>A token 1, B token 1</td></tr>
+    <tr><td>72: <code>step()</code></td><td>decode step d1; nothing is in flight yet</td><td>none</td></tr>
+    <tr><td>73: <code>step()</code></td><td>decode d2; post-process d1 ({{cite deepinfer/worker/worker.py:143-144}})</td><td>A token 2, B token 2</td></tr>
+    <tr><td>74: <code>step()</code></td><td>decode d3 (A and B are still in <code>running</code>); post-process d2: both reach <code>max_tokens</code></td><td>A token 3, B token 3 (<code>finished</code>)</td></tr>
+    <tr><td>75: <code>step()</code></td><td>the scheduler moves A and B to <code>finished_seqs</code>; an empty step; post-process d3 gives nothing, because both already ended ({{cite csrc/engine/scheduler.hpp:906-915}})</td><td>none</td></tr>
+    <tr><td>76: flush</td><td><code>has_unfinished_requests()</code> is false; the flush post-processes the empty step</td><td>none</td></tr>
+  </tbody>
+</table>
+<x-simplified><p>The table assumes one data-parallel rank and a multimodal worker that answers before the <code>fetch()</code> of call 70; else the prefill comes at call 101 (the ANY point). Real runs accept some drafts, so a decode step can give up to <code>nextn + 1</code> = 6 tokens per request. The pattern stays: with ZOS, decode tokens arrive one call late, and the run ends with one or two calls that return nothing.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Seeds: the LLM seed and the request seed">
+<p>There are two seeds, and they do different things.</p>
+<ul>
+  <li><strong><code>LLM(seed=0)</code></strong> goes to <code>ModelConfig.seed</code>. The Worker calls <code>set_random_seed(seed + global_rank)</code> for Python <code>random</code>, NumPy and PyTorch, at start-up and again after the memory profile and graph capture ({{cite deepinfer/worker/base.py:170-172}}, {{cite deepinfer/worker/base.py:194}}, {{cite deepinfer/worker/base.py:286-288}}, {{cite deepinfer/model_executor/utils.py:13-18}}).</li>
+  <li><strong><code>SamplingParams(seq_seed=...)</code></strong> is the seed that the sampling kernels use for that request. Without it, the constructor takes 64 bits from Python <code>random</code> ({{cite deepinfer/sampling_params.py:86-88}}). The Worker runs in the same process, so a <code>SamplingParams</code> object made after <code>LLM(...)</code> takes its bits from the state that <code>LLM(seed)</code> set.</li>
+</ul>
+<x-warning title="One shared SamplingParams gives one seed to all requests">
+<p>The seed is made in the constructor, and <code>_add_request</code> copies the object with <code>copy.deepcopy</code>, which does not run the constructor again (line 151). So if you pass one object (or none: then <code>generate()</code> makes one), every request gets the <em>same</em> <code>seq_seed</code>. Two requests with the same prompt then get the same random numbers, and they can give the same text. Pass a list of objects with different seeds if you need different samples, as <code>eval/run_eval.py</code> does ({{cite eval/run_eval.py:225-234}}).</p>
+</x-warning>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and data parallelism">
+<ul>
+  <li><strong>One process per data-parallel rank.</strong> Each rank makes its own <code>LLM</code>. <code>examples/_launch.py</code> starts the processes ({{cite examples/_launch.py:35-44}}).</li>
+  <li><strong>All ranks loop together.</strong> <code>has_unfinished_requests()</code> and the scheduler's votes are collective calls ({{cite deepinfer/engine/llm_engine.py:675-678}}). So a rank with no prompts also calls <code>generate()</code>, and runs empty steps until all ranks are done.</li>
+  <li><strong>Context-parallel ranks</strong> are follower processes that the engine starts; <code>LLM</code> does not see them ({{cite deepinfer/engine/llm_engine.py:377-395}}).</li>
+  <li><strong>Threads.</strong> <code>generate()</code> is not thread-safe: two threads would share one engine and one counter. Tokenization runs on the calling thread; <code>TOKENIZERS_PARALLELISM=false</code> turns off the tokenizer's own thread pool (line 69).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths and surprises">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>No prompts and no token ids</td><td><code>ValueError</code></td><td>{{cite deepinfer/entrypoints/llm.py:117-118}}</td></tr>
+    <tr><td>Two lists of different length</td><td><code>ValueError</code></td><td>{{cite deepinfer/entrypoints/llm.py:123-124}}</td></tr>
+    <tr><td>A list of prompts with one <code>multi_modal_data</code> dict</td><td><code>KeyError: 0</code> (the dict is indexed with <code>i</code>)</td><td>{{cite deepinfer/entrypoints/llm.py:140}}</td></tr>
+    <tr><td>Fewer <code>SamplingParams</code> than prompts</td><td><code>IndexError</code></td><td>{{cite deepinfer/entrypoints/llm.py:138}}</td></tr>
+    <tr><td>An empty prompt</td><td><code>ValueError("prompt must not be empty")</code> from the engine</td><td>{{cite deepinfer/engine/llm_engine.py:553-554}}</td></tr>
+    <tr><td>A token id out of range</td><td>log line; the request has no result (see the warning above)</td><td>{{cite deepinfer/engine/llm_engine.py:582-589}}</td></tr>
+    <tr><td>A prompt longer than the limit</td><td>one output with <code>finish_reason = "prompt_length_exceeded"</code>; its token is the last prompt token, so the decoded text is that token</td><td>{{cite csrc/engine/outputs.hpp:297-304}}</td></tr>
+    <tr><td>Unknown keyword argument</td><td><code>TypeError</code> from <code>EngineArgs</code></td><td>{{cite deepinfer/entrypoints/llm.py:70-81}}</td></tr>
+  </tbody>
+</table>
+<p><strong>The EOS token in the text.</strong> The last output of a request that stops on EOS holds the EOS token itself. The scheduler appends a token before it checks the stop rule ({{cite csrc/engine/scheduler.hpp:983-988}}). Line 190 calls <code>decode</code> without <code>skip_special_tokens</code>, so the text can end with the EOS token's text.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that this file touches">
+<table>
+  <thead><tr><th>Variable</th><th>What the file does</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>TOKENIZERS_PARALLELISM</code></td><td>sets <code>false</code> if not set</td><td>{{cite deepinfer/entrypoints/llm.py:69}}</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>not read here; <code>EngineArgs</code> sets <code>1</code> for the NORMAL engine when the variable is not set, which explains the flush</td><td>{{cite deepinfer/engine/arg_utils.py:51-55}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/engine-step-loop}}: the step loop from the user's view.</li>
+  <li>{{link code/llm-engine}}: the engine that <code>LLM</code> wraps.</li>
+  <li>{{link code/sampling-params}}: the settings of each request.</li>
+  <li>{{link code/outputs-hpp}}: why each handle needs a clone.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why outputs come one call late and the flush exists.</li>
+  <li>{{link tours/life-of-a-request}}: one request from <code>generate()</code> to text.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What does <code>generate()</code> return with the default <code>decode_sequence=True</code>, and with <code>False</code>?
+    <x-a><p><code>True</code>: one string per request, the decode of its output token ids. <code>False</code>: one <code>list[RequestOutput]</code> per request, one object per token ({{cite deepinfer/entrypoints/llm.py:187-190}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Which defaults does <code>LLM</code> change compared with <code>EngineArgs</code>, and what is the effect of the second one?
+    <x-a><p><code>disable_log_stats=True</code> and <code>stop_preempted_request=False</code> ({{cite deepinfer/entrypoints/llm.py:67-68}}). With the second one, a preempted request goes back to the waiting queue and is computed again, instead of an early stop with <code>insufficient_system_resource</code> ({{cite csrc/engine/scheduler.hpp:771-788}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>_run_engine</code> call <code>flush_inflight_reqs()</code> after the last <code>step()</code>?
+    <x-a><p>With ZOS, the Worker post-processes a decode step during the next call. When no work is left, the outputs of the last step are still in the Worker; the flush post-processes them ({{cite deepinfer/worker/worker.py:182-187}}, {{cite deepinfer/worker/worker.py:274-283}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You call <code>llm.generate(["Hi"] * 4)</code> with no sampling parameters. Why can all four texts be the same?
+    <x-a><p><code>generate()</code> makes one <code>SamplingParams()</code>, which draws one random <code>seq_seed</code> in its constructor ({{cite deepinfer/entrypoints/llm.py:125-127}}, {{cite deepinfer/sampling_params.py:74}}). <code>_add_request</code> deep-copies that object for each request, so all four copies have the same seed (line 151). The sampler draws its random numbers from the seed and the position, so all four requests get the same numbers. If their logits are also equal, they get the same tokens. This is the deep dive "Seeds".</p></x-a>
+  </x-q>
+</x-quiz>

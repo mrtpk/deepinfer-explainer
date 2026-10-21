@@ -1,0 +1,191 @@
+---
+title: deepinfer/sampling_params.py: SamplingParams
+nav_title: sampling_params.py
+level: Beginner
+prerequisites: learn/sampling, code/entrypoints-llm
+related: concepts/sampler, code/entrypoints-llm, code/llm-engine, code/prepare-sample-cpp, code/sequence-hpp, concepts/structured-outputs, concepts/determinism
+summary: SamplingParams holds the per-request settings: temperature, top-p, top-k, seed, length, logprobs, EOS rules, grammar and golden tokens. This page lists every field with its default and checks, and follows each one to the sampler.
+---
+<h2>Purpose</h2>
+<p><code>SamplingParams</code> holds the settings of one request: how to choose each token, when to stop, and which extra values to return.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/sampling_params.py</code>, 119 lines. The header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/sampling_params.py:2}})</td></tr>
+    <tr><th>Main class</th><td><code>SamplingParams</code> ({{cite deepinfer/sampling_params.py:13}}). The constant <code>SAMPLING_EPS = 1e-5</code> ({{cite deepinfer/sampling_params.py:10}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process, in Python, once per request. It imports <code>torch</code> only for the int32 limit ({{cite deepinfer/sampling_params.py:8}}).</td></tr>
+    <tr><th>Called by</th><td>User scripts, <code>LLM.generate</code> (default object), <code>LLMEngine.add_request</code> (from a dict), and two dummy runs in the model runner.</td></tr>
+    <tr><th>Calls</th><td>Only <code>random.getrandbits</code> and <code>torch.iinfo</code>.</td></tr>
+    <tr><th>Not in this file</th><td>Any sampling. The C++ code reads the values; the {{link concepts/sampler | sampler}} uses them.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b3b_sampling_path" alt="Panel 1: the Python SamplingParams object with its 13 constructor arguments; a box of changes in Python (temperature below 1e-5 becomes 1e-5 with top_p 1 and top_k -1, a missing seed becomes 64 random bits, max_tokens 0 becomes 1, the engine sets eos_id, YOCO turns prompt_logprobs off, bad values raise ValueError); then the C++ Sequence copies 9 sampling values and 2 stopping values once; so_args goes to the grammar builder and golden_token_ids to the Sequence. Panel 2: per step, prepare_sampler_inputs fills temperatures float32, top_ps float32, top_ks int32, seq_seeds uint64, stop_token_ids int32 [n, 2] and max_top_logprobs, with example values for two requests." caption="Figure: the path of each field. C++ reads the numbers once, when it makes the sequence (panel 1). Each step copies them into flat arrays for the sampler (panel 2). Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>User scripts</strong> make one object per request, or one for all. Example: the eval script sets temperature, top-p, <code>max_tokens</code> and a fixed <code>seq_seed</code> per sample ({{cite eval/run_eval.py:225-234}}).</li>
+  <li><strong><code>LLM.generate</code></strong> makes <code>SamplingParams()</code> when you pass none ({{cite deepinfer/entrypoints/llm.py:125-127}}). <code>_add_request</code> deep-copies the object for each request ({{cite deepinfer/entrypoints/llm.py:151}}).</li>
+  <li><strong><code>LLMEngine.add_request</code></strong> also accepts a dict. It drops keys with the value <code>None</code> and calls the constructor ({{cite deepinfer/engine/llm_engine.py:521-526}}).</li>
+  <li><strong>The model runner</strong> uses <code>SamplingParams(temperature=0.0)</code> for placeholder metadata and <code>SamplingParams(top_p=0.99, top_logprobs=20)</code> in the profile run ({{cite deepinfer/worker/model_runner.py:396}}, {{cite deepinfer/worker/model_runner.py:484}}).</li>
+</ul>
+
+<h3>Who reads the values</h3>
+<ul>
+  <li>The C++ <code>Sequence</code> constructor copies 9 values into <code>SamplingScalars</code> and 2 into <code>StoppingCriteria</code> ({{cite csrc/engine/sequence.hpp:280-281}}).</li>
+  <li><code>LLMEngine.add_request</code> reads <code>golden_token_ids</code>, <code>so_args</code> and <code>prompt_logprobs</code> in Python ({{cite deepinfer/engine/llm_engine.py:529-537}}, {{cite deepinfer/engine/llm_engine.py:562}}, {{cite deepinfer/engine/llm_engine.py:607}}).</li>
+</ul>
+
+<h2>Walk through the main methods</h2>
+<p>The file is short, so this part also serves as the list of key names.</p>
+
+<h3>The fields</h3>
+<x-code file="deepinfer/sampling_params.py" lines="47-83" highlight="63,70-71,74-79,81" />
+<table>
+  <thead><tr><th>Argument</th><th>Type</th><th>Default</th><th>Meaning</th><th>Rule ({{cite deepinfer/sampling_params.py:93-105}})</th></tr></thead>
+  <tbody>
+    <tr><td><code>temperature</code></td><td><code>float</code></td><td>1.0</td><td>{{term temperature}}: divides the logits.</td><td>≥ 0. Below 1e-5 it becomes 1e-5, and top-p and top-k turn off (lines 76-79).</td></tr>
+    <tr><td><code>top_p</code></td><td><code>float</code></td><td>1.0</td><td>{{term top-p}} filter.</td><td>0 &lt; top_p ≤ 1.</td></tr>
+    <tr><td><code>top_k</code></td><td><code>int</code></td><td>-1</td><td>{{term top-k}} filter; -1 = off.</td><td>-1, or 1 … 2,147,483,647. 0 raises.</td></tr>
+    <tr><td><code>ignore_eos</code></td><td><code>bool</code></td><td>False</td><td>Go on after the EOS token.</td><td>No check.</td></tr>
+    <tr><td><code>max_tokens</code></td><td><code>int</code></td><td>16</td><td>Most output tokens.</td><td>0 becomes 1 (lines 70-71). Then 1 … 2,147,483,647.</td></tr>
+    <tr><td><code>logprobs</code></td><td><code>bool</code></td><td>False</td><td>"Compatibility parameter; ignored" (line 30).</td><td>Deleted at line 63; not stored.</td></tr>
+    <tr><td><code>prompt_logprobs</code></td><td><code>bool</code></td><td>False</td><td>Return {{term prompt-logprobs}}.</td><td>No check. Turned off under YOCO truncation.</td></tr>
+    <tr><td><code>top_logprobs</code></td><td><code>int</code></td><td>0</td><td>How many best alternatives per token.</td><td>0 … 1000.</td></tr>
+    <tr><td><code>first_n_token_no_eos</code></td><td><code>int</code></td><td>0</td><td>With 1: the first output token cannot be EOS.</td><td>No check. Only the value 1 has an effect.</td></tr>
+    <tr><td><code>eos_id</code></td><td><code>int</code></td><td>0</td><td>The EOS id for the rule above and for draft stops.</td><td>No check. The engine overwrites it.</td></tr>
+    <tr><td><code>so_args</code></td><td><code>dict | None</code></td><td>None</td><td>Grammar of a {{term structured-output}}.</td><td>Checked later, by the grammar builder.</td></tr>
+    <tr><td><code>golden_token_ids</code></td><td><code>list[int] | None</code></td><td>None</td><td>{{term golden-tokens}}: forced output tokens.</td><td>No check.</td></tr>
+    <tr><td><code>seq_seed</code></td><td><code>int | None</code></td><td>None</td><td>{{term seq-seed}}: the random seed of the request.</td><td>None: 64 random bits. Other int: masked to 64 bits. Not an int: <code>TypeError</code>.</td></tr>
+  </tbody>
+</table>
+
+<h3>Order of the work in <code>__init__</code></h3>
+<ol>
+  <li>Line 63: drop <code>logprobs</code>.</li>
+  <li>Lines 65-73: store the values; a <code>max_tokens</code> of 0 becomes 1.</li>
+  <li>Line 74: make the seed (see below).</li>
+  <li>Line 75: <code>_verify_args()</code> checks the ranges. It runs <em>before</em> the temperature clamp, so it sees the values that you gave.</li>
+  <li>Lines 76-79: a temperature below <code>SAMPLING_EPS</code> becomes <code>1e-5</code>, and <code>top_p = 1.0</code>, <code>top_k = -1</code>.</li>
+  <li>Lines 80-83: store the four fields that have no check.</li>
+</ol>
+<x-warning title="Temperature 0 is not exact greedy decoding">
+<p>The engine has no separate greedy path. Temperature 0 becomes <code>1e-5</code>. The sampler still makes a seeded draw from a very sharp distribution (see {{link concepts/sampler}}). Your <code>top_p</code> and <code>top_k</code> are replaced, but they must still pass the checks: <code>SamplingParams(temperature=0, top_k=0)</code> raises.</p>
+</x-warning>
+
+<h3><code>_make_seed</code>: the seed rules</h3>
+<x-code file="deepinfer/sampling_params.py" lines="85-91" highlight="88,90-91" />
+<ol>
+  <li>Line 88: no seed gives 64 random bits from Python's <code>random</code> module. So two runs give different tokens, unless you pass a seed or seed the <code>random</code> module.</li>
+  <li>Line 90: an <code>int</code> is masked to 64 bits. A negative seed is valid: -1 becomes 18,446,744,073,709,551,615. <code>True</code> is an <code>int</code> in Python, so it gives seed 1.</li>
+  <li>Line 91: any other type raises <code>TypeError()</code> with an empty message. A NumPy integer is not a Python <code>int</code>, so <code>np.int64(7)</code> raises too.</li>
+</ol>
+<p>Because of the mask, the range check on <code>seq_seed</code> at lines 104-105 can never fail.</p>
+
+<h3><code>so_args</code>: the grammar dict</h3>
+<p>The docstring describes the keys in Chinese ({{cite deepinfer/sampling_params.py:39-43}}). Translated and split into a list:</p>
+<ul>
+  <li><code>"schema_type"</code> and <code>"schema"</code>: the grammar.</li>
+  <li>Optional <code>"trigger_token_ids"</code> (one <code>list[int]</code>): the token sequence that turns the grammar on. Before the full sequence appears, the output is free.</li>
+  <li>Optional <code>"bound_token_id"</code>: a non-negative integer; 0 is valid. Missing or <code>None</code> means no bound. A list is not valid. It needs a non-empty <code>trigger_token_ids</code>.</li>
+  <li>When the bound is active, free tokens are no longer allowed. The output first follows the trigger sequence token by token, then enters the grammar.</li>
+</ul>
+<p>The class does not check the dict. The grammar builder checks it in <code>build()</code>, and then compiles the grammar on a thread pool ({{cite deepinfer/structure_output/so_matcher_builder.py:58-95}}):</p>
+<ul>
+  <li><code>"serialized"</code> raises <code>ValueError</code> (offline use needs <code>schema_type</code> and <code>schema</code>). <code>"bound_token_ids"</code> (plural) raises <code>ValueError</code> ({{cite deepinfer/structure_output/so_matcher_builder.py:60-63}}).</li>
+  <li>A bad trigger or bound does not raise: the builder returns an aborted matcher ({{cite deepinfer/structure_output/so_matcher_builder.py:71-76}}). When the request goes into the queue, it gets the status <code>FINISHED_SO_FAILED</code> ({{cite deepinfer/engine/llm_engine.py:620-623}}), and the scheduler ends it without a prefill ({{cite csrc/engine/scheduler.hpp:363-367}}).</li>
+</ul>
+<p>The page {{link concepts/structured-outputs}} explains the grammar matcher. <code>examples/benchmark.py</code> shows a regex example: <code>{"schema_type": "regex", "schema": r"Hello, my name is [a-z]+"}</code> ({{cite examples/benchmark.py:280}}).</p>
+
+<h3>What the engine changes after the constructor</h3>
+<x-code file="deepinfer/engine/llm_engine.py" lines="525-537" highlight="526,527,529,537" />
+<ol>
+  <li>Line 527: <code>eos_id</code> always becomes the tokenizer's EOS id. The docstring calls the field a "HACK" with default 0 "only for warm up phase" ({{cite deepinfer/sampling_params.py:36-38}}). So a value that you set has no effect through <code>add_request</code>.</li>
+  <li>Lines 529-537: with <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code> not <code>off</code>, <code>prompt_logprobs</code> becomes <code>False</code>, with a warning in the log.</li>
+</ol>
+<p>The engine changes the object that it gets. <code>LLM</code> passes a deep copy, so your object stays as it was. A direct caller of <code>LLMEngine.add_request</code> sees its own object change.</p>
+
+<h3><code>__repr__</code></h3>
+<p>The text form shows 9 of the 13 fields ({{cite deepinfer/sampling_params.py:107-119}}). It leaves out <code>first_n_token_no_eos</code>, <code>eos_id</code> and <code>golden_token_ids</code>. <code>logprobs</code> is not stored, so it cannot show.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="How the values reach the sampler, step by step">
+<ol>
+  <li><strong>Once, in the Sequence constructor.</strong> C++ reads attributes by name from the Python object:
+<x-code file="csrc/engine/sequence.hpp" lines="92-115" />
+  and <code>max_tokens</code> and <code>ignore_eos</code> into <code>StoppingCriteria</code> ({{cite csrc/engine/sequence.hpp:181-190}}). The Python object stays in the sequence as <code>generation.params</code>, but C++ never reads these numbers from it again.</li>
+  <li><strong>Each step, in the metadata.</strong> Each <code>SequenceMetadata</code> copies the <code>SamplingScalars</code> struct ({{cite csrc/engine/sequence.hpp:380}}).</li>
+  <li><strong>Each step, in <code>prepare_sampler_inputs</code>.</strong> The function fills one entry per sequence in pinned CPU tensors: <code>temperatures</code> and <code>top_ps</code> as float32, <code>top_ks</code> as int32, <code>seq_seeds</code> as uint64 ({{cite csrc/engine/prepare_sample.cpp:82-88}}, {{cite csrc/engine/prepare_sample.cpp:157-161}}). <code>max_top_logprobs</code> is the largest <code>top_logprobs</code> of the batch (line 157).</li>
+  <li><strong>EOS rules.</strong> In a prefill, a sequence with <code>first_n_token_no_eos == 1</code> in its last prompt chunk adds a row and its <code>eos_id</code> to the suppression list ({{cite csrc/engine/prepare_sample.cpp:20-22}}, {{cite csrc/engine/prepare_sample.cpp:192-195}}). In a decode with drafts, <code>stop_token_ids[i] = [eos_id, -1]</code>, or <code>[-1, -1]</code> with <code>ignore_eos</code> ({{cite csrc/engine/prepare_sample.cpp:217-219}}).</li>
+  <li><strong>Prompt logprobs.</strong> With <code>prompt_logprobs</code>, the prompt rows get the same temperature, top-p and top-k ({{cite csrc/engine/prepare_sample.cpp:181-189}}).</li>
+  <li><strong>To the device.</strong> All arrays go to the device with <code>non_blocking=True</code> ({{cite csrc/engine/prepare_sample.cpp:257-264}}).</li>
+  <li><strong>Stop check.</strong> After the step, the scheduler stops a sequence on EOS (unless <code>ignore_eos</code>), at <code>max_model_len</code>, or at <code>max_tokens</code> output tokens ({{cite csrc/engine/scheduler.hpp:1035-1052}}).</li>
+</ol>
+<p><strong>Worked example.</strong> R1 has <code>temperature=0.6, top_p=0.95, seq_seed=7</code>. R2 has <code>temperature=0</code> and no seed. In one decode step: <code>temperatures = [0.6, 1e-5]</code>, <code>top_ps = [0.95, 1.0]</code>, <code>top_ks = [-1, -1]</code>, <code>seq_seeds = [7, &lt;64 random bits&gt;]</code>. Note that <code>0.6</code> as float32 is 0.60000002384.</p>
+</x-deepdive>
+
+<x-deepdive title="Where max_tokens matters besides the stop">
+<ul>
+  <li><strong>Memory reserve.</strong> <code>add_sequence</code> reserves room in the token vector for <code>max_tokens</code> more tokens ({{cite csrc/engine/sequence.hpp:286-289}}, {{cite csrc/engine/scheduler.hpp:135-141}}). It also reserves the block table for <code>(len + max_tokens) / 128 + 1</code> blocks ({{cite csrc/engine/scheduler.hpp:189-192}}). These are host-memory reserves, not KV blocks.</li>
+  <li><strong>Batch planning.</strong> The default of 16 tokens is short. Benchmarks set <code>max_tokens=1</code> for prefill-only requests ({{cite examples/benchmark.py:283}}).</li>
+  <li><strong>The other limit.</strong> <code>max_model_len</code> also stops a sequence, with the same reason <code>"length"</code> ({{cite csrc/engine/scheduler.hpp:1043-1045}}, {{cite csrc/engine/sequence.hpp:49-50}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Input</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>temperature=-0.1</code></td><td><code>ValueError("temperature must be non-negative ...")</code></td><td>{{cite deepinfer/sampling_params.py:94-95}}</td></tr>
+    <tr><td><code>top_p=0</code> or <code>top_p=1.5</code></td><td><code>ValueError("top_p must be in (0, 1] ...")</code></td><td>{{cite deepinfer/sampling_params.py:96-97}}</td></tr>
+    <tr><td><code>top_k=0</code> or <code>top_k=-2</code></td><td><code>ValueError("top_k must be -1 (disable), or between 1 and int32 max ...")</code></td><td>{{cite deepinfer/sampling_params.py:98-99}}</td></tr>
+    <tr><td><code>max_tokens=-5</code></td><td><code>ValueError("max_tokens must be &gt;= 1 ...")</code></td><td>{{cite deepinfer/sampling_params.py:100-101}}</td></tr>
+    <tr><td><code>top_logprobs=1001</code></td><td><code>ValueError("top_logprobs must be in [0, 1000] ...")</code></td><td>{{cite deepinfer/sampling_params.py:102-103}}</td></tr>
+    <tr><td><code>seq_seed="7"</code> or <code>np.int64(7)</code></td><td><code>TypeError()</code>, no message</td><td>{{cite deepinfer/sampling_params.py:91}}</td></tr>
+    <tr><td><code>logprobs=True</code></td><td>no error, no effect</td><td>{{cite deepinfer/sampling_params.py:63}}</td></tr>
+    <tr><td><code>prompt_logprobs=True</code> and a fork</td><td>RuntimeError "Forking a cached prefix does not support prompt logprobs"</td><td>{{cite csrc/engine/scheduler.hpp:1064}}</td></tr>
+    <tr><td>A type that C++ cannot cast (for example <code>top_k=2.5</code>)</td><td>error when the engine makes the Sequence (a pybind11 cast error)</td><td>{{cite csrc/engine/sequence.hpp:107}}</td></tr>
+  </tbody>
+</table>
+<p>The checks run in the constructor. If you change an attribute later, for example <code>params.top_p = 0</code>, nothing checks the new value.</p>
+</x-deepdive>
+
+<x-deepdive title="Settings outside the class that change sampling">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Effect</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code></td><td><code>off</code></td><td>Not <code>off</code>: <code>prompt_logprobs</code> is forced to False.</td><td>{{cite deepinfer/environ.py:188}}, {{cite deepinfer/engine/llm_engine.py:529-537}}</td></tr>
+    <tr><td><code>DEEPINFER_SAMPLER_FORCE_TOPK</code></td><td>0 (off)</td><td>Samples only from the top N logits, whatever <code>top_k</code> says.</td><td>{{cite deepinfer/environ.py:150}}, {{cite deepinfer/model_executor/layers/sampler.py:91}}</td></tr>
+    <tr><td><code>DEEPINFER_DECODE_TOKEN_BLACKLIST</code></td><td>empty</td><td>Token ids that are never sampled.</td><td>{{cite deepinfer/environ.py:151}}, {{cite deepinfer/model_executor/layers/sampler.py:107-110}}</td></tr>
+    <tr><td><code>DEEPINFER_BATCH_INVARIANT</code></td><td>off</td><td>With <code>DEEPINFER_ENABLE_MTP_VARLEN=0</code> and a fixed <code>seq_seed</code>: the same outputs for the same inputs (NVIDIA only).</td><td>{{cite deepinfer/environ.py:197}}, {{cite README.md:28}}</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/sampler}} explains each of these settings in its deep dives.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/sampler}}: what the sampler does with each value.</li>
+  <li>{{link concepts/structured-outputs}}: the grammar that <code>so_args</code> describes.</li>
+  <li>{{link concepts/determinism}}: seeds and batch invariance.</li>
+  <li>{{link code/entrypoints-llm}}: where the default object comes from.</li>
+  <li>{{link code/engine-pyi}}: the C++ types that receive the values.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What are the defaults of <code>temperature</code>, <code>top_p</code>, <code>top_k</code> and <code>max_tokens</code>?
+    <x-a><p>1.0, 1.0, -1 (off) and 16 ({{cite deepinfer/sampling_params.py:49-53}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You write <code>SamplingParams(temperature=0, top_p=0.5, top_k=40)</code>. Which values does the sampler get?
+    <x-a><p>Temperature <code>1e-5</code>, top-p <code>1.0</code>, top-k <code>-1</code>. The checks pass first (0 ≥ 0, 0.5 in range, 40 in range), then lines 76-79 replace the three values ({{cite deepinfer/sampling_params.py:75-79}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>eos_id=42</code> and call <code>LLM.generate</code>. Which EOS id does the request use?
+    <x-a><p>The tokenizer's EOS id. <code>add_request</code> sets <code>sampling_params.eos_id = self.eos_id</code> for every request ({{cite deepinfer/engine/llm_engine.py:527}}, {{cite deepinfer/engine/llm_engine.py:225}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">After <code>add_request</code>, a script sets <code>seq.sampling_params.temperature = 2.0</code>. Does the next step sample with temperature 2.0?
+    <x-a><p>No. The C++ <code>Sequence</code> copied the value into <code>SamplingScalars</code> in its constructor ({{cite csrc/engine/sequence.hpp:280}}, {{cite csrc/engine/sequence.hpp:105}}). <code>SequenceMetadata</code> and <code>prepare_sampler_inputs</code> read that copy ({{cite csrc/engine/sequence.hpp:380}}, {{cite csrc/engine/prepare_sample.cpp:158}}). This is the deep dive "How the values reach the sampler".</p></x-a>
+  </x-q>
+</x-quiz>

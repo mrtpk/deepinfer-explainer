@@ -1,0 +1,252 @@
+---
+title: Paged KV cache and block manager
+nav_title: Paged KV cache and block manager
+level: Intermediate
+prerequisites: learn/kv-cache, concepts/scheduler
+related: code/block-manager-hpp, concepts/scheduler, concepts/request-lifecycle, concepts/input-metadata, concepts/zero-overhead-scheduling, code/scheduler-hpp, code/cache-engine, code/sequence-hpp, learn/kv-cache
+summary: The engine side of the paged KV cache. Two C++ BlockManager objects hand out KV blocks and state slots, the scheduler decides when, and C++ code turns block tables into index tensors for the kernels.
+---
+<x-sentence>Two C++ block managers give each sequence its KV blocks and one state slot. C++ code then turns the block tables into indices for the kernels.</x-sentence>
+
+<h2>The idea</h2>
+<p>The page {{link learn/kv-cache}} explains the basics. The {{term kv-cache}} is split into {{term kv-block | blocks}} of 128 tokens. A {{term block-table}} per sequence records which blocks it owns. That page also shows the memory layout and the preemption rule. This page looks at the same cache from the engine side. It answers four questions:</p>
+<ol>
+  <li><strong>Who hands out blocks?</strong> Two C++ objects of the class {{term block-manager}}. One manages KV blocks. The other manages {{term state-slot | state slots}}, one per running sequence.</li>
+  <li><strong>When?</strong> The C++ scheduler asks for blocks in each step. A prompt gets all its blocks at the first prefill chunk. A decode step adds one block when it needs one. Python code gives the blocks back when a sequence ends.</li>
+  <li><strong>Can two sequences share a block?</strong> Yes, but only a {{term forked-sequence}}. Each block has a {{term ref-count}}. There is no {{term prefix-caching}} in this release.</li>
+  <li><strong>How do the kernels find the blocks?</strong> Before each step, C++ code turns each block table into int32 index tensors, for example the {{term slot-mapping}}.</li>
+</ol>
+<p><strong>An everyday comparison.</strong> Think of a hotel with numbered rooms. The front desk keeps the free room keys in a box. A new guest gets keys from the front of the box. A guest who leaves puts the keys at the back of the box. Each guest has a card with a list of room numbers: that card is the block table. Two guests from one family can share a room. The room is free again only when both guests give back their key.</p>
+<p>The comparison stops here: the front desk does not choose who gets a room. In DeepInfer the scheduler decides, and the block manager only counts and hands out numbers. Also, a hotel does not copy the contents of a room. DeepInfer copies the last, partly filled block when it forks a sequence.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3b_kv_alloc" alt="Panel 1: the KV BlockManager with 10 entries, where entry 0 is grey and never used and sequence A owns blocks 1, 2 and 3; the state BlockManager with 5 entries, where A owns slot 1. Panel 2: six rows. 1: all blocks free, free list 1 to 9. 2: A takes 3 blocks from the head. 3: B needs 8 blocks, only 6 are free, so B waits. 4: A takes block 4 in a decode step because 380 + 6 + 5 = 391 tokens need more than 384 slots. 5: A ends and frees blocks 4, 3, 2, 1 to the tail; the free list is 5 6 7 8 9 4 3 2 1. 6: B takes 8 blocks from the head: 5, 6, 7, 8, 9, 4, 3, 2." caption="Figure: the two pools and one run with toy numbers. See how block ids lose their order after one free: B gets [5, 6, 7, 8, 9, 4, 3, 2]. Click to zoom." />
+<p>Read panel 1 first: each sequence owns blocks in the KV pool <em>and</em> one slot in the state pool. Then read panel 2 from top to bottom. A new block always comes from the head of the free list, and a freed block goes to the tail. So after some time, the blocks of one sequence are spread over the pool. The block table hides this from the kernels.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the engine makes two managers</h3>
+<p>The sizes come from the {{term memory-profiling}} run at start-up. {{link learn/kv-cache}} shows that run in its deep dive "Where the memory comes from". Then the engine makes the managers:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="262-267" highlight="265-266" caption="The state manager exists only when the model has per-sequence state. The DeepSeek V4.1 model has it (SWA ring and compression state)." />
+<ul>
+  <li><code>num_gpu_blocks</code> is the mean block count over all ranks, rounded down to an even number ({{cite deepinfer/worker/base.py:264-266}}).</li>
+  <li><code>num_state_seqs</code> is <code>int(max_num_seqs × DEEPINFER_NUM_STATE_SLOTS_RATIO) + 1</code>. The ratio defaults to 1.2 ({{cite deepinfer/worker/cache_engine.py:201-202}}, {{cite deepinfer/worker/cache_engine.py:650}}, {{cite deepinfer/environ.py:162}}). With <code>max_num_seqs = 256</code>, the pool has 308 entries.</li>
+  <li>Both managers are the same C++ class. Entry 0 of each pool is never given out ({{cite csrc/engine/block_manager.hpp:27-35}}).</li>
+</ul>
+<p>The engine passes both managers to the C++ <code>Scheduler</code> ({{cite deepinfer/engine/llm_engine.py:307-312}}). From then on, only the scheduler and the release code in Python touch them.</p>
+
+<h3>Step 2: one lock for both pools</h3>
+<p>Each <code>schedule()</code> call takes both locks first. It holds them until the step's plan is complete:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="275-284" highlight="276-277,282-284">
+<x-tr line="279-281">The SchedulerOutputs of the last step borrow the storage of these three vectors (see the pybind properties clone_states/clone_blocks/zero_states). Python must use them up before the next schedule; here we clear them and use them again.</x-tr>
+</x-code>
+<p><code>BlockManagerMutexAcquire</code> locks the state manager first, then the block manager. It unlocks in the opposite order ({{cite csrc/engine/block_manager.hpp:189-204}}). Line 276 releases the Python {{term gil}}, because the lock refuses to wait while the GIL is held (deep dive "Locks, the GIL and threads").</p>
+
+<h3>Step 3: prefill takes all blocks of a prompt at once</h3>
+<p>A new prompt needs blocks <em>and</em> a state slot. The scheduler checks both together:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="194-201">
+<x-tr line="194">Joint check for blocks and state: if no state slot is free, treat the block manager as LATER too.</x-tr>
+</x-code>
+<ul>
+  <li><code>OK</code>: the prompt fits now. <code>LATER</code>: it can fit when other sequences free blocks. The prefill batch stops here ({{cite csrc/engine/scheduler.hpp:386-388}}).</li>
+  <li><code>NEVER</code>: the prompt needs <code>num_blocks</code> blocks or more, so it can never fit ({{cite csrc/engine/block_manager.hpp:128-136}}). The scheduler ends the request with status <code>FINISHED_IGNORED</code> ({{cite csrc/engine/scheduler.hpp:389-396}}).</li>
+</ul>
+<p>When the scheduler accepts the prompt, it allocates at the first chunk, for the whole sequence:</p>
+<x-code file="csrc/engine/block_manager.hpp" lines="206-214">
+<x-tr line="206">The caller must make sure that there are enough resources.</x-tr>
+</x-code>
+<p>The call site is {{cite csrc/engine/scheduler.hpp:518-520}}. <code>get_num_blocks()</code> is a round-up division: <code>ceil((len + in-flight tokens + draft tokens) / 128)</code> ({{cite csrc/engine/sequence.hpp:291-293}}). A chunked prompt therefore owns all its blocks before its second chunk runs.</p>
+
+<h3>Step 4: decode adds one block when the count grows</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="817-828" highlight="819-820,821-825" />
+<ol>
+  <li>Line 818: count the blocks that the sequence needs now. The count includes tokens in flight and the draft tokens of {{link concepts/speculative-decoding | speculative decoding}}.</li>
+  <li>Lines 819-820: if the table is too short, take one block from the head of the free list.</li>
+  <li>Lines 821-825: if the table is too long, free the extra blocks. This happens when the count goes down, for example when fewer tokens are in flight or fewer draft tokens are stored.</li>
+</ol>
+<p>The decode loop calls <code>_append_slot</code> only after it made sure that one block is free. If no block is free, it preempts a sequence first ({{cite csrc/engine/scheduler.hpp:630-640}}). The page {{link learn/kv-cache}} explains that rule in its deep dive "Preemption in DeepInfer".</p>
+
+<h3>Step 5: Python gives the blocks back</h3>
+<p>A sequence that ends does not free its blocks at once. The next decode schedule moves it from <code>running</code> to <code>finished_seqs</code> ({{cite csrc/engine/scheduler.hpp:752-763}}). Then the engine frees it in the callback <code>pre_sampler_sync</code>, while the device samples:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="844-846" />
+<p><code>finalize_seq</code> calls <code>scheduler.free_seq</code> ({{cite deepinfer/engine/llm_engine.py:804-806}}). The C++ code frees three things:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="738-750" highlight="739,741,743-744" />
+<p>The KV blocks go back in reverse order, so the first block of the table goes to the very end of the free list ({{cite csrc/engine/block_manager.hpp:147-149}}). Panel 2 of the figure shows this in row 5.</p>
+
+<h3>Step 6: block tables become kernel indices</h3>
+<x-diagram name="b3b_kv_to_kernels" alt="Panel 1: sequence B with block table 5,6,7,8,9,4,3,2 and state slot 2 goes into C++ code, which makes slot_mapping_store_ca for ratio 1 (entry 999 goes to slot 359), for ratio 2 (entry 499 goes to slot 179), slot_mapping_store_swa (token 999 goes to slot 329; tokens 0 to 865 get -1) and state_block_idx [2]. Panel 2: in decode without ZOS, C++ writes block_tables [total_q, 320]; with ZOS, C++ packs a flat block_tables array with offsets and a device kernel computes the slots." caption="Figure: from one block table to the int32 tensors that the kernels read, for a prefill and for a decode step." />
+<p>The scheduler gives the worker a list of {{term sequence-metadata | SequenceMetadata}} objects. Each one holds a <em>reference</em> to the block table of its sequence, not a copy ({{cite csrc/engine/sequence.hpp:349}}, {{cite csrc/engine/sequence.hpp:379}}). C++ code then builds the index tensors:</p>
+<ul>
+  <li><strong>Prefill, and decode without ZOS:</strong> <code>prepare_prompt_v4</code> and <code>prepare_decode_v4</code> compute every slot on the CPU ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:41-108}}). The page {{link learn/kv-cache}} reads that code line by line in its deep dive "From token position to byte".</li>
+  <li><strong>Decode with {{term zos}}</strong> (the default for the offline API): the engine picks <code>prepare_decode_v4_zos</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:143}}). C++ only packs all block tables into one flat array:</li>
+</ul>
+<x-code file="csrc/engine/zos.cpp" lines="258-271" highlight="266,268-270" />
+<p>Then a device kernel, <code>prepare_v4_decode_metadata</code>, computes the slot mappings and the per-token block tables on the device ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367}}). The page {{link concepts/input-metadata}} explains the other fields of the input metadata.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Timing: when a sequence takes and gives back blocks">
+<table>
+  <thead><tr><th>Event</th><th>What changes</th><th>When</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>First prefill chunk</td><td>all blocks of <code>get_num_blocks()</code> + 1 state slot</td><td>inside <code>schedule()</code></td><td>{{cite csrc/engine/scheduler.hpp:518-520}}</td></tr>
+    <tr><td>Later prefill chunks</td><td>nothing (the table is already full)</td><td>-</td><td>{{cite csrc/engine/scheduler.hpp:518}}</td></tr>
+    <tr><td>Decode step</td><td>+1 block, or extra blocks freed</td><td>inside <code>schedule()</code></td><td>{{cite csrc/engine/scheduler.hpp:635-637}}</td></tr>
+    <tr><td>Preemption</td><td>all blocks + state slot + MTP slot freed</td><td>at once, inside <code>schedule()</code></td><td>{{cite csrc/engine/scheduler.hpp:779}}, {{cite csrc/engine/scheduler.hpp:787}}</td></tr>
+    <tr><td>Normal end (stop, length, abort)</td><td>all blocks + state slot freed</td><td>in <code>pre_sampler_sync</code> of the next decode step</td><td>{{cite deepinfer/engine/llm_engine.py:844-846}}</td></tr>
+    <tr><td>Fork clone</td><td>source block and state unpinned</td><td>in <code>pre_sampler_sync</code> of the same step, after a CUDA event</td><td>{{cite deepinfer/engine/llm_engine.py:109-116}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Finished sequences wait for a decode step.</strong> Only <code>_schedule_decode</code> calls <code>free_finished_seqs()</code> ({{cite csrc/engine/scheduler.hpp:562}}). A prefill step returns an empty <code>finished_seqs</code> list ({{cite csrc/engine/scheduler.hpp:549}}). So during a series of prefill steps, sequences that already ended keep their blocks.</p>
+<p><strong>Tokens in flight count.</strong> With ZOS, the scheduler plans step N+1 before step N is processed. Each scheduled step adds <code>nextn + 1</code> = 6 in-flight tokens to the sequence ({{cite csrc/engine/scheduler.hpp:689}}, {{cite csrc/engine/scheduler.hpp:726}}). <code>get_num_blocks()</code> adds them, and the 5 draft tokens, to the length. Example: a sequence has 380 tokens, 6 tokens in flight and 5 drafts. It needs <code>ceil(391 / 128) = 4</code> blocks, although 380 tokens fit in 3 blocks.</p>
+<p><strong>After a decode step.</strong> <code>process_outputs</code> commits only the accepted tokens. Drafts that the sampler rejects do not stay in the cache count ({{cite csrc/engine/scheduler.hpp:997-1000}}). The next <code>_append_slot</code> can then free a block again.</p>
+</x-deepdive>
+
+<x-deepdive title="Reference counts and forked sequences, with numbers">
+<p>A block can belong to two sequences. This happens only through <code>Scheduler.fork_seq</code>, which makes a {{term forked-sequence}} from the cached prefix of a parent. In this release, only <code>examples/benchmark.py</code> calls it, to start many requests from one prefilled prompt ({{cite examples/benchmark.py:331-353}}). No file in <code>deepinfer/</code> calls it.</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="1101-1121" highlight="1110,1112-1113,1115-1118" />
+<ol>
+  <li>Line 1110: every block of the parent table gets <code>ref_count + 1</code> ({{cite csrc/engine/block_manager.hpp:88-93}}).</li>
+  <li>Lines 1112-1113: the fork also shares the parent's state slot, with a pin.</li>
+  <li>Lines 1115-1118: a fork with an incomplete prompt goes to the front of <code>waiting</code>. A fork with a complete prompt goes to the <code>prompted</code> queue, marked as forked.</li>
+</ol>
+<p>The shared last block is a problem: both sequences will write new tokens into it. So, before a fork runs, the scheduler gives it its own copy of the last block and its own state slot. The comment above the loop says, translated: <em>"a forked seq must first clone its state and its last (possibly half-written) block"</em> ({{cite csrc/engine/scheduler.hpp:581-582}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="602-618" highlight="606-607,610-611,613-614,616-617" />
+<p><strong>Worked example.</strong> The parent has 1,000 cached tokens and the table <code>[5, 6, 7, 8, 9, 4, 3, 2]</code>. The fork gets the same table, and all 8 blocks now have <code>ref_count = 2</code>.</p>
+<ol>
+  <li>Line 608: <code>num_blocks = ceil(1000 / 128) = 8</code>. The last used block is index 7, block 2. It holds 1,000 − 896 = 104 tokens.</li>
+  <li>Line 607: a new block comes from the free list, for example block 1.</li>
+  <li>Lines 610-611: the pair <code>(2, 1)</code> goes into <code>clone_blocks</code>: copy block 2 into block 1.</li>
+  <li>Line 616: the fork's table becomes <code>[5, 6, 7, 8, 9, 4, 3, 1]</code>. Blocks 5 to 3 stay shared.</li>
+  <li>The engine runs the copy on the device ({{cite deepinfer/engine/llm_engine.py:889-905}}). The C++ copy loop gives back every source id ({{cite csrc/engine/scheduler.hpp:1288-1301}}). At the next <code>pre_sampler_sync</code>, the engine waits for the copy event and calls <code>unpin_blocks([2])</code>. Block 2 goes back to <code>ref_count = 1</code>: only the parent owns it now.</li>
+</ol>
+<p>A pair <code>(src, 0)</code> means "only give back <code>src</code>, do not copy" ({{cite deepinfer/_C/engine.pyi:380-383}}). Lines 612-615 use it for parent blocks after the last used one: the fork does not need them.</p>
+<x-note title="unpin_blocks is free_blocks">
+<p>The Python name <code>unpin_blocks</code> is bound to the C++ method <code>free_blocks</code> ({{cite csrc/engine/pybind_scheduler.cpp:68}}). "Unpin" and "free" are the same operation: <code>ref_count − 1</code>, and a push to the free list at 0.</p>
+</x-note>
+</x-deepdive>
+
+<x-deepdive title="Prefix caching: what this release has, and what it does not have">
+<p>{{term prefix-caching | Prefix caching}} reuses the KV cache of an earlier request that starts with the same tokens. The DeepInfer docs describe such a system, but the release does not include it:</p>
+<ul>
+  <li>The README lists "A KV cache system" under "not included in this release" ({{cite README.md:38-40}}).</li>
+  <li>The deployment notes describe the external system. It matches prefixes on a hash chain, moves the KV cache from 3FS storage into host shared memory, and then copies it into device memory ({{cite doc/inference_deployment_qa.md:157}}). The hit length is a multiple of the 128-token block size ({{cite doc/inference_deployment_qa.md:191}}).</li>
+  <li>The notes also say why the state matters: the SWA cache is in the state slot, not in blocks ({{cite doc/inference_deployment_qa.md:163}}). A hit on the blocks without the SWA state needs a replay of the last 128 tokens ({{cite doc/inference_deployment_qa.md:185}}).</li>
+</ul>
+<p><strong>What the engine has.</strong></p>
+<ol>
+  <li>No code compares the tokens of a new prompt with cached blocks. A new prompt always gets new, empty blocks ({{cite csrc/engine/scheduler.hpp:374-397}}).</li>
+  <li>The local variable <code>prefix_caching_hit</code> in <code>_schedule_prefill</code> is <code>true</code> for every new prompt and for every fork. It only turns off a lookahead check for those sequences ({{cite csrc/engine/scheduler.hpp:373-375}}, {{cite csrc/engine/scheduler.hpp:451-458}}). It does not mean a cache hit.</li>
+  <li>The field <code>cache.hit_tokens</code> (Python: <code>Sequence.cached_hit_tokens</code>) exists ({{cite csrc/engine/sequence.hpp:204}}, {{cite csrc/engine/pybind_sequence.cpp:118}}). Python can set it, because the stub has a setter ({{cite deepinfer/_C/engine.pyi:454-455}}). But only <code>fork_seq</code> copies it ({{cite csrc/engine/scheduler.hpp:1086}}), and no code in the release sets it to a value other than 0.</li>
+  <li>The engine has empty hook methods for KV saving, for example <code>do_save_kvcache</code> ({{cite deepinfer/engine/llm_engine.py:815-822}}). An external system can fill them. The page {{link code/llm-engine}} lists all hooks.</li>
+  <li>The only in-engine reuse is the fork of the previous section.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Locks, the GIL and threads">
+<p><code>BlockManager</code> inherits a mutex from <code>deepinfer::Lockable</code>:</p>
+<x-code file="csrc/utils/lockable.hpp" lines="15-35" highlight="16,25-27,35">
+<x-tr line="16">"Holding the GIL is forbidden when you call this function, to avoid deadlock!"</x-tr>
+</x-code>
+<ol>
+  <li>Line 16: <code>lock()</code> raises an error if the calling thread holds the Python GIL. A thread that waits for the mutex while it holds the GIL can block every other Python thread.</li>
+  <li>Line 17: the fast path tries the lock once.</li>
+  <li>Lines 25-27: else it waits at most 20 seconds, then raises <code>"failed to lock mutex"</code>.</li>
+  <li>Line 35: the mutex is an error-check mutex. A second <code>lock()</code> from the same thread fails, and it does not hang.</li>
+</ol>
+<p>The bindings follow this rule. <code>pin_blocks</code>, <code>unpin_blocks</code>, <code>lock</code> and <code>reset</code> release the GIL ({{cite csrc/engine/pybind_scheduler.cpp:67-71}}). <code>Scheduler.try_allocate_seq</code> releases the GIL, then takes both locks ({{cite csrc/engine/pybind_scheduler.cpp:85-92}}).</p>
+<p><strong>The <code>_nolock</code> methods.</strong> <code>allocate_nolock</code>, <code>free_blocks_nolock</code> and the others expect that the caller holds the lock. The scheduler holds it for the whole <code>_schedule()</code> call, and the decode code says so in a comment ({{cite csrc/engine/scheduler.hpp:560}}). The binding <code>allocate_nolock</code> is the only one of these that Python can call ({{cite csrc/engine/pybind_scheduler.cpp:72}}).</p>
+<p><strong>Which threads use the managers.</strong> The scheduler runs on the main thread. <code>DeferredRelease.release()</code> also runs on the main thread, inside the Worker's call of <code>pre_sampler_sync</code> ({{cite deepinfer/worker/worker.py:162-164}}). We found no second thread that calls the managers. So in this release the lock is mainly a safety check.</p>
+</x-deepdive>
+
+<x-deepdive title="Shapes of the index tensors">
+<p>Let <code>n_seq</code> be the number of sequences in the step, and <code>total_q</code> the number of query tokens. All tensors are int32.</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Shape</th><th>Value</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>slot_mapping_store_ca[n]</code>, prefill</td><td><code>[n_cq]</code>; at least 1 entry per sequence</td><td>row in the paged cache of ratio <code>n</code>, or -1 for a pad</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:47-68}}</td></tr>
+    <tr><td><code>slot_mapping_store_ca[n]</code>, decode</td><td><code>[total_q]</code></td><td>-1 unless the token completes a group of <code>n</code></td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:72-91}}</td></tr>
+    <tr><td><code>slot_mapping_store_swa</code></td><td><code>[total_q]</code></td><td><code>state_id × swa_block_size + pos % swa_block_size</code>, or -1</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:98-108}}</td></tr>
+    <tr><td><code>state_block_idx</code></td><td><code>[n_seq]</code> prefill, <code>[total_q]</code> decode</td><td>the state slot of the sequence</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:111-125}}</td></tr>
+    <tr><td><code>block_tables</code>, decode without ZOS</td><td><code>[total_q, max_num_blocks]</code></td><td>the table of the sequence, once per query token; the right side is not set</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:207-229}}</td></tr>
+    <tr><td><code>block_tables</code> + <code>block_table_offsets</code>, decode with ZOS</td><td><code>[total_blocks]</code> + <code>[n_seq + 1]</code></td><td>all tables back to back (CSR format)</td><td>{{cite csrc/engine/zos.cpp:245-246}}</td></tr>
+  </tbody>
+</table>
+<p><strong><code>max_num_blocks</code>.</strong> The model runner computes it once: <code>ceil(runtime_max_model_len / 128)</code>, rounded up to a multiple of 64 ({{cite deepinfer/worker/model_runner.py:114-115}}). Example: <code>runtime_max_model_len = 32784</code> gives <code>ceil(256.1) = 257</code>, then 320.</p>
+<p><strong><code>n_cq</code> in a prefill.</strong> For each sequence, <code>max(1, seqlen_k / n − (seqlen_k − seqlen_q) / n)</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:49}}). Example: a 1,000-token prompt in one chunk gives 1,000 entries for <code>n = 1</code> and 500 entries for <code>n = 2</code>. A chunk that completes no group of 2 still gets one pad entry with slot -1 (lines 62-67).</p>
+<p><strong>How many blocks per token in decode.</strong> Without ZOS: <code>ceil((seqlen_k / r) / (128 / r))</code>, with <code>r</code> the smallest compress ratio ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:219-222}}). With ZOS, the length is <code>seqlen_k − seqlen_q + max_seqlen_q</code>, because the device can grow the query length up to <code>nextn + 1</code> ({{cite csrc/engine/zos.cpp:219-225}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Pool sizes and limits, with numbers">
+<p>Take the example of {{link learn/kv-cache}}: 9,778 KV blocks and <code>max_num_seqs = 256</code>.</p>
+<table>
+  <thead><tr><th>Limit</th><th>Rule</th><th>Value in the example</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Usable KV blocks</td><td><code>num_gpu_blocks − 1</code></td><td>9,777</td><td>{{cite csrc/engine/block_manager.hpp:28}}</td></tr>
+    <tr><td>Largest table that can ever be <code>OK</code></td><td><code>NEVER</code> at <code>n ≥ num_blocks</code>, so at most <code>num_blocks − 1</code> blocks (the start-up check below is stricter)</td><td>9,777 blocks = 1,251,456 token slots</td><td>{{cite csrc/engine/block_manager.hpp:129-131}}</td></tr>
+    <tr><td>Start-up check</td><td><code>runtime_max_model_len ≤ int(128 × num_gpu_blocks × 0.8)</code></td><td>≤ 1,001,267</td><td>{{cite deepinfer/engine/llm_engine.py:445-446}}</td></tr>
+    <tr><td>State slots</td><td><code>int(256 × 1.2) + 1</code>, entry 0 not used</td><td>308 entries, 307 usable</td><td>{{cite deepinfer/worker/cache_engine.py:201-202}}</td></tr>
+    <tr><td>Running sequences</td><td><code>max_num_seqs</code></td><td>256</td><td>{{cite csrc/engine/scheduler.hpp:595}}, {{cite csrc/engine/scheduler.hpp:628}}</td></tr>
+    <tr><td>Prefill watermark</td><td>start a prefill only at usage ≤ 0.9</td><td>at most 8,800 used blocks</td><td>{{cite csrc/engine/scheduler.hpp:313}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Why more state slots than sequences?</strong> The code does not say. But the code shows two cases where a slot is in use although its sequence does not run:</p>
+<ul>
+  <li>An ended sequence keeps its slot until the next decode step frees it (deep dive "Timing").</li>
+  <li>A fork gets a new slot while the parent's slot is still pinned for the fork.</li>
+</ul>
+<p><strong>Usage counts block 0.</strong> <code>get_gpu_cache_usage</code> divides the used entries by <code>num_blocks</code>, and entry 0 is never free ({{cite csrc/engine/scheduler.hpp:830-835}}). In the toy pool of the figure, an empty pool has a usage of 1/10.</p>
+</x-deepdive>
+
+<x-deepdive title="Preemption and recompute, from the engine side">
+<p>{{link learn/kv-cache}} explains which sequence the scheduler preempts. This section shows what happens to the cache state of that sequence.</p>
+<ol>
+  <li><code>free_seq_nolock</code> gives back the MTP info slot, the state slot and all blocks, and clears the table ({{cite csrc/engine/scheduler.hpp:738-745}}).</li>
+  <li>For a recompute, <code>reset_for_recompute</code> sets the cache count, the in-flight count and the SWA start to 0, and clears the drafts ({{cite csrc/engine/sequence.hpp:223-227}}, {{cite csrc/engine/sequence.hpp:258-261}}, {{cite csrc/engine/sequence.hpp:134-142}}). The tokens stay.</li>
+  <li>The sequence goes to the front of <code>waiting</code>. Its table is empty, so the next prefill treats it as a new prompt of <code>len</code> tokens: prompt plus output so far ({{cite csrc/engine/scheduler.hpp:374-386}}).</li>
+  <li>With ZOS, the step that was in flight when the scheduler preempted the sequence still returns. <code>process_outputs</code> sees the status <code>WAITING</code> in a decode step and skips the sequence, so the old results do not change the reset counts ({{cite csrc/engine/scheduler.hpp:917-925}}).</li>
+</ol>
+<x-note title="The length check does not stop a recompute">
+<p>The new prefill checks <code>len &gt; prompt_limit</code> ({{cite csrc/engine/scheduler.hpp:376-384}}). Without chunked prefill, <code>prompt_limit = min(max_model_len, max_num_batched_tokens)</code> ({{cite csrc/engine/scheduler.hpp:112}}). But <code>SchedulerConfig</code> refuses <code>max_num_batched_tokens &lt; max_model_len</code> without chunked prefill ({{cite deepinfer/config.py:208-212}}). So <code>prompt_limit</code> is always <code>max_model_len</code>. A running sequence ends with <code>length</code> as soon as it is longer than <code>max_model_len</code> ({{cite csrc/engine/scheduler.hpp:1043-1046}}). Thus a preempted sequence is never longer than the limit, and its recompute passes the check.</p>
+</x-note>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A prompt that can never fit.</strong> The scheduler logs "exceeds the capacity of block_manager" and ends the request with the finish reason <code>prompt_length_exceeded</code> ({{cite csrc/engine/scheduler.hpp:389-396}}, {{cite csrc/engine/sequence.hpp:53-54}}). The direct call <code>Scheduler.try_allocate_seq</code> raises instead: <code>"can never allocate N blocks"</code> ({{cite csrc/engine/block_manager.hpp:230-233}}).</li>
+  <li><strong>Free blocks, but no state slot.</strong> A prompt waits with <code>LATER</code> when the state pool is empty, even if many KV blocks are free ({{cite csrc/engine/scheduler.hpp:197-199}}).</li>
+  <li><strong>Lock errors.</strong> A call to <code>BlockManager.lock()</code> from C++ code that holds the GIL raises an error. A wait of more than 20 seconds raises <code>"failed to lock mutex"</code> ({{cite csrc/utils/lockable.hpp:16}}, {{cite csrc/utils/lockable.hpp:25-27}}).</li>
+  <li><strong>Broken counts.</strong> A double free makes <code>ref_count</code> negative and raises <code>"ref_count corrupted"</code> ({{cite csrc/engine/block_manager.hpp:98-99}}). A table with the wrong length after <code>_append_slot</code> raises with both numbers ({{cite csrc/engine/scheduler.hpp:826-827}}). <code>BlockManager.reset()</code> does not reset anything: it only checks that all blocks are free ({{cite csrc/engine/block_manager.hpp:37}}).</li>
+  <li><strong>Open question: an abort between two prefill chunks.</strong> We found no code that frees the blocks and the state slot of such a request. See the note below.</li>
+</ul>
+<x-note title="Open question: a possible leak after an abort between chunks">
+<p>We read the code but did not run it. The steps below need <code>chunked_prefill=True</code> and a call of <code>LLMEngine.abort_request</code>.</p>
+<ol>
+  <li>The first chunk gives the prompt all its blocks and its state slot ({{cite csrc/engine/scheduler.hpp:518-520}}).</li>
+  <li>After each chunk, <code>process_outputs</code> puts the sequence back at the front of <code>waiting</code> ({{cite csrc/engine/scheduler.hpp:1016-1019}}).</li>
+  <li><code>abort_sequence</code> finds it there and sets <code>FINISHED_ABORTED</code> ({{cite csrc/engine/scheduler.hpp:147-160}}). <code>abort_request</code> frees nothing ({{cite deepinfer/engine/llm_engine.py:651-656}}).</li>
+  <li>The next schedule moves it to <code>ignored_seqs</code> and does not free it ({{cite csrc/engine/scheduler.hpp:363-367}}, {{cite csrc/engine/scheduler.hpp:570-577}}).</li>
+  <li><code>ignored_seqs</code> only gets an output ({{cite csrc/engine/outputs.hpp:297-304}}). No Python code reads <code>ignored_seqs</code>, and the engine frees only <code>finished_seqs</code> ({{cite deepinfer/engine/llm_engine.py:844-846}}).</li>
+</ol>
+<p>The offline <code>LLM</code> class never calls <code>abort_request</code>. The engine calls it only for multimodal failures ({{cite deepinfer/engine/llm_engine.py:942-945}}). Those requests never became schedulable ({{cite deepinfer/ve/multimodal_processor.py:290-292}}), so they own no blocks.</p>
+</x-note>
+<p><strong>Why it matters.</strong> The block managers decide how many requests run and when a request must wait. Most questions of the type "why does my request wait?" have one of four answers. There is no free block, or no free state slot. Or usage is above the 90 % watermark, or ended sequences still hold blocks. When you read the scheduler, look for each call into the two managers.</p>
+
+<x-quiz>
+  <x-q level="easy">Which two objects hand out cache memory in DeepInfer, and what does each one manage?
+    <x-a><p>Two C++ <code>BlockManager</code> objects. One manages the KV blocks of 128 tokens. The other manages the state slots, one per running sequence ({{cite deepinfer/engine/llm_engine.py:265-266}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The free list is <code>[4, 5, 6]</code>. A sequence with the table <code>[1, 2, 3]</code> ends. What is the free list after <code>free_seq</code>?
+    <x-a><p><code>[4, 5, 6, 3, 2, 1]</code>. <code>free_blocks_nolock</code> frees the table in reverse order, and each freed block goes to the tail ({{cite csrc/engine/block_manager.hpp:147-149}}, {{cite csrc/engine/block_manager.hpp:100-102}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With ZOS, a decode sequence has 380 tokens, 6 tokens in flight and 5 draft tokens. How many blocks must its table hold?
+    <x-a><p><code>ceil((380 + 6 + 5) / 128) = ceil(391 / 128) = 4</code> ({{cite csrc/engine/sequence.hpp:291-293}}). <code>_append_slot</code> adds the fourth block in this step ({{cite csrc/engine/scheduler.hpp:819-820}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A forked sequence has 1,000 cached tokens and shares the table <code>[5, 6, 7, 8, 9, 4, 3, 2]</code> with its parent. Which block does the scheduler copy, and what is the <code>ref_count</code> of that block after the next <code>pre_sampler_sync</code>?
+    <x-a><p><code>ceil(1000 / 128) = 8</code>, so the last used block is index 7, block 2. The scheduler copies block 2 into a new block and puts <code>(2, new)</code> into <code>clone_blocks</code> ({{cite csrc/engine/scheduler.hpp:607-611}}). After the copy, <code>DeferredRelease</code> calls <code>unpin_blocks([2])</code>, so block 2 goes from 2 back to 1: only the parent owns it ({{cite deepinfer/engine/llm_engine.py:109-116}}). This is the deep dive "Reference counts and forked sequences".</p></x-a>
+  </x-q>
+  <x-q level="hard">A new request repeats the prompt of an earlier request word for word. Does DeepInfer reuse the earlier KV blocks?
+    <x-a><p>No. The release has no prefix cache: a new prompt always gets new blocks ({{cite csrc/engine/scheduler.hpp:374-397}}), and the README lists the KV cache system as not included ({{cite README.md:38-40}}). The variable <code>prefix_caching_hit</code> does not mean a hit ({{cite csrc/engine/scheduler.hpp:373-375}}). Only a fork shares blocks.</p></x-a>
+  </x-q>
+</x-quiz>

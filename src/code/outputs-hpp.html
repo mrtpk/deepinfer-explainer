@@ -1,0 +1,240 @@
+---
+title: csrc/engine/outputs.hpp: RequestOutput and its pool
+nav_title: outputs.hpp
+level: Intermediate
+prerequisites: concepts/request-lifecycle, concepts/speculative-decoding
+related: code/llm-engine, code/entrypoints-llm, code/engine-pyi, code/scheduler-hpp, concepts/request-lifecycle, concepts/zero-overhead-scheduling, tours/life-of-a-request
+summary: outputs.hpp defines RequestOutput (one new token of one request), a fixed pool of 10000 of them, and build_request_outputs, which turns one engine step into output handles. pybind_output.cpp binds them, with clone and raw-pointer accessors.
+---
+<h2>Purpose</h2>
+<p><code>outputs.hpp</code> turns the sampled tokens of one step into C++ <code>RequestOutput</code> objects, one per new token, inside a pool that the engine reuses.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>csrc/engine/outputs.hpp</code>, 308 lines, header only. <code>csrc/engine/pybind_output.cpp</code>, 138 lines: lines 9-46 bind this header; lines 48-135 bind the input-metadata and sampler-input types (see {{link code/engine-pyi}}).</td></tr>
+    <tr><th>Main things</th><td><code>struct RequestOutput</code> ({{cite csrc/engine/outputs.hpp:18}}), <code>class RequestOutputPool</code> ({{cite csrc/engine/outputs.hpp:45}}), the function <code>build_request_outputs</code> ({{cite csrc/engine/outputs.hpp:94}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process of each data-parallel rank, on the main thread, on the CPU. <code>build_request_outputs</code> releases the {{term gil}} while it works ({{cite csrc/engine/outputs.hpp:104}}).</td></tr>
+    <tr><th>Called by</th><td><code>LLMEngine._process_model_outputs</code> (build), <code>DeferredRelease.release</code> (pool release), <code>LLM._run_engine</code> (clone).</td></tr>
+    <tr><th>Calls</th><td><code>SchedulerOutputs</code> and <code>Sequence</code> from <code>scheduler.hpp</code> and <code>sequence.hpp</code>, <code>get_finished_reason</code> ({{cite csrc/engine/sequence.hpp:45-64}}), and the data pointers of CPU tensors.</td></tr>
+    <tr><th>Not in this file</th><td>Sampling and the logprob math (the sampler), the stop decision (<code>Scheduler::_check_stop</code>), and the text decode (<code>LLM</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b3b_outputs_life" alt="Panel 1: for one request in a decode step with 5 draft rows, accepted_token_ids is 412, 77, -1, -1, -1 and the sampled token is 9051, with pushed_tokens 3. Three outputs follow: 412 and 77 with finished false and draft_tok 0, then 9051 with draft_tok 6 and accept_tok 3. Panel 2: three step cards. 1: in step N the C++ pool allocates objects and returns uint64 handles, at most 10000. 2: LLMEngine keeps the handles in DeferredRelease and returns them; the next pre_sampler_sync releases them. 3: before step N+1, LLM clones each handle into a Python-owned object." caption="Figure: one decode step makes one output per accepted draft plus one for the sampled token (panel 1). The pool owns the objects for about one step, so the caller clones them (panel 2). Click to zoom." />
+<p>Read panel 1 from left to right: the counters <code>draft_tok</code> and <code>accept_tok</code> are only on the last output of the step. Panel 2 shows the three owners of an output in time order.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>LLMEngine.__init__</code></strong> makes one <code>RequestOutputPool</code> ({{cite deepinfer/engine/llm_engine.py:230}}).</li>
+  <li><strong><code>LLMEngine._process_model_outputs</code></strong> calls <code>build_request_outputs</code> with 17 arguments, right after <code>scheduler.process_outputs</code> ({{cite deepinfer/engine/llm_engine.py:743-761}}).</li>
+  <li><strong><code>DeferredRelease.release</code></strong> gives the handles of the last step back to the pool ({{cite deepinfer/engine/llm_engine.py:106-107}}). It runs at the start of <code>pre_sampler_sync</code> ({{cite deepinfer/engine/llm_engine.py:830-831}}).</li>
+  <li><strong><code>LLM._run_engine</code></strong> calls <code>RequestOutput.clone</code> for every handle ({{cite deepinfer/entrypoints/llm.py:179-182}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>seq->is_finished()</code>, <code>get_output_len()</code>, <code>get_prompt_len()</code>, <code>get_last_token_id()</code> and the MTP fields of each scheduled {{term sequence}} ({{cite csrc/engine/sequence.hpp:295-305}}).</li>
+  <li><code>get_finished_reason</code>, which maps a status to text such as <code>"stop"</code> or <code>"length"</code> ({{cite csrc/engine/sequence.hpp:45-64}}).</li>
+  <li><code>aligned_alloc</code> and <code>std::free</code> for the pool memory ({{cite csrc/engine/outputs.hpp:54}}, {{cite csrc/engine/outputs.hpp:62}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>RequestOutput</code></td><td>{{cite csrc/engine/outputs.hpp:18-43}}</td><td>One new token of one request, with logprobs, finish data and draft counters.</td></tr>
+    <tr><td><code>RequestOutputPool</code></td><td>{{cite csrc/engine/outputs.hpp:45-81}}</td><td>10000 preallocated slots. <code>allocate</code> returns a <code>uint64</code> address; <code>release</code> destroys objects and keeps the slots.</td></tr>
+    <tr><td><code>build_request_outputs</code></td><td>{{cite csrc/engine/outputs.hpp:94-308}}</td><td>Makes the outputs of one step and returns their handles as <code>np.ndarray[np.uint64]</code>.</td></tr>
+    <tr><td><code>DEF_OUTPUT_FIELD</code> macro</td><td>{{cite csrc/engine/pybind_output.cpp:12-14}}</td><td>For each field: a read-only property and a static <code>get_&lt;field&gt;(ptr)</code>.</td></tr>
+    <tr><td><code>RequestOutput.clone</code></td><td>{{cite csrc/engine/pybind_output.cpp:17-18}}</td><td>Copies the object at a handle into a new, Python-owned object.</td></tr>
+    <tr><td>pool and build bindings</td><td>{{cite csrc/engine/pybind_output.cpp:37-46}}</td><td><code>RequestOutputPool()</code>, <code>release</code>, <code>build_request_outputs</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The fields of <code>RequestOutput</code></h3>
+<x-code file="csrc/engine/outputs.hpp" lines="27-42" />
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Meaning</th><th>Special values</th></tr></thead>
+  <tbody>
+    <tr><td><code>request_id</code></td><td><code>str</code></td><td>The id that the caller gave to <code>add_request</code>.</td><td></td></tr>
+    <tr><td><code>prompt_len</code></td><td><code>int</code></td><td>Prompt length in tokens.</td><td></td></tr>
+    <tr><td><code>token_id</code></td><td><code>int</code></td><td>The new token.</td><td>For an ignored sequence: its last token, not a new one (line 298).</td></tr>
+    <tr><td><code>finish_reason</code></td><td><code>str</code></td><td>{{term finish-reason}}, for example <code>"stop"</code>.</td><td><code>""</code> while the request runs.</td></tr>
+    <tr><td><code>finished</code></td><td><code>bool</code></td><td>True on the last output of the request.</td><td></td></tr>
+    <tr><td><code>max_num_batched_tokens</code></td><td><code>int</code></td><td>A copy of the engine setting.</td><td>Same value in every output.</td></tr>
+    <tr><td><code>token_logprobs</code></td><td><code>float</code></td><td>{{term logprob}} of <code>token_id</code>.</td><td>Floor -9999.0. Ignored sequences: 1.0 (invalid).</td></tr>
+    <tr><td><code>nextn_logprobs</code></td><td><code>float</code></td><td>Draft logprob of an accepted draft token.</td><td>1.0 = invalid (sampled token, or not computed).</td></tr>
+    <tr><td><code>sum_smaller_probs</code></td><td><code>float</code></td><td>See {{link concepts/sampler}}.</td><td>-1.0 = not computed.</td></tr>
+    <tr><td><code>top_logprobs</code>, <code>top_token_ids</code></td><td><code>list</code></td><td>The best <code>top_logprobs</code> alternatives of this request.</td><td>Empty if the request asked for 0.</td></tr>
+    <tr><td><code>num_output_tokens</code></td><td><code>int</code></td><td>Output length up to and with this token.</td><td></td></tr>
+    <tr><td><code>prompt_logprobs</code></td><td><code>list[float]</code></td><td>{{term prompt-logprobs}}, on the output of a prefill step.</td><td>Floor -9999.0.</td></tr>
+    <tr><td><code>draft_tok</code>, <code>accept_tok</code></td><td><code>int</code></td><td>Drafts checked + 1, drafts accepted + 1.</td><td>0 except on the last output of a step.</td></tr>
+    <tr><td><code>confidence_score</code></td><td><code>list[float] | None</code></td><td>A copy of the sequence's <code>prev_confidence_raw</code>: the raw draft confidence of the round before the last one ({{cite csrc/engine/sequence.hpp:125-126}}, line 292).</td><td><code>None</code> if empty.</td></tr>
+  </tbody>
+</table>
+
+<h3><code>RequestOutputPool</code>: 10000 slots</h3>
+<x-code file="csrc/engine/outputs.hpp" lines="45-81" highlight="51,54,65-69,77-78" />
+<ol>
+  <li>Line 51: the size is a compile-time constant, 10000.</li>
+  <li>Lines 53-60: the constructor allocates raw memory for all slots at once, and puts every slot on a free stack.</li>
+  <li>Lines 64-70: <code>allocate</code> takes the last free slot and builds the object in it with placement <code>new</code>. It returns the address as <code>uint64</code>: an {{term output-handle}}. Line 65 raises if no slot is free.</li>
+  <li>Lines 72-80: <code>release</code> takes an array of handles, destroys each object and puts the slot back. It does not check that a handle came from this pool, or that it is still in use.</li>
+</ol>
+
+<h3><code>build_request_outputs</code>: setup</h3>
+<x-code file="csrc/engine/outputs.hpp" lines="102-111" highlight="104,106-107" />
+<p>Lines 102-174 only read data pointers. Every input tensor must be contiguous and on the CPU (comment at line 106). The accepted-token tensors are optional; when they exist, <code>first_token_positions_</code> must exist too (line 152). Line 176 reuses one static vector for the list of handles, so that list needs no new memory per step. (The strings and vectors inside each output still allocate.)</p>
+<x-code file="csrc/engine/outputs.hpp" lines="176-192" highlight="176,179-180,184-191">
+<x-tr line="182-183">Clamp prompt logprobs to the same -9999.0 floor as the token and top logprobs below. -inf (out-of-vocabulary image tokens, positions that top-p or force-topk removed) becomes -9999.0.</x-tr>
+</x-code>
+
+<h3><code>build_request_outputs</code>: one sequence</h3>
+<p>The loop runs over the first <code>n</code> scheduled sequences, where <code>n = token_logprobs.size(0)</code> (line 179). For each sequence it first counts the accepted drafts:</p>
+<x-code file="csrc/engine/outputs.hpp" lines="199-216" highlight="205-206,209-212,215-216" />
+<ol>
+  <li>Line 205: the request's rows end where the next request's rows start, or at <code>total_q</code>.</li>
+  <li>Line 206: <code>num_draft_i = rows − 1</code>. The last row is the fresh sample.</li>
+  <li>Lines 207-213: count accepted drafts until the first <code>-1</code>.</li>
+  <li>Lines 215-216: with drafts, <code>draft_tok = drafts + 1</code> and <code>accept_tok = accepted + 1</code>. Without drafts, both are 1.</li>
+</ol>
+<x-code file="csrc/engine/outputs.hpp" lines="230-255" highlight="230-234,247-248,250-253" />
+<ol>
+  <li>Lines 230-234: stop at a <code>-1</code>, or when the output count reaches <code>pushed_tokens</code>. <code>pushed_tokens</code> comes from <code>process_outputs</code>: the number of tokens it appended before the sequence finished ({{cite csrc/engine/scheduler.hpp:982-995}}).</li>
+  <li>Line 247: only the last pushed token can have <code>finished = true</code>.</li>
+  <li>Line 248: <code>num_output_tokens</code> counts back from the current output length.</li>
+  <li>Line 251: earlier tokens get an empty finish reason.</li>
+</ol>
+<x-code file="csrc/engine/outputs.hpp" lines="257-294" highlight="257-259,271-276,282-283,288-293">
+<x-tr line="287">Set draft_tok/accept_tok on the golden token (the last emitted token of this step).</x-tr>
+</x-code>
+<ol>
+  <li>Lines 257-259: if one pushed token is left, it is the freshly sampled token <code>token_ids[i]</code>. Line 259 checks that exactly one was left.</li>
+  <li>Lines 282-283: only this output carries the prompt logprobs. So a prefill step returns them in its single output.</li>
+  <li>Lines 288-293: the last output of the step gets the draft counters and the confidence values.</li>
+</ol>
+<p>Lines 297-304 add one output for each sequence in <code>ignored_seqs</code>: prompts that were too long, requests aborted while they waited, requests whose multimodal or grammar step failed, and sequences that preemption stopped. Their <code>token_id</code> is the last token of the sequence, and the logprob fields have the invalid values.</p>
+
+<h3>The bindings and the clone rule</h3>
+<x-code file="csrc/engine/pybind_output.cpp" lines="12-39" highlight="14,17-18,24,39" />
+<ol>
+  <li>Lines 12-14: for each field, the macro makes a read-only property <em>and</em> a static function <code>RequestOutput.get_&lt;field&gt;(ptr)</code>. The comment calls it "the raw-pointer fast path on the Python side". The static function reads one field at a handle without a copy. No Python file in this release calls a <code>get_</code> function.</li>
+  <li>Line 18: <code>clone(ptr)</code> runs the C++ copy constructor and returns a <code>unique_ptr</code>, so Python owns the copy. Strings and vectors are copied too.</li>
+  <li>Line 24: <code>max_num_batched_tokens</code> has a property but no <code>get_</code> function.</li>
+  <li>Line 39: <code>release</code> takes the argument name <code>unused_request_outputs</code>.</li>
+</ol>
+<x-warning title="A handle is valid for about one step">
+<p><code>step()</code> returns handles of step N. The engine releases them at the <code>pre_sampler_sync</code> of the next <code>step()</code> call ({{cite deepinfer/engine/llm_engine.py:974}}, {{cite deepinfer/engine/llm_engine.py:830-831}}). After that, the slot can hold a different request's output. Clone each handle, or read it with a <code>get_</code> function, before you call <code>step()</code> again. The docstring of <code>step()</code> says the same ({{cite deepinfer/engine/llm_engine.py:866-870}}).</p>
+</x-warning>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Inputs of build_request_outputs: shapes and types">
+<ul>
+  <li><code>n</code>: the number of real sequences in the step.</li>
+  <li><code>total_q</code>: the number of query rows. In a decode step it is <code>n × (nextn + 1)</code> at most.</li>
+  <li><code>K</code>: the largest <code>top_logprobs</code> in the batch.</li>
+</ul>
+<table>
+  <thead><tr><th>Argument</th><th>Type, shape</th><th>Read at</th></tr></thead>
+  <tbody>
+    <tr><td><code>scheduler_outputs</code></td><td><code>SchedulerOutputs</code>: <code>scheduled_seqs</code>, <code>ignored_seqs</code></td><td>{{cite csrc/engine/outputs.hpp:195}}, {{cite csrc/engine/outputs.hpp:297}}</td></tr>
+    <tr><td><code>token_ids</code></td><td>int32 <code>[n]</code>: the sampled token</td><td>{{cite csrc/engine/outputs.hpp:271}}</td></tr>
+    <tr><td><code>token_logprobs</code></td><td>float32 <code>[n]</code>; its size defines <code>n</code></td><td>{{cite csrc/engine/outputs.hpp:179}}</td></tr>
+    <tr><td><code>top_logprobs_</code>, <code>top_token_ids_</code></td><td>float32 / int32 <code>[n, K]</code>, same shape</td><td>{{cite csrc/engine/outputs.hpp:114-123}}</td></tr>
+    <tr><td><code>sum_smaller_probs_</code></td><td>float32 <code>[n]</code>, optional</td><td>{{cite csrc/engine/outputs.hpp:124-128}}</td></tr>
+    <tr><td><code>accepted_token_ids_</code>, <code>accepted_token_logprobs_</code></td><td>int32 / float32 <code>[total_q]</code>, flat; <code>-1</code> = not accepted</td><td>{{cite csrc/engine/outputs.hpp:141-150}}</td></tr>
+    <tr><td><code>accepted_top_*</code></td><td><code>[total_q, K]</code>, optional</td><td>{{cite csrc/engine/outputs.hpp:155-163}}</td></tr>
+    <tr><td><code>accepted_sum_smaller_probs_</code>, <code>accepted_token_last_logprobs_</code></td><td>float32 <code>[total_q]</code>, optional</td><td>{{cite csrc/engine/outputs.hpp:164-173}}</td></tr>
+    <tr><td><code>pushed_tokens_before_finish</code></td><td>int32 <code>[n]</code>, from <code>process_outputs</code></td><td>{{cite csrc/engine/outputs.hpp:102-103}}</td></tr>
+    <tr><td><code>prompt_logprobs</code></td><td><code>list[list[float] | None] | None</code>, one entry per sequence</td><td>{{cite csrc/engine/outputs.hpp:184-192}}</td></tr>
+    <tr><td><code>first_token_positions_</code></td><td>int32 <code>[n]</code>: start row of each request in the flat tensors</td><td>{{cite csrc/engine/outputs.hpp:137}}, {{cite csrc/engine/outputs.hpp:204-205}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Return value.</strong> <code>py::array_t&lt;uint64_t&gt;(size, data)</code> copies the static vector into a new NumPy array ({{cite csrc/engine/outputs.hpp:307}}). So the returned array stays valid when the next call clears the vector; only the objects behind the handles go away.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked examples: how many outputs per request">
+<p>All examples have <code>nextn = 5</code>, so a decode request has 6 rows: 5 draft rows and 1 fresh row.</p>
+<table>
+  <thead><tr><th>Case</th><th>Accepted rows</th><th><code>pushed_tokens</code></th><th>Outputs</th><th><code>draft_tok</code> / <code>accept_tok</code></th></tr></thead>
+  <tbody>
+    <tr><td>Two drafts accepted</td><td><code>412, 77, -1, -1, -1</code></td><td>3</td><td>412, 77, then sampled 9051</td><td>6 / 3, on 9051</td></tr>
+    <tr><td>All drafts accepted</td><td>5 ids</td><td>6</td><td>5 drafts + the bonus sample</td><td>6 / 6</td></tr>
+    <tr><td>None accepted</td><td><code>-1</code> first</td><td>1</td><td>only the sampled token</td><td>6 / 1</td></tr>
+    <tr><td>77 is EOS</td><td><code>412, 77, -1, …</code></td><td>2</td><td>412, then 77 with <code>finished = true</code>, reason <code>"stop"</code></td><td>6 / 3, on 77</td></tr>
+    <tr><td>Prefill, last chunk</td><td>none</td><td>1</td><td>one output, with prompt logprobs if asked</td><td>1 / 1</td></tr>
+    <tr><td>Prefill, not the last chunk</td><td>none</td><td>0</td><td>no output</td><td>-</td></tr>
+  </tbody>
+</table>
+<p>In the EOS case, the loop stops after 77 because the next row is <code>-1</code> (lines 230-231). (If that row held a token, line 233 would stop the loop, because <code>appended_tokens</code> would exceed <code>pushed_tokens</code>.) Now <code>appended_tokens</code> equals <code>pushed_tokens</code>, so line 257 skips the sampled token: it is dropped. But <code>accept_tok</code> was counted before the loop, so it is still 3 (lines 207-216).</p>
+<p><strong>How a script uses the counters.</strong> <code>examples/offline_inference.py</code> computes the accept rate of a request: drafts = <code>Σ draft_tok − count(draft_tok &gt; 0)</code>, accepted = <code>Σ accept_tok − count(draft_tok &gt; 0)</code> ({{cite examples/offline_inference.py:82-86}}). For the first row of the table: (6 − 1) drafts and (3 − 1) accepted, so 2 / 5 = 40 %.</p>
+</x-deepdive>
+
+<x-deepdive title="Pool size: how many outputs can be alive">
+<p>Follow one call of <code>step()</code> with ZOS on, number <em>k</em> ({{cite deepinfer/worker/worker.py:143-189}}):</p>
+<ol>
+  <li>The Worker post-processes step <em>k</em> − 1. <code>build_request_outputs</code> allocates the set S<sub>k</sub>.</li>
+  <li>The Worker starts sampling and calls <code>pre_sampler_sync</code>. <code>DeferredRelease</code> releases S<sub>k−1</sub>, which the last <code>step()</code> returned.</li>
+  <li><code>step()</code> returns S<sub>k</sub>, and the engine collects it for the next release.</li>
+</ol>
+<p>So for a short time, two sets are alive. Without ZOS, the Worker post-processes after <code>pre_sampler_sync</code> (line 183-185), so only one set is alive.</p>
+<p><strong>Worst case.</strong> A decode step makes at most <code>nextn + 1</code> outputs per request, plus one per ignored sequence. With ZOS:</p>
+<pre><code class="language-none">alive ≤ 2 × max_num_seqs × (nextn + 1)   (+ ignored sequences)
+max_num_seqs = 256, nextn = 5:  2 × 256 × 6 = 3,072   (fits in 10,000)
+max_num_seqs = 834, nextn = 5:  2 × 834 × 6 = 10,008  (can exceed 10,000)</code></pre>
+<p>The second line is an upper bound: it needs every draft of every request to be accepted in two steps in a row. If the pool runs out, <code>allocate</code> raises <code>"RequestOutputPool exhausted (max_size=10000); outputs are not being released"</code> (line 65). The limit is a constant in the header; no setting changes it.</p>
+</x-deepdive>
+
+<x-deepdive title="Threads, the GIL and memory">
+<ul>
+  <li><strong>GIL.</strong> <code>build_request_outputs</code> reads the NumPy array <code>pushed_tokens_before_finish</code> first, while it still holds the GIL (lines 102-103). Then it releases the GIL (line 104) and takes it back only to make the NumPy result (line 306). The tensor reads and the pool calls do not need Python.</li>
+  <li><strong>One thread.</strong> The function uses a <code>static</code> result vector (line 176). Two threads that call it at the same time would share that vector. The engine calls it only from the main thread.</li>
+  <li><strong>Pool memory.</strong> <code>aligned_alloc(alignof(RequestOutput), sizeof(RequestOutput) × 10000)</code> (line 54). The strings and vectors inside each object allocate their own heap memory; <code>release</code> frees it with <code>std::destroy_at</code> (line 77).</li>
+  <li><strong>Clone memory.</strong> A clone is a normal heap object that Python owns. <code>LLM</code> keeps all clones of all requests until <code>generate()</code> returns ({{cite deepinfer/entrypoints/llm.py:175-188}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Pool memory allocation fails at start-up</td><td>RuntimeError "RequestOutputPool: failed to allocate N bytes"</td><td>{{cite csrc/engine/outputs.hpp:55}}</td></tr>
+    <tr><td>All 10000 slots in use</td><td>RuntimeError "RequestOutputPool exhausted …"</td><td>{{cite csrc/engine/outputs.hpp:65}}</td></tr>
+    <tr><td>A tensor is not contiguous, or top / accepted shapes differ</td><td>RuntimeError from <code>TORCH_CHECK</code></td><td>{{cite csrc/engine/outputs.hpp:107}}, {{cite csrc/engine/outputs.hpp:117-119}}, {{cite csrc/engine/outputs.hpp:144-146}}</td></tr>
+    <tr><td>Accepted tokens without <code>first_token_positions_</code></td><td>RuntimeError</td><td>{{cite csrc/engine/outputs.hpp:152}}</td></tr>
+    <tr><td><code>pushed_tokens_before_finish</code> has the wrong length</td><td>RuntimeError</td><td>{{cite csrc/engine/outputs.hpp:180}}</td></tr>
+    <tr><td>More than one sampled token left to emit</td><td>RuntimeError</td><td>{{cite csrc/engine/outputs.hpp:259}}</td></tr>
+    <tr><td>A released or foreign handle passed to <code>clone</code> or <code>release</code></td><td>no check: undefined behavior</td><td>{{cite csrc/engine/pybind_output.cpp:18}}, {{cite csrc/engine/outputs.hpp:76}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/request-lifecycle}}: where a request ends and gets its finish reason.</li>
+  <li>{{link concepts/speculative-decoding}}: why one step can give several tokens.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why outputs come one step late.</li>
+  <li>{{link code/llm-engine}}: <code>step()</code>, <code>DeferredRelease</code> and <code>_process_model_outputs</code>.</li>
+  <li>{{link code/entrypoints-llm}}: the caller that clones and groups the outputs.</li>
+  <li>{{link tours/life-of-a-request}}: stops 12 and 13 follow one output.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Why does <code>LLM._run_engine</code> call <code>RequestOutput.clone(raw_output)</code>?
+    <x-a><p>A handle is the address of an object in the pool. The engine releases it at the next <code>pre_sampler_sync</code>, and the slot is used again ({{cite deepinfer/engine/llm_engine.py:974}}, {{cite csrc/engine/outputs.hpp:72-80}}). The clone is a Python-owned copy that stays valid ({{cite csrc/engine/pybind_output.cpp:17-18}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In a decode step with <code>nextn = 5</code>, a request's accepted rows are <code>[8, -1, -1, -1, -1]</code> and nothing stops it. How many outputs does it get, and what are <code>draft_tok</code> and <code>accept_tok</code> on the last one?
+    <x-a><p>Two outputs: token 8, then the sampled token. <code>draft_tok = 5 + 1 = 6</code>, <code>accept_tok = 1 + 1 = 2</code>, both on the sampled token ({{cite csrc/engine/outputs.hpp:215-216}}, {{cite csrc/engine/outputs.hpp:288-290}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A prompt is too long and the scheduler ignores it. What does its one output contain?
+    <x-a><p><code>token_id</code> = the last token of the prompt, <code>finished = true</code>, <code>finish_reason = "prompt_length_exceeded"</code>, <code>token_logprobs = 1.0</code> (invalid), <code>num_output_tokens = 1</code> ({{cite csrc/engine/outputs.hpp:297-304}}, {{cite csrc/engine/sequence.hpp:53-54}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With ZOS on, <code>max_num_seqs = 1000</code> and <code>nextn = 5</code>. Can the pool run out? Explain with the order of the calls in one <code>step()</code>.
+    <x-a><p>Yes, in the worst case. In call <em>k</em>, post-processing of step <em>k</em> − 1 allocates the new outputs before <code>pre_sampler_sync</code> releases the outputs of call <em>k</em> − 1 ({{cite deepinfer/worker/worker.py:143-164}}). So two sets are alive: up to 2 × 1000 × 6 = 12,000 &gt; 10,000 if all drafts are accepted. Then <code>allocate</code> raises ({{cite csrc/engine/outputs.hpp:65}}). This is the deep dive "Pool size".</p></x-a>
+  </x-q>
+</x-quiz>
