@@ -1,0 +1,155 @@
+---
+title: Cross-layer KV sharing
+nav_title: Cross-layer KV sharing
+level: Advanced
+prerequisites: concepts/kv-compression, concepts/sparse-attention-indexer, concepts/model-map
+related: concepts/yoco-swa-replay, concepts/mla-attention, concepts/paged-kv-cache, code/v4-cross-layer, code/v4-attn, code/cache-engine
+summary: A layer can reuse the compressed KV, the indexer keys or the top-k list of an earlier source layer. SharedLayerTopology turns three lists of source layers from config.json into checked segment maps; the cache engine then allocates the compressed-KV and index-K caches only for source layers.
+---
+<x-sentence>A source layer computes and stores a value once; the next layers in its segment read the same cache or list instead of their own.</x-sentence>
+
+<h2>The idea</h2>
+<p>Neighbour layers often need very similar keys. {{term cross-layer-sharing | Cross-layer KV sharing}} uses this. A {{term source-layer}} computes a value and stores it. The layers right after it, its consumers, read that value and do not compute or store their own copy. A source and its consumers form a <em>segment</em>.</p>
+<p>DeepInfer can share three values, each with its own map:</p>
+<ol>
+  <li><strong>KV</strong> (<code>layer_kv_map</code>): the {{link concepts/kv-compression | compressed KV}} in <code>ca_cache</code>, and its compression state.</li>
+  <li><strong>Index K</strong> (<code>layer_index_k_map</code>): the keys of the {{term sparse-indexer}} in <code>ica_cache</code>.</li>
+  <li><strong>Top-k</strong> (<code>layer_index_module_map</code>): the whole indexer and its result, the list of selected keys.</li>
+</ol>
+<p>The {{link concepts/sliding-window-attention | sliding-window}} cache is never shared. Each layer also keeps its own query and its own attention output. So a consumer reads the same keys as its source, but asks its own question.</p>
+<p><strong>An everyday comparison.</strong> Think of a team that shares one set of notes. One person (the source) takes the notes; the next people read them and do not write their own. Each person still writes a personal report (the query and the output). The comparison stops here: the team order is fixed, and a reader can only use the notes of the nearest note-taker before it.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5b_cross_layer" alt="Panel 1: a grid with 8 layers as columns and 5 rows. Compress ratios are 0, 2, 2, 2, 2, 1, 2, 2. KV row: layer 0 none, layers 1, 3, 5, 6 own, layer 2 reads 1, layer 4 reads 3, layer 7 reads 6. Index-K row: the same as KV. Top-k row: layers 1, 2, 3, 5, 6 own, layer 4 reads 3, layer 7 reads 6. SWA ring row: every layer owns its ring. Panel 2: three boxes. Layer 3 as source writes ca_cache, ca_state, ica_cache and topk_indices; the CrossLayerRuntime carries pre_rope_kv, topk_indices and the loaded prefill buffers; layer 4 as consumer has no compressor and no indexer and reads views of layer 3's caches." caption="Figure: an example sharing config with 8 layers (made-up values). Look at layer 2: it has its own indexer, but it reads the KV and the index keys of layer 1. Click to zoom." />
+<p>Panel 1 shows the three maps for the example. A solid cell means "own"; a dashed cell names the source. Panel 2 shows how one forward moves values from layer 3 to layer 4. The real source lists come from config.json and are not in the repo.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: config.json gives lists of source layers</h3>
+<x-code file="deepinfer/hugging_face/config.py" lines="62-85" highlight="64-65,72-74" />
+<p><code>_source_map</code> maps each layer from the first source to the end to the nearest source at or before it. Example: sources <code>[1, 3, 5, 6]</code> with 8 layers give <code>{1: 1, 2: 1, 3: 3, 4: 3, 5: 5, 6: 6, 7: 6}</code>. If config.json has no <code>index_k_source_layer_ids</code>, the index-K map uses the KV sources (line 74). Every compressed layer gets the same <code>layer_info_shared_cfg</code> ({{cite deepinfer/hugging_face/config.py:129}}). SWA-only layers get none ({{cite deepinfer/hugging_face/config.py:99-108}}).</p>
+
+<h3>Step 2: SharedLayerTopology makes and checks the maps</h3>
+<p>The model builds one <code>SharedLayerTopology</code> at start-up, for the main layers and the draft layers ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:339-351}}). It turns each map into a list over all layers. A layer that is not in the map is its own source:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/cross_layer.py" lines="143-155" highlight="145-146,151-154" />
+<p>Line 151 fills the gaps with self-references. Lines 152-154 forbid sharing in the draft (MTP) layers. Then <code>_validate</code> checks the rules ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:89-118}}). Each map must be contiguous segments. Each consumer must carry the shared config, with the same compress ratio and <code>index_topk</code> as its source. KV consumers must have the same SWA setting. The maps must nest. The deep dive "The validation rules" gives the details.</p>
+
+<h3>Step 3: the cache engine allocates caches only for sources</h3>
+<x-code file="deepinfer/worker/cache_engine.py" lines="424-465" highlight="429-431,447-449">
+<x-tr line="425-427">Whether index K is reused depends only on the index-K map, not on the whole index module or the main KV map. When index_mapped_layer_id != layer_id, the layer reuses the ica_cache of another layer's indexer and does not store index K again; otherwise the layer owns its index KV. Only an independent compressor indexer needs index state.</x-tr>
+<x-tr line="430">share-index-K: reuse the K cache of another layer's indexer; do not move the kv offset and do not allocate index state.</x-tr>
+<x-tr line="446">Whether the main (compressed) KV is reused depends only on the KV map, not on the index map.</x-tr>
+</x-code>
+<p>A consumer gets the <em>same tensor view</em> as its source (lines 431 and 449). It adds no bytes to the block row and no compression state. The engine reads the maps from <code>layer_info_shared_cfg</code> of each layer, and asserts that a source comes before its consumers ({{cite deepinfer/worker/cache_engine.py:141-162}}).</p>
+
+<h3>Step 4: only sources get the modules</h3>
+<p>The builder passes the source flags to each layer's container. A KV consumer gets no <code>PackedWkv</code>; a top-k consumer gets no indexer ({{cite deepinfer/model_executor/models/v4_modules/builder.py:63-73}}, {{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:252-273}}). An index-source layer that is not an index-K source has an indexer, but it borrows <code>k_proj</code> and <code>k_norm</code> from its index-K source ({{cite deepinfer/model_executor/models/v4_modules/builder.py:76-91}}). At run time, <code>V4Attention</code> reads its three flags from the topology:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="251-260" />
+
+<h3>Step 5: values travel through CrossLayerRuntime</h3>
+<p>Some values exist only during one forward: the top-k list, the pre-RoPE KV, and the BF16 prefill buffers. <code>DeepseekModel.forward</code> makes one {{term cross-layer-runtime}} object and passes it to every layer ({{cite deepinfer/model_executor/models/deepseek.py:165-166}}). A source writes; a consumer reads:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="568-570" />
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="585-586" />
+<p>Each value has a single slot. This works because the segments are contiguous and the layers run in order, so the value in the slot always comes from the nearest source ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:284-287}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The validation rules">
+<table>
+  <thead><tr><th>Rule</th><th>Why</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td>All carried <code>layer_info_shared_cfg</code> copies are equal; at least one exists</td><td>The topology keeps only the first copy</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:71-75}}</td></tr>
+    <tr><td>Each map is contiguous segments: a consumer points to the nearest source before it</td><td>One slot per value in <code>CrossLayerRuntime</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:169-179}}</td></tr>
+    <tr><td>A consumer carries <code>layer_info_shared_cfg</code></td><td>Without it, the cache engine treats the layer as a source and gives it a cache that nobody writes</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:106-112}}</td></tr>
+    <tr><td>Same <code>kv_compress_ratio</code> and <code>index_topk</code> as the source; same <code>use_swa</code> for KV</td><td>The shared cache layout and index width must match</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:240-261}}</td></tr>
+    <tr><td>The first YOCO consumer layer is a KV source</td><td>"share-kv must not cross the YOCO compaction boundary"</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:114-116}}</td></tr>
+    <tr><td>Segments nest: top-k ⊆ index K ⊆ KV</td><td>Index K is projected from the source's compressed KV, so it cannot cross a KV segment</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:191-197}}</td></tr>
+    <tr><td>No sharing in draft layers</td><td>"The MTP module does not support cross-layer sharing"</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:152-154}}</td></tr>
+    <tr><td>A sparse KV source or index source has its own indexer with <code>kproj</code></td><td>It must make <code>pre_rope_kv</code> and the index K</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:323-324}}</td></tr>
+  </tbody>
+</table>
+<p><strong>The nesting check, step by step.</strong> <code>_validate_map_refines</code> tests <code>coarse[fine[l]] == coarse[l]</code> for every layer ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:182-189}}). In words: the fine source of layer <em>l</em> must be in the same coarse segment as <em>l</em>.</p>
+<ol>
+  <li>Example (valid): top-k map <code>[0, 1, 2, 3, 3, 5, 6, 6]</code>, index-K map <code>[0, 1, 1, 3, 3, 5, 6, 6]</code>. Layer 2: fine source 2, coarse source of 2 is 1, coarse source of layer 2 is 1. Equal.</li>
+  <li>Example (invalid): KV sources <code>[1, 4]</code> and index-K sources <code>[1, 3]</code>. Layer 4: index-K source 3, KV source of 3 is 1, KV source of 4 is 4. Not equal, so the assert fails. Layer 4 would read index keys that were projected from another KV segment.</li>
+</ol>
+<p>A consequence: every KV source is also an index-K source and an index source (the comment on {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:93-96}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Who owns what: modules, caches and runtime values">
+<table>
+  <thead><tr><th>Item</th><th>Only in</th><th>Consumers</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td><code>PackedWkv</code> / <code>Compressor</code></td><td>KV source</td><td>none</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:345-352}}</td></tr>
+    <tr><td><code>ca_cache</code> bytes, <code>ca_state</code></td><td>KV source</td><td>same view</td><td>{{cite deepinfer/worker/cache_engine.py:447-465}}</td></tr>
+    <tr><td><code>KProject</code> (index-K store)</td><td>index-K source</td><td>read the source's <code>ica_cache</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:91-94}}</td></tr>
+    <tr><td><code>ica_cache</code> bytes</td><td>index-K source</td><td>same view</td><td>{{cite deepinfer/worker/cache_engine.py:428-439}}</td></tr>
+    <tr><td><code>MQA</code> indexer and the index part of <code>q_b_proj</code></td><td>index source</td><td>use <code>topk_indices</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:292-299}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:354-364}}</td></tr>
+    <tr><td><code>swa_cache</code>, query, output projection</td><td>every layer</td><td>(not shared)</td><td>{{cite deepinfer/worker/cache_engine.py:406-422}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Runtime values</strong> ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:289-336}}):</p>
+<ul>
+  <li><code>pre_rope_kv</code>: a KV source with a local indexer writes it (attn.py line 548). An index-K source that is not a KV source reads it (line 550).</li>
+  <li><code>topk_indices</code>: written by an index source (line 586); read by top-k consumers (line 569).</li>
+  <li><code>loaded_prefill_kv</code> and its offset: the BF16 prefill buffer of a KV source, with the compressed rows already loaded. A KV consumer reuses it and overwrites only the SWA rows ({{cite deepinfer/model_executor/models/v4_modules/attn.py:723-750}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:833-842}}).</li>
+  <li><code>loaded_prefill_index_kv</code>: the FP4 index keys loaded by an index-K source; its index-source consumers reuse them and compute only their own logits ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:181-202}}).</li>
+  <li><code>block_candidate_idxs</code> and related fields: the candidate-block feature (next deep dive).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Memory saved: worked example">
+<p>Use the example config of the figure (made-up values). It has 8 main layers with ratios <code>[0, 2, 2, 2, 2, 1, 2, 2]</code>. KV and index-K sources are <code>[1, 3, 5, 6]</code>. Assume FP4 entries (288 B) and an example <code>index_head_dim</code> of 128, so one index key takes 128 / 2 + 128 / 32 = 68 B ({{cite deepinfer/worker/cache_engine.py:73-80}}).</p>
+<table>
+  <thead><tr><th>Per block row</th><th>Without sharing</th><th>With sharing</th></tr></thead>
+  <tbody>
+    <tr><td>Main KV, C2 layers (64 × 288 = 18,432 B each)</td><td>6 layers: 110,592 B</td><td>3 sources (1, 3, 6): 55,296 B</td></tr>
+    <tr><td>Main KV, C1 layer 5 (128 × 288 B)</td><td>36,864 B</td><td>36,864 B</td></tr>
+    <tr><td>Index K, C2 layers (64 × 68 = 4,352 B each)</td><td>6 layers: 26,112 B</td><td>3 sources: 13,056 B</td></tr>
+    <tr><td>Index K, C1 layer 5 (128 × 68 B)</td><td>8,704 B</td><td>8,704 B</td></tr>
+    <tr><td><strong>Total</strong></td><td><strong>182,272 B</strong></td><td><strong>113,920 B</strong> (−37.5 %)</td></tr>
+  </tbody>
+</table>
+<p>Each part is padded to 32 bytes; these numbers are already multiples of 32 ({{cite deepinfer/worker/cache_engine.py:437-439}}, {{cite deepinfer/worker/cache_engine.py:459-461}}). The whole row is then padded to <code>lcm(128, 288)</code> = 1,152 B ({{cite deepinfer/worker/cache_engine.py:481-484}}). The compression state also shrinks: 3 instead of 6 C2 rings of 28,672 B per state slot ({{cite deepinfer/worker/cache_engine.py:190-198}}). A smaller block row gives more blocks in the same memory, so more tokens fit.</p>
+</x-deepdive>
+
+<x-deepdive title="Candidate blocks (an extra sharing feature)">
+<p>config.json can name one <code>candidate_source_layer_id</code>. The HF loader then marks every layer from that one to the end as using its candidates, with <code>candidate_topk_blocks</code> and <code>candidate_block_size</code> ({{cite deepinfer/hugging_face/config.py:76-84}}). The source layer selects a set of candidate key blocks; later index-source layers score and select top-k only inside that set ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:49-53}}).</p>
+<p>The checks are in {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:199-238}}:</p>
+<ul>
+  <li>The candidate source is an index source with <code>index_topk</code> above 0.</li>
+  <li><code>candidate_topk_blocks</code> is a positive multiple of 8, and the block size is 1 … 16.</li>
+  <li>Consumers have the same compress ratio as the source.</li>
+  <li>The candidate capacity is at least the consumer's <code>index_topk</code>.</li>
+</ul>
+<p> The indexer adds more limits, for example 8 or 16 tokens per candidate block ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:101-109}}). The page {{link code/v4-index-attn}} covers the kernels.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A gap in a segment.</strong> A map such as <code>{4: 4, 6: 4}</code> with layer 5 missing fails: layer 5 becomes its own source and cuts the segment ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:44-47}}, {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:176-179}}).</li>
+  <li><strong>A consumer without the shared config.</strong> The topology asserts; without the check, the layer would read a cache that nobody writes ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:106-112}}).</li>
+  <li><strong>Sharing across the YOCO boundary.</strong> If the first consumer layer reuses an earlier layer's KV, the assert on {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:116}} fails. See {{link concepts/yoco-swa-replay}}.</li>
+  <li><strong>A source after its consumer.</strong> The cache engine asserts that a mapped layer is not later than the layer ({{cite deepinfer/worker/cache_engine.py:160-161}}).</li>
+  <li><strong>A model with no shared layer.</strong> <code>build_shared_layer_topology</code> returns <code>None</code>, and every layer is a source ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:346-351}}). The V4.1 HF loader always attaches the shared config to compressed layers, so this happens only without compressed layers.</li>
+</ul>
+<p><strong>Why it matters.</strong> Sharing cuts the bytes per token of the paged cache and the work of the compressor and indexer. The price is accuracy that the model must learn in training, and strict rules about the order of layers. When a layer reads strange keys, check its three source ids first.</p>
+
+<x-quiz>
+  <x-q level="easy">Which cache is never shared between layers?
+    <x-a><p>The sliding-window ring (<code>swa_cache</code>). The cache engine allocates it for every SWA layer with no map lookup ({{cite deepinfer/worker/cache_engine.py:406-422}}).</p></x-a>
+  </x-q>
+  <x-q level="medium"><code>kv_source_layer_ids = [2, 5]</code> with 8 main layers. Which layers read the compressed KV of layer 2?
+    <x-a><p>Layers 3 and 4: <code>_source_map</code> gives <code>{2: 2, 3: 2, 4: 2, 5: 5, 6: 5, 7: 5}</code> ({{cite deepinfer/hugging_face/config.py:62-65}}). Layers 0 and 1 are not in the map, so they are their own sources ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:151}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A layer is an index source but not an index-K source. What does it compute itself, and what does it read?
+    <x-a><p>It computes its own index query and weights and selects its own top-k ({{cite deepinfer/model_executor/models/v4_modules/attn.py:292-299}}). It reads the index keys of its index-K source: the cache engine gives it that layer's <code>ica_cache</code> ({{cite deepinfer/worker/cache_engine.py:429-431}}), and in prefill it reuses the loaded keys ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:193-196}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">KV sources are <code>[1, 4]</code> and index-K sources are <code>[1, 3]</code>. Is the config valid? Explain with the check.
+    <x-a><p>No. <code>_validate_map_refines("index-k", ..., "kv", ...)</code> checks <code>kv[ik[l]] == kv[l]</code>. For layer 4: <code>ik[4]</code> = 3, <code>kv[3]</code> = 1, <code>kv[4]</code> = 4, so the assert fails ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:185-189}}, {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:196-197}}). See the deep dive "The validation rules".</p></x-a>
+  </x-q>
+  <x-q level="hard">In the worked example, how many bytes per block row does sharing save, and why does the C1 layer save nothing?
+    <x-a><p>182,272 − 113,920 = 68,352 B. Layer 5 is a C1 source. A consumer must have the same compress ratio as its source ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:253-261}}). So the C2 layers around it cannot share with it. See the deep dive "Memory saved: worked example".</p></x-a>
+  </x-q>
+</x-quiz>

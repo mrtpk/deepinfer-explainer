@@ -1,0 +1,193 @@
+---
+title: YOCO and SWA bounded replay
+nav_title: YOCO and SWA bounded replay
+level: Advanced
+prerequisites: concepts/model-map, concepts/sliding-window-attention, concepts/kv-compression, concepts/cross-layer-kv-sharing
+related: concepts/mla-attention, concepts/context-parallelism, concepts/speculative-decoding, concepts/input-metadata, code/deepseek, code/v4-attn, code/decoder-layer, reference/env-vars
+summary: YOCO splits the main layers into producer and consumer layers. Consumer layers project their compressed KV from one shared hidden state. With the optional prefill truncation (README feature "Decoder SWA bounded replay"), a prefill computes the consumer layers only for the last KEEP_TOKENS prompt tokens (140 in the README), with the window cut at that range. Only their compressed KV still covers every token.
+---
+<x-sentence>Consumer layers take their compressed KV from one shared hidden state, so a prefill can run them only for the last 140 tokens.</x-sentence>
+
+<h2>The idea</h2>
+<p>{{term yoco}} splits the N main layers at <code>n_prefill_layer</code>, the first layer with {{term compress-ratio}} 1:</p>
+<ul>
+  <li><strong>Producer layers</strong> <code>[0, n_prefill_layer)</code> work as usual. The deployment notes call them "encoder layers".</li>
+  <li><strong>Consumer layers</strong> <code>[n_prefill_layer, N)</code> make their compressed KV from one {{term shared-hidden}}, not from their own input. The notes call them "decoder layers" ({{cite doc/inference_deployment_qa.md:187}}).</li>
+</ul>
+<p>This changes what a long prefill must compute. The compressed KV of every consumer layer depends only on the shared hidden state, and that comes from the producer layers. So the consumer layers do not need to run attention and MoE on the full prompt to fill their compressed caches. They need the full prompt for two things only: the output of the last token, and their {{link concepts/sliding-window-attention | sliding-window}} KV.</p>
+<p>{{term swa-bounded-replay | SWA bounded replay}} uses this. With <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code>, a prefill runs the consumer layers only for the last <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code> tokens of the prompt. The README gives 140 as the V4.1 setting ({{cite README.md:25}}). The window of these tokens is cut at the start of the kept range. The consumer-layer SWA KV that results is then approximate. This is a deduction from the visibility rule. The deployment notes also call the replay result approximate, for use in decode only ({{cite doc/inference_deployment_qa.md:183}}, {{cite doc/inference_deployment_qa.md:187}}).</p>
+<p>The truncation is <strong>off by default</strong> ({{cite deepinfer/environ.py:188}}). Without it, every layer computes every prompt token, and the shared hidden state only changes where the compressed KV comes from.</p>
+<p><strong>An everyday comparison.</strong> Think of a long meeting with a written summary. Late participants read the summary (the compressed KV from the shared state) and listen only to the last ten minutes (the kept tokens). They can then follow the next discussion well. The comparison stops here: their notes about those ten minutes differ a little from the notes of a full listener. The engine accepts that difference.</p>
+<x-note title="The name YOCO">
+<p>The repo does not expand the name. In the research literature, YOCO ("You Only Cache Once") is a decoder-decoder design with a similar split. This site uses the name only as the code uses it.</p>
+</x-note>
+
+<h2>The picture</h2>
+<x-diagram name="b5b_yoco" alt="Panel 1: three bars over positions 0 to 1000. Producer layers compute all rows. Consumer layers compute only rows 860 to 999 (140 rows); rows 0 to 859 are not computed. The compressed KV and index K of consumer layers cover all 1,000 positions, from the full shared hidden state. Panel 2: a zoom from 840 to 1006 with the keep boundary at 860. Query 860 sees 1 key, query 900 sees 41 keys, query 987 and query 999 see full windows of 128 keys. The ring writes positions 866 to 999. Panel 3: three boxes: off computes 1,000 rows with full windows; mask computes 1,000 rows with the window cut at 860; compact computes 140 rows with the window cut at 860." caption="Figure: compact truncation for a 1,000-token prompt with KEEP_TOKENS = 140. Look at panel 2: only the queries from 987 on see a full window. Click to zoom." />
+<p>Panel 1 shows which rows each group of layers computes. Panel 2 shows the window of the kept queries in a consumer layer, and which positions go into the ring. Panel 3 compares the three modes.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: producer and consumer layers</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/yoco.py" lines="14-21" />
+<p>The HF loader sets <code>n_prefill_layer</code> to the index of the first ratio-1 layer ({{cite deepinfer/hugging_face/config.py:158-161}}). By line 21, that layer is the first consumer. The docstring of the loader says otherwise; the page {{link concepts/model-map}} explains the difference. This site describes the code.</p>
+
+<h3>Step 2: the shared hidden state</h3>
+<p>The first consumer layer saves its attention-norm output in the {{term cross-layer-runtime}}:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="146-152">
+<x-tr line="147-148">First consumer layer: the attn-norm bf16 hidden is the shared hidden. Write it in place into the cross-layer runtime, for this layer and the later consumer layers (held across layers).</x-tr>
+<x-tr line="149-150">Under yoco compaction this is the compact version (the boundary code above has already switched to the compact copy); the full version goes through consumer_full_hidden.</x-tr>
+<x-tr line="151">TODO(YOCO): remove this clone (it now prevents an in-place clear inside attn).</x-tr>
+</x-code>
+<p>In a consumer layer that is a KV source, the compressor weights go into a separate projection, <code>shared_hidden_kv_proj</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:345-352}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:372-373}}). In decode and in a prefill without compaction, the layer projects the shared hidden state with it ({{cite deepinfer/model_executor/models/v4_modules/attn.py:775-780}}). The query and the SWA KV still come from the layer's own input, because the HF loader sets <code>yoco_swa_share_hidden=False</code> ({{cite deepinfer/hugging_face/config.py:47}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:249}}).</p>
+
+<h3>Step 3: the settings and the guard</h3>
+<x-code file="deepinfer/environ.py" lines="187-194">
+<x-tr line="189-190">YoCo consumer prefill truncation mode: off turns it off; mask keeps every query and only narrows the SWA visible range; compact really removes the truncated queries, to reduce the work of the consumer layers.</x-tr>
+<x-tr line="192-194">Number of last query tokens kept when YoCo consumer prefill truncation is on. In both mask and compact, the SWA visible range is the intersection of the original window and the rectangle of the last KEEP_TOKENS. KEEP_TOKENS must be &gt;= window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS; the default is 0, so set it explicitly when truncation is on.</x-tr>
+</x-code>
+<p>The model runner checks the minimum at start-up:</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="104-113" highlight="109-113">
+<x-tr line="104-105">Keep the three-state mode, to check later whether truncation is on and whether it uses the compact layout. ModelMetadata already makes sure that the model has YoCo consumer layers when truncation is on.</x-tr>
+<x-tr line="108">The truncation length must be at least window_size + backtracking, so that after a rollback the decoder still gets a full window of SWA.</x-tr>
+</x-code>
+<p>With the defaults, the minimum is 128 + 6 = 134, so the README value 140 passes. The C++ input preparation checks the same rule again ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:353-357}}). <code>ModelMetadata</code> also asserts that the model has consumer layers, that <code>n_prefill_layer</code> is above 0 and that <code>KEEP_TOKENS</code> is above 0 ({{cite deepinfer/model_executor/model_metadata_utils.py:90-92}}).</p>
+
+<h3>Step 4: the boundary in the forward</h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="190-207" highlight="191,196-198,207">
+<x-tr line="193">YOCO truncation: the metadata layout switches from full to compact; the hidden states switch inside the first YOCO consumer layer.</x-tr>
+<x-tr line="194">Rule: what must be computed to the end (compact) becomes input_metadata; the full metadata goes to the full-source path through the cross-layer runtime.</x-tr>
+<x-tr line="195">NOTE: when the metadata switches to compact, the hidden states passed in are still the original ones.</x-tr>
+<x-tr line="200-202">All DFlash target layers are on the consumer side: dflash_input switches to the compact row count together with the hidden states (cp_mirror_len under CP, else total_q), so that the rows of dflash_input_store match the consumer layer's hidden states.</x-tr>
+</x-code>
+<ol>
+  <li>Line 191: only in a prefill, and only at the first consumer layer (<code>yoco_boundary_layer_idx</code> is <code>n_prefill_layer</code> when truncation is on, {{cite deepinfer/model_executor/models/deepseek.py:126-127}}).</li>
+  <li>Lines 196-198 (compact): the layers from here on get the compact metadata view. The full metadata stays in the runtime for the KV store.</li>
+  <li>Line 207 (mask): the layers get a view with a narrower window and the same rows.</li>
+</ol>
+<p>Inside the first consumer layer, the hidden states and the mHC residual also switch to the kept rows. Before the switch, the layer saves the full attention-norm output as <code>consumer_full_hidden</code>:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="134-142" highlight="137-141" />
+
+<h3>Step 5: full compressed KV, compact attention</h3>
+<p>In compact mode, each consumer layer first writes its compressed KV and index keys for <em>all</em> prompt positions, from the full hidden state:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="769-774" />
+<p><code>_store_yoco_full_kv</code> uses the full metadata and <code>consumer_full_hidden</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:672-721}}). Then the normal path runs on the kept rows only, and skips the KV store: "only the compact query's topk is computed" ({{cite deepinfer/model_executor/models/v4_modules/attn.py:537-540}}). The SWA KV of the kept rows goes into the ring through <code>yoco_consumer_slot_mapping_store_swa</code> ({{cite deepinfer/model_executor/input_metadata/yoco.py:55-56}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: a 1,000-token prompt">
+<p>Settings: <code>compact</code>, <code>KEEP_TOKENS</code> = 140, window 128 (the docs value), ring 134, one sequence, one prefill chunk (<code>q_start</code> = 0, <code>q_len</code> = <code>data_len</code> = 1,000), no context parallelism.</p>
+<ol>
+  <li><strong>Producer layers.</strong> All 1,000 rows, as without YOCO.</li>
+  <li><strong>Clip.</strong> <code>clip_prefix</code> = clamp(1,000 − 140 − 0, 0, 999) = 860 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:225}}). The kept rows are 860 … 999: <code>yoco_consumer_total_q</code> = 140, <code>yoco_consumer_query_indices</code> = [860 … 999] ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:261-265}}).</li>
+  <li><strong>Boundary.</strong> At layer <code>n_prefill_layer</code>, the hidden states shrink from <code>[1000, hc, hidden]</code> to <code>[140, hc, hidden]</code>, by a gather with the query indices ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:65-67}}).</li>
+  <li><strong>Compressed KV.</strong> Each KV-source consumer layer writes entries for all 1,000 positions: 1,000 in a C1 layer, 500 in a C2 layer. Index keys likewise ({{cite deepinfer/model_executor/models/v4_modules/attn.py:692-721}}).</li>
+  <li><strong>Window.</strong> For a kept query at <em>pos</em>, the oldest visible key is max(<em>pos</em> − 127, 860) ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:155}}). Query 860 sees 1 key; query 900 sees 41; queries 987 … 999 see 128.</li>
+  <li><strong>Ring.</strong> A kept row writes the ring only if it is among the last 134 rows of the chunk: rows 866 … 999 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:267-271}}). Rows 860 … 865 are computed but not stored.</li>
+  <li><strong>Top-k.</strong> The indexer selects keys only for the 140 kept queries. Each kept query reads <code>(pos + 1) / ratio</code> compressed entries, as without truncation ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:292-301}}).</li>
+  <li><strong>First decode step.</strong> The query at 1,000 reads ring positions 873 … 1,000. All of them were written: 873 … 999 by the prefill, 1,000 by the step itself.</li>
+</ol>
+<p><strong>Work.</strong> Each consumer layer runs its query projection, attention and MoE on 140 rows instead of 1,000. Only the KV path stays at full length. Each KV-source consumer layer projects, compresses and stores the KV of all 1,000 positions. It also stores their index keys. The deployment notes report "nearly halving total prefill computation" for V4.1 ({{cite doc/inference_deployment_qa.md:187}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Why the result is approximate, and why that is acceptable">
+<p>The first consumer layer gets exact inputs for every kept row: they come from the producer layers, which saw the whole prompt. Its SWA KV is exact. But its attention output for rows 860 … 986 used a cut window. So the next consumer layer gets slightly different inputs for those rows, and stores slightly different SWA KV. The difference moves forward one window per layer. This is a deduction from the visibility rule ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:149-168}}).</p>
+<p>The deployment notes agree. An exact rebuild "would require running the last 2,560 tokens through 20 decoder layers" (128 × 20). The replay result "is used for decode only and never enters the prefix cache" ({{cite doc/inference_deployment_qa.md:187}}). The numbers 20 and 2,560 come from the docs.</p>
+<p>The cache layout follows the same rule. The SWA rings of consumer layers are in the "dropped" part of the state slot, which never goes to the external KV store ({{cite deepinfer/worker/cache_engine.py:113-116}}, {{cite deepinfer/worker/cache_engine.py:221-235}}). The compressed KV of consumer layers is exact, because it comes from the full shared hidden state.</p>
+<p><strong>Why <code>KEEP_TOKENS ≥ window + backtracking</code>.</strong> The translated comment says: after a rollback, the decoder must still get a full window of SWA ({{cite deepinfer/worker/model_runner.py:108}}). With 134 kept rows, the ring holds every position that the first decode step can read. The README value 140 is 6 rows above this minimum; the repo does not say why.</p>
+</x-deepdive>
+
+<x-deepdive title="mask and compact, and the views">
+<p><code>InputMetadataV4</code> gets the YOCO fields from the mixin <code>YocoMetadataMixin</code>. C++ fills one of two field sets, never both:</p>
+<table>
+  <thead><tr><th>Field</th><th>Mode</th><th>Shape</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>yoco_mask_swa_index_pivots</code></td><td>mask</td><td>int32 <code>[total_q, 4]</code></td><td>Pivots of the cut window, full layout; rows before the range see no SWA key ({{cite deepinfer/model_executor/input_metadata/yoco.py:35-37}})</td></tr>
+    <tr><td><code>yoco_consumer_query_indices</code></td><td>compact</td><td>int32 <code>[total_q_c]</code></td><td>Full row of each kept row ({{cite deepinfer/model_executor/input_metadata/yoco.py:38-39}})</td></tr>
+    <tr><td><code>yoco_consumer_cu_seqlens_q</code>, <code>_total_q</code>, <code>_positions</code></td><td>compact</td><td><code>[num_seqs + 1]</code>, int, <code>[total_q_c]</code></td><td>The compact batch ({{cite deepinfer/model_executor/input_metadata/yoco.py:40-45}})</td></tr>
+    <tr><td><code>yoco_consumer_swa_index_pivots</code></td><td>compact</td><td>int32 <code>[total_q_c, 4]</code></td><td>Pivots of the cut window ({{cite deepinfer/model_executor/input_metadata/yoco.py:46-47}})</td></tr>
+    <tr><td><code>yoco_consumer_ks</code>, <code>_ke</code>, <code>_kv_ca_index_offset_len</code></td><td>compact</td><td>per ratio</td><td>Compressed key ranges of the kept rows ({{cite deepinfer/model_executor/input_metadata/yoco.py:48-54}})</td></tr>
+    <tr><td><code>yoco_consumer_slot_mapping_store_swa</code></td><td>compact</td><td>int32 <code>[total_q_c]</code></td><td>Ring slots; −1 for placeholder rows ({{cite deepinfer/model_executor/input_metadata/yoco.py:55-56}})</td></tr>
+    <tr><td><code>yoco_consumer_cp_*</code>, <code>yoco_cp_*</code></td><td>compact, CP &gt; 1</td><td>scalars, index tensors</td><td>Re-split after the compaction ({{cite deepinfer/model_executor/input_metadata/yoco.py:57-64}})</td></tr>
+  </tbody>
+</table>
+<p>The predicates test which field set exists ({{cite deepinfer/model_executor/input_metadata/yoco.py:66-84}}). The two views are shallow copies:</p>
+<x-code file="deepinfer/model_executor/input_metadata/yoco.py" lines="86-128" highlight="90,104-113,115-118">
+<x-tr line="87">yoco decoder truncation changes only the mask; it does not really truncate.</x-tr>
+<x-tr line="95-99">Make a compact shallow copy of the metadata for the first YoCo consumer layer. Switch the query-aligned fields and the SWA visible range to the compact layout, and clear the expanded attention fields so that they are rebuilt. With CP &gt; 1, also redo the zigzag split and build the layer-boundary redistribution index. Fields that are not rewritten share tensors with the original metadata; do not change them in place.</x-tr>
+<x-tr line="111-112">Swap the SWA visible range for the compact yoco pivots: the consumer layer reads kv_swa_full_index(_pivots) as usual and gets the truncation semantics.</x-tr>
+<x-tr line="114">Fields expanded during the forward are set to None; compute_attn_info expands them again from the compact metadata.</x-tr>
+<x-tr line="119-120">input_ids is used only in the embedding before the layer loop, so keep the original varlen tensor. gate_force_random is gathered from the global full layout to the compact layout.</x-tr>
+</x-code>
+<p>Both modes use the same visibility function in C++, so the kept rows get the same numbers ({{cite deepinfer/model_executor/input_metadata/yoco.py:1-6}}). The checker in <code>examples/yoco</code> uses mask as the reference for compact ({{cite examples/yoco/README.md:3}}). One more rule applies to chunks. When a whole chunk is before the kept range, compact mode keeps the last row of the chunk as a placeholder ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:222-225}}). That row writes no ring slot ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:266-271}}).</p>
+</x-deepdive>
+
+<x-deepdive title="_store_yoco_full_kv, line by line">
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="682-721" highlight="684-685,688,692-709,710-712,714-721" />
+<ol>
+  <li><strong>Lines 684-685.</strong> An SWA-only consumer layer has no compressed KV, so it returns at once.</li>
+  <li><strong>Line 688.</strong> Expand the index fields of the full metadata (once; later calls do nothing).</li>
+  <li><strong>Lines 692-709.</strong> A KV source projects <code>consumer_full_hidden</code> with <code>shared_hidden_kv_proj</code> only. It skips the merged projection, so it does not compute unused index weights. Then it stores the main KV for all rows and keeps <code>pre_rope_kv</code>.</li>
+  <li><strong>Lines 710-712.</strong> A KV consumer with its own indexer reads <code>pre_rope_kv</code> from the runtime.</li>
+  <li><strong>Lines 714-721.</strong> The index-K store for all rows.</li>
+</ol>
+<p>Cross-layer sharing must not cross the boundary: the first consumer layer must be a KV source ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:114-116}}). At the boundary, <code>compact_yoco_boundary</code> also compacts a top-k list that a producer layer shares with consumer layers ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:116-122}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Context parallelism, DFlash and Engram">
+<ul>
+  <li><strong>CP.</strong> Compact mode cuts first and then splits for CP again. Each rank selects its kept rows, all ranks all-gather them, and each rank takes its new rows ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:55-76}}). The view rebuilds the mirror index with <code>prepare_cp_mirror</code> ({{cite deepinfer/model_executor/input_metadata/yoco.py:130-182}}). The userbuffer grows to carry the mHC residual ({{cite deepinfer/model_executor/models/deepseek.py:417-420}}).</li>
+  <li><strong>DFlash.</strong> The DFlash target layers must be all producers or all consumers ({{cite deepinfer/model_executor/models/deepseek.py:128-135}}). If they are consumers, <code>dflash_input</code> shrinks to the kept rows ({{cite deepinfer/model_executor/models/deepseek.py:199-205}}).</li>
+  <li><strong>Engram.</strong> Engram layers must be producers in compact mode ({{cite deepinfer/model_executor/models/deepseek.py:136-138}}, {{cite deepinfer/model_executor/models/decoder_layer.py:136}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="The scheduler, the cost estimate and the cache-hit policy">
+<ul>
+  <li><strong>Cost estimate.</strong> The engine gives the mode and <code>KEEP_TOKENS</code> to the <code>FlopsEstimator</code> ({{cite deepinfer/engine/llm_engine.py:318-322}}). It counts the consumer rows from the cut-off, and keeps the last row of a fully cut chunk ({{cite csrc/engine/flops_estimator.hpp:259-278}}).</li>
+  <li><strong><code>truncate_len</code>.</strong> The engine passes <code>KEEP_TOKENS</code> to the C++ scheduler only in compact mode, else 0 ({{cite deepinfer/engine/llm_engine.py:260}}, {{cite deepinfer/engine/llm_engine.py:315}}). In this release, <code>scheduler.hpp</code> only stores the value ({{cite csrc/engine/scheduler.hpp:88}}, {{cite csrc/engine/scheduler.hpp:1167}}).</li>
+  <li><strong>Hit policy (docs only).</strong> The deployment notes give two rules. First: "under the YOCO truncation requirement, the maximum hit length for an input of length L is at most L − 134". Second: "If an SWA KV cache exists in the range L1 − 128 to L1, the hit length is L1; otherwise it is L1 − 128" ({{cite doc/inference_deployment_qa.md:191}}). L1 is the hit length from the block KV cache, and 134 is "128-token window + 6 tokens of speculative backtracking". The KV cache system is not in this release ({{cite README.md:40}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Checking compact against mask: examples/yoco">
+<p>The folder <code>examples/yoco/</code> has an equivalence checker with two levels ({{cite examples/yoco/README.md:5-8}}):</p>
+<ul>
+  <li><strong>L1</strong> (<code>mask-compact</code>, one device, no weights). It compares the SWA pivots, the visible keys, the store slots and the compressed key ranges of both modes. The reference is: visible = window ∩ [N − KEEP_TOKENS, N) ({{cite examples/yoco/yoco_equiv.py:116-118}}). The cases cover a prompt shorter than, equal to and longer than <code>KEEP_TOKENS</code>, and chunks before, across and inside the range ({{cite examples/yoco/yoco_equiv.py:79-99}}).</li>
+  <li><strong>L2</strong> (<code>logp</code> + <code>compare</code>, 8 devices, a V4.1 checkpoint). It runs mask and then compact on a fixed trajectory. Then it compares logprobs and top-K element by element ({{cite examples/yoco/run_yoco_equiv_l2.sh:9-11}}).</li>
+</ul>
+<pre><code class="language-bash">python examples/yoco/yoco_equiv.py mask-compact --keep-tokens 140 --window 128
+examples/yoco/run_yoco_equiv_l2.sh --model_name /path/to/compatible-v41-hf</code></pre>
+<p>The checker compares compact with mask, not with "off". It checks that compaction removes rows without other changes. It does not measure the approximation itself.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Set KEEP_TOKENS together with the mode">
+<p>Set <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code> when you set the mode. Its default is 0, and any mode other than <code>off</code> then fails an assert ({{cite deepinfer/model_executor/model_metadata_utils.py:90-92}}).</p>
+</x-warning>
+<ul>
+  <li><strong>Too few kept tokens.</strong> A value below window + backtracking (134 with the defaults) fails at start-up ({{cite deepinfer/worker/model_runner.py:110-113}}). More draft tokens raise the minimum.</li>
+  <li><strong>A model without consumer layers.</strong> The mode needs <code>n_prefill_layer &lt; N</code> and above 0 ({{cite deepinfer/model_executor/model_metadata_utils.py:90-91}}).</li>
+  <li><strong>Engram or split DFlash targets in compact mode.</strong> Asserts at model build ({{cite deepinfer/model_executor/models/deepseek.py:128-138}}).</li>
+  <li><strong>Small differences in the output.</strong> With truncation on, the consumer-layer SWA KV of the last prompt tokens is approximate (a deduction from the visibility rule; the deployment notes agree). To compare with a reference run, set the mode to <code>off</code>.</li>
+</ul>
+<p><strong>Why it matters.</strong> With compaction on, the consumer half of the model costs much less in a long prefill. Only its KV path runs on every token. The price is an approximation in the consumer-layer SWA KV of the last prompt tokens, which the first decode tokens read. The attention and MoE work of the consumer layers does not grow with the prompt length.</p>
+
+<x-quiz>
+  <x-q level="easy">What is the default of <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code>, and which values does it accept?
+    <x-a><p><code>off</code>; it accepts <code>off</code>, <code>mask</code> and <code>compact</code> ({{cite deepinfer/environ.py:188}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With a window of 128 and the default 5 draft tokens, what is the smallest valid <code>KEEP_TOKENS</code>?
+    <x-a><p>128 + 6 = 134. The backtracking count is at least nextn + 1 = 6 ({{cite deepinfer/environ.py:132}}), and the runner asserts window + backtracking ≤ KEEP_TOKENS ({{cite deepinfer/worker/model_runner.py:110}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In compact mode, why can the consumer layers skip most prompt rows but still have a complete compressed cache?
+    <x-a><p>Their compressed KV comes from the shared hidden state ({{cite deepinfer/model_executor/models/v4_modules/attn.py:345-352}}). The first consumer layer saves the full attention-norm output as <code>consumer_full_hidden</code> before the rows shrink ({{cite deepinfer/model_executor/models/decoder_layer.py:137-140}}), and <code>_store_yoco_full_kv</code> writes the KV of all positions from it ({{cite deepinfer/model_executor/models/v4_modules/attn.py:692-709}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A 1,000-token prompt, compact, KEEP_TOKENS = 140, window 128. How many SWA keys does the consumer-layer query at position 900 see, and which kept rows write the ring?
+    <x-a><p>41 keys (860 … 900): the oldest visible key is max(900 − 127, 1,000 − 140) = 860 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:155}}). Rows 866 … 999 write the ring, because a row must be in the kept range and among the last 134 rows ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:267-271}}). See the deep dive "Worked example".</p></x-a>
+  </x-q>
+  <x-q level="hard">The deployment notes say the replay result "never enters the prefix cache". Where does the code put the consumer-layer SWA rings to match this?
+    <x-a><p>In the "dropped" region of the state slot, after the stored SWA rings of the producer layers. Only the stored region goes to the store ({{cite deepinfer/worker/cache_engine.py:113-116}}, {{cite deepinfer/worker/cache_engine.py:221-235}}, {{cite deepinfer/worker/cache_engine.py:306}}).</p></x-a>
+  </x-q>
+</x-quiz>

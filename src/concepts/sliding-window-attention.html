@@ -1,0 +1,182 @@
+---
+title: Sliding-window attention
+nav_title: Sliding-window attention
+level: Intermediate
+prerequisites: learn/attention, learn/kv-cache, concepts/mla-attention
+related: concepts/kv-compression, concepts/sparse-attention-indexer, concepts/yoco-swa-replay, concepts/speculative-decoding, concepts/paged-kv-cache, code/v4-attn
+summary: Every attention layer of DeepSeek-V4.1-Flash reads the most recent tokens (a window of 128 in the docs) from a ring of 134 slots per sequence and layer. This page shows the ring, the decode and prefill index paths, and how the window joins the compressed keys.
+---
+<x-sentence>Each layer reads the last 128 tokens exactly, from a per-sequence ring of 134 slots; compressed layers add selected older keys.</x-sentence>
+
+<h2>The idea</h2>
+<p>In normal {{term attention}}, a new token reads the keys of <em>all</em> earlier tokens. The cost and the {{term kv-cache}} then grow with the length of the sequence. {{term sliding-window-attention | Sliding-window attention}} (SWA) reads only the last <em>W</em> tokens: the window. Its cache has a fixed size for each sequence, whatever the length.</p>
+<p>In DeepInfer every attention layer has a window. The config key <code>sliding_window</code> gives <em>W</em> ({{cite deepinfer/hugging_face/config.py:284}}). The repo does not contain the value; the deployment notes use 128 ({{cite doc/inference_deployment_qa.md:191}}). This page uses 128 as the example value.</p>
+<p>A window alone forgets old tokens. So most layers also read {{link concepts/kv-compression | compressed keys}} that cover the whole history. A layer with {{term compress-ratio}} 0 is "SWA only": it reads the window and nothing else.</p>
+<p>The window lives in a {{term ring-buffer}} of 134 slots per sequence and layer: 128 for the window plus 6 {{term backtracking-tokens}}. Position <em>p</em> always goes to slot <em>p</em> % 134. A new token replaces the token that is 134 positions older.</p>
+<p><strong>An everyday comparison.</strong> Think of a round table with 134 numbered seats. Guest number <em>p</em> sits on seat <em>p</em> % 134 and sends the earlier guest on that seat away. To talk to "the last 128 guests", you walk around the table from one seat. The comparison stops here: a real guest leaves for ever, but a compressed copy of each token stays in the main cache.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5b_swa_ring" alt="Panel 1: a position axis from 0 to 1000. The query at position 1000 reads the window 873 to 1000 and some compressed entries spread over the whole history. Panel 2: two rows of 67 cells show the 134 ring slots. Slots 69 to 133 and 0 to 62 hold the window of the query at 1000; slot 62 is the query itself; slots 63 to 67 hold the 5 draft tokens 1001 to 1005; slot 68 still holds position 872, which no query of the step needs. Panel 3: a prefill buffer with a history section (positions 1920 to 2047) and a new-token section (2048 to 2347). Query 2048 reads 127 history keys and 1 new key; query 2248 reads 128 new keys." caption="Figure: the window, the ring and the prefill index for one sequence and one layer. Look at panel 2: the window wraps around the end of the ring. Click to zoom." />
+<p>Panel 1 shows what one decode query reads. Panel 2 shows where those keys are: the ring wraps, so the window of position 1000 starts at slot 69 and ends at slot 62. Panel 3 shows the prefill case, where the keys come from a gathered buffer with two sections.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: every layer gets a ring</h3>
+<p>The Hugging Face loader gives every layer kind <code>sink_mode="swa"</code>: the SWA-only spec, the compressed spec and the DFlash spec ({{cite deepinfer/hugging_face/config.py:99-108}}, {{cite deepinfer/hugging_face/config.py:111-116}}, {{cite deepinfer/hugging_face/config.py:136-143}}). The cache engine allocates a ring for each layer with that mode:</p>
+<x-code file="deepinfer/worker/cache_engine.py" lines="682-687" highlight="687">
+<x-tr line="684">Intentionally does not check use_swa: a use_swa=False layer (packed-KV / YoCo consumer) also takes an SWA slot that is never read or written.</x-tr>
+</x-code>
+<p>With the default settings, the ring size is the window plus the backtracking count:</p>
+<x-code file="deepinfer/worker/cache_engine.py" lines="88-93" highlight="93">
+<x-tr line="89-92">swa_block_size is window_size plus the part stored extra for rollback. If window_size &lt; 0 in the config, the model has no SWA layer: return 0. NextN must roll back n tokens. A maximum rollback count can also be set directly.</x-tr>
+</x-code>
+<p><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> is never below <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> ({{cite deepinfer/environ.py:132}}). The default draft count is 5 ({{cite deepinfer/environ.py:129}}), so the ring has 128 + 6 = 134 slots. Each slot holds one {{term latent-kv}} vector of 512 values in FP8 with one UE8M0 scale per 32 values: 512 + 16 = 528 bytes ({{cite deepinfer/worker/cache_engine.py:261-263}}, {{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-118}}). The ring is in the sequence's {{term state-slot}}, not in the paged blocks.</p>
+
+<h3>Step 2: decode writes the new tokens into the ring</h3>
+<p>Before each step, the input preparation computes one ring slot for each new token. The C++ code shows the rule:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="98-108" highlight="103-106" />
+<p>The slot is <code>state_id × 134 + position % 134</code>. In decode, every query token gets a slot. In a prefill, only the last 134 tokens of the chunk get one. Older tokens get −1 (no write), because no window can reach them again. In decode, the fused kernel writes the FP8 vector straight into <code>swa_cache</code> through this {{term slot-mapping}} ({{cite deepinfer/model_executor/models/v4_modules/attn.py:421-432}}).</p>
+<x-note title="Decode with zero-overhead scheduling"><p>With zero-overhead scheduling, which a NORMAL engine uses by default, the C++ function is not used for decode. The device kernel <code>prepare_v4_decode_metadata</code> fills the same fields, with the same window and ring size ({{cite deepinfer/model_executor/model_metadata_utils.py:143}}, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367}}). Prefill always uses C++.</p></x-note>
+
+<h3>Step 3: decode reads the window</h3>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="639-651" highlight="646-649">
+<x-tr line="645">Length is window_size, but not more than the number of available tokens.</x-tr>
+</x-code>
+<p>The {{link code/prepare-tensor-input-v4 | C++ input builder page}} explains this file. C++ sends only two numbers per query: the slot of the oldest window key and the length. A TileLang kernel expands them on the device into <code>kv_swa_index</code>, int32 <code>[T, 128]</code>. The reference code shows the rule:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py" lines="85-93" highlight="91" />
+<p>Line 91 keeps the ring base (<code>offset // 134 × 134</code>) and wraps the slot with <code>% 134</code>. Unused columns stay −1. The call site is {{cite deepinfer/model_executor/input_metadata/input_metadata.py:372-376}}.</p>
+
+<h3>Step 4: prefill builds one buffer and a two-part index</h3>
+<p>A prefill does not read the ring directly. It copies the history window of each sequence into a BF16 buffer, then appends the SWA KV of the new tokens:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="844-857" highlight="847-852,855">
+</x-code>
+<p>The comment on line 854 says: the store slots can overlap the loaded range, so the store must come after the load. For each query, C++ gives four numbers, the {{term swa-pivots}}: start and length in the history section, then start and length in the new-token section ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:478-527}}). The kernel <code>expand_swa_index</code> turns them into <code>kv_swa_full_index</code>, int32 <code>[T, 128]</code>:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/swa_index.py" lines="10-32" highlight="31" />
+
+<h3>Step 5: the window joins the compressed keys</h3>
+<p>A compressed layer reads two key lists. In prefill, <code>kv_index_cat</code> joins the window list and the compressed list into one row of <code>window + topk</code> indices ({{cite deepinfer/model_executor/models/v4_modules/attn.py:603-612}}). In decode, the kernel gets the two caches as two arguments:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="640-653" highlight="642-646,650" />
+<p>An SWA-only layer has no <code>ca_cache</code>, so <code>key_cache_extra</code> is <code>None</code> and the layer reads only the window. Both kernels also get the {{term attention-sink}} values of the layer ({{cite deepinfer/model_executor/models/v4_modules/attn.py:622}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:665}}). The page {{link concepts/mla-attention}} explains the sinks.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Why 134 slots, not 128">
+<p>A decode step writes all its new SWA vectors first, then runs attention. With the default 5 draft tokens, one step has 6 query tokens per sequence: positions <em>p</em> to <em>p</em> + 5 (see {{link concepts/speculative-decoding}}). The rule is in {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:103-104}} and {{cite deepinfer/model_executor/models/v4_modules/attn.py:421-432}}.</p>
+<ol>
+  <li>The first query (position <em>p</em>) needs positions <em>p</em> − 127 to <em>p</em>.</li>
+  <li>The step also writes positions <em>p</em> + 1 to <em>p</em> + 5.</li>
+  <li>So the ring must hold positions <em>p</em> − 127 to <em>p</em> + 5 at the same time: 133 positions.</li>
+  <li>With 128 slots, the draft at <em>p</em> + 1 would overwrite position <em>p</em> − 127, which the first query still reads.</li>
+</ol>
+<p>The code reserves <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> = 6 extra slots, so the ring has 134 slots: one more than this count needs. The docs give two reasons for the extra slots. The hit policy calls them "6 tokens of speculative backtracking" ({{cite doc/inference_deployment_qa.md:191}}). The store copy "can overshoot the boundary by at most 5 tokens, which is absorbed by the 6 extra positions" ({{cite doc/inference_deployment_qa.md:165}}).</p>
+<p><strong>Rejected drafts.</strong> A rejected draft is never deleted. The next step starts at the first rejected position and writes the same positions again, into the same slots. Then the ring holds the correct tokens again.</p>
+<p>The compression state uses the same rule with its own numbers: its ring must hold <code>ratio + tokens per step − 1</code> entries ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:98-100}}). See {{link concepts/kv-compression}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Ring size, bytes and settings">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect on the ring</th></tr></thead>
+  <tbody>
+    <tr><td><code>sliding_window</code> (config.json)</td><td>not in the repo (128 in the docs)</td><td>{{cite deepinfer/hugging_face/config.py:284}}</td><td>The window <em>W</em>. Every layer must use the model value ({{cite deepinfer/model_executor/models/v4_modules/attn.py:243}}).</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5</td><td>{{cite deepinfer/environ.py:129}}</td><td>Raises the backtracking count to at least 6.</td></tr>
+    <tr><td><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td>0, raised to nextn + 1</td><td>{{cite deepinfer/environ.py:132}}</td><td>Ring = <em>W</em> + this value ({{cite deepinfer/worker/cache_engine.py:93}}).</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code></td><td>off</td><td>{{cite deepinfer/environ.py:163}}</td><td>On: the ring grows by <code>DEEPINFER_PREFILL_STORE_EXTRA_SIZE</code> (default 128), plus <code>KEEP_TOKENS</code> when YOCO truncation is on ({{cite deepinfer/worker/cache_engine.py:96-110}}).</td></tr>
+  </tbody>
+</table>
+<p><strong>Bytes.</strong> One ring per layer and sequence: 134 × 528 B = 70,752 B. The code pads each layer to 32 bytes; 70,752 is already a multiple of 32 ({{cite deepinfer/worker/cache_engine.py:274-277}}). The SWA format is always MXFP8, also when the main cache uses FP4: <code>use_fp4=False</code> for SWA ({{cite deepinfer/worker/cache_engine.py:261-263}}).</p>
+<p><strong>Tensor view.</strong> <code>swa_cache</code> is uint8 <code>[num_state_slots, 134, 1, 528]</code>. The row stride is the size of the whole state slot, so one row index (<code>state_id</code>) selects one sequence ({{cite deepinfer/worker/cache_engine.py:419-422}}, {{cite deepinfer/worker/cache_engine.py:216-218}}).</p>
+<p><strong>Where in the slot.</strong> The slot starts with the "stored" SWA rings of the producer layers. Then come the "dropped" SWA rings of the YOCO consumer layers, and the compression state ({{cite deepinfer/worker/cache_engine.py:221-241}}). Only the stored part goes to the external KV store. The deployment notes give its size: "20 layers × 134 tokens × 528 B = 1,415,040 B per sequence" ({{cite doc/inference_deployment_qa.md:169}}). The number 20 comes from the docs, not from the code. See {{link concepts/yoco-swa-replay}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Decode index, worked example">
+<p>Sequence with <code>state_id</code> 3, decode query at position 1,000, window 128, ring 134 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:644-649}}):</p>
+<ol>
+  <li><code>real_window_size</code> = min(1,000 + 1, 128) = 128.</li>
+  <li>The oldest key is 1,000 − 128 + 1 = 873. 873 % 134 = 69, so <code>offset</code> = 3 × 134 + 69 = 471.</li>
+  <li>The kernel makes 128 slots: 402 + (69 + <em>j</em>) % 134 for <em>j</em> = 0 … 127 ({{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:91}}).</li>
+  <li><em>j</em> = 0 … 64 give slots 471 … 535 (positions 873 … 937). <em>j</em> = 65 … 127 wrap and give slots 402 … 464 (positions 938 … 1,000).</li>
+  <li>Slot 464 = 3 × 134 + 1,000 % 134 = 402 + 62: the query's own key, written in the same step ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:104}}).</li>
+</ol>
+<p>A short sequence at position 50 gets <code>real_window_size</code> = 51, so columns 51 … 127 are −1.</p>
+<p>Shapes: <code>kv_swa_index_offset_len</code> int32 <code>[T, 2]</code>; <code>kv_swa_index</code> int32 <code>[T, 128]</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:313-317}}). With zero-overhead scheduling, the device kernel <code>prepare_v4_decode_metadata</code> builds the offsets ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:326-367}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Prefill: load plan, pivots and store, line by line">
+<p><strong>The load plan.</strong> C++ copies each sequence's history window from its ring into the first section of the buffer:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="372-388" highlight="378-383" />
+<ol>
+  <li><strong>Lines 378-379.</strong> The history window is positions <code>q_start − W</code> to <code>q_start − 1</code>: the <em>W</em> tokens before the chunk.</li>
+  <li><strong>Lines 380-382.</strong> Positions before 0 (or before <code>swa_valid_start</code>) become zero rows: a segment with <code>src_block_id = −1</code>.</li>
+  <li><strong>Line 383.</strong> The rest is a ring range. The builder splits it where the ring wraps, so one sequence has at most three segments ({{cite csrc/engine/input_metadata/block_load_plan.cpp:37-46}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:268-271}}).</li>
+  <li><strong>Line 387.</strong> The section always has <code>num_seqs × W</code> rows.</li>
+</ol>
+<p>Example: 2,048 cached tokens, so the history is 1,920 … 2,047. 1,920 % 134 = 44. The plan has two segments: ring rows 44 … 133 (90 tokens), then rows 0 … 37 (38 tokens). A new prompt (<code>q_start</code> = 0) gets one zero segment of 128 rows.</p>
+<p><strong>The pivots.</strong></p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="490-524" highlight="507,512-517,520-523">
+<x-tr line="499-500">Zero-state recompute: the SWA state of [0, valid_start) is cleared, so the left edge of the visible window is clamped to valid_start, to avoid attention to cleared slots. With valid_start = 0 (normal path) this is the same as the original start_in_win = min(W, max(j+1, W − q_start)).</x-tr>
+<x-tr line="502">The code below assumes valid_start &lt;= q_start. The visible range is always larger than the input range.</x-tr>
+<x-tr line="506">Lower bound of the absolute position of a visible key: the max of the window bound and the valid-state bound, clamped to &gt;= 0.</x-tr>
+<x-tr line="511">Section 1 (history, read from the state buffer): visible range [min(abs_lo, q_start), q_start).</x-tr>
+<x-tr line="519">Section 2 (new in this chunk): visible range [max(abs_lo, q_start), pos].</x-tr>
+</x-code>
+<ol>
+  <li><strong>Line 507.</strong> The oldest visible key is <code>pos − W + 1</code>, not below <code>valid_start</code> and 0.</li>
+  <li><strong>Lines 512-517.</strong> Section 1: the history part. <code>start_slot</code> is the first visible row of this sequence's 128 history rows; the length is <code>W − start_slot</code>.</li>
+  <li><strong>Lines 520-523.</strong> Section 2: the new part, from <code>k_lo</code> to the query itself.</li>
+</ol>
+<p>Example, same sequence (2,048 cached, 300 new). Query <em>j</em> = 0 (position 2,048): <code>abs_lo</code> = 1,921, <code>start_slot</code> = 1, so 127 history keys and 1 new key. Query <em>j</em> = 200 (position 2,248): <code>abs_lo</code> = 2,121, <code>start_slot</code> = 128 (empty history part), <code>k_lo</code> = 73, so 128 new keys.</p>
+<p><strong>The store.</strong> After the load, <code>store_kv_cache</code> writes the last 134 new vectors into the ring ({{cite deepinfer/model_executor/models/v4_modules/attn.py:855}}). The prefill vectors went through an FP8 round trip (<code>cast_back=True</code>). So attention in the prefill sees the same numbers that decode later reads from the ring ({{cite deepinfer/model_executor/models/v4_modules/attn.py:412-419}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Where SWA sits among the layer kinds">
+<table>
+  <thead><tr><th>Layer kind</th><th>Window</th><th>Compressed keys</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td>Ratio 0 (SWA only)</td><td>yes</td><td>no</td><td><code>_win_spec</code>, <code>sparse_stage=0</code> ({{cite deepinfer/hugging_face/config.py:99-108}})</td></tr>
+    <tr><td>Ratio 1 or 2, sparse</td><td>yes (must be: {{cite deepinfer/model_executor/models/v4_modules/attn.py:95-96}})</td><td>top-k of the indexer</td><td><code>_compress_spec</code> ({{cite deepinfer/hugging_face/config.py:111-133}})</td></tr>
+    <tr><td>Ratio 1 or 2, dense (<code>index_topk</code> = 0)</td><td>yes</td><td>all</td><td>supported by the code, not made by the HF loader</td></tr>
+    <tr><td><code>use_swa=False</code></td><td>no</td><td>yes (must be: {{cite deepinfer/model_executor/models/v4_modules/attn.py:94}})</td><td>no HF key sets it; the default is <code>True</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:93}})</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li><strong>RoPE.</strong> A compressed layer builds its rotary table with <code>compress_rope_theta</code>; an SWA-only layer uses <code>rope_theta</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:275-280}}). The SWA keys of a layer use that layer's table.</li>
+  <li><strong>Projection.</strong> The SWA vector comes from the same merged GEMM as the query latent (<code>q_a_kv_swa_proj</code>, {{cite deepinfer/model_executor/models/v4_modules/attn.py:280-288}}).</li>
+  <li><strong>Sharing.</strong> Cross-layer sharing never shares the ring. Each layer stores its own SWA KV ({{cite deepinfer/worker/cache_engine.py:406-422}}). See {{link concepts/cross-layer-kv-sharing}}.</li>
+  <li><strong>Draft model.</strong> The DFlash layers also have <code>sink_mode="swa"</code> and their own rings ({{cite deepinfer/hugging_face/config.py:136-143}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Zero-state recompute: swa_valid_start">
+<p>Each sequence has a field <code>swa_valid_start</code> ({{cite csrc/engine/sequence.hpp:205}}). The C++ code treats ring positions before it as missing: the load plan zero-fills them and the pivots do not point at them ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:380-382}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:501-509}}).</p>
+<p>In this release, no code sets the field above 0. <code>reset_for_recompute</code> sets it to 0 ({{cite csrc/engine/sequence.hpp:223-227}}), and pybind exposes it to Python as a read-write property ({{cite csrc/engine/pybind_sequence.cpp:132}}), but no Python code writes it. The field is a hook for the "encoder SWA bounded replay" of the docs. After a prefix-cache hit without SWA state, that design recomputes only the last 128 tokens ({{cite doc/inference_deployment_qa.md:183-185}}). The KV cache system that would use it is not in this release ({{cite README.md:40}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A layer with another window.</strong> <code>V4Attention</code> asserts that the layer window equals the model window, and names the layer ({{cite deepinfer/model_executor/models/v4_modules/attn.py:243}}).</li>
+  <li><strong>A sparse layer without SWA.</strong> <code>use_swa=False</code> with an indexer fails an assert ({{cite deepinfer/model_executor/models/v4_modules/attn.py:95-96}}).</li>
+  <li><strong>Ring smaller than the window.</strong> The C++ load plan checks <code>swa_block_size ≥ window_size</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:369}}).</li>
+  <li><strong>A query with no visible key.</strong> A <code>swa_valid_start</code> that is too large makes section 2 empty. C++ stops with "query token sees nothing" ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:521}}).</li>
+  <li><strong>A low backtracking value has no effect.</strong> A value below <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> is raised with no message ({{cite deepinfer/environ.py:132}}). A higher value makes every ring larger.</li>
+  <li><strong>Memory per sequence.</strong> The ring is per layer and per sequence, also for short requests. With N main layers, a sequence always takes at least N × 70,752 B of state, whatever its length.</li>
+</ul>
+<p><strong>Why it matters.</strong> The window gives every layer exact attention to recent tokens, with a cache whose size does not grow. Most memory questions about long sequences then go to the compressed cache. Most correctness questions about speculative decoding go to the ring: the 6 extra slots make draft tokens safe.</p>
+
+<x-quiz>
+  <x-q level="easy">Where does DeepInfer store the sliding-window KV: in the paged KV blocks or somewhere else?
+    <x-a><p>In the sequence's state slot, as a ring of 134 slots per layer. The paged blocks hold only the compressed KV and the indexer keys ({{cite deepinfer/worker/cache_engine.py:406-422}}, {{cite deepinfer/worker/cache_engine.py:216-218}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">A sequence has <code>state_id</code> 3. In which slot of <code>swa_cache</code> does the token at position 1,000 go?
+    <x-a><p>3 × 134 + 1,000 % 134 = 402 + 62 = 464 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:104}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A prefill chunk has 1,000 new tokens. How many of them does the code write into the ring, and why not all?
+    <x-a><p>The last 134. Line 103 gives −1 to every token with <code>seqlen_q − j &gt; swa_block_size</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:103-106}}). Older tokens are outside every future window, and the ring would overwrite them anyway.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does a ring of exactly 128 slots fail when <code>DEEPINFER_USE_NEXTN_DECODE</code> is 5?
+    <x-a><p>A decode step writes the SWA KV of positions <em>p</em> … <em>p</em> + 5 before attention ({{cite deepinfer/model_executor/models/v4_modules/attn.py:421-432}}). The query at <em>p</em> still needs <em>p</em> − 127. With 128 slots, position <em>p</em> + 1 goes to the slot of <em>p</em> − 127 and destroys it. The code adds at least nextn + 1 = 6 slots ({{cite deepinfer/environ.py:132}}, {{cite deepinfer/worker/cache_engine.py:93}}). See the deep dive "Why 134 slots, not 128".</p></x-a>
+  </x-q>
+  <x-q level="hard">In a prefill with 2,048 cached tokens, how many history keys and how many new keys does the query at position 2,048 read?
+    <x-a><p>127 history keys (1,921 … 2,047) and 1 new key (itself). <code>abs_lo</code> = 2,048 − 127 = 1,921, so <code>start_slot</code> = 1,921 − 1,920 = 1 and the section-1 length is 127 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:507-523}}).</p></x-a>
+  </x-q>
+</x-quiz>

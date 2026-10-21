@@ -1,0 +1,161 @@
+---
+title: KV compression (C1 and C2)
+nav_title: KV compression
+level: Advanced
+prerequisites: learn/kv-cache, learn/number-formats, concepts/mla-attention, concepts/sliding-window-attention
+related: concepts/sparse-attention-indexer, concepts/cross-layer-kv-sharing, concepts/paged-kv-cache, concepts/yoco-swa-replay, code/v4-compress, code/v4-attn, code/cache-engine
+summary: A compressed layer stores one 512-value cache entry per token (C1) or per 2 tokens (C2). C2 mixes the two tokens with a learned softmax gate and keeps the score and latent of the most recent tokens in a small fp32 state ring. Entries are FP4 (288 B) by default, or FP8 (528 B).
+---
+<x-sentence>A C2 layer mixes each pair of tokens into one cache entry; a C1 layer keeps one entry per token. Both cover the whole history.</x-sentence>
+
+<h2>The idea</h2>
+<p>The {{link concepts/sliding-window-attention | sliding window}} gives exact keys for the last 128 tokens only. To see older tokens, a layer needs keys for the whole history. {{term kv-compression | KV compression}} keeps those keys small in two ways.</p>
+<ol>
+  <li><strong>Fewer entries.</strong> The {{term compress-ratio}} <em>n</em> of a layer is 1 or 2. The code calls the two kinds C1 and C2 ({{cite deepinfer/model_executor/models/v4_modules/compress.py:75-76}}). A C1 layer stores one {{term compressed-entry}} per token. A C2 layer stores one entry per 2 tokens.</li>
+  <li><strong>Fewer bytes per entry.</strong> Each entry has 512 values in {{term fp4}} with scales: 288 bytes. The FP8 option uses 528 bytes.</li>
+</ol>
+<p>A C2 entry is not the average of two tokens. A second projection, the <em>gate</em>, gives each value of each token a score. A {{term softmax}} over the 2 tokens turns the scores into weights, value by value. The entry is the weighted sum of the two token vectors. So the model learns which token is more important for each value.</p>
+<p>The cache entries live in the paged cache <code>ca_cache</code>, in blocks of 128 tokens. A C1 layer has 128 entries per block, a C2 layer 64. A C2 layer also needs a little {{term compression-state}} per sequence, because the first token of a pair must wait for the second.</p>
+<p><strong>An everyday comparison.</strong> Think of a photo album where you keep one photo for every two days. For each part of the picture (sky, faces, background), you choose the share of each day. Then you blend the two photos. The comparison stops here: the "parts" are 512 numbers, and the model learned the blend rule in training.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5b_compress" alt="Panel 1: six cards in two rows. 1 project the hidden state with Gate and A into fp32 [2, 1024]; 2 split into score [2, 512] and latent [2, 512]; 3 mix: softmax of the scores over the 2 tokens, weighted sum of the latents, bf16 [512]; 4 RMSNorm, which also gives pre_rope_kv for the indexer; 5 RoPE on the last 64 values at position 2j; 6 cast to FP4 (288 bytes) and store into ca_cache. Panel 2: a ring of 7 state slots after a decode step at positions 1000 to 1005; slot 5 holds the older position 999; the step makes entries 500, 501 and 502 at the odd positions. Panel 3: the two entry formats: FP4 with 256 bytes of values and 32 e4m3 scales, 288 bytes; FP8 with 512 bytes of values and 16 ue8m0 scales, 528 bytes." caption="Figure: C2 compression in one layer. Follow panel 1 from card 1 to card 6. Panel 2 shows why a C2 layer needs a state ring. Click to zoom." />
+<p>Panel 1 is the path of one pair of tokens. Panel 2 shows the decode case. Each token writes its score and latent into a ring of 7 slots, and every odd position makes one entry. Panel 3 compares the two byte layouts.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the projection</h3>
+<p>The weights are in <code>PackedWkv</code>, an object of class <code>SoftmaxAPEGatedColumnParallelLora</code>:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="63-97" highlight="66,86-95" />
+<p>Line 66 explains why C1 has no gate: "the single-token softmax of C1 is always 1". <code>V4Attention</code> merges <code>[Gate, A]</code> into one GEMM over the BF16 hidden state. The output is fp32 for C2 and bf16 for C1 ({{cite deepinfer/model_executor/models/v4_modules/attn.py:345-371}}). Only a KV-source layer has these weights; see {{link concepts/cross-layer-kv-sharing}}.</p>
+
+<h3>Step 2: C1 passes through, C2 mixes</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/compress.py" lines="82-120" highlight="89-93,96,97-109,111-119" />
+<ol>
+  <li>Lines 89-93: C1. The projected vector is the entry. With context parallelism, a gather puts the rows back in sequence order.</li>
+  <li>Line 96: C2. The fp32 output splits into <code>score</code> (gate part) and <code>latent</code> (A part), each <code>[T, 512]</code>.</li>
+  <li>Lines 97-109: prefill. One kernel makes all new entries of the chunk and updates the state.</li>
+  <li>Lines 111-119: decode. Another kernel writes each token into the state ring and makes an entry where a pair ends. <code>max_seqlen_q</code> is 1 + 5 = 6 with the default drafts.</li>
+</ol>
+<p>The TileLang kernel does the mix value by value. It computes the softmax weights over the 2 tokens, then the weighted sum of the latents ({{cite deepinfer/model_executor/layers/tilelang_ops/cuda/compress.py:120-132}}). The reference code says the same in one line: <code>(latent_slice * score_slice.softmax(dim=0)).sum(dim=0)</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:199}}).</p>
+
+<h3>Step 3: norm, RoPE, cast and store in one kernel</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/compress.py" lines="131-167" highlight="144,146,148-166" />
+<p>One fused kernel does RMSNorm, {{term rope}} on the last 64 values, the cast to the cache format, and the store at <code>slot_mapping_store_ca</code>. With <code>out_stage="norm"</code> it also returns the vector after the norm and before RoPE (<code>pre_rope_kv</code>). The {{link concepts/sparse-attention-indexer | indexer}} projects its keys from that vector ({{cite deepinfer/model_executor/models/v4_modules/compress.py:1-6}}). <code>get_kv_cache_format</code> finds the format from the last dimension of the cache: 288 or 528 bytes ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:171-187}}).</p>
+
+<h3>Step 4: which position does an entry have?</h3>
+<p>Before the step, the input preparation computes the position and the cache slot of each new entry. For prefill this is C++; for decode with zero-overhead scheduling (the default) a device kernel does the same work ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367}}). The C++ prefill code:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="56-68" highlight="58-60,63-66" />
+<p>Entry <em>j</em> covers tokens <em>j</em>·<em>n</em> … <em>j</em>·<em>n</em> + <em>n</em> − 1. Its RoPE position is <em>j</em>·<em>n</em>, the position of its first token (line 59). A prefill makes an entry only for complete pairs: <em>j</em> runs from <code>(k − q) / n</code> to <code>k / n</code> − 1, with each division rounded down. The slot uses the block table: 64 entries per block for C2 (line 60). A sequence with no complete pair still gets one pad row with slot −1 (lines 63-66).</p>
+
+<h3>Step 5: where the entries go, and the state ring</h3>
+<x-code file="deepinfer/worker/cache_engine.py" lines="445-465" highlight="448-449,452-458,463-465">
+<x-tr line="446">Whether the main (compressed) KV is reused depends only on the KV map, not on the index map.</x-tr>
+<x-tr line="451">All compress ratios (C1/C2) are handled the same way.</x-tr>
+</x-code>
+<p>Each block row of <code>gpu_blocks</code> has a byte range for this layer: <code>128 // ratio</code> entries of 288 or 528 bytes. Only C2 gets a state, of <code>get_inference_compress_block_size(2)</code> tokens:</p>
+<x-code file="deepinfer/worker/cache_engine.py" lines="130-133" />
+<p>With the default backtracking count 6, the ring has 2 + 5 = 7 tokens. <code>_alloc_state</code> views it as fp32 <code>[num_state_slots, 7, 2, 512]</code>: index 0 is the score, index 1 is the latent ({{cite deepinfer/worker/cache_engine.py:367-374}}, {{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:208-209}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: a 1,000-token prompt in a C2 layer">
+<p>A new prompt of 1,000 tokens (<code>seqlen_k</code> = <code>seqlen_q</code> = 1,000), one C2 layer, FP4 entries, block size 128.</p>
+<ol>
+  <li><strong>Entries.</strong> <em>j</em> = 0 … 499: 500 entries ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:47-49}}). Entry 499 covers tokens 998 and 999; its RoPE position is 998.</li>
+  <li><strong>Blocks.</strong> The sequence has 8 blocks (1,000 / 128, rounded up). Entry <em>j</em> goes to block <code>block_table[j / 64]</code>, row <code>j % 64</code>. Entries 448 … 499 fill 52 of the 64 rows of the eighth block.</li>
+  <li><strong>Bytes.</strong> 500 × 288 B = 144,000 B of entries in this layer. The 8 blocks reserve 8 × 64 × 288 B = 147,456 B.</li>
+  <li><strong>State after the prefill.</strong> The kernel stores the score and latent of the last <code>min(1,000, 7)</code> tokens: positions 993 … 999 go to ring slots <code>pos % 7</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:201-209}}).</li>
+  <li><strong>First decode step.</strong> Positions 1,000 … 1,005. Each token writes slot <code>(context_len − 1) % 7</code>. Positions 1,001, 1,003 and 1,005 end a pair, so they make entries 500, 501 and 502 ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:227-248}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:79-91}}). The other three tokens get slot −1.</li>
+</ol>
+<p><strong>An odd prompt.</strong> With 1,001 tokens, the prefill still makes 500 entries. Token 1,000 exists only in the state ring and in the sliding window. The first decode token (position 1,001) reads token 1,000 from the ring and makes entry 500.</p>
+<p><strong>What a query sees.</strong> A query at position <em>p</em> reads <code>(p + 1) / n</code> entries, rounded down ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:449}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:598}}). At <em>p</em> = 1,000 in a C2 layer that is 500 entries (tokens 0 … 999). Token 1,000 itself is in the window.</p>
+</x-deepdive>
+
+<x-deepdive title="Why 7 state slots">
+<p>The decode kernel asserts that the ring holds one compression window plus the tokens of one step:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/compress.py" lines="96-100" highlight="98-100" />
+<ol>
+  <li>A step brings at most <code>max_seqlen_q</code> = 6 tokens per sequence ({{cite deepinfer/model_executor/models/v4_modules/compress.py:117}}).</li>
+  <li>The first token of the step can be the second half of a pair whose first half came in the step before. So the ring must keep 1 older token plus 6 new ones: 2 + 6 − 1 = 7.</li>
+  <li><code>get_inference_compress_block_size</code> gives <code>ratio + max(0, backtracking − 1)</code> = 2 + 5 = 7 ({{cite deepinfer/worker/cache_engine.py:130-133}}).</li>
+</ol>
+<p>The function is cached with <code>lru_cache</code>. After a change of <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> in the same process, call <code>clear_compress_block_size_cache()</code> ({{cite deepinfer/worker/cache_engine.py:136-138}}).</p>
+<p><strong>Not stored.</strong> The compression state is in the "dropped" part of the state slot. The docs say that compression windows end at multiples of the 128-token store grain, so the state has no dependency across a store boundary ({{cite doc/inference_deployment_qa.md:163}}, {{cite deepinfer/worker/cache_engine.py:285}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Entry formats, byte by byte">
+<table>
+  <thead><tr><th>Format</th><th>Values</th><th>Scales</th><th>Bytes per entry</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td><code>V41_FP4_FORMAT</code> (default)</td><td>512 × e2m1 = 256 B</td><td>32 × e4m3, one per 16 values = 32 B</td><td><strong>288</strong></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:119-128}}</td></tr>
+    <tr><td><code>V41_FORMAT</code> (MXFP8)</td><td>512 × e4m3 = 512 B</td><td>16 × UE8M0, one per 32 values = 16 B</td><td><strong>528</strong></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-118}}</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li><strong>Layout.</strong> Both are token-interleaved: each entry is <code>[values | scales]</code>, with no padding between entries ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:314-318}}).</li>
+  <li><strong>Choice.</strong> <code>use_fp4_sparse_kv</code> selects FP4 for <code>ca_cache</code>. The HF loader sets it to <code>True</code> unless config.json says otherwise ({{cite deepinfer/hugging_face/config.py:302-303}}). The scale group size follows: 16 for FP4, 32 for FP8 and for SWA ({{cite deepinfer/model_executor/model_metadata_utils.py:37-39}}).</li>
+  <li><strong>The 512 values.</strong> <code>kv_lora_rank</code> + <code>qk_rope_head_dim</code> must equal 512 ({{cite deepinfer/worker/cache_engine.py:53-54}}). RoPE goes on the last 64 values (<code>offset = 512 − rotary_dim</code>, {{cite deepinfer/model_executor/models/v4_modules/compress.py:156}}).</li>
+  <li><strong>Block row.</strong> A C2 layer adds 64 × 288 = 18,432 B to each block row; a C1 layer adds 128 × 288 = 36,864 B ({{cite deepinfer/worker/cache_engine.py:452-461}}). The whole row is padded to <code>lcm(128, bytes_per_token)</code> ({{cite deepinfer/worker/cache_engine.py:481-484}}).</li>
+</ul>
+<p>Per token and layer, with FP4: C1 288 B, C2 144 B. The indexer keys of a sparse layer come on top ({{link concepts/sparse-attention-indexer}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Prefill and decode read the entries in different ways">
+<ul>
+  <li><strong>Prefill.</strong> The entries are stored first. Then <code>load_paged_kv_cache</code> converts the entries of each sequence to BF16 and appends them to the gathered buffer, after the SWA rows ({{cite deepinfer/model_executor/models/v4_modules/attn.py:833-839}}). A query's compressed indices point into that buffer.</li>
+  <li><strong>Decode.</strong> The kernel reads <code>ca_cache</code> directly. The indices are physical slots: <code>block_table[pos // tpb] × tpb + pos % tpb</code>, with <code>tpb</code> = 64 for C2 ({{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:41-57}}).</li>
+  <li><strong>Sparse or dense.</strong> In a sparse layer the indexer selects <code>index_topk</code> entries. A dense compressed layer reads all <code>(p + 1) / n</code> entries; in prefill, its index row has width <code>pad128(max_model_len / n)</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:358-363}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Shapes and dtypes">
+<table>
+  <thead><tr><th>Object</th><th>dtype and shape</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td><code>projected_kv</code></td><td>C2: fp32 <code>[T, 1024]</code>; C1: bf16 <code>[T, 512]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:90}}, {{cite deepinfer/model_executor/models/v4_modules/compress.py:95}}</td></tr>
+    <tr><td><code>score</code>, <code>latent</code></td><td>fp32 <code>[T, 512]</code> each</td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:96}}</td></tr>
+    <tr><td><code>kv_compressed</code> (prefill)</td><td>bf16 <code>[new entries, 512]</code></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:45-46}}</td></tr>
+    <tr><td><code>kv_compressed</code> (decode)</td><td>bf16 <code>[T, 512]</code>, zero rows where no pair ends</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:93-94}}</td></tr>
+    <tr><td><code>positions_c[n]</code>, <code>slot_mapping_store_ca[n]</code></td><td>int32 <code>[new entries]</code> (prefill) or <code>[T]</code> (decode)</td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:235-237}}</td></tr>
+    <tr><td><code>ca_cache</code></td><td>uint8 <code>[num_blocks, 128 // n, 1, 288 or 528]</code></td><td>{{cite deepinfer/worker/cache_engine.py:211-213}}</td></tr>
+    <tr><td><code>ca_state</code> (C2 only)</td><td>fp32 <code>[num_state_slots, 7, 2, 512]</code> = 28,672 B per slot</td><td>{{cite deepinfer/worker/cache_engine.py:214-215}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="What was removed: C4, C128, overlap, APE">
+<p>The code rejects older compression features with a clear message:</p>
+<x-code file="deepinfer/model_executor/model_metadata_utils.py" lines="51-58" />
+<p>The <code>Compressor</code> checks the same two flags again ({{cite deepinfer/model_executor/models/v4_modules/compress.py:77-78}}). Note the defaults: <code>cfg.get("use_ape", True)</code> treats a missing key as "APE on". The HF loader sets <code>use_ape=False</code> ({{cite deepinfer/hugging_face/config.py:41}}), so a V4.1 checkpoint passes. The class name <code>SoftmaxAPEGatedColumnParallelLora</code> still contains "APE", but the code does not use APE.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Another ratio.</strong> Ratio 4 or 128 in config.json raises <code>ValueError</code> "C4 and C128 have been removed" ({{cite deepinfer/model_executor/model_metadata_utils.py:52-53}}).</li>
+  <li><strong>A config without <code>use_ape</code>.</strong> Outside the HF loader, a missing <code>use_ape</code> key counts as <code>True</code>. If the model has a compressed layer, this raises <code>ValueError</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:57-58}}).</li>
+  <li><strong>A state ring that is too small.</strong> The decode kernel asserts <code>state size ≥ ratio + max_seqlen_q − 1</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:98-100}}). This can happen if the ring size is cached and the backtracking value changes later ({{cite deepinfer/worker/cache_engine.py:130-138}}).</li>
+  <li><strong>Wrong dtype into the compressor.</strong> C1 must get bf16 and no state; C2 must get fp32 and a state. Both are asserts ({{cite deepinfer/model_executor/models/v4_modules/compress.py:90}}, {{cite deepinfer/model_executor/models/v4_modules/compress.py:95}}).</li>
+  <li><strong>Block size.</strong> C++ checks that the block size divides by every ratio ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:3-9}}).</li>
+  <li><strong>Precision.</strong> FP4 keeps 16 values per scale. If the outputs drift, compare with <code>use_fp4_sparse_kv=false</code> in config.json (528-byte entries).</li>
+</ul>
+<p><strong>Why it matters.</strong> The compressed cache is the part of the KV cache that grows with the sequence. Its size per token decides how many long requests fit on a device. A C2 FP4 layer needs 144 bytes per token. A classic BF16 layer with 64 heads and separate K and V of 512 values each needs 131,072 (see {{link concepts/mla-attention}}).</p>
+
+<x-quiz>
+  <x-q level="easy">How many compressed entries does a C2 layer store for a 1,000-token prompt, and how many bytes in FP4?
+    <x-a><p>500 entries ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:47-49}}), 500 × 288 B = 144,000 B ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:119-128}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Why does a C1 layer have no <code>Gate</code> weight?
+    <x-a><p>A softmax over a single token is always 1, so the weight would not change anything ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:66}}, {{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:86-95}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Which RoPE position does the C2 entry of tokens 998 and 999 get?
+    <x-a><p>998: <code>p_pos[i_cq] = j * n</code> with <em>j</em> = 499 and <em>n</em> = 2 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:59}}). The fused kernel applies RoPE at <code>positions_c</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:144}}, {{cite deepinfer/model_executor/models/v4_modules/compress.py:151-157}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With the default settings, why does <code>ca_state</code> have 7 token slots, and what is in each slot?
+    <x-a><p>A decode step brings up to 6 tokens, and the first can close a pair opened in the step before: 2 + 6 − 1 = 7 ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:98-100}}, {{cite deepinfer/worker/cache_engine.py:130-133}}). Each slot holds the fp32 score (index 0) and latent (index 1) of one token, 512 values each ({{cite deepinfer/worker/cache_engine.py:367-374}}, {{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:208-209}}). See the deep dive "Why 7 state slots".</p></x-a>
+  </x-q>
+  <x-q level="hard">A prompt has 1,001 tokens. Where is token 1,000 after the prefill, and when does it enter <code>ca_cache</code>?
+    <x-a><p>The prefill makes only complete pairs, so token 1,000 has no entry yet ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:58}}). Its score and latent are in the state ring (the prefill stores the last 7 tokens, {{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:201-209}}), and its SWA KV is in the window. The first decode token, position 1,001, closes the pair and makes entry 500 ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:237-248}}).</p></x-a>
+  </x-q>
+</x-quiz>

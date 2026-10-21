@@ -1,0 +1,162 @@
+---
+title: v4_modules/compress.py: the KV compressor
+nav_title: v4_modules/compress.py
+level: Advanced
+prerequisites: concepts/kv-compression, concepts/mla-attention
+related: concepts/kv-compression, concepts/sparse-attention-indexer, concepts/yoco-swa-replay, code/v4-attn, code/v4-index-attn, code/v4-mla-attn, code/tilelang-ops
+summary: compress.py holds two small runtime classes. Compressor turns the projected KV of a C1 or C2 layer into compressed entries, stores them in ca_cache and returns the pre-RoPE vector for the indexer. KProject is the indexer's key projection of that vector.
+---
+<h2>Purpose</h2>
+<p><code>compress.py</code> makes the compressed cache entries of one layer: it mixes the token pairs of a C2 layer, then normalizes, rotates, casts and stores each entry.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/v4_modules/compress.py</code>, 167 lines. Role 2 "runtime adapter" ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:10-15}}).</td></tr>
+    <tr><th>Main classes</th><td><code>KProject</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:32}}), <code>Compressor</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:56}}).</td></tr>
+    <tr><th>Runs in</th><td>Every worker process, inside the attention of each KV-source layer with compressed KV. All work is device kernels; decode runs inside a CUDA graph.</td></tr>
+    <tr><th>Called by</th><td><code>V4Attention._store_main_kv</code> (<code>attn.py</code>); <code>MQA.store_index_kv</code> (<code>index_attn.py</code>) for <code>KProject</code>.</td></tr>
+    <tr><th>Calls</th><td>TileLang interface kernels <code>compress_and_update_state_prefill</code>, <code>compress_and_update_state_decode</code>, <code>fused_norm_rope_hadamard_cast_store_kvcache</code>, <code>gather</code>; <code>get_kv_cache_format</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The weights (<code>mla_attn.py</code>), the merged projection GEMM (<code>attn.py</code>), the index-K norm and store (<code>index_attn.py</code>), the kernel code (<code>layers/tilelang_ops/</code>), the cache layout (<code>worker/cache_engine.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The module docstring says the same in three lines ({{cite deepinfer/model_executor/models/v4_modules/compress.py:1-6}}). The concept is on {{link concepts/kv-compression}}.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b5b_compress" alt="Panel 1: six cards: project with Gate and A, split into score and latent, mix the 2 tokens with a softmax, RMSNorm, RoPE at position 2j, cast to FP4 and store into ca_cache. Panel 2: the decode state ring of 7 slots with positions 999 to 1005. Panel 3: the FP4 entry of 288 bytes and the FP8 entry of 528 bytes." caption="Figure: what one C2 layer does with this file. Cards 2-6 of panel 1 are the Compressor; card 1 is in attn.py. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>V4Attention._init_compressor_and_indexer</code> makes one <code>Compressor</code> per KV-source layer with compressed KV, from the container <code>attn_module.PackedWkv</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:345-347}}).</li>
+  <li><code>V4Attention._store_main_kv</code> calls <code>forward_store_kv_cache</code> with the projected KV, <code>ca_cache</code> and <code>ca_state</code>. It asks for <code>pre_rope_kv</code> only when the layer has its own indexer ({{cite deepinfer/model_executor/models/v4_modules/attn.py:509-523}}). This happens in the normal path and in the YOCO full-KV path ({{cite deepinfer/model_executor/models/v4_modules/attn.py:546}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:584}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:708}}).</li>
+  <li><code>MQA.__init__</code> makes a <code>KProject</code> in index-K source layers ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:91-94}}). <code>MQA.store_index_kv</code> calls <code>forward_pre_norm</code> and reads <code>norm</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:144-145}}).</li>
+</ul>
+<p>No code in the repo calls <code>Compressor.forward</code> or <code>KProject.forward</code>; the callers use the other methods.</p>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>Compression kernels</strong> in <code>layers/tilelang_ops/compress.py</code>: one for prefill, one for decode ({{cite deepinfer/model_executor/models/v4_modules/compress.py:16-19}}). <code>ops.py</code> picks the CUDA or Ascend version.</li>
+  <li><strong>The fused transform</strong> <code>fused_norm_rope_hadamard_cast_store_kvcache</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:20-26}}). This file passes no Hadamard arguments.</li>
+  <li><strong>Helpers:</strong> <code>gather</code> for the CP reorder, <code>get_kv_cache_format</code>, <code>convert_rmsnorm</code>, <code>ReplicatedLinear</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:11-29}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<p>The file is small, so this section also walks through the code.</p>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>KProject.__init__</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:35-47}}</td><td>Wraps the indexer's <code>k_proj</code> weight in a <code>ReplicatedLinear</code> and converts <code>k_norm</code>.</td></tr>
+    <tr><td><code>KProject.forward_pre_norm</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:49-50}}</td><td>The linear part only; the caller fuses the norm into the store.</td></tr>
+    <tr><td><code>Compressor.__init__</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:63-80}}</td><td>Checks the ratio and the removed features; keeps the norm and the RoPE table.</td></tr>
+    <tr><td><code>Compressor.forward_pre_norm</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:82-120}}</td><td>C1: pass through. C2: mix the pairs and update the state.</td></tr>
+    <tr><td><code>Compressor.forward_store_kv_cache</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:131-167}}</td><td>Norm, RoPE, cast and store into <code>ca_cache</code>; returns <code>pre_rope_kv</code> on request.</td></tr>
+  </tbody>
+</table>
+
+<h3><code>Compressor.__init__</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/compress.py" lines="71-80" highlight="75-78" />
+<ol>
+  <li>Line 71: the container must be a <code>SoftmaxAPEGatedColumnParallelLora</code> (see {{link code/v4-mla-attn}}).</li>
+  <li>Lines 75-76: only ratios 1 and 2.</li>
+  <li>Lines 77-78: overlap and APE were removed. The default of <code>use_ape</code> here is <code>True</code>, so the config must say <code>False</code>; the HF loader does ({{cite deepinfer/hugging_face/config.py:41}}).</li>
+  <li>Line 79: the RMSNorm weight of the container. Line 80: the layer's RoPE table, shared with <code>V4Attention</code>.</li>
+</ol>
+
+<h3><code>Compressor.forward_pre_norm</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/compress.py" lines="82-120" highlight="89-93,95-96,98-109,111-119" />
+<ol>
+  <li><strong>Lines 89-93 (C1).</strong> The input must be bf16 and there is no state. With context parallelism, <code>mirror_cp_reverse_index</code> puts the gathered rows back in sequence order.</li>
+  <li><strong>Lines 95-96 (C2).</strong> The input must be fp32 <code>[T, 1024]</code> with a state. <code>chunk(2)</code> gives <code>score</code> (the Gate output) and <code>latent</code> (the A output).</li>
+  <li><strong>Lines 98-109 (prefill).</strong> The kernel makes one entry per complete pair of the chunk, reads the first token of a pair from the state when it came in an earlier chunk, and stores the last tokens into the state ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:178-209}}). CP is handled inside the kernel with the reverse index.</li>
+  <li><strong>Lines 111-119 (decode).</strong> One row per query token. <code>max_seqlen_q</code> = <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> lets the kernel check the state size ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:98-100}}).</li>
+</ol>
+
+<h3><code>Compressor.forward_store_kv_cache</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/compress.py" lines="140-167" highlight="144-147,150-157,158,159-165,167" />
+<ol>
+  <li><strong>Line 144.</strong> <code>positions_c[ratio]</code>: the RoPE position of each entry, the position of its first token.</li>
+  <li><strong>Lines 145-146.</strong> Add a head axis of size 1; allocate <code>pre_rope_kv</code> only when the caller asks.</li>
+  <li><strong>Line 147.</strong> The cache format comes from the last dimension of <code>ca_cache</code>: 288 B (FP4) or 528 B (FP8).</li>
+  <li><strong>Lines 150-157.</strong> RMSNorm, then RoPE on the last <code>rotary_dim</code> values (<code>offset = 512 − rotary_dim</code>).</li>
+  <li><strong>Lines 159-165.</strong> Store at <code>slot_mapping_store_ca[ratio]</code>; slot −1 means no write. <code>out_stage="norm"</code> copies the vector after the norm and before RoPE into <code>pre_rope_kv</code>.</li>
+  <li><strong>Line 167.</strong> Remove the head axis: <code>[rows, 512]</code>.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<table>
+  <thead><tr><th>Object</th><th>Prefill</th><th>Decode</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td><code>projected_kv</code> (C2)</td><td>fp32 <code>[T, 1024]</code></td><td>fp32 <code>[T, 1024]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:95}}</td></tr>
+    <tr><td><code>projected_kv</code> (C1)</td><td>bf16 <code>[T, 512]</code></td><td>bf16 <code>[T, 512]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:90}}</td></tr>
+    <tr><td><code>state_cache</code> (C2)</td><td colspan="2">fp32 <code>[num_state_slots, 7, 2, 512]</code>, strided view of the state slot</td><td>{{cite deepinfer/worker/cache_engine.py:367-374}}</td></tr>
+    <tr><td><code>kv_compressed</code></td><td>bf16 <code>[Tc, 512]</code>, Tc = new entries (at least 1 per sequence)</td><td>bf16 <code>[T, 512]</code>, zero rows where no pair ends</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:45-46}}, {{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:93-94}}</td></tr>
+    <tr><td><code>positions_c[r]</code>, <code>slot_mapping_store_ca[r]</code></td><td>int32 <code>[Tc]</code></td><td>int32 <code>[T]</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:235-237}}</td></tr>
+    <tr><td><code>kv_cache</code> (<code>ca_cache</code>)</td><td colspan="2">uint8 <code>[num_blocks, 128 // r, 1, 288 or 528]</code></td><td>{{cite deepinfer/worker/cache_engine.py:211-213}}</td></tr>
+    <tr><td>return <code>pre_rope_kv</code></td><td>bf16 <code>[Tc, 512]</code> or <code>None</code></td><td>bf16 <code>[T, 512]</code> or <code>None</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:167}}</td></tr>
+  </tbody>
+</table>
+<p>In decode, <code>pre_rope_kv</code> has one row per query token; rows where no entry ends are zero rows. The index-K store sends them to slot −1, so nothing is written for them.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one decode step in a C2 layer">
+<p>One sequence at positions 1,000 … 1,005 (1 token + 5 drafts), FP4 cache, <code>state_id</code> 7.</p>
+<ol>
+  <li><code>projected_kv</code> is fp32 <code>[6, 1024]</code>; <code>score</code> and <code>latent</code> are <code>[6, 512]</code>.</li>
+  <li>The decode kernel writes each token into state slot <code>(context_len − 1) % 7</code>: positions 1,000 … 1,005 go to slots 6, 0, 1, 2, 3, 4 ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:227-232}}).</li>
+  <li>Positions 1,001, 1,003 and 1,005 end a pair. Their rows of <code>kv_compressed</code> get the mix of (1,000, 1,001), (1,002, 1,003) and (1,004, 1,005); the other rows are zero ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:236-248}}).</li>
+  <li>C++ (or the ZOS device kernel) gave <code>positions_c</code> = [0, 1000, 0, 1002, 0, 1004] and slots −1 for the even positions ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:79-91}}).</li>
+  <li>The fused kernel writes 3 entries of 288 B: entries 500, 501 and 502 of the sequence, at <code>block_table[500 / 64] × 64 + 500 % 64</code> and the next two rows.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Container is not <code>SoftmaxAPEGatedColumnParallelLora</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:71}}</td></tr>
+    <tr><td>Ratio not 1 or 2</td><td><code>ValueError</code> "Only C1/C2 compression is supported"</td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:75-76}}</td></tr>
+    <tr><td><code>compress_overlap</code> on, or <code>use_ape</code> on or missing</td><td><code>ValueError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:77-78}}</td></tr>
+    <tr><td>C1 input not bf16, or a state is given</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:90}}</td></tr>
+    <tr><td>C2 input not fp32, or no state</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:95}}</td></tr>
+    <tr><td>State ring smaller than <code>ratio + max_seqlen_q − 1</code></td><td><code>AssertionError</code> in the decode wrapper</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:98-100}}</td></tr>
+    <tr><td>Cache last dimension is not 288 or 528</td><td><code>ValueError</code> "Unsupported KV cache dtype/shape"</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:177-187}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Settings and checkpoint names">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:117}}</td><td><code>max_seqlen_q</code> = value + 1 for the decode kernel.</td></tr>
+    <tr><td><code>use_fp4_sparse_kv</code> (config.json)</td><td><code>True</code> ({{cite deepinfer/hugging_face/config.py:303}})</td><td>cache layout ({{cite deepinfer/worker/cache_engine.py:327-332}})</td><td>The cache row size, which line 147 reads back as the format.</td></tr>
+    <tr><td><code>kv_compress_ratio</code> (per layer)</td><td>from <code>compress_ratios</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:73}}</td><td>C1 or C2 path; the key <code>"1"</code> or <code>"2"</code> into the metadata dicts.</td></tr>
+  </tbody>
+</table>
+<p><strong>Checkpoint names.</strong> The HF weights <code>attn.compressor.wkv</code>, <code>attn.compressor.wgate</code> and <code>attn.compressor.norm</code> become <code>PackedWkv.A</code>, <code>PackedWkv.Gate</code> and <code>PackedWkv.norm</code> ({{cite deepinfer/hugging_face/names.py:51-53}}). The indexer's <code>attn.indexer.wk</code> and <code>k_norm</code> become the weights of <code>KProject</code> ({{cite deepinfer/hugging_face/names.py:55-56}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/kv-compression}}: the idea, the state ring and the formats.</li>
+  <li>{{link concepts/sparse-attention-indexer}}: the user of <code>pre_rope_kv</code> and <code>KProject</code>.</li>
+  <li>{{link concepts/cross-layer-kv-sharing}}: why only KV-source layers have a <code>Compressor</code>.</li>
+  <li>{{link concepts/yoco-swa-replay}}: the full-KV store of the YOCO consumer layers.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which layers have a <code>Compressor</code>?
+    <x-a><p>Layers with compressed KV that are KV sources ({{cite deepinfer/model_executor/models/v4_modules/attn.py:345-346}}). SWA-only layers and share-KV consumers have none.</p></x-a>
+  </x-q>
+  <x-q level="medium">What is <code>pre_rope_kv</code>, and who asks for it?
+    <x-a><p>The entry after the RMSNorm and before RoPE, bf16 <code>[rows, 512]</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:159-167}}). A layer with its own indexer asks for it (<code>return_pre_rope_kv=self.has_local_index</code>, {{cite deepinfer/model_executor/models/v4_modules/attn.py:522}}); <code>KProject</code> projects it to the index keys.</p></x-a>
+  </x-q>
+  <x-q level="medium">How does <code>forward_store_kv_cache</code> know whether to write FP4 or FP8 entries?
+    <x-a><p>It does not get a flag. <code>get_kv_cache_format</code> reads the last dimension of <code>ca_cache</code>: 288 means FP4, 528 means FP8 ({{cite deepinfer/model_executor/models/v4_modules/compress.py:147}}, {{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:171-187}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In a decode step at positions 1,000 … 1,005, which rows of <code>kv_compressed</code> are not zero, and what are the matching <code>positions_c</code>?
+    <x-a><p>The rows of positions 1,001, 1,003 and 1,005, because they end a pair ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:236-248}}). Their <code>positions_c</code> are 1,000, 1,002 and 1,004: the first token of each pair ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:82-86}}). See the deep dive "Worked example".</p></x-a>
+  </x-q>
+</x-quiz>

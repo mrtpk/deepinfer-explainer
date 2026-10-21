@@ -1,0 +1,167 @@
+---
+title: v4_modules/cross_layer.py: sharing topology and the cross-layer runtime
+nav_title: v4_modules/cross_layer.py
+level: Advanced
+prerequisites: concepts/cross-layer-kv-sharing, concepts/sparse-attention-indexer
+related: concepts/cross-layer-kv-sharing, concepts/yoco-swa-replay, concepts/kv-compression, code/v4-attn, code/v4-index-attn, code/deepseek, code/cache-engine
+summary: cross_layer.py builds and checks the static sharing topology of the model (SharedLayerTopology), holds the per-forward values that a source layer passes to later layers (CrossLayerRuntime), and exports flat per-layer flags for the cost estimate (SharedLayerMetadata).
+---
+<h2>Purpose</h2>
+<p><code>cross_layer.py</code> decides, once at start-up, which layer is the source of each shared value, and carries those values from layer to layer during a forward.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/v4_modules/cross_layer.py</code>, 383 lines. Role 4 "topology and assembly" ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:16-20}}).</td></tr>
+    <tr><th>Main classes</th><td><code>SharedLayerTopology</code> ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:22}}), <code>CrossLayerRuntime</code> ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:276-277}}), <code>SharedLayerMetadata</code> ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:354-355}}).</td></tr>
+    <tr><th>Runs in</th><td>Every worker process. The topology is plain Python at start-up. The runtime is one Python object per forward; its fields hold device tensors.</td></tr>
+    <tr><th>Called by</th><td><code>V41Builder</code>, <code>DeepseekForCausalLM.__init__</code>, <code>ModelMetadata</code>, <code>DeepseekModel.forward</code>; read by <code>V4Attention</code>, <code>MQA</code>, <code>DeepseekDecoderLayer</code>, <code>yoco.py</code>; C++ <code>FlopsEstimator</code>.</td></tr>
+    <tr><th>Calls</th><td>Only <code>iter_runtime_attn_modules</code> and <code>AttrDict</code>. No kernels.</td></tr>
+    <tr><th>Not in this file</th><td>The source-id lists to maps conversion (<code>hugging_face/config.py</code>), the cache aliasing (<code>worker/cache_engine.py</code>), the reads and writes of the runtime values (<code>attn.py</code>, <code>index_attn.py</code>, <code>yoco.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The module docstring names the three parts ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:1-8}}). The concept is on {{link concepts/cross-layer-kv-sharing}}.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b5b_cross_layer" alt="Panel 1: a grid of 8 example layers and their source for KV, index K and top-k; every layer owns its SWA ring. Panel 2: layer 3 as source writes caches and runtime values, the CrossLayerRuntime carries them, layer 4 as consumer reads views and the top-k list." caption="Figure: panel 1 is what SharedLayerTopology computes; panel 2 is what CrossLayerRuntime carries. The config values are made up. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The builder</strong> makes a topology to decide which containers get <code>PackedWkv</code> and an indexer ({{cite deepinfer/model_executor/models/v4_modules/builder.py:100-106}}, {{cite deepinfer/model_executor/models/v4_modules/builder.py:63-73}}).</li>
+  <li><strong><code>DeepseekForCausalLM.__init__</code></strong> makes it again for the runtime modules and passes it to every layer ({{cite deepinfer/model_executor/models/deepseek.py:266-269}}, {{cite deepinfer/model_executor/models/decoder_layer.py:85}}).</li>
+  <li><strong><code>ModelMetadata</code></strong> calls <code>build_shared_layer_metadata</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:75}}). The C++ <code>FlopsEstimator</code> reads the flag lists from it ({{cite csrc/engine/flops_estimator.hpp:158-171}}).</li>
+  <li><strong><code>DeepseekModel.forward</code></strong> makes one <code>CrossLayerRuntime</code> per forward ({{cite deepinfer/model_executor/models/deepseek.py:165-166}}). A decoder layer called without one makes its own ({{cite deepinfer/model_executor/models/decoder_layer.py:108-109}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<p><code>iter_runtime_attn_modules</code> walks the attention list and skips the lm-head entry, so main and draft layers get one runtime number each ({{cite deepinfer/model_executor/layer_utils.py:6-16}}). Nothing else: this file has no tensor work.</p>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>SharedLayerTopology.__init__</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:56-59}}</td><td>Collect the config, build the maps, validate.</td></tr>
+    <tr><td><code>_process_cfg</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:61-75}}</td><td>Finds the layers that carry <code>layer_info_shared_cfg</code>; checks that all copies are equal.</td></tr>
+    <tr><td><code>_build_layer_maps</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:77-87}}</td><td>Three dense maps, the candidate map and the candidate configs.</td></tr>
+    <tr><td><code>_validate</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:89-118}}</td><td>All checks in one pass.</td></tr>
+    <tr><td><code>_build_layer_map</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:120-155}}</td><td>Sparse config map → list with self-references; no sharing in draft layers.</td></tr>
+    <tr><td><code>_build_candidate_layer_map</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:157-166}}</td><td>Keeps the candidate map sparse.</td></tr>
+    <tr><td><code>_validate_segmented_map</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:168-179}}</td><td>Consumers point to the nearest source before them.</td></tr>
+    <tr><td><code>_validate_map_refines</code>, <code>_validate_index_kv_compatibility</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:181-197}}</td><td>Top-k ⊆ index K ⊆ KV.</td></tr>
+    <tr><td><code>_validate_candidate_config</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:199-238}}</td><td>Candidate-block limits.</td></tr>
+    <tr><td><code>_validate_shared_layer_cfg</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:240-261}}</td><td>Same ratio, <code>index_topk</code> and (for KV) <code>use_swa</code> as the source.</td></tr>
+    <tr><td><code>is_*_source_layer</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:263-273}}</td><td>Flag queries for one layer.</td></tr>
+    <tr><td><code>CrossLayerRuntime</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:276-336}}</td><td>Per-forward values, one slot each.</td></tr>
+    <tr><td><code>build_shared_layer_topology</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:339-351}}</td><td><code>None</code> when no layer carries the shared config.</td></tr>
+    <tr><td><code>SharedLayerMetadata</code>, <code>build_shared_layer_metadata</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:354-383}}</td><td>Flat lists for consumers that need only the flags.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>_process_cfg</code>: one shared config</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/cross_layer.py" lines="61-75" highlight="66-69,71,74-75" />
+<ol>
+  <li>Lines 66-69: every runtime layer that carries <code>layer_info_shared_cfg</code> joins the list. The HF loader gives it to every compressed layer ({{cite deepinfer/hugging_face/config.py:129}}).</li>
+  <li>Line 71: at least one layer must carry it. <code>build_shared_layer_topology</code> checks this first and returns <code>None</code> instead ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:346-351}}).</li>
+  <li>Lines 74-75: all copies must be equal; the first one is the canonical config.</li>
+</ol>
+
+<h3><code>_build_layer_map</code>: dense maps</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/cross_layer.py" lines="143-155" highlight="145-146,148-150,151,152-154" />
+<ol>
+  <li>Lines 145-146: without its own map, index K follows the top-k map. (The HF loader always writes an index-K map, by default equal to the KV map: {{cite deepinfer/hugging_face/config.py:74}}.)</li>
+  <li>Lines 148-150: every id must be a valid layer.</li>
+  <li>Line 151: a layer that is not in the map is its own source.</li>
+  <li>Lines 152-154: the draft (MTP) layers must not share.</li>
+</ol>
+
+<h3><code>_validate</code>: the checks</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/cross_layer.py" lines="89-118" highlight="97-113,114-116,117-118" />
+<ol>
+  <li>Lines 97-113: for each map, check the segments, then check each consumer: it carries the config, and it matches its source.</li>
+  <li>Lines 114-116: the first YOCO consumer layer is a KV source (see {{link concepts/yoco-swa-replay}}).</li>
+  <li>Lines 117-118: the nesting check and the candidate checks.</li>
+</ol>
+<p>All checks are <code>assert</code> statements, so a bad config stops the start-up with an <code>AssertionError</code> and a message that names the layer.</p>
+
+<h3><code>CrossLayerRuntime</code>: the per-forward values</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/cross_layer.py" lines="310-336" />
+<p>The docstring explains why one slot per value is enough: the segments are contiguous and the layers run in order, so the value in the slot always comes from the nearest source ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:284-287}}). The object is not returned through the layer outputs; the same reference goes to every layer ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:281-282}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: every CrossLayerRuntime field">
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Written by</th><th>Read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>shared_hidden</code></td><td>bf16 <code>[T, hidden]</code></td><td>first YOCO consumer layer ({{cite deepinfer/model_executor/models/decoder_layer.py:146-152}})</td><td>YOCO KV sources ({{cite deepinfer/model_executor/models/v4_modules/attn.py:763}})</td></tr>
+    <tr><td><code>pre_rope_kv</code></td><td>bf16 <code>[rows, 512]</code></td><td>KV source with an indexer ({{cite deepinfer/model_executor/models/v4_modules/attn.py:546-548}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:709}})</td><td>index-K source that is not a KV source ({{cite deepinfer/model_executor/models/v4_modules/attn.py:549-551}}); in the YOCO full-KV path, any non-KV-source layer with its own indexer ({{cite deepinfer/model_executor/models/v4_modules/attn.py:710-712}})</td></tr>
+    <tr><td><code>topk_indices</code></td><td>int32 <code>[T, index_topk]</code></td><td>index source ({{cite deepinfer/model_executor/models/v4_modules/attn.py:585-586}})</td><td>top-k consumers ({{cite deepinfer/model_executor/models/v4_modules/attn.py:568-570}})</td></tr>
+    <tr><td><code>loaded_prefill_kv</code>, <code>_main_offset</code></td><td>bf16 <code>[total_kv, 1, 512]</code>, int</td><td>KV source in prefill ({{cite deepinfer/model_executor/models/v4_modules/attn.py:840-842}})</td><td>KV consumers ({{cite deepinfer/model_executor/models/v4_modules/attn.py:747-750}})</td></tr>
+    <tr><td><code>loaded_prefill_index_kv</code></td><td>(FP4 values, scales)</td><td>index-K source in prefill ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:198-201}})</td><td>index-K consumers ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:193-196}})</td></tr>
+    <tr><td><code>consumer_full_metadata</code>, <code>consumer_full_hidden</code></td><td>metadata, bf16 <code>[T_full, hidden]</code></td><td>YOCO boundary ({{cite deepinfer/model_executor/models/deepseek.py:197}}, {{cite deepinfer/model_executor/models/decoder_layer.py:140}})</td><td><code>_store_yoco_full_kv</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:682-705}})</td></tr>
+    <tr><td><code>block_candidate_idxs</code>, <code>candidate_*</code></td><td>int32 <code>[T, topk_block]</code>, …</td><td>candidate source (in <code>index_attn.py</code>)</td><td>candidate consumers</td></tr>
+  </tbody>
+</table>
+<p>The YOCO boundary also rewrites two fields in place: it compacts <code>topk_indices</code> and <code>block_candidate_idxs</code> to the kept rows, and clears the candidate caches ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:116-122}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the maps of the figure">
+<p>Made-up config: 8 main layers, 1 draft layer, so <code>num_layers</code> = 9 and <code>n_main_layer</code> = 8. Source lists: KV <code>[1, 3, 5, 6]</code>, index <code>[1, 2, 3, 5, 6]</code>, no index-K list.</p>
+<ol>
+  <li>The HF loader makes <code>layer_kv_map = {1: 1, 2: 1, 3: 3, 4: 3, 5: 5, 6: 6, 7: 6}</code>, the same map for index K (line 74 of <code>config.py</code>), and <code>layer_index_module_map = {1: 1, 2: 2, 3: 3, 4: 3, 5: 5, 6: 6, 7: 6}</code> ({{cite deepinfer/hugging_face/config.py:62-75}}).</li>
+  <li><code>_build_layer_map</code> gives <code>layer_kv_map = [0, 1, 1, 3, 3, 5, 6, 6, 8]</code>. Layer 0 and the draft layer 8 point to themselves.</li>
+  <li><code>_validate_segmented_map</code> walks the list: 0 is a source, 1 is a source, 2 → 1 equals the last source, and so on. Pass.</li>
+  <li>Refinement, top-k inside index K: for layer 2, <code>ik[ix[2]] = ik[2] = 1</code> and <code>ik[2] = 1</code>. Pass. Index K inside KV: the maps are equal. Pass.</li>
+  <li>YOCO: the ratios are <code>[0, 2, 2, 2, 2, 1, 2, 2]</code>, so <code>n_prefill_layer</code> = 5 and <code>layer_kv_map[5]</code> = 5. Pass.</li>
+  <li><code>build_shared_layer_metadata</code> gives <code>is_kv_source_list = [T, T, F, T, F, T, T, F, T]</code> and the same for index K; <code>is_index_source_list</code> differs only at layer 2 (<code>T</code>).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>No layer carries the shared config</td><td><code>build_shared_layer_topology</code> returns <code>None</code>; every layer is a source</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:346-351}}</td></tr>
+    <tr><td>Two layers carry different shared configs</td><td><code>AssertionError</code> "layer N has a different layer_info_shared_cfg"</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:74-75}}</td></tr>
+    <tr><td>A map is missing, or an id is out of range</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:147-150}}</td></tr>
+    <tr><td>Sharing in a draft layer</td><td><code>AssertionError</code> "sharing on MTP layers is not supported"</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:152-154}}</td></tr>
+    <tr><td>A gap or a jump in a segment</td><td><code>AssertionError</code> "must be contiguous segments"</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:176-179}}</td></tr>
+    <tr><td>Consumer without the shared config</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:110-112}}</td></tr>
+    <tr><td>Consumer and source differ in ratio, <code>index_topk</code> or <code>use_swa</code></td><td><code>AssertionError</code> with both values</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:250-261}}</td></tr>
+    <tr><td>Share-KV across the YOCO boundary</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:116}}</td></tr>
+    <tr><td>Segments do not nest</td><td><code>AssertionError</code> "must refine"</td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:186-189}}</td></tr>
+    <tr><td>Bad candidate config</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:199-238}}</td></tr>
+  </tbody>
+</table>
+<p>Nothing in this file logs and continues. A TODO notes that the candidate checks may become stricter ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:220}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Three topologies from one config">
+<p>The same config is turned into a topology at three places: in the builder (containers), in <code>DeepseekForCausalLM.__init__</code> (runtime modules) and in each <code>ModelMetadata</code> (flag lists). The cache engine does not use the class at all: it reads the raw maps from each layer's <code>layer_info_shared_cfg</code> ({{cite deepinfer/worker/cache_engine.py:141-162}}). The code keeps these in agreement by convention, and the comment on lines 106-109 explains the one case that would break it: a consumer without the shared config.</p>
+<p>The layer count also differs in form: the builder passes <code>num_hidden_layers + nextn</code> ({{cite deepinfer/model_executor/models/v4_modules/builder.py:102}}); the model counts its modules minus the embedding and the lm head ({{cite deepinfer/model_executor/models/deepseek.py:267-269}}). Both give the number of main plus draft layers.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/cross-layer-kv-sharing}}: the idea, the rules and the memory saved.</li>
+  <li>{{link concepts/yoco-swa-replay}}: the YOCO fields of the runtime and the boundary rule.</li>
+  <li>{{link concepts/sparse-attention-indexer}}: index K and the top-k list.</li>
+  <li>{{link concepts/kv-compression}}: what a KV source stores.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">How many <code>CrossLayerRuntime</code> objects does one forward of the main model use?
+    <x-a><p>One. <code>DeepseekModel.forward</code> makes it and passes the same reference to every layer ({{cite deepinfer/model_executor/models/deepseek.py:165-166}}, {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:281-282}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A layer is missing from <code>layer_kv_map</code> in the config. What does <code>SharedLayerTopology</code> make of it?
+    <x-a><p>A KV source: <code>raw.get(layer_id, layer_id)</code> ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:151}}). If the layer sits between a source and its consumers, the segment check then fails ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:44-47}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does a single slot per value work in <code>CrossLayerRuntime</code>?
+    <x-a><p>The maps are contiguous segments and the layers run in order of their id. So when a consumer runs, the last value written is the one of its nearest source ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:284-287}}, {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:169-179}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the worked example, what are <code>is_kv_source_list</code> and <code>is_index_source_list</code>, and why does layer 2 differ?
+    <x-a><p><code>is_kv_source_list = [T, T, F, T, F, T, T, F, T]</code>; <code>is_index_source_list</code> is the same except <code>T</code> at layer 2 ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:370-374}}). Layer 2 is in <code>index_source_layer_ids</code> but not in <code>kv_source_layer_ids</code>, so it runs its own indexer on the KV and index keys of layer 1. See the deep dive "Worked example".</p></x-a>
+  </x-q>
+</x-quiz>
