@@ -1,0 +1,292 @@
+---
+title: Hardware platforms: NVIDIA and Ascend
+nav_title: NVIDIA and Ascend
+level: Intermediate
+prerequisites: learn/gpus-kernels, learn/parallelism, learn/moe
+related: concepts/hardware-discovery, concepts/tilelang-kernels, concepts/python-cpp-boundary, concepts/expert-parallelism, concepts/low-precision-formats, code/platform
+summary: DeepInfer runs on NVIDIA GPUs and on Huawei Ascend NPUs. At start-up it makes one Platform object, and the shared code reads all hardware choices from it.
+---
+<x-sentence>At start-up, DeepInfer checks the device files of the machine and makes one {{term platform}} for NVIDIA or for Ascend. All shared code reads its hardware choices from that object.</x-sentence>
+
+<h2>The idea</h2>
+<p>DeepInfer supports two kinds of {{term accelerator | accelerators}}: NVIDIA SM100 {{term gpu | GPUs}} and Huawei Ascend 950 {{term npu | NPUs}} ({{cite README.md:33-36}}). The two chips need different software:</p>
+<ul>
+  <li>NVIDIA uses {{term cuda}}. Ascend uses {{term cann}} and the PyTorch plug-in {{term torch-npu}}.</li>
+  <li>NVIDIA GPUs talk to each other with {{term nccl}}. Ascend NPUs use {{term hccl}}.</li>
+  <li>Each chip needs its own {{term kernel | kernels}}: the small programs that do the math on the device.</li>
+</ul>
+<p>Most of DeepInfer is the same for both chips: the scheduler, the model code, the sampler and the engine loop. Only a small number of places are different. DeepInfer collects those places in one object, the <em>Platform object</em>, in <code>deepinfer/platform.py</code>.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a travel plug adapter. Your laptop is the same in every country. Only the adapter changes. You choose the adapter once, when you arrive, and not each time you use the laptop. In DeepInfer, the shared code is the laptop. The Platform object is the adapter. DeepInfer chooses it once per process, at start-up.</p>
+
+<p>The work has three steps:</p>
+<ol>
+  <li><strong>Detect.</strong> The <code>deep_cluster</code> package looks for device files such as <code>/dev/davinci0</code> or <code>/dev/nvidia0</code>. It does not import PyTorch.</li>
+  <li><strong>Choose.</strong> <code>get_platform()</code> makes a <code>PlatformNPU</code> on Ascend and a <code>PlatformGPU</code> in all other cases.</li>
+  <li><strong>Use.</strong> Shared code reads names such as <code>PLATFORM.distributed_backend</code>. A kernel dispatcher loads the kernel folder for the chosen hardware.</li>
+</ol>
+<p>One process uses one platform. One deployment uses one hardware type. The last part of this page explains why DeepInfer is therefore <em>not</em> an {{term afd | AFD}} system.</p>
+
+<h2>The picture</h2>
+<x-diagram name="platform_select" alt="Panel 1: accelerator_kind checks Ascend device files first, then NVIDIA device files, else cpu; get_platform turns ascend into PlatformNPU and everything else into PlatformGPU. Panel 2: a table of the values each class sets, and the eight extra start-up steps that only PlatformNPU does." caption="How DeepInfer picks a platform (panel 1) and what each Platform class sets (panel 2). Click the diagram to see it at full size." />
+<p>Read panel 1 from left to right. The first check that finds device files wins. Panel 2 shows that both classes fill the same names with different values. Only the Ascend class also changes the process: it sets {{term environment-variable | environment variables}} and patches PyTorch.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: detect the hardware without PyTorch</h3>
+<p><code>accelerator_kind()</code> returns <code>"ascend"</code>, <code>"nvidia"</code> or <code>"cpu"</code>. It only looks at files. It checks Ascend first.</p>
+<x-code file="deep_cluster/hardware/device.py" lines="14-23" highlight="19-23" caption="The whole decision. <code>functools.cache</code> runs the check once per process." />
+<p>The Ascend check looks for <code>/dev/davinci_manager</code>, for <code>/dev/davinci&lt;N&gt;</code> files, or for UB devices in <code>/sys/class/ubcore</code> ({{cite deep_cluster/hardware/ascend.py:61-68}}). The NVIDIA check looks for folders in <code>/proc/driver/nvidia/gpus</code> or for <code>/dev/nvidia&lt;N&gt;</code> files ({{cite deep_cluster/hardware/nvidia.py:40-48}}). The page {{link concepts/hardware-discovery}} explains this package in full.</p>
+
+<h3>Step 2: make the Platform object, once</h3>
+<x-code file="deepinfer/platform.py" lines="222-227" highlight="226" caption="Only <code>&quot;ascend&quot;</code> gives <code>PlatformNPU</code>. Both <code>&quot;nvidia&quot;</code> and <code>&quot;cpu&quot;</code> give <code>PlatformGPU</code>." />
+<p>Code does not call <code>get_platform()</code> directly. It writes <code>from deepinfer import PLATFORM</code>. The package makes this name on first use, with a module-level <code>__getattr__</code>:</p>
+<x-code file="deepinfer/__init__.py" lines="53-64" highlight="58-62" caption="The package makes the platform on first use. The comment gives the reason: on Ascend, the constructor patches PyTorch and starts the device runtime." />
+<p>The first line of <code>deepinfer/__init__.py</code> is a rule in Chinese. Translated: <em>"It is strictly forbidden to import torch or to initialize a device in this file in any form. It causes failures in child processes."</em> ({{cite deepinfer/__init__.py:1}}). The lazy <code>PLATFORM</code> follows this rule: <code>import deepinfer</code> does not import PyTorch.</p>
+
+<h3>Step 3: the two classes</h3>
+<p>The base class <code>Platform</code> lists four names that every platform must set ({{cite deepinfer/platform.py:19-27}}). The NVIDIA class is short:</p>
+<x-code file="deepinfer/platform.py" lines="55-83" highlight="57-58,63,80-82" />
+<p><code>PlatformNPU</code> sets <code>"asc"</code>, <code>"hccl"</code> and <code>torch.int16</code> instead ({{cite deepinfer/platform.py:86-89}}, {{cite deepinfer/platform.py:138}}). Its constructor also does eight extra steps. The deep dive <a href="#npu-init">PlatformNPU.__init__, line by line</a> reads them one at a time.</p>
+
+<h3>Step 4: shared code uses the platform</h3>
+<p>The second diagram shows the four places where the platform sends the shared code to different code.</p>
+<x-diagram name="platform_switch_points" alt="Panel 1: an interface file calls ops.expand_swa_index_tl; the dispatcher ops.py loads tilelang_ops/cuda or tilelang_ops/asc. Panel 2: three more switch points: torch.cuda calls are mapped to torch.npu on Ascend, an import hook replaces two vendor functions on Ascend, and setup.py builds a CUDA or an NPU C++ extension." caption="The four switch points. Teal boxes are shared code. Amber boxes are patches that exist only on Ascend." />
+<p><strong>Kernels.</strong> Interface files such as <code>swa_index.py</code> call <code>ops.expand_swa_index_tl(width)(pivots, out)</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/swa_index.py:31}}). The {{term tilelang}} dispatcher <code>ops.py</code> decides where that name comes from:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/ops.py" lines="13-22" highlight="15" caption="Line 15 imports the subpackage <code>cuda</code> or <code>asc</code>, from <code>PLATFORM.tilelang_ops_backend</code>." />
+<x-note title="Where the dispatch is">
+<p>The dispatch happens in <code>tilelang_ops/ops.py</code>. The file <code>tilelang_ops/__init__.py</code> is empty ({{cite deepinfer/model_executor/layers/tilelang_ops/__init__.py}}). It does not choose a backend.</p>
+</x-note>
+<p><strong>Communication.</strong> Every device {{term process-group}} uses the platform backend and options:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="82-93" highlight="82-83,86,93" caption="All device groups (world, local, DP, CP, EP, Engram) get <code>backend</code> and <code>options</code> from <code>PLATFORM</code>. CPU-side groups use <code>&quot;gloo&quot;</code>." />
+<p><strong>Memory.</strong> The shared-memory buffer asks the platform to pin its CPU memory ({{cite deepinfer/shared_memory.py:119}}). {{term pinned-memory | Pinned memory}} makes copies between CPU and device faster.</p>
+
+<h3>Step 5: Ascend-only patches</h3>
+<p>Some shared code calls <code>torch.cuda.*</code> directly. On Ascend, <code>PlatformNPU</code> imports <code>torch_npu.contrib.transfer_to_npu</code>. That module maps <code>torch.cuda.*</code> onto <code>torch.npu.*</code> ({{cite deepinfer/platform.py:120-123}}). Two {{term vendor-library | vendor}} functions do not exist on Ascend in the needed form. An {{term import-hook}} replaces them:</p>
+<x-code file="deepinfer/npu_ops/__init__.py" lines="1-12" caption="After this runs, <code>from deep_select.interface import topk</code> gives the NPU version in <code>deepinfer/npu_ops/deep_select.py</code>." />
+<p><code>PlatformNPU.__init__</code> imports this package ({{cite deepinfer/platform.py:140-141}}). On NVIDIA, nothing imports it, so the vendor functions stay unchanged.</p>
+
+<h3>Step 6: build time</h3>
+<p>The C++ {{term extension-module}} <code>deepinfer._C</code> is built with {{term pybind11}}. <code>setup.py</code> asks <code>deep_cluster</code> which hardware the build machine has, and picks the extension type and the source files:</p>
+<x-code file="setup.py" lines="38-53" highlight="38-39,45-46,49" caption="On Ascend: <code>NpuExtension</code>, two Ascend source files, and the macro <code>WITH_NPU</code>. The CUDA branch follows in lines 54-72." />
+<p>The vendor libraries also have Ascend versions. <code>scripts/build_vendor.sh</code> builds <code>DeepEP-Ascend</code> and <code>DeepGEMM-Ascend</code> instead of <code>DeepEP</code> and <code>DeepGEMM</code> ({{cite scripts/build_vendor.sh:7-22}}). All six vendor folders are git submodules ({{cite .gitmodules}}). This site does not explain their insides.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="accelerator_kind(): the exact detection rules">
+<p>The function is in <code>deep_cluster/hardware/device.py</code>. It has a keyword-only parameter <code>_root</code> (default <code>Path("/")</code>). Tests use it to point the checks at a fake file tree.</p>
+<x-code file="deep_cluster/hardware/ascend.py" lines="61-68" caption="Ascend check. Any one of three signals is enough." />
+<ol>
+  <li>Line 62: <code>/dev/davinci_manager</code> exists, <em>or</em> at least one <code>/dev/davinci&lt;N&gt;</code> file exists (<code>_DAVINCI_PATTERN</code>, {{cite deep_cluster/hardware/ascend.py:13}}).</li>
+  <li>Lines 64-67: else, for each <code>udma*</code> entry in <code>/sys/class/ubcore</code>, read <code>device/ub_totalues</code>. A value above 0 means Ascend.</li>
+</ol>
+<x-code file="deep_cluster/hardware/nvidia.py" lines="40-48" caption="NVIDIA check: one folder per GPU in /proc/driver/nvidia/gpus (named by PCI bus id), else /dev/nvidia&lt;N&gt; files." />
+<p><strong>Order and edge cases.</strong></p>
+<ul>
+  <li>Ascend is checked first ({{cite deep_cluster/hardware/device.py:19-20}}). A host with both kinds of device files is treated as Ascend.</li>
+  <li>No device files: the result is <code>"cpu"</code>. <code>get_platform()</code> then makes a <code>PlatformGPU</code> ({{cite deepinfer/platform.py:226}}). <code>PlatformGPU()</code> itself does not check for a GPU ({{cite deepinfer/platform.py:60-63}}). The first real CUDA call fails later.</li>
+  <li>The result is cached with <code>@functools.cache</code> ({{cite deep_cluster/hardware/device.py:17}}). Device files are read once per process.</li>
+  <li><code>ascend.py</code> also has a module constant <code>IS_NPU</code> that checks only <code>/dev/davinci_manager</code> ({{cite deep_cluster/hardware/ascend.py:153}}). <code>get_platform()</code> does not use it.</li>
+</ul>
+<p><strong>Related helpers in the same file.</strong> <code>visible_device_env_name()</code> returns <code>"ASCEND_RT_VISIBLE_DEVICES"</code>, <code>"CUDA_VISIBLE_DEVICES"</code>, or <code>None</code> when it finds no accelerator ({{cite deep_cluster/hardware/device.py:36-43}}). <code>get_bf16_tflops_limit()</code> returns a peak BF16 speed in TFLOPS: 432 on Ascend, 2250 on x86 SM100 hosts and 2500 on Arm SM100 hosts ({{cite deep_cluster/hardware/device.py:151-156}}). All other hosts raise <code>RuntimeError("unknown GPU type")</code> there: an NVIDIA GPU that is not compute capability 10.x, or a host with no accelerator ({{cite deep_cluster/hardware/device.py:159-164}}).</p>
+</x-deepdive>
+
+<x-deepdive title="PlatformNPU.__init__, line by line">
+<p id="npu-init">The Ascend constructor does much more than set three values. It changes environment variables and patches PyTorch. This is why <code>PLATFORM</code> is lazy.</p>
+<x-code file="deepinfer/platform.py" lines="91-143" highlight="94-102,120-121,128,136,141" />
+<p><strong>Lines 92-102: visible devices.</strong> Most of DeepInfer reads <code>CUDA_VISIBLE_DEVICES</code>, also on Ascend (for example {{cite deepinfer/worker/base.py:127}}). So the two {{term visible-devices | visible-device}} variables must agree. There are four cases:</p>
+<table>
+  <thead><tr><th><code>CUDA_VISIBLE_DEVICES</code></th><th><code>ASCEND_RT_VISIBLE_DEVICES</code></th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>not set</td><td>set, for example <code>0,1</code></td><td>Copies the value into <code>CUDA_VISIBLE_DEVICES</code>, then shows a <code>UserWarning</code>.</td></tr>
+    <tr><td>not set</td><td>not set</td><td>No change. Both are <code>None</code>, so they are equal.</td></tr>
+    <tr><td>set</td><td>same value</td><td>No change.</td></tr>
+    <tr><td>set</td><td>different value, or not set</td><td><code>RuntimeError</code> ({{cite deepinfer/platform.py:101-102}}).</td></tr>
+  </tbody>
+</table>
+<p><strong>Lines 104-118: environment variables.</strong> Some lines always overwrite. Others use <code>setdefault</code>, so your own value wins.</p>
+<table>
+  <thead><tr><th>Variable</th><th>Value</th><th>How</th><th>Purpose (from the code comment or the name)</th></tr></thead>
+  <tbody>
+    <tr><td><code>PYTORCH_NPU_ALLOC_CONF</code></td><td><code>expandable_segments:True</code></td><td>overwrite</td><td>Less NPU memory fragmentation.</td></tr>
+    <tr><td><code>TASK_QUEUE_ENABLE</code></td><td><code>0</code></td><td>overwrite</td><td>Disables the task queue.</td></tr>
+    <tr><td><code>HCCL_BUFFSIZE</code></td><td><code>16</code></td><td>overwrite</td><td>HCCL buffer size.</td></tr>
+    <tr><td><code>HCCL_CONNECT_TIMEOUT</code></td><td><code>240</code></td><td>default</td><td>HCCL time-outs.</td></tr>
+    <tr><td><code>HCCL_EXEC_TIMEOUT</code></td><td><code>200</code></td><td>default</td><td>HCCL time-outs.</td></tr>
+    <tr><td><code>HCCL_HOST_SOCKET_PORT_RANGE</code>, <code>HCCL_NPU_SOCKET_PORT_RANGE</code></td><td><code>auto</code></td><td>default</td><td>Port selection.</td></tr>
+    <tr><td><code>TORCH_NPU_DEVICE_CAPABILITY</code></td><td><code>9.0</code></td><td>default</td><td>Temporary work-around for a torch_npu bug.</td></tr>
+    <tr><td><code>TILELANG_DEFAULT_TARGET</code></td><td><code>ascend</code></td><td>default</td><td>See lines 123-128 below.</td></tr>
+  </tbody>
+</table>
+<p><strong>Lines 120-128: the PyTorch patch.</strong> <code>transfer_to_npu</code> maps <code>torch.cuda.*</code> onto <code>torch.npu.*</code>. A side effect: <code>torch.cuda.is_available()</code> now returns <code>True</code> on a host with no NVIDIA GPU. TileLang uses that call to guess its compile target, so it would compile kernels for CUDA. Line 128 sets the default target to <code>ascend</code> to stop this.</p>
+<p><strong>Lines 130-131.</strong> <code>allow_internal_format = True</code> and <code>set_compile_mode(jit_compile=False)</code> are torch_npu settings. This site does not explain torch_npu internals.</p>
+<p><strong>Line 136: stream alias.</strong> CUDA-style code reads <code>stream.cuda_stream</code> to get the raw stream handle. NPU streams call it <code>npu_stream</code>. The line adds a <code>cuda_stream</code> property to <code>torch.npu.Stream</code> that returns <code>npu_stream</code>.</p>
+<p><strong>Lines 138-143.</strong> Sets <code>fp8_sf_type = torch.int16</code>, installs the import hook (<code>import deepinfer.npu_ops</code>, marked <code>TODO(NPU): Intended to be removed</code>), and loads the host-register functions (next deep dive).</p>
+</x-deepdive>
+
+<x-deepdive title="Pinned host memory on both platforms">
+<p>DeepInfer keeps a large shared-memory buffer for data that goes from the CPU to the device. The buffer is pinned so that copies can use DMA:</p>
+<x-code file="deepinfer/shared_memory.py" lines="113-120" highlight="119">
+<x-tr line="113">The real large shared-memory block.</x-tr>
+<x-tr line="114-115">SharedMemory makes it shared across processes. Then it is pinned as host pinned memory to speed up H2D copies (GPU: cudaHostRegister; NPU: aclrtHostRegisterV2, see platform.py).</x-tr>
+<x-tr line="120">"Allocated: is_shared=…, is_pinned=…"</x-tr>
+</x-code>
+<p><strong>NVIDIA.</strong> <code>cudaHostRegister(ptr, nbytes, 0)</code> through <code>torch.cuda.cudart()</code> ({{cite deepinfer/platform.py:65-73}}).</p>
+<p><strong>Ascend.</strong> torch_npu has no such call, so DeepInfer loads <code>libascendcl.so</code> with <code>ctypes</code>:</p>
+<x-code file="deepinfer/platform.py" lines="156-207" highlight="158,170,173-174,193,201-202" />
+<ul>
+  <li>The flag <code>_ACL_HOST_REG_PINNED = 0x10000000</code> asks for pinned memory (line 158).</li>
+  <li>Error <code>507910</code> (already registered) on pin and <code>507911</code> (not registered) on unpin are ignored. All other errors give a warning, not an exception (lines 202-207 here; {{cite deepinfer/platform.py:215-219}} for unpin). The copy then uses the slow pageable path.</li>
+  <li>The ACL device context is per thread. Without it, a bare register call fails with error <code>107002</code>. So each call first runs <code>torch.npu.set_device(torch.npu.current_device())</code> (lines 186-193).</li>
+  <li>If the driver is too old and the functions are missing, start-up stops with <code>RuntimeError</code> (lines 169-178).</li>
+</ul>
+<p>The base class has empty <code>pin_host_memory</code> and <code>unpin_host_memory</code> methods. A future platform that cannot pin memory still works, with slower copies ({{cite deepinfer/platform.py:37-49}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Communication: backends, options and SM limits">
+<p>Start-up first joins all ranks with a CPU-only {{term gloo | Gloo}} group ({{cite deepinfer/worker/base.py:334-340}}). Then <code>create_process_groups</code> makes the device groups. Every device group uses the same backend:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="26-37" caption="Groups are cached by (ranks, backend, options), so each group is created only once." />
+<p><strong>NCCL options.</strong> <code>PlatformGPU.get_distributed_options()</code> sets <code>config.max_ctas</code> and <code>config.min_ctas</code> to <code>DEEPINFER_NCCL_NUM_SMS</code> ({{cite deepinfer/platform.py:75-83}}). The default is 32 ({{cite deepinfer/environ.py:108}}). A CTA is one thread block, and one CTA runs on one {{term sm | SM}}. So this value sets how many SMs an NCCL operation uses. The other SMs stay free for compute kernels that run at the same time.</p>
+<p><strong>HCCL options.</strong> <code>PlatformNPU.get_distributed_options()</code> returns a default <code>ProcessGroupHCCL.Options()</code> ({{cite deepinfer/platform.py:145-149}}). The HCCL settings come from the <code>HCCL_*</code> environment variables in the constructor.</p>
+<p><strong>Other platform checks in this area.</strong></p>
+<ul>
+  <li><code>is_within_nvl_domain()</code> always returns <code>True</code> on NPU. On GPU it asks DeepEP for the size of the NVLink domain ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:130-134}}).</li>
+  <li>EPLB moves expert weights through <code>symm_mem</code> only on GPU. The comment says: <em>NPU doesn't support symm_mem yet</em> ({{cite deepinfer/model_executor/eplb/__init__.py:199-200}}).</li>
+  <li>The NVIDIA build script installs NCCL 2.32.3 over the version that comes with PyTorch ({{cite build.sh:16-19}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="The kernel dispatcher ops.py, line by line">
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/ops.py" lines="1-32" highlight="15-22,25,31-32" />
+<ol>
+  <li><strong>Line 13.</strong> <code>from deepinfer import PLATFORM</code> makes the platform if it does not exist yet.</li>
+  <li><strong>Line 15.</strong> Imports <code>...tilelang_ops.cuda</code> or <code>...tilelang_ops.asc</code>.</li>
+  <li><strong>Lines 16-17.</strong> <code>pkgutil.iter_modules</code> lists every module in that folder, and each one is imported. An import only defines the factories. Most {{term kernel-factory | kernel factories}} use the <code>@tilelang.jit</code> decorator. They compile a kernel when they are called, not at import.</li>
+  <li><strong>Lines 18-20.</strong> Keeps only public names that end in <code>_tl</code> and are not modules.</li>
+  <li><strong>Line 21.</strong> If two modules define the same <code>_tl</code> name with different objects, an <code>assert</code> fails with the message <code>backend symbol collision</code>, so the import fails.</li>
+  <li><strong>Line 22.</strong> Copies the factory into the namespace of <code>ops</code>. Callers then write <code>ops.name_tl</code>.</li>
+  <li><strong>Lines 25-32.</strong> Python calls a module-level <code>__getattr__</code> only when normal lookup fails (PEP 562). So <code>ops.unknown_tl</code> raises <code>KernelUnavailableError</code>. It is a subclass of <code>AttributeError</code>, so <code>hasattr(ops, "x_tl")</code> still returns <code>False</code>.</li>
+</ol>
+<p><strong>Coverage.</strong> At this commit, <code>cuda/</code> exports 43 <code>_tl</code> factories and <code>asc/</code> exports 42. The one that exists only on CUDA is <code>detect_outlier_and_abort_tl</code>, a debug check ({{cite deepinfer/model_executor/layers/tilelang_ops/outlier_detection.py:10-26}}). Kernel tests turn <code>KernelUnavailableError</code> into a skip on non-NVIDIA hosts ({{cite deepinfer/model_executor/layers/tilelang_ops/conftest.py:100-113}}).</p>
+<p><strong>The same kernel, two versions.</strong> Both files below define <code>expand_swa_index_tl(width)</code>. They take the same tensors: int32 <code>pivots</code> of shape <code>[n, 4]</code> and int32 <code>output</code> of shape <code>[n, width]</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/swa_index.py:10-22}}). The way they split the work is different:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/cuda/swa_index.py" lines="7-20" highlight="7,18" caption="CUDA: a grid of blocks with 128 threads each. Each block handles 4 rows and up to 1024 columns." />
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/asc/swa_index.py" lines="1-62" highlight="5,8-11,14,25,29-35,40,60" caption="Ascend: one program per vector core (<code>tile_kernels.get_num_vec_cores()</code>) and a persistent loop over tiles of 32 rows. Line 40 copies a tile of pivots into an on-chip buffer. Lines 41-59 compute 64 columns at a time with SIMD instructions. Line 60 copies the result tile out." />
+<x-simplified>
+<p>"Vector core" and "on-chip buffer" are short names for Ascend hardware parts. The page {{link concepts/tilelang-kernels}} explains TileLang on both platforms.</p>
+</x-simplified>
+</x-deepdive>
+
+<x-deepdive title="fp8_sf_type: why int32 on NVIDIA and int16 on Ascend">
+<p>DeepInfer stores many weights and activations in {{term fp8 | FP8}}. Each block of FP8 values has a {{term scale-factor}}. One common scale format is UE8M0: an 8-bit exponent with no sign and no mantissa, so one scale uses one byte. DeepInfer packs several one-byte scales into one integer. The integer type is <code>PLATFORM.fp8_sf_type</code>:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/fused_transform.py" lines="63-67" highlight="65-66" />
+<p>So on NVIDIA one <code>int32</code> holds 4 scales. On Ascend one <code>int16</code> holds 2 scales. The pack factor is simply <code>fp8_sf_type.itemsize</code>:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/norm.py" lines="23-51" highlight="42-43,47,51">
+<x-tr line="31">Allocate the scale factors (sf) for an FP8 cast. Returns (external view, kernel argument). The layout matches tile_kernels.quant.</x-tr>
+<x-tr line="33">row-major: float32 (B, M, d_scale), contiguous.</x-tr>
+<x-tr line="34-36">row-major packed ue8m0 (the mega-MoE x_sf layout): fp8_sf_type (B, M, d_scale/pack_factor), contiguous. Each element packs pack_factor consecutive ue8m0 values along k. The kernel writes them byte by byte through a uint8 (B, M, d_scale) view.</x-tr>
+<x-tr line="37">col-major (TMA aligned): float32 (B, M, d_scale), column-major view. Each column is padded to align(M, 4).</x-tr>
+<x-tr line="38-40">col-major packed ue8m0: fp8_sf_type (B, M, ceil(d_scale/pack_factor)), column-major view. The kernel writes byte by byte through a uint8 (B, M, packs, pack_factor) view.</x-tr>
+</x-code>
+<p>A worked example: a row has <code>d_scale = 8</code> scales. On NVIDIA, the packed row-major tensor has shape <code>(B, M, 2)</code> in <code>int32</code>. On Ascend, it has shape <code>(B, M, 4)</code> in <code>int16</code>. Both use 8 bytes per row. Line 51 shows one more difference. On NVIDIA, the column-major layout pads <code>M</code> up to a multiple of 4. On Ascend, it does not pad.</p>
+<p>Other code checks the type directly. The FP8 linear layer converts loaded weight scales if their type is not <code>fp8_sf_type</code> ({{cite deepinfer/model_executor/layers/linear.py:67-70}}). It asserts the type before each FP8 GEMM ({{cite deepinfer/model_executor/layers/linear.py:164}}). The KV cache sizes its scale tensor with the same type ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:244-248}}). The page {{link concepts/low-precision-formats}} explains the formats.</p>
+</x-deepdive>
+
+<x-deepdive title="The npu_ops import hook in detail">
+<p><code>patch_imports()</code> replaces the built-in <code>builtins.__import__</code> with its own function. It changes only statements of the form <code>from X import a, b</code>.</p>
+<x-code file="deepinfer/npu_ops/patch_imports.py" lines="55-93" highlight="63-64,71,86-91">
+<x-tr line="62">Only handle <code>from name import a, b</code> (not <code>*</code>). fromlist can be None.</x-tr>
+<x-tr line="78">Get the original target module. Imports inside it are still patched.</x-tr>
+<x-tr line="88">When the source module itself imports the matching target, give it the original object.</x-tr>
+</x-code>
+<p>Step by step, for <code>from deep_select.interface import topk</code> on Ascend:</p>
+<ol>
+  <li>Python calls <code>_hooked_import("deep_select.interface", ..., fromlist=("topk",), level=0)</code>.</li>
+  <li><code>_patch_map</code> has <code>{"deep_select.interface": {"topk": "deepinfer.npu_ops.deep_select.topk"}}</code>, so the name is patched.</li>
+  <li>The hook returns a new, empty module object. Its <code>topk</code> is a <code>Lazy</code> wrapper ({{cite deepinfer/npu_ops/patch_imports.py:33-52}}). The real NPU function loads only on the first call.</li>
+  <li>Exception: <code>deepinfer/npu_ops/deep_select.py</code> itself imports <code>topk</code> from <code>deep_select.interface</code>. Because the caller is the source module, it gets the <em>original</em> vendor function (lines 86-89). Without this rule, the NPU version would call itself.</li>
+  <li>Other names of the module go to the real module through the fake module's <code>__getattr__</code> (line 92).</li>
+</ol>
+<p>The hook does not change <code>sys.modules</code>, and <code>patch_imports()</code> can run only once ({{cite deepinfer/npu_ops/patch_imports.py:114-116}}). Its docstring is in Chinese. Translated: <em>"Replace <code>from dst.mod import name</code> with a lazy <code>src.mod.name</code>. Only from-imports are intercepted; sys.modules is not faked. src loads only when the patched object is first used."</em> ({{cite deepinfer/npu_ops/patch_imports.py:97-111}}).</p>
+<p><strong>The two replacements.</strong></p>
+<x-code file="deepinfer/npu_ops/deep_select.py" lines="20-26" caption="The sampler does not pass <code>return_value</code> ({{cite deepinfer/model_executor/layers/sampler.py:12}}), so it gets <code>torch.topk</code>. The sparse-attention indexer passes <code>return_value=False</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:225}}) and gets the real vendor kernel." />
+<p>The vision encoder imports <code>_flash_attn_fwd</code> in {{cite deepinfer/model_executor/models/vision_encoder/vit.py:13}}. The ViT replacement calls <code>torch_npu.npu_fusion_attention</code> in <code>"TND"</code> layout, with no causal mask, and with scale <code>1/sqrt(head_dim)</code> ({{cite deepinfer/npu_ops/vit_attn.py:9-31}}). Its docstring says, translated: <em>"varlen attention for the ViT: not causal, full attention inside each segment."</em> Both files carry a <code>TODO(NPU): To be removed</code> note.</p>
+</x-deepdive>
+
+<x-deepdive title="Two builds in one source tree: deepinfer/_so/&lt;accelerator&gt;-&lt;arch&gt;">
+<p>The build puts the compiled <code>.so</code> files of each platform in a separate folder. At import time, <code>deepinfer/__init__.py</code> adds the right folder to the package search path:</p>
+<x-code file="deepinfer/__init__.py" lines="9-32" highlight="15,23-25,30-32">
+<x-tr line="10-13">Platform folder tag for the extension module (deepinfer._C). It matches the <code>&lt;accelerator&gt;-&lt;arch&gt;</code> naming of the build scripts (scripts/*.sh, Makefile), for example <code>nvidia-x86_64</code>. Use only light signals (environment variables, deep_cluster.hardware). Never import torch here.</x-tr>
+<x-tr line="24">No accelerator, or detection failed: use nvidia as the default.</x-tr>
+<x-tr line="28-29">Build outputs are stored per platform (deepinfer/_so/&lt;tag&gt;/). After that folder is on the package search path, import still finds the canonical SOABI name, but in this platform's copy. So nvidia and ascend builds for the same CPU architecture can live in one source tree.</x-tr>
+</x-code>
+<x-warning title="Keep DEEPINFER_ACCELERATOR exported on Ascend">
+<p><code>envs.DEEPINFER_ACCELERATOR</code> has the default <code>"nvidia"</code> ({{cite deepinfer/environ.py:101}}). So line 15 gives <code>"nvidia"</code> when the variable is not set. The <code>accelerator_kind()</code> fall-back on lines 16-22 runs only when the variable is set to an empty string. On an Ascend host you must export <code>DEEPINFER_ACCELERATOR=ascend</code>. The README says the same: "Keep it exported in the environment where you run DeepInfer" ({{cite README.md:59-61}}).</p>
+</x-warning>
+<p>The build side uses the same tag. <code>scripts/build.sh</code> builds into <code>build/&lt;tag&gt;</code> and links each <code>.so</code> into <code>deepinfer/_so/&lt;tag&gt;/</code> ({{cite scripts/build.sh:11-14}}, {{cite scripts/build.sh:23-26}}). The Makefile has one target per platform, for example <code>make build-ascend</code> ({{cite Makefile:3-11}}).</p>
+<p>The same file sets four process-wide variables at import time ({{cite deepinfer/__init__.py:36-44}}). One comment explains <code>PYTORCH_NVML_BASED_CUDA_CHECK=1</code>. Translated: <em>"Importing dependencies can call torch.cuda.is_available. If CUDA initializes early, a later CUDA_VISIBLE_DEVICES has no effect. So use NVML-based detection instead."</em></p>
+</x-deepdive>
+
+<x-deepdive title="Build time: extension sources, vendor libraries, requirements">
+<p><strong>Extension sources.</strong> Eleven C++ files are common to both platforms: the engine, scheduler bindings, ZOS, input metadata, sampling preparation and the graph timer ({{cite setup.py:22-34}}). Each platform adds two files:</p>
+<table>
+  <thead><tr><th></th><th>NVIDIA</th><th>Ascend</th></tr></thead>
+  <tbody>
+    <tr><td>Extension class</td><td><code>CUDAExtension</code></td><td><code>NpuExtension</code> (from torch_npu)</td></tr>
+    <tr><td>Extra sources</td><td><code>csrc/cuda_utils.cpp</code>, <code>csrc/graph_timer/graph_timer_cuda.cpp</code></td><td><code>csrc/asc_utils.cpp</code>, <code>csrc/graph_timer/graph_timer_asc.cpp</code></td></tr>
+    <tr><td>Extra flags</td><td><code>-fvisibility=hidden</code>, links <code>libcuda</code></td><td><code>-fopenmp -fvisibility=hidden -DWITH_NPU</code></td></tr>
+    <tr><td>Needs</td><td>a conda env or virtualenv (else <code>RuntimeError</code>)</td><td>torch_npu installed</td></tr>
+  </tbody>
+</table>
+<p>Sources: {{cite setup.py:38-72}}. Both platform files implement the same functions, declared in one header in the namespace <code>deepinfer::cuda::utils</code>: <code>alloc_tensor</code>, <code>import_ipc_tensor</code>, <code>export_ipc_tensor</code>, <code>cuda_copy_async</code>, <code>get_current_stream</code> ({{cite csrc/cuda_utils.hpp:16-25}}). The header itself switches on <code>WITH_NPU</code>, for example for the default device:</p>
+<x-code file="csrc/cuda_utils.hpp" lines="27-33" caption="kPrivateUse1 is the PyTorch device type that out-of-tree backends such as torch_npu use." />
+<p><strong>Vendor libraries.</strong> <code>DeepSelect</code> and <code>FlashMLA</code> have one source tree that builds for both targets. The script sets <code>BUILD_TARGET</code> to <code>CUDA</code> or <code>ASCEND</code> ({{cite scripts/build_vendor.sh:7-22}}). It passes the value as <code>DEEP_SELECT_BUILD_TARGET_PLATFORM</code> or <code>FLASH_MLA_BUILD_TARGET_PLATFORM</code> ({{cite scripts/build_vendor.sh:30-44}}). DeepEP and DeepGEMM have separate Ascend repositories. In all cases the installed Python package names are the same (<code>deep_select flash_mla deep_ep deep_gemm</code>), so the Python code imports the same names on both platforms.</p>
+<p><strong>Python requirements.</strong> NVIDIA installs <code>torch==2.13.0+cu132</code> ({{cite requirements-nvidia.txt:1-3}}). Ascend installs the CPU build <code>torch==2.13.0+cpu</code> plus <code>torch-npu==2.13.0rc1</code> ({{cite requirements-ascend.txt:1-4}}). The README asks for CUDA 13 on NVIDIA and CANN 9.2 on Ascend ({{cite README.md:51-52}}).</p>
+</x-deepdive>
+
+<h2 id="is-it-afd">Is DeepInfer AFD (Attention-FFN Disaggregation)?</h2>
+<p><strong>No.</strong> {{term afd | AFD}} runs the attention layers on one group of devices and the FFN or expert layers on another group. In every layer, hidden states go from the attention group to the FFN group and back. DeepInfer does not do this. There are four reasons in the code and docs.</p>
+<x-diagram name="afd_vs_deepinfer" alt="Panel 1: AFD has an attention pool and a separate FFN pool with hidden states crossing between them every layer. Panel 2: in DeepInfer each device runs attention and the MoE layer; DeepEP dispatch and combine move tokens between devices only for the experts. Panel 3: the docs describe separate vision-encoder, prefill and decode instances, which are not in this release." caption="AFD compared with DeepInfer. The only split that the docs describe is E/P/D, and it is not in this release." />
+<ol>
+  <li><strong>One hardware type per deployment.</strong> Each process makes its platform from its own device files. Every device process group then uses <code>PLATFORM.distributed_backend</code>, which is <code>"nccl"</code> or <code>"hccl"</code> ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:82-117}}). NCCL and HCCL are different libraries, and the code has no path that connects an NCCL group to an HCCL group. So all ranks of one job use the same hardware type.</li>
+  <li><strong>Attention and MoE run in the same layer, on the same device.</strong> <code>DeepseekDecoderLayer.forward</code> calls attention and then the MoE block, one after the other:
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="155-173" highlight="155,169" /></li>
+  <li><strong>MoE uses expert parallelism, not a separate pool.</strong> With {{term expert-parallelism}}, each device holds a part of the experts. {{term deepep | DeepEP}} <code>dispatch</code> sends each token to the devices of its experts, and <code>combine</code> sends the results back ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:461-511}}). Every one of these devices also runs attention, with {{term data-parallelism}}: "attention uses data parallelism (#DP = #EP)" ({{cite doc/inference_deployment_qa.md:33}}).</li>
+  <li><strong>The only split in the docs is E/P/D, and it is not in this release.</strong> The docs describe separate vision-encoder, prefill and decode instances ({{cite doc/inference_deployment_qa.md:31}}, {{cite doc/inference_deployment_qa.md:41-63}}). Each prefill or decode instance runs the whole language model, attention and MoE. A VE instance runs only the vision encoder, on one GPU ({{cite doc/inference_deployment_qa.md:51}}). The README lists "VE/Prefill/Decode disaggregation" under "not included in this release" ({{cite README.md:38-41}}). See {{term epd}}.</li>
+</ol>
+<x-simplified>
+<p>Point 1 is about one job. The docs say DeepInfer "runs on both NVIDIA and Huawei Ascend platforms" ({{cite doc/inference_deployment_qa.md:19}}). That means two separate deployments, one per hardware type, not one mixed job.</p>
+</x-simplified>
+
+<h2>What can go wrong</h2>
+<x-warning title="Visible-device mismatch on Ascend">
+<p>If <code>CUDA_VISIBLE_DEVICES</code> is set and is not equal to <code>ASCEND_RT_VISIBLE_DEVICES</code>, start-up stops with <code>RuntimeError</code> ({{cite deepinfer/platform.py:101-102}}). This also happens when only <code>CUDA_VISIBLE_DEVICES</code> is set. Set both to the same value, or set only <code>ASCEND_RT_VISIBLE_DEVICES</code>.</p>
+</x-warning>
+<ul>
+  <li><strong>Wrong <code>.so</code> folder.</strong> If <code>DEEPINFER_ACCELERATOR</code> is not exported on Ascend, the package looks in <code>_so/nvidia-&lt;arch&gt;/</code>. The import of <code>deepinfer._C</code> can then fail or find the wrong build. See the deep dive on the <code>_so</code> folder.</li>
+  <li><strong>Platform made too early.</strong> On Ascend, the first access to <code>PLATFORM</code> starts the device runtime. It must happen after <code>ASCEND_RT_VISIBLE_DEVICES</code> is set ({{cite deepinfer/__init__.py:58-59}}). Do not touch <code>deepinfer.PLATFORM</code> in code that runs before the worker sets its devices.</li>
+  <li><strong>torch in <code>deepinfer/__init__.py</code>.</strong> The package rule forbids it, because it breaks child processes ({{cite deepinfer/__init__.py:1}}).</li>
+  <li><strong>Missing kernel on one platform.</strong> A call to a factory that the backend does not have raises <code>KernelUnavailableError</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/ops.py:31-32}}).</li>
+  <li><strong>Old Ascend driver.</strong> If <code>libascendcl.so</code> has no <code>aclrtHostRegisterV2</code>, start-up stops with <code>RuntimeError</code> ({{cite deepinfer/platform.py:169-178}}).</li>
+  <li><strong>Slow copies, no error.</strong> A failed pin only gives a warning. Copies from shared memory then use the slow pageable path ({{cite deepinfer/platform.py:202-207}}). Look for "aclrtHostRegisterV2 ... failed" in the logs.</li>
+  <li><strong>No accelerator.</strong> On a machine with no device files, DeepInfer still makes a <code>PlatformGPU</code>. The error comes later, at the first CUDA call.</li>
+</ul>
+<p><strong>Why it matters.</strong> The Platform object keeps vendor checks out of most of the code. To read the model or the scheduler, you can ignore the hardware. A third hardware type needs a Platform subclass, a kernel folder next to <code>cuda/</code> and <code>asc/</code>, and a build branch in <code>setup.py</code>.</p>
+
+<x-quiz>
+  <x-q level="easy">Which function decides between NVIDIA and Ascend? Does it import PyTorch?
+    <x-a><p><code>accelerator_kind()</code> in <code>deep_cluster/hardware/device.py</code>. It does not import PyTorch. It only checks device files, such as <code>/dev/davinci_manager</code> and <code>/proc/driver/nvidia/gpus</code>.</p></x-a>
+  </x-q>
+  <x-q level="easy">What is the value of <code>PLATFORM.distributed_backend</code> in an Ascend process?
+    <x-a><p><code>"hccl"</code> ({{cite deepinfer/platform.py:89}}). On NVIDIA it is <code>"nccl"</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">An interface file calls <code>ops.expand_swa_index_tl(width)</code>. On Ascend, which file has the kernel code? Which file makes that choice?
+    <x-a><p>The code is in <code>tilelang_ops/asc/swa_index.py</code>. The choice is in <code>tilelang_ops/ops.py</code>, line 15: it imports the subpackage named by <code>PLATFORM.tilelang_ops_backend</code>, which is <code>"asc"</code>. (<code>tilelang_ops/__init__.py</code> is empty.)</p></x-a>
+  </x-q>
+  <x-q level="medium">On an Ascend host, <code>CUDA_VISIBLE_DEVICES=0,1</code> is set and <code>ASCEND_RT_VISIBLE_DEVICES</code> is not set. What happens when the process makes the platform?
+    <x-a><p><code>RuntimeError</code>. The first branch needs <code>CUDA_VISIBLE_DEVICES</code> to be unset. The second branch compares <code>"0,1"</code> with <code>None</code>, and they are not equal ({{cite deepinfer/platform.py:94-102}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Can one DeepInfer job use 8 NVIDIA GPUs for attention and 8 Ascend NPUs for the MoE experts? Give two reasons from the code.
+    <x-a><p>No. (1) All device process groups use one backend from <code>PLATFORM.distributed_backend</code>, NCCL or HCCL, and the code cannot connect the two. (2) <code>DeepseekDecoderLayer.forward</code> runs attention and the MoE block one after the other on the same device. Expert parallelism moves tokens between devices that all run attention too. It does not put the experts on a separate pool. (Also: E/P/D disaggregation is not in this release.)</p></x-a>
+  </x-q>
+</x-quiz>

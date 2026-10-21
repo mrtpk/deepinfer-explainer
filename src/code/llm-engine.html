@@ -1,0 +1,335 @@
+---
+title: engine/llm_engine.py: the LLMEngine class
+nav_title: engine/llm_engine.py
+level: Intermediate
+related: code/entrypoints-llm, code/worker, code/worker-base, code/scheduler-hpp, code/engine-pyi, concepts/engine-step-loop, concepts/zero-overhead-scheduling, concepts/request-lifecycle, tours/life-of-a-request, tours/engine-step, tours/startup
+summary: LLMEngine starts the workers, sizes the KV cache, owns the C++ scheduler, and runs one engine step each time LLM calls step().
+---
+<h2>Purpose</h2>
+<p><code>LLMEngine</code> turns requests into engine steps: it starts the workers and the KV cache, puts each request into the C++ scheduler, and runs one step per call to <code>step()</code>.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/engine/llm_engine.py</code>, 1,029 lines of Python. The header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/engine/llm_engine.py:2}})</td></tr>
+    <tr><th>Main class</th><td><code>LLMEngine</code> ({{cite deepinfer/engine/llm_engine.py:130}}). Also <code>DeferredRelease</code> ({{cite deepinfer/engine/llm_engine.py:67}}) and <code>_spawn_worker</code> ({{cite deepinfer/engine/llm_engine.py:122}}).</td></tr>
+    <tr><th>Runs in</th><td>The process of one data-parallel rank. The {{term driver-worker}} runs in the same process.</td></tr>
+    <tr><th>Called by</th><td><code>LLM</code> in <code>deepinfer/entrypoints/llm.py</code>, and scripts such as <code>examples/benchmark.py</code>.</td></tr>
+    <tr><th>Calls</th><td>The C++ extension <code>deepinfer._C.engine</code>, the driver <code>Worker</code>, the tokenizer, and helper objects for images, structured outputs and statistics.</td></tr>
+    <tr><th>Not in this file</th><td>No model math and no kernels. The Worker and the model runner launch all device work.</td></tr>
+  </tbody>
+</table>
+<p>The docstring says that the class "receives requests from clients and generates texts". It also says: "This release does not include an online-serving wrapper" ({{cite deepinfer/engine/llm_engine.py:140-141}}). So in this release, the only caller in the package is the offline class <code>LLM</code>.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="code_llm_engine_place" alt="Three columns. Left: LLM and scripts call LLMEngine; a note says each data-parallel rank is its own process. Centre: LLMEngine with its attributes; the C++ ones (request_output_pool, block_manager, state_manager, scheduler, sequence_metadata_pool) are violet. Right: the C++ extension deepinfer._C.engine, the driver Worker in the same process, and optional context-parallel follower workers. A dashed arrow shows the Worker calling back into the engine." caption="Who calls <code>LLMEngine</code>, what it owns, and what it calls. Click to zoom." />
+<p>Read the diagram from left to right. Blue is Python in the engine process. Violet is C++ code that the engine calls. Green is the Worker, which launches the device work. The dashed arrow is the only way back from the Worker into the engine.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>LLM.__init__</code></strong> makes the engine with <code>LLMEngine.from_engine_args(engine_args)</code> ({{cite deepinfer/entrypoints/llm.py:84}}).</li>
+  <li><strong><code>LLM._add_request</code></strong> tokenizes the prompt and calls <code>add_request</code> with an int32 NumPy array ({{cite deepinfer/entrypoints/llm.py:153-166}}).</li>
+  <li><strong><code>LLM._run_engine</code></strong> calls <code>step()</code> while <code>has_unfinished_requests()</code> is true. At the end it calls <code>flush_inflight_reqs()</code> once ({{cite deepinfer/entrypoints/llm.py:176-186}}).</li>
+  <li><strong><code>LLM.close</code></strong> calls <code>close()</code> ({{cite deepinfer/entrypoints/llm.py:197-198}}).</li>
+  <li><strong>Benchmarks</strong> call <code>llm.llm_engine.step()</code> directly and read <code>llm.llm_engine.scheduler</code> ({{cite examples/benchmark.py:230-231}}, {{cite examples/benchmark.py:252-253}}).</li>
+</ul>
+<p>One process holds one engine. For data parallelism, <code>examples/_launch.py</code> starts one process per data-parallel rank with the <code>spawn</code> method ({{cite examples/_launch.py:35-44}}). Each process makes its own <code>LLM</code> ({{cite examples/_config.py:106-117}}).</p>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>The C++ engine.</strong> <code>BlockManager</code>, <code>Scheduler</code>, <code>RequestOutputPool</code>, <code>SequenceMetadataPool</code> and four functions come from <code>deepinfer._C.engine</code> ({{cite deepinfer/engine/llm_engine.py:19-31}}). The {{term pybind11}} sources are in <code>csrc/engine/</code>.</li>
+  <li><strong>The driver Worker.</strong> Every call to the Worker goes through <code>_run_workers</code>, which calls <code>driver_worker.run_workers</code> ({{cite deepinfer/engine/llm_engine.py:1017-1025}}).</li>
+  <li><strong>Helpers.</strong> The Hugging Face tokenizer ({{cite deepinfer/engine/llm_engine.py:200-205}}), the <code>MultimodalProcessor</code> ({{cite deepinfer/engine/llm_engine.py:209-221}}), the <code>SOMatcherBuilder</code> for structured outputs ({{cite deepinfer/engine/llm_engine.py:329-342}}), <code>StatsLogger</code> ({{cite deepinfer/engine/llm_engine.py:298-305}}) and an optional <code>ProfileManager</code> ({{cite deepinfer/engine/llm_engine.py:236-239}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>DeferredRelease</code></td><td>{{cite deepinfer/engine/llm_engine.py:67}}</td><td>Keeps the buffers of a step one step longer, then gives them back to their pools.</td></tr>
+    <tr><td><code>_spawn_worker</code></td><td>{{cite deepinfer/engine/llm_engine.py:122}}</td><td>Entry function of a context-parallel follower process.</td></tr>
+    <tr><td><code>LLMEngine.__init__</code></td><td>{{cite deepinfer/engine/llm_engine.py:155}}</td><td>Start-up: tokenizer, workers, weights, KV cache, scheduler, statistics.</td></tr>
+    <tr><td><code>_create_scheduler</code></td><td>{{cite deepinfer/engine/llm_engine.py:307}}</td><td>Makes the C++ <code>Scheduler</code> with 14 arguments.</td></tr>
+    <tr><td><code>so_matcher_builder</code></td><td>{{cite deepinfer/engine/llm_engine.py:329}}</td><td>Property. Makes the structured-output builder on first use.</td></tr>
+    <tr><td><code>close</code></td><td>{{cite deepinfer/engine/llm_engine.py:350}}</td><td>Stops the statistics logger, the builder, the workers and the image workers.</td></tr>
+    <tr><td><code>_init_workers</code></td><td>{{cite deepinfer/engine/llm_engine.py:368}}</td><td>Starts the follower processes, then makes the driver Worker.</td></tr>
+    <tr><td><code>_init_cache</code></td><td>{{cite deepinfer/engine/llm_engine.py:416}}</td><td>Measures free memory, makes the KV cache, captures CUDA graphs.</td></tr>
+    <tr><td><code>from_engine_args</code></td><td>{{cite deepinfer/engine/llm_engine.py:460-469}}</td><td>Class method. Turns <code>EngineArgs</code> into the four config objects.</td></tr>
+    <tr><td><code>add_request</code></td><td>{{cite deepinfer/engine/llm_engine.py:471}}</td><td>Checks a request, makes a <code>Sequence</code> and gives it to the scheduler.</td></tr>
+    <tr><td><code>abort_request</code></td><td>{{cite deepinfer/engine/llm_engine.py:633}}</td><td>Removes requests from the scheduler. Returns (count, tokens).</td></tr>
+    <tr><td><code>get_num_unfinished_requests</code></td><td>{{cite deepinfer/engine/llm_engine.py:658}}</td><td>Local count: scheduler sequences plus requests that wait for a grammar.</td></tr>
+    <tr><td><code>has_unfinished_requests</code></td><td>{{cite deepinfer/engine/llm_engine.py:665}}</td><td>True if any data-parallel rank has work (all-reduce MAX).</td></tr>
+    <tr><td><code>_process_model_outputs</code></td><td>{{cite deepinfer/engine/llm_engine.py:686}}</td><td>Gives the sampled tokens to the scheduler and builds the outputs.</td></tr>
+    <tr><td>hook methods</td><td>{{cite deepinfer/engine/llm_engine.py:800-858}}</td><td>Methods that the code marks as "virtual functions", for parts that are not in this release. Most are empty (see the deep dive). The same block also holds two real methods: <code>pre_sampler_sync</code> and <code>get_num_pendings</code>.</td></tr>
+    <tr><td><code>pre_sampler_sync</code></td><td>{{cite deepinfer/engine/llm_engine.py:830}}</td><td>Callback. Frees old buffers and finished sequences while the device samples.</td></tr>
+    <tr><td><code>step</code></td><td>{{cite deepinfer/engine/llm_engine.py:860}}</td><td>One engine step. Returns <code>uint64</code> handles of <code>RequestOutput</code> objects.</td></tr>
+    <tr><td><code>_execute_model_async_step</code></td><td>{{cite deepinfer/engine/llm_engine.py:961}}</td><td>Sends <code>execute_model_step</code> to the Worker.</td></tr>
+    <tr><td><code>flush_inflight_reqs</code></td><td>{{cite deepinfer/engine/llm_engine.py:977}}</td><td>Gets the outputs of the last step that the Worker still holds.</td></tr>
+    <tr><td><code>post_process</code></td><td>{{cite deepinfer/engine/llm_engine.py:984}}</td><td>Callback. Runs when the results of a step are ready on the CPU.</td></tr>
+    <tr><td><code>_run_workers</code></td><td>{{cite deepinfer/engine/llm_engine.py:1017}}</td><td>Calls a Worker method on this rank and on all follower ranks.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>Start-up: <code>__init__</code></h3>
+<p>The constructor does the work in a fixed order. The order matters: the KV cache size depends on the memory that the weights leave free.</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="230-246" highlight="233,241,244" caption="Workers first, then the weights, then the KV cache." />
+<ol>
+  <li>Read the first device id from <code>CUDA_VISIBLE_DEVICES</code> ({{cite deepinfer/engine/llm_engine.py:188-189}}).</li>
+  <li>Load the tokenizer ({{cite deepinfer/engine/llm_engine.py:200-205}}).</li>
+  <li>Make a <code>MultimodalProcessor</code> if the model class has <code>multi_modal_mapper</code> and the engine type is not <code>COMPLETION</code> ({{cite deepinfer/engine/llm_engine.py:209-221}}). The only registered architecture maps to <code>DeepseekVLForCausalLM</code> ({{cite deepinfer/model_executor/models/__init__.py:15-17}}), which has this method ({{cite deepinfer/model_executor/models/deepseek_vl.py:105}}).</li>
+  <li>Make the <code>RequestOutputPool</code>, then start the workers with <code>_init_workers()</code>.</li>
+  <li>Load the weights on all ranks: <code>_run_workers("load_model")</code>. With <code>load_format="dummy"</code> the load is skipped.</li>
+  <li>Size and make the KV cache with <code>_init_cache()</code>.</li>
+  <li>Make the two block managers and the scheduler (below).</li>
+  <li>Make the <code>StatsLogger</code>. Its peak speed is two times the BF16 peak, as an FP8-equivalent value ({{cite deepinfer/engine/llm_engine.py:304}}).</li>
+</ol>
+<x-code file="deepinfer/engine/llm_engine.py" lines="265-274" highlight="265-267" caption="The KV {{term block-manager}} gets one entry per KV block. The second manager handles {{term state-slot | state slots}} and exists only when the state has a size." />
+<p>The C++ <code>Scheduler</code> gets 14 arguments ({{cite deepinfer/engine/llm_engine.py:307-327}}). Three of them depend on settings: the data-parallel group (the CPU Gloo group when ZOS is on), the YOCO truncation length, and the prefill limit <code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code>.</p>
+
+<h3><code>_init_workers</code>: processes for context parallelism</h3>
+<x-code file="deepinfer/engine/llm_engine.py" lines="370-413" highlight="377,389-395,399,402,411" />
+<ol>
+  <li>Line 371 counts the visible devices.</li>
+  <li>Lines 377-395 start one process for each context-parallel rank 1 … <code>cp_size − 1</code>. Each process runs <code>_spawn_worker</code>, which makes a <code>Worker</code> with <code>is_driver_worker=False</code>. That Worker never returns: it waits in a loop for method calls ({{cite deepinfer/worker/base.py:120-123}}, {{cite deepinfer/worker/base.py:129-133}}).</li>
+  <li>Line 384 sets the local device of the follower to <code>cp_rank % ngpus</code>.</li>
+  <li>Lines 398-413 make the driver Worker in this process, with <code>local_rank=0</code> and <code>cp_rank=0</code>. The engine gives it two {{term engine-callbacks}}.</li>
+</ol>
+<x-note title="No process per data-parallel rank here">
+<p><code>_init_workers</code> starts processes only for context parallelism. With <code>cp_size = 1</code> it starts no process at all. Data-parallel ranks come from the launcher script, one engine per process.</p>
+</x-note>
+
+<h3><code>_init_cache</code>: how many KV blocks</h3>
+<x-code file="deepinfer/engine/llm_engine.py" lines="437-458" highlight="437-438,441,445-446,453,457" />
+<ol>
+  <li>Line 437: every rank runs a {{term memory-profiling}} pass. The driver Worker writes the result into <code>cache_config.num_gpu_blocks</code> ({{cite deepinfer/worker/base.py:267}}). The engine shares this <code>cache_config</code> object with the driver Worker, so line 438 can read it. The method's return value is not used.</li>
+  <li>Line 441: zero blocks stop start-up with <code>ValueError</code>.</li>
+  <li>Lines 445-446: the cache must hold the longest sequence, with 20 % spare. See the deep dive for the numbers.</li>
+  <li>Line 453: every rank makes its <code>CacheEngine</code>.</li>
+  <li>Line 457: <code>warm_up_model</code> captures the CUDA graphs ({{cite deepinfer/worker/base.py:274-288}}).</li>
+</ol>
+<x-warning title="The docstring and the code do not agree">
+<p>The docstring says that the engine takes "the minimum number of blocks across all workers" ({{cite deepinfer/engine/llm_engine.py:426-428}}). The code takes the <em>mean</em>: an all-reduce SUM over the world group, then a division by the group size, rounded down to an even number ({{cite deepinfer/worker/base.py:264-266}}). This site describes the code.</p>
+</x-warning>
+
+<h3><code>add_request</code>: from token ids to a sequence</h3>
+<p>The caller gives a 1-D <code>np.int32</code> array of token ids. The engine does not tokenize ({{cite deepinfer/engine/llm_engine.py:493-494}}).</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="521-540" highlight="525-527,529,537" caption="A dict becomes a <code>SamplingParams</code>; keys with the value <code>None</code> are dropped. Prompt log-probabilities are turned off when YOCO truncation is on." />
+<x-code file="deepinfer/engine/llm_engine.py" lines="580-589" highlight="581,584,589">
+<x-tr line="580">Check the token values.</x-tr>
+</x-code>
+<p>A token id outside <code>[0, max_valid_token_id)</code> does not raise an error. The engine writes a log line and returns <code>None</code>. With image data, the upper limit grows by <code>ImageTokenOffset.NUM_SPECIAL</code>, because image tokens use ids above the vocabulary.</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="606-631" highlight="609-613,618,623,628">
+<x-tr line="610">The caller manages scheduling itself and cannot re-enter through pump, so build synchronously.</x-tr>
+</x-code>
+<ol>
+  <li>Without structured output, <code>_enqueue</code> runs at once and adds the {{term sequence}} to the scheduler's waiting queue.</li>
+  <li>With structured output and <code>enqueue=True</code>, the grammar compiles on a thread pool. <code>_enqueue</code> runs later, when <code>pump()</code> finds the result ready ({{cite deepinfer/engine/llm_engine.py:841-842}}).</li>
+  <li>With <code>enqueue=False</code>, the engine builds the grammar matcher now and blocks until it is ready. The caller adds the sequence itself.</li>
+</ol>
+
+<h3><code>step</code>: one engine step</h3>
+<x-diagram name="code_llm_engine_step" alt="Twelve numbered cards in three lanes: LLMEngine, C++ engine, driver Worker. 1 step starts; 2 the C++ scheduler schedules; 3 optional clone and zero of states and blocks; 4 after-schedule checks; 5 forward step N; 6 post-process step N-1; 7 post_process callback in the engine; 8 C++ commits the tokens and builds outputs; 9 sample step N; 10 pre_sampler_sync callback; 11 keep step N for the next call; 12 return the handles." caption="One call of <code>step()</code> for a decode step with ZOS on. Rows 5 to 11 happen inside one Worker call." />
+<p>The engine part of <code>step()</code> is short. It schedules, does a few checks, and hands the batch to the Worker:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="881-908" highlight="885-887,895,898,905,908" />
+<ol>
+  <li>Lines 885-887: the C++ scheduler picks the sequences for this step. It returns a list of <code>SequenceMetadata</code> from the pool, and a <code>SchedulerOutputs</code> object.</li>
+  <li>Lines 889-905: sometimes the scheduler asks to copy state slots and KV blocks. This happens for a forked sequence, which starts from the cache of another sequence ({{cite csrc/engine/scheduler.hpp:420-437}}, {{cite csrc/engine/scheduler.hpp:602-618}}). Only the binding <code>Scheduler.fork_seq</code> makes forked sequences, and no Python file in this release calls it ({{cite csrc/engine/pybind_scheduler.cpp:123}}). In this release no scheduler code fills <code>zero_states</code>. Only when a list is not empty does the engine call the Worker. The returned ids are unpinned in this step's <code>pre_sampler_sync</code>.</li>
+  <li>Line 908: <code>post_schedule</code> is an empty hook in this release.</li>
+</ol>
+<x-code file="deepinfer/engine/llm_engine.py" lines="961-975" highlight="965-973" caption="<code>driver_kwargs</code> go only to the driver Worker. <code>is_prompt</code> and <code>is_placeholder</code> also go to the follower ranks." />
+<p>A step with no sequences still runs: <code>is_placeholder</code> is then true, and the Worker runs the model on a placeholder sequence ({{cite deepinfer/worker/worker.py:125-127}}). The schedulers of all data-parallel ranks vote with an all-reduce during scheduling ({{cite csrc/engine/scheduler.hpp:316-332}}). So every rank must call <code>step()</code> the same number of times, also a rank with no work. The page {{link concepts/dp-step-votes}} explains the votes.</p>
+
+<h3><code>post_process</code> and <code>_process_model_outputs</code></h3>
+<p>The Worker calls <code>post_process</code> when the sampled tokens of a step are on the CPU ({{cite deepinfer/worker/worker.py:262-271}}).</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="984-1015" highlight="992,997-1002,1013" />
+<p><code>_process_model_outputs</code> does three C++ calls in order:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="717-732" highlight="718,727" />
+<ol>
+  <li><code>process_MTPInfo</code> copies the new draft tokens of {{link concepts/speculative-decoding | speculative decoding}}, and their confidence values, into each scheduled sequence ({{cite csrc/engine/scheduler.hpp:1196-1250}}).</li>
+  <li><code>scheduler.process_outputs</code> appends the accepted tokens to each sequence and checks if the sequence is finished ({{cite csrc/engine/scheduler.hpp:955-992}}).</li>
+  <li><code>build_request_outputs</code> makes the <code>RequestOutput</code> objects in the {{term request-output-pool}} and returns their handles ({{cite deepinfer/engine/llm_engine.py:743-761}}). One request can get more than one output in a step, one for each accepted token ({{cite csrc/engine/outputs.hpp:83-85}}).</li>
+</ol>
+<p>The order is fixed. A C++ comment says, translated: <em>"build output reads the confidence values from before this update, so process_MTPInfo must be called before build output"</em> ({{cite csrc/engine/scheduler.hpp:1244-1245}}).</p>
+<p>If statistics are on, the method also returns a function that logs a <code>StepStats</code> record. <code>post_process</code> calls it, and an error there only writes a log line ({{cite deepinfer/engine/llm_engine.py:1004-1008}}).</p>
+
+<h3><code>pre_sampler_sync</code> and <code>DeferredRelease</code></h3>
+<p>The Worker calls <code>pre_sampler_sync</code> right after it launches the sampling kernels ({{cite deepinfer/worker/worker.py:154-164}}). The CPU work in this callback overlaps with the device work.</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="830-846" highlight="831,841-842,844-846" />
+<x-code file="deepinfer/engine/llm_engine.py" lines="67-71">
+<x-tr line="68">Release the resources that a step made one step later, so that the caller has finished reading them.</x-tr>
+<x-tr line="70">Collect the resources to release. Release them at the next pre_sampler_sync, overlapped with GPU computation.</x-tr>
+</x-code>
+<p>Three kinds of objects wait in <code>DeferredRelease</code>: the <code>SequenceMetadata</code> list of a step, the <code>RequestOutput</code> handles of a step, and the state and block ids from a clone. For the clone ids, <code>release()</code> first waits for a CUDA event that marks the end of the clone ({{cite deepinfer/engine/llm_engine.py:109-116}}).</p>
+
+<h3>The small methods</h3>
+<ul>
+  <li><code>has_unfinished_requests()</code> combines the local answer of all data-parallel ranks with an all-reduce MAX. With ZOS it uses the CPU group, else the device group ({{cite deepinfer/engine/llm_engine.py:665-679}}). So every rank keeps calling <code>step()</code> until all ranks are done.</li>
+  <li><code>flush_inflight_reqs()</code> asks the Worker for the outputs of the step that it still holds ({{cite deepinfer/engine/llm_engine.py:977-982}}, {{cite deepinfer/worker/worker.py:274-283}}).</li>
+  <li><code>abort_request()</code> takes one id or many ids and returns the number of aborted sequences and their total length ({{cite deepinfer/engine/llm_engine.py:648-656}}).</li>
+  <li><code>close()</code> runs once. It calls <code>stop</code> on all workers ({{cite deepinfer/engine/llm_engine.py:350-366}}). <code>__del__</code> also calls it ({{cite deepinfer/engine/llm_engine.py:347-348}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow of one step: objects, shapes and types">
+<p>This table follows the data of one decode step through the engine. <code>n</code> is the number of sequences in the step. <code>total_q</code> is the number of query tokens in the step (more than <code>n</code> with draft tokens).</p>
+<table>
+  <thead><tr><th>Object</th><th>Type and shape</th><th>Made by</th><th>Valid until</th></tr></thead>
+  <tbody>
+    <tr><td><code>seq_metadata_list</code></td><td><code>list[SequenceMetadata]</code>, length <code>n</code></td><td><code>Scheduler.schedule(pool)</code></td><td>Given back to the pool by <code>DeferredRelease</code>. Translated: <em>"allocated from the pool; must be returned with pool.release after use"</em> ({{cite deepinfer/_C/engine.pyi:340-343}})</td></tr>
+    <tr><td><code>clone_states</code>, <code>clone_blocks</code></td><td><code>int32 [k, 2]</code>, pairs (src, dst). For blocks, dst = 0 means "only give back src"</td><td>scheduler</td><td>The next <code>schedule()</code>. They borrow the scheduler's memory ({{cite deepinfer/_C/engine.pyi:380-388}})</td></tr>
+    <tr><td><code>zero_states</code></td><td><code>int32 [k]</code>, state ids to clear</td><td>scheduler</td><td>The next <code>schedule()</code> ({{cite deepinfer/_C/engine.pyi:417-420}})</td></tr>
+    <tr><td><code>output.first_token_positions</code></td><td>CPU <code>int32 [n]</code>: offset of each request's first token in the flat <code>[total_q]</code> tensors</td><td>sampler</td><td>one step ({{cite deepinfer/sequence.py:224-226}})</td></tr>
+    <tr><td><code>output.accepted_token_ids</code></td><td><code>[total_q]</code>, flat</td><td>sampler</td><td>Passed to C++ without a copy ({{cite deepinfer/engine/llm_engine.py:698-702}})</td></tr>
+    <tr><td><code>next_n_token_ids</code></td><td><code>int32 [n, nextn]</code></td><td>draft model, or padding</td><td>one step</td></tr>
+    <tr><td><code>next_n_token_confidence_rates</code></td><td><code>[n, nextn]</code></td><td>confidence head</td><td>one step ({{cite deepinfer/sequence.py:236-239}})</td></tr>
+    <tr><td><code>first_token_latencies</code>, <code>pushed_tokens_before_finish</code></td><td><code>float64 [n]</code>, <code>int32 [n]</code></td><td><code>process_outputs</code></td><td>The next <code>process_outputs</code> call. They borrow a static buffer ({{cite deepinfer/_C/engine.pyi:336-339}})</td></tr>
+    <tr><td><code>request_outputs</code></td><td><code>np.ndarray[np.uint64]</code>: raw pointers</td><td><code>build_request_outputs</code></td><td>The next <code>pre_sampler_sync</code> (one step later)</td></tr>
+  </tbody>
+</table>
+<p><strong>Padding of draft tokens.</strong> A prefill step makes no draft tokens, so <code>output.next_n_token_ids</code> is <code>None</code>. A NORMAL engine then pads ({{cite deepinfer/engine/llm_engine.py:706-711}}). The pad row is <code>[vocab_size − 1] * DEEPINFER_USE_NEXTN_DECODE</code> ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:9-11}}). Example: 3 requests and the default <code>nextn = 5</code> give an <code>int32</code> tensor of shape <code>[3, 5]</code>, and every value is <code>vocab_size − 1</code>. With <code>nextn = 0</code>, the row is empty and line 711 uses <code>unsqueeze(0)</code> instead of <code>tile</code>.</p>
+<p><strong>Reading an output.</strong> A handle is a raw pointer, so Python cannot keep it. <code>LLM._run_engine</code> calls <code>RequestOutput.clone(raw_output)</code> for every handle before the next step ({{cite deepinfer/entrypoints/llm.py:179-182}}). The docstring of <code>step()</code> gives the rule:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="866-870" />
+</x-deepdive>
+
+<x-deepdive title="Processes and threads around the engine">
+<table>
+  <thead><tr><th>What</th><th>Kind</th><th>Made where</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>Engine + driver Worker</td><td>the main process of one data-parallel rank</td><td>the launcher, for example {{cite examples/_launch.py:35-44}}</td><td>always</td></tr>
+    <tr><td>Context-parallel follower Workers</td><td><code>cp_size − 1</code> processes, <code>spawn</code>, <code>daemon=True</code></td><td>{{cite deepinfer/engine/llm_engine.py:377-395}}</td><td><code>context_parallel_size &gt; 1</code></td></tr>
+    <tr><td>Image pre-processing workers</td><td>processes made with <code>fork</code></td><td>{{cite deepinfer/ve/multimodal_processor.py:93-103}}</td><td>when the engine has a <code>MultimodalProcessor</code></td></tr>
+    <tr><td>Grammar compile pool</td><td><code>ThreadPoolExecutor</code>, one thread per idle CPU (at least 1)</td><td>{{cite deepinfer/engine/llm_engine.py:334-341}}, {{cite deepinfer/structure_output/so_matcher_builder.py:45-48}}</td><td>on the first structured-output request</td></tr>
+    <tr><td>Statistics log writer</td><td>daemon thread</td><td>{{cite deepinfer/engine/stats_logger.py:185-187}}</td><td>always</td></tr>
+    <tr><td>Profiling HTTP server</td><td>daemon thread with uvicorn</td><td>{{cite deepinfer/engine/profile_server.py:136-157}}</td><td><code>DEEPINFER_PROFILE_HTTP_ENABLE=1</code></td></tr>
+  </tbody>
+</table>
+<p><strong>How the followers get their work.</strong> <code>run_workers</code> first broadcasts <code>(method, kwargs)</code> to the context-parallel group, then calls the method on the driver ({{cite deepinfer/worker/base.py:290-302}}). The followers run the same method with the same <code>kwargs</code>. Only the driver gets <code>driver_kwargs</code>, so only the driver sees <code>seq_metadata_list</code> and <code>scheduler_outputs</code>. The followers get the prepared input tensors from the driver by a tensor broadcast inside the model runner ({{cite deepinfer/worker/model_runner.py:201-213}}, {{cite deepinfer/worker/model_runner.py:216-217}}).</p>
+<p><strong>What happens when the parent dies.</strong> A follower asks the Linux kernel for <code>SIGKILL</code> when its parent process dies ({{cite deepinfer/worker/base.py:42-46}}, {{cite deepinfer/worker/base.py:130}}). A crash in a follower prints a crash header first ({{cite deepinfer/logger.py:148-166}}).</p>
+<p><strong>Thread rule for structured outputs.</strong> Translated comment: <em>"submit and pump are both called on the main thread; worker threads only fill the future and do not touch the scheduling of sequences."</em> ({{cite deepinfer/structure_output/so_matcher_builder.py:50}}). So the scheduler is used from one thread only.</p>
+</x-deepdive>
+
+<x-deepdive title="How the engine works with zero-overhead scheduling (ZOS)">
+<p>ZOS lets the CPU prepare step N+1 while the device still computes step N. The page {{link concepts/zero-overhead-scheduling}} explains the idea. This section lists what changes in <code>llm_engine.py</code>.</p>
+<ol>
+  <li><strong>The default.</strong> <code>EngineArgs.__post_init__</code> sets <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> to <code>1</code> for NORMAL and COMPLETION engines, if you did not set it ({{cite deepinfer/engine/arg_utils.py:51-55}}, {{cite deepinfer/engine/engine_type.py:15-17}}). A PROMPT engine gets <code>0</code>.</li>
+  <li><strong>The scheduler's data-parallel group.</strong> With ZOS, the scheduler gets the CPU (Gloo) group ({{cite deepinfer/engine/llm_engine.py:313}}). The C++ code sees the backend name <code>"gloo"</code> and puts its all-reduce tensors on the CPU ({{cite csrc/engine/scheduler.hpp:109}}, {{cite csrc/engine/scheduler.hpp:170-180}}).</li>
+  <li><strong><code>has_unfinished_requests</code></strong> uses the same CPU group ({{cite deepinfer/engine/llm_engine.py:667-672}}).</li>
+  <li><strong>Outputs come one step late.</strong> For a decode step, the Worker keeps the step state and post-processes it in the next call ({{cite deepinfer/worker/worker.py:182-187}}). So <code>step()</code> number N returns the tokens of step N−1. The hook docstring says the same: with ZOS, <code>process_output</code> handles the tokens of the previous step ({{cite deepinfer/engine/llm_engine.py:824-828}}).</li>
+  <li><strong>The last step.</strong> When no work is left, <code>LLM</code> calls <code>flush_inflight_reqs()</code> to get the last outputs ({{cite deepinfer/entrypoints/llm.py:177-178}}).</li>
+  <li><strong>Buffers live one step longer.</strong> <code>DeferredRelease</code> keeps the buffers of step N−1 until the <code>pre_sampler_sync</code> of step N.</li>
+  <li><strong>The length limit grows.</strong> With ZOS the runtime limit adds <code>nextn + 1</code> more positions ({{cite deepinfer/config.py:11-16}}). This value goes into the KV cache check in <code>_init_cache</code>.</li>
+</ol>
+<x-warning title="Do not keep a RequestOutput handle">
+<p>A handle from <code>step()</code> points into the pool. The pool gets the object back at the next <code>pre_sampler_sync</code>. Clone the output first, as <code>LLM</code> does.</p>
+</x-warning>
+</x-deepdive>
+
+<x-deepdive title="Sizing the KV cache: the numbers">
+<p><strong>Step 1: free memory per rank.</strong> <code>profile_num_available_blocks</code> runs a profiling forward pass and computes ({{cite deepinfer/worker/base.py:228-245}}):</p>
+<pre><code class="language-python">peak    = peak_torch_allocated + max(non_torch_allocated, 0)
+kv_mem  = total_gpu_memory * gpu_memory_utilization - peak
+kv_mem -= 2 * state_size        # "state store & copy buffer"
+blocks  = max(int(kv_mem // cache_block_size), 0)</code></pre>
+<p><strong>Step 2: one value for all ranks.</strong> All ranks add their <code>blocks</code> with an all-reduce SUM. Each rank then takes <code>sum // world_size // 2 * 2</code>: the mean, rounded down to an even number ({{cite deepinfer/worker/base.py:264-266}}).</p>
+<p><strong>Step 3: the engine check.</strong> The block size is 128 tokens for this model ({{cite deepinfer/model_executor/model_metadata_utils.py:133-135}}). The engine needs <code>runtime_max_model_len ≤ int(128 × num_gpu_blocks × 0.8)</code> ({{cite deepinfer/engine/llm_engine.py:445-446}}).</p>
+<p><strong>A worked example</strong> with the settings of <code>examples/offline_inference.py</code>: <code>max_model_len=32768</code> ({{cite examples/offline_inference.py:53}}), the default <code>nextn = 5</code> and ZOS on.</p>
+<ol>
+  <li><code>runtime_max_model_len = 32768 + 5 + (5 + 1) + 5 = 32784</code> ({{cite deepinfer/config.py:11-16}}).</li>
+  <li>The check needs <code>128 × blocks × 0.8 ≥ 32784</code>, so <code>blocks ≥ 320.16</code>. At least 321 blocks are necessary.</li>
+  <li>With 320 blocks, <code>int(128 × 320 × 0.8) = 32768 &lt; 32784</code>, and start-up stops with <code>ValueError</code>.</li>
+</ol>
+<p><strong>After the check.</strong> <code>CacheEngine</code> writes <code>num_state_seqs</code>, <code>bytes_of_state_per_seqs</code> and <code>bytes_per_block</code> into the shared <code>cache_config</code> ({{cite deepinfer/worker/cache_engine.py:949-951}}). The engine reads them at line 263 for a log line and at line 266 for the state manager.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code> is not set</td><td><code>KeyError</code> in <code>__init__</code></td><td>{{cite deepinfer/engine/llm_engine.py:188}}</td></tr>
+    <tr><td>No memory left for KV blocks</td><td><code>ValueError</code> ("No available memory for the cache blocks")</td><td>{{cite deepinfer/engine/llm_engine.py:441-444}}</td></tr>
+    <tr><td>KV cache too small for <code>max_model_len</code></td><td><code>ValueError</code> with both numbers</td><td>{{cite deepinfer/engine/llm_engine.py:446-451}}</td></tr>
+    <tr><td>Empty prompt</td><td><code>ValueError("prompt must not be empty")</code></td><td>{{cite deepinfer/engine/llm_engine.py:553-554}}</td></tr>
+    <tr><td>Token id below 0 or too large</td><td>log line, <code>add_request</code> returns <code>None</code></td><td>{{cite deepinfer/engine/llm_engine.py:582-589}}</td></tr>
+    <tr><td><code>Sequence(...)</code> fails</td><td>error log, then the exception goes up</td><td>{{cite deepinfer/engine/llm_engine.py:593-601}}</td></tr>
+    <tr><td>Image bytes are <code>None</code></td><td>the sequence starts as <code>FINISHED_VE_FAILED</code></td><td>{{cite deepinfer/engine/llm_engine.py:548-549}}, {{cite deepinfer/engine/llm_engine.py:603-604}}</td></tr>
+    <tr><td>Grammar build was aborted</td><td><code>FINISHED_SO_FAILED</code> before it enters the queue</td><td>{{cite deepinfer/engine/llm_engine.py:621-622}}</td></tr>
+    <tr><td>Wrong structured-output state at the last prefill chunk</td><td>error log; only this request ends with <code>FINISHED_SO_FAILED</code></td><td>{{cite deepinfer/engine/llm_engine.py:913-928}}</td></tr>
+    <tr><td>Image pre-processing failed</td><td>error log, then <code>abort_request</code> for those requests</td><td>{{cite deepinfer/engine/llm_engine.py:939-945}}</td></tr>
+    <tr><td>PROMPT engine gets a decode batch</td><td><code>AssertionError</code></td><td>{{cite deepinfer/engine/llm_engine.py:947-949}}</td></tr>
+    <tr><td>Statistics logging fails</td><td>traceback and error log; the step goes on</td><td>{{cite deepinfer/engine/llm_engine.py:1004-1008}}</td></tr>
+    <tr><td>Statistics logger fails in <code>close()</code></td><td>ignored (<code>suppress(Exception)</code>)</td><td>{{cite deepinfer/engine/llm_engine.py:355-356}}</td></tr>
+  </tbody>
+</table>
+<p>Some log messages are in Chinese. Line 944 says, translated: <em>"Multimodal processing failed (usually a damaged image or video); about to abort N requests."</em> Line 1008 says: <em>"Failed to print statistics."</em></p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that this file reads">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect in this file</th></tr></thead>
+  <tbody>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code></td><td>none (must be set)</td><td>{{cite deepinfer/engine/llm_engine.py:188}}, {{cite deepinfer/engine/llm_engine.py:371}}</td><td>Driver device id and the device count for followers.</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td><code>0</code> in <code>environ.py</code>; <code>EngineArgs</code> sets <code>1</code> for NORMAL and COMPLETION ({{cite deepinfer/environ.py:179}}, {{cite deepinfer/engine/arg_utils.py:51-55}})</td><td>{{cite deepinfer/engine/llm_engine.py:313}}, {{cite deepinfer/engine/llm_engine.py:667}}</td><td>CPU or device group for the scheduler and for <code>has_unfinished_requests</code>.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code></td><td><code>off</code> (<code>off</code>, <code>mask</code>, <code>compact</code>) ({{cite deepinfer/environ.py:188}})</td><td>{{cite deepinfer/engine/llm_engine.py:259}}</td><td>Not <code>off</code>: prompt log-probabilities are turned off ({{cite deepinfer/engine/llm_engine.py:529-537}}).</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code></td><td><code>0</code> ({{cite deepinfer/environ.py:191}})</td><td>{{cite deepinfer/engine/llm_engine.py:260}}, {{cite deepinfer/engine/llm_engine.py:321}}</td><td>Truncation length for the scheduler, only in <code>compact</code> mode. The README uses 140 ({{cite README.md:25}}).</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code></td><td>unset = no limit; the scheduler gets <code>2**30</code> ({{cite deepinfer/environ.py:124-125}}, {{cite deepinfer/environ.py:9}})</td><td>{{cite deepinfer/engine/llm_engine.py:317}}</td><td>Limit for the prefill batch.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/engine/llm_engine.py:711}}, {{cite deepinfer/engine/llm_engine.py:720}}</td><td>Number of draft tokens; shape of the padding.</td></tr>
+    <tr><td><code>DEEPINFER_PROFILE_HTTP_ENABLE</code></td><td><code>0</code> ({{cite deepinfer/environ.py:202}})</td><td>{{cite deepinfer/engine/llm_engine.py:237}}</td><td>Starts the profiling HTTP server.</td></tr>
+    <tr><td><code>DEEPINFER_USE_MULTIMODAL_POOL</code></td><td><code>EngineArgs</code> sets <code>1</code> except for COMPLETION ({{cite deepinfer/engine/arg_utils.py:56-60}})</td><td>{{cite deepinfer/engine/llm_engine.py:184}}</td><td>Only printed in the start-up log line.</td></tr>
+  </tbody>
+</table>
+<p>All <code>DEEPINFER_*</code> values are read once and then cached. <code>environ.rearm(name)</code> makes the next access read the variable again ({{cite deepinfer/environ.py:44-57}}, {{cite deepinfer/environ.py:213-215}}). <code>EngineArgs</code> calls <code>rearm</code> after it sets a default.</p>
+</x-deepdive>
+
+<x-deepdive title="Hook methods for parts that are not in this release">
+<p>Lines 800-858 hold methods that the code calls "virtual functions" (<em>虚函数</em>). Most of them are empty in this file. <code>finalize_seq</code> frees the sequence, and <code>should_copy_state</code> returns <code>False</code>. The block also holds <code>pre_sampler_sync</code> and <code>get_num_pendings</code>, which are not hooks:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="800-828">
+<x-tr line="800">From here on, all methods are virtual functions.</x-tr>
+<x-tr line="802">Virtual function: initialize the data structures that PD disaggregation needs.</x-tr>
+<x-tr line="805">Virtual function: handle a finished request.</x-tr>
+<x-tr line="809">Virtual function: handle the scheduler result of each step.</x-tr>
+<x-tr line="812">Virtual function: decide whether to save the current state of seq.</x-tr>
+<x-tr line="816">Virtual function: save the KV cache; called in pre_sampler_sync.</x-tr>
+<x-tr line="819">Virtual function: prefill engine prepares to save the KV cache.</x-tr>
+<x-tr line="822">Virtual function: prefill engine saves the KV cache.</x-tr>
+<x-tr line="825-828">Virtual function: handle the tokens that one step outputs. ZOS off: the current step. ZOS on: the previous step.</x-tr>
+</x-code>
+<ul>
+  <li>No class in the repository subclasses <code>LLMEngine</code>. A search for <code>(LLMEngine)</code> finds nothing.</li>
+  <li><code>copy_state</code> starts as <code>None</code> ({{cite deepinfer/engine/llm_engine.py:284-285}}), and no file sets it. So <code>do_copy_state</code> and the state copy in <code>step()</code> do nothing in this release ({{cite deepinfer/engine/llm_engine.py:930-937}}).</li>
+  <li><code>init_pd_split</code> runs only for PROMPT and COMPLETION engines ({{cite deepinfer/engine/llm_engine.py:454-455}}). <code>LLM</code> always makes a NORMAL engine, because <code>EngineArgs.engine_type</code> defaults to <code>NORMAL</code> ({{cite deepinfer/engine/arg_utils.py:41}}).</li>
+</ul>
+<p>These hooks match the README: the release does not include a KV cache system or VE/prefill/decode disaggregation, but "most required engine functionality is already implemented" ({{cite README.md:38-42}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/engine-step-loop}}: the loop of <code>step()</code> calls, from the user's view.</li>
+  <li>{{link concepts/request-lifecycle}}: what happens to a sequence between <code>add_request</code> and the last output.</li>
+  <li>{{link concepts/scheduler}} and {{link concepts/paged-kv-cache}}: the C++ objects that the engine owns.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why outputs come one step late.</li>
+  <li>{{link concepts/dp-step-votes}}: why every data-parallel rank calls <code>step()</code> the same number of times.</li>
+  <li>{{link concepts/structured-outputs}}: the grammar builder that <code>add_request</code> uses.</li>
+  <li>{{link learn/kv-cache}}: the basics of the KV cache that <code>_init_cache</code> sizes.</li>
+  <li>{{link tours/startup}} and {{link tours/engine-step}}: the same code as guided tours.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which class calls <code>LLMEngine.step()</code> in normal offline use, and what does <code>step()</code> return?
+    <x-a><p><code>LLM._run_engine</code> in <code>deepinfer/entrypoints/llm.py</code> ({{cite deepinfer/entrypoints/llm.py:176-178}}). <code>step()</code> returns a NumPy array of <code>uint64</code> handles to <code>RequestOutput</code> objects in the <code>RequestOutputPool</code>. <code>LLM</code> clones each one before the next step.</p></x-a>
+  </x-q>
+  <x-q level="easy">You run with <code>context_parallel_size = 1</code>. How many worker processes does <code>_init_workers</code> start?
+    <x-a><p>None. The loop <code>for cp_rank in range(1, cp_size)</code> is empty ({{cite deepinfer/engine/llm_engine.py:377}}). The driver Worker runs inside the engine process.</p></x-a>
+  </x-q>
+  <x-q level="medium">A request has the token id <code>-1</code> in its prompt. What does <code>add_request</code> do? Does it raise?
+    <x-a><p>It does not raise. It writes an info log line "Drop request ... due to invalid token" and returns <code>None</code> ({{cite deepinfer/engine/llm_engine.py:582-589}}). Only an <em>empty</em> prompt raises <code>ValueError</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">With ZOS on, a sequence is in a decode step. In which call of <code>step()</code> does the caller get the token of that step?
+    <x-a><p>In the next call. The Worker keeps the state of a ZOS decode step in <code>prev_step_state</code> and post-processes it during the next <code>execute_model_step</code> ({{cite deepinfer/worker/worker.py:143-144}}, {{cite deepinfer/worker/worker.py:182-187}}). For the last step, <code>flush_inflight_reqs()</code> gets it.</p></x-a>
+  </x-q>
+  <x-q level="hard">You set <code>max_model_len=32768</code>, keep <code>DEEPINFER_USE_NEXTN_DECODE=5</code> and ZOS on. Profiling gives each of 8 ranks 400, 400, 400, 400, 300, 300, 300 and 301 blocks. Does start-up pass the KV cache check?
+    <x-a><p>The sum is 2801. <code>2801 // 8 = 350</code>, and <code>350 // 2 * 2 = 350</code> ({{cite deepinfer/worker/base.py:264-266}}). The check needs <code>int(128 × 350 × 0.8) = 35840 ≥ 32784</code> ({{cite deepinfer/engine/llm_engine.py:445-446}}, {{cite deepinfer/config.py:11-16}}). So it passes, although some ranks measured only 300 blocks. The docstring says "minimum", but the code uses the mean. This is the deep dive "Sizing the KV cache".</p></x-a>
+  </x-q>
+</x-quiz>

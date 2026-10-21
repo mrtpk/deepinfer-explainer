@@ -1,0 +1,528 @@
+---
+title: Environment variables
+nav_title: Environment variables
+section: reference
+level: Intermediate
+related: code/environ, concepts/hardware-platforms, concepts/speculative-decoding, concepts/eplb, concepts/determinism, concepts/zero-overhead-scheduling, concepts/yoco-swa-replay
+summary: DeepInfer reads 59 DEEPINFER_* environment variables through one class, envs, in deepinfer/environ.py. This page lists each variable with its type, default, effect and the code that reads it, and tells when the value is read.
+---
+<x-sentence>DeepInfer reads each <code>DEEPINFER_*</code> setting from the process environment one time, on first use, through the class <code>envs</code> in <code>deepinfer/environ.py</code>.</x-sentence>
+
+<p>Use this page in two ways. To learn the mechanism, read the first four sections. To look up one variable, go to <a href="#all-variables">All DEEPINFER variables</a>, or search for its name. The variable tables are made by the script <code>tools/gen_env_vars.py</code> from <code>environ.py</code>. The "What it does" text is written by hand from the code that reads each variable.</p>
+
+<h2>What an environment variable is</h2>
+<p>An {{term environment-variable}} is a named text value that a process gets from its parent when it starts. In a shell, you set one for all later commands with <code>export</code>, or for one command only:</p>
+<pre><code class="language-bash">export DEEPINFER_ACCELERATOR=nvidia          # for this shell and all programs it starts
+DEEPINFER_ENFORCE_EAGER=1 python3 examples/offline_inference.py   # for one command only</code></pre>
+<p>In Python, the process environment is the dict <code>os.environ</code>. <code>os.getenv("NAME")</code> returns the text, or <code>None</code> when the variable is not set. A child process gets a copy of the environment of its parent. A change in the parent after the child starts does not reach the child.</p>
+<p>Environment variables are always text. A program must parse the text into a number, a flag or a path. DeepInfer does this in one place, <code>deepinfer/environ.py</code>. The file defines one class, <code>envs</code>, with one attribute for each variable:</p>
+<x-code file="deepinfer/environ.py" lines="97-111" highlight="101,104,108,110">
+  <x-tr line="98">The module that defines all environment variables in one place.</x-tr>
+</x-code>
+<p>Other code reads a value as <code>envs.DEEPINFER_NCCL_NUM_SMS</code>, for example in {{cite deepinfer/platform.py:81}}. The package exports <code>envs</code> at the top level, so <code>from deepinfer import envs</code> works ({{cite deepinfer/__init__.py:6}}).</p>
+<x-note title="59 variables in 16 groups">
+<p><code>environ.py</code> declares 59 variables. Comments such as <code># -- MTP --</code> put them in 16 groups. This page uses the same groups. Five more <code>DEEPINFER_*</code> names are read directly with <code>os.getenv</code> or <code>std::getenv</code>, outside <code>environ.py</code>. They are in <a href="#other-deepinfer-names">a separate table</a>.</p>
+</x-note>
+
+<h2>How DeepInfer reads a variable</h2>
+
+<h3>The EnvVar descriptor</h3>
+<p>Each attribute of <code>envs</code> is an <code>EnvVar</code> object. <code>EnvVar</code> is a {{term descriptor}}: a Python object in a class that controls what an attribute read returns. When code reads <code>envs.X</code> and <code>X</code> is still a descriptor, Python calls <code>X.__get__</code>. This is the whole mechanism:</p>
+<x-code file="deepinfer/environ.py" lines="28-57" highlight="40-42,46-48,50,56" caption="The descriptor parses the text on the first read. Then it replaces itself with the plain value." />
+<ol>
+  <li><strong>Class definition (lines 40-42).</strong> Python calls <code>__set_name__</code> for each attribute when it makes the class <code>envs</code>. The descriptor remembers its name, for example <code>"DEEPINFER_NCCL_NUM_SMS"</code>. It also adds itself to the module dict <code>_descriptors</code>.</li>
+  <li><strong>First read (lines 49-50).</strong> <code>envs.DEEPINFER_NCCL_NUM_SMS</code> calls <code>__get__</code>. It reads <code>os.getenv(self.name)</code> and gives the text to its parse function <code>init</code>.</li>
+  <li><strong>Cache (line 56).</strong> <code>setattr(owner, self.name, value)</code> puts the parsed value, for example the int <code>32</code>, into the class. The descriptor is now gone from the class dict.</li>
+  <li><strong>Later reads.</strong> The attribute is now a plain int. Python returns it directly and does not call any function. So a later change of <code>os.environ</code> has no effect on <code>envs</code>.</li>
+</ol>
+<p>So a read after the first one costs the same as a normal class attribute. And the code never parses a variable that no code reads, so a bad value in it gives no error.</p>
+<x-simplified>
+<p>"The first read caches the value" is true for each process. DeepInfer starts its extra workers with <code>SpawnProcess</code> ({{cite deepinfer/engine/llm_engine.py:389-395}}, {{cite deepinfer/logger.py:169-170}}). A spawned process is a new Python interpreter, so it has its own <code>envs</code> class and reads the environment again. It reads the environment that it got from its parent at start.</p>
+</x-simplified>
+
+<h3>How the text becomes a value</h3>
+<p>The factory methods <code>EnvVar.int()</code>, <code>EnvVar.bool()</code> and the others choose the parse function ({{cite deepinfer/environ.py:61-94}}). All of them use four small helpers:</p>
+<x-code file="deepinfer/environ.py" lines="12-25" highlight="13" />
+<table>
+  <thead><tr><th>Factory</th><th>Unset</th><th>Text <code>""</code></th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><code>EnvVar.bool()</code></td><td>the default</td><td><code>False</code></td><td>Only <code>"0"</code>, <code>""</code>, <code>"false"</code> and <code>"False"</code> give <code>False</code>. <code>"off"</code>, <code>"no"</code> and <code>"FALSE"</code> give <code>True</code>.</td></tr>
+    <tr><td><code>EnvVar.int()</code></td><td>the default</td><td><code>ValueError</code></td><td><code>"64"</code> gives <code>64</code>. <code>"1e3"</code> gives <code>ValueError</code>.</td></tr>
+    <tr><td><code>EnvVar.float()</code></td><td>the default</td><td><code>ValueError</code></td><td><code>"1.8"</code> gives <code>1.8</code>.</td></tr>
+    <tr><td><code>EnvVar.str()</code></td><td>the default</td><td><code>""</code></td><td>The text, unchanged.</td></tr>
+    <tr><td><code>EnvVar.str_or_none()</code></td><td><code>None</code></td><td><code>""</code></td><td>The text, unchanged.</td></tr>
+    <tr><td><code>EnvVar.int_or_none()</code></td><td><code>None</code></td><td><code>ValueError</code></td><td><code>"65536"</code> gives <code>65536</code>.</td></tr>
+    <tr><td><code>EnvVar.choice()</code></td><td>the default</td><td><code>ValueError</code></td><td>The text must be one of <code>choices</code>; the test is case-sensitive ({{cite deepinfer/environ.py:86-94}}).</td></tr>
+  </tbody>
+</table>
+<p>Four variables use their own parse function. <code>DEEPINFER_GLOO_TIMEOUT</code> makes a <code>timedelta</code>. <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> and <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> read another variable. <code>DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE</code> accepts a comma-separated list ({{cite deepinfer/environ.py:110}}, {{cite deepinfer/environ.py:132-147}}). The deep dive <a href="#derived">Derived variables</a> reads them.</p>
+<p><strong>Errors name the variable.</strong> If the parse fails, lines 51-55 raise the same exception type again, with the variable name in front. For example, <code>DEEPINFER_NCCL_NUM_SMS=abc</code> gives <code>ValueError: DEEPINFER_NCCL_NUM_SMS: invalid literal for int() with base 10: 'abc'</code>. If the exception type cannot take one text argument, the original exception is raised.</p>
+
+<h2>When DeepInfer reads a variable</h2>
+<p>A value is fixed at the first read in each process. So the important question is: when is the first read? There are three cases.</p>
+<ol>
+  <li><strong>At import time.</strong> Some code reads <code>envs.X</code> at the top level of a module, in a class body, or in the default value of a function argument. Python runs this code at {{term import-time | import time}}. <a href="#import-time-table">The import-time table</a> lists every such read.</li>
+  <li><strong>At first use.</strong> Most reads are inside functions. The first call fixes the value, for example when the engine builds its config or a worker builds the model.</li>
+  <li><strong>In C++.</strong> Two variables are read by the C++ extension with <code>std::getenv</code>, separately from <code>envs</code>: <code>DEEPINFER_USE_NEXTN_DECODE</code> ({{cite csrc/engine/utils.hpp:36-40}}) and <code>DEEPINFER_CPP_LOG_LEVEL</code> ({{cite csrc/utils/log.hpp:19-31}}).</li>
+</ol>
+
+<h3>Set variables before you import deepinfer</h3>
+<x-warning title="Set the environment first, then import">
+<p>Set all <code>DEEPINFER_*</code> variables and the visible-device variables before <code>import deepinfer</code> and before <code>import torch</code>. A value that you set later can be ignored without an error.</p>
+</x-warning>
+<p>The example scripts follow this rule. The module docstring of <code>examples/_config.py</code> says so:</p>
+<x-code file="examples/_config.py" lines="1-7">
+  <x-tr line="1">Shared config, environment setup and LLM construction for the V4 scripts and the tests/models end-to-end tests.</x-tr>
+  <x-tr line="3">Config and environment setup are closely coupled, so they are in this one module.</x-tr>
+  <x-tr line="5-6">Note: this module must NOT import deepinfer at the top level. The environment setup must be complete before deepinfer is imported. For this reason, create_llm also imports deepinfer lazily, inside the function.</x-tr>
+</x-code>
+<p><code>create_llm</code> sets the environment, then the visible devices, and only then imports torch and DeepInfer:</p>
+<x-code file="examples/_config.py" lines="96-110" highlight="104,106,108,110">
+  <x-tr line="96">Build the LLM in the child process: first set CUDA_VISIBLE_DEVICES and the environment, then import deepinfer lazily.</x-tr>
+  <x-tr line="98">llm_kwargs go to LLM unchanged and can replace the common defaults below.</x-tr>
+  <x-tr line="99-100">profile_init wraps the LLM construction in a temporary profiler to warm up kineto. The caller must not wrap create_llm in a profiler: CUPTI initializes CUDA when it starts, so a CUDA_VISIBLE_DEVICES that is set later has no effect.</x-tr>
+  <x-tr line="102">On Ascend NPU, import torch initializes the ACL environment, so a later ASCEND_RT_VISIBLE_DEVICES setting fails.</x-tr>
+</x-code>
+<p>There are three reasons for this order:</p>
+<ul>
+  <li><strong><code>import deepinfer</code> reads <code>DEEPINFER_ACCELERATOR</code>.</strong> The package calls <code>_so_platform_tag()</code> at module level to find its compiled extension folder ({{cite deepinfer/__init__.py:15}}, {{cite deepinfer/__init__.py:30-32}}).</li>
+  <li><strong>Device runtimes read the visible devices once.</strong> After CUDA or the Ascend runtime starts, a new <code>CUDA_VISIBLE_DEVICES</code> or <code>ASCEND_RT_VISIBLE_DEVICES</code> has no effect. For this reason, <code>import deepinfer</code> sets <code>PYTORCH_NVML_BASED_CUDA_CHECK=1</code> ({{cite deepinfer/__init__.py:37-39}}), and <code>PLATFORM</code> is made only on first use ({{cite deepinfer/__init__.py:58-59}}).</li>
+  <li><strong>Some modules read variables at import time</strong> (next table).</li>
+</ul>
+
+<h3 id="import-time-table">Variables read at import time</h3>
+<p>The script found these reads with Python's <code>ast</code> module: each <code>envs.X</code> outside a function body. The table also lists <code>DEEPINFER_ACCELERATOR</code>. A function reads it, but <code>deepinfer/__init__.py</code> calls that function at module level ({{cite deepinfer/__init__.py:30}}). For these variables, the value at the time of the module import counts. A later <code>rearm</code> does not change values that the module already copied, for example the default argument <code>prefill_attempt_interval</code> of <code>SchedulerConfig.__init__</code>.</p>
+<!-- BEGIN GENERATED import-time -->
+<table>
+  <thead><tr><th>Variable</th><th>Read at import in</th></tr></thead>
+  <tbody>
+    <tr><td><a class="cite" href="#DEEPINFER_ACCELERATOR"><code>DEEPINFER_<wbr>ACCELERATOR</code></a></td><td>{{cite deepinfer/__init__.py:15 | <code>deepinfer/__init__.py:15</code>}}</td></tr>
+    <tr><td><a class="cite" href="#DEEPINFER_USE_NEXTN_DECODE"><code>DEEPINFER_<wbr>USE_<wbr>NEXTN_<wbr>DECODE</code></a></td><td>{{cite deepinfer/structure_output/matcher.py:20 | <code>matcher.py:20</code>}}</td></tr>
+    <tr><td><a class="cite" href="#DEEPINFER_ENGRAM_PAD_TOKEN"><code>DEEPINFER_<wbr>ENGRAM_<wbr>PAD_<wbr>TOKEN</code></a></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:42 | <code>engram.py:42</code>}}</td></tr>
+    <tr><td><a class="cite" href="#DEEPINFER_XGRAMMAR_DEBUG"><code>DEEPINFER_<wbr>XGRAMMAR_<wbr>DEBUG</code></a></td><td>{{cite deepinfer/structure_output/matcher.py:18 | <code>matcher.py:18</code>}}</td></tr>
+    <tr><td><a class="cite" href="#DEEPINFER_XGRAMMAR_TIMEOUT"><code>DEEPINFER_<wbr>XGRAMMAR_<wbr>TIMEOUT</code></a></td><td>{{cite deepinfer/structure_output/matcher.py:19 | <code>matcher.py:19</code>}}</td></tr>
+    <tr><td><a class="cite" href="#DEEPINFER_PREFILL_ATTEMPT_INTERVAL"><code>DEEPINFER_<wbr>PREFILL_<wbr>ATTEMPT_<wbr>INTERVAL</code></a></td><td>{{cite deepinfer/config.py:193 | <code>config.py:193</code>}}</td></tr>
+    <tr><td><a class="cite" href="#DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL"><code>DEEPINFER_<wbr>PREFILL_<wbr>ANY_<wbr>ATTEMPT_<wbr>INTERVAL</code></a></td><td>{{cite deepinfer/config.py:194 | <code>config.py:194</code>}}</td></tr>
+  </tbody>
+</table>
+<!-- END GENERATED import-time -->
+
+<h3>Values that the code changes at run time</h3>
+<p>Some code changes a value after start-up. It uses one of three methods.</p>
+<p><strong>1. <code>os.environ.setdefault</code> plus <code>rearm</code>.</strong> <code>EngineArgs</code> chooses a default that depends on the engine type. Then it calls <code>environ.rearm</code>, which puts the descriptor back, so the next read parses the new text:</p>
+<x-code file="deepinfer/engine/arg_utils.py" lines="48-60" highlight="51-55" />
+<x-code file="deepinfer/environ.py" lines="213-221" />
+<p>So <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> is <code>False</code> in <code>environ.py</code>, but it is on for NORMAL and COMPLETION engines ({{cite deepinfer/engine/engine_type.py:15-17}}). <code>DEEPINFER_USE_MULTIMODAL_POOL</code> is on for all engines except COMPLETION. Your own exported value wins, because <code>setdefault</code> does not overwrite.</p>
+<p><strong>2. Direct assignment to <code>envs</code>.</strong> <code>envs.X = value</code> replaces the class attribute. The profile run sets <code>DEEPINFER_FORCE_IMBALANCE_RATIO</code> to <code>1.8</code> and then back to <code>0.0</code> ({{cite deepinfer/worker/model_runner.py:509-512}}). The EP buffer writes the calculated SM count into <code>DEEPINFER_USERBUFFER_COMM_SMS</code> ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:86-90}}). These assignments do not change <code>os.environ</code>, so child processes and C++ do not see them.</p>
+<p><strong>3. Tests.</strong> pytest runs many tests in one process. Without help, the first test that reads a variable fixes it for all later tests. An autouse fixture in <code>tests/conftest.py</code> restores <code>os.environ</code> after each test and calls <code>rearm_all()</code>:</p>
+<x-code file="tests/conftest.py" lines="12-26" highlight="26" />
+<p>Some tests change <code>envs</code> directly with the pytest {{term monkeypatch}} fixture. A comment in <code>tests/worker/test_state_cache_ops.py</code> explains a trap: <code>monkeypatch.setattr</code> first reads the old value, and that read replaces the descriptor. So the undo restores a plain value, not the descriptor. The test depends on <code>rearm_all()</code> in the autouse fixture, which runs after the undo ({{cite tests/worker/test_state_cache_ops.py:93-97}}). The same test must also clear an <code>lru_cache</code> that keeps old results ({{cite tests/worker/test_state_cache_ops.py:102-103}}, {{cite deepinfer/worker/cache_engine.py:130-138}}).</p>
+
+<h2 id="all-variables">All DEEPINFER variables</h2>
+<p>One table for each group of <code>environ.py</code>, in file order. How to read a row:</p>
+<ul>
+  <li><strong>Variable.</strong> The name, the type and the default. The default is the exact expression in <code>environ.py</code>, and "defined in" links to its line. For <code>bool</code> variables, see the parse rule in <a href="#how-deepinfer-reads-a-variable">How DeepInfer reads a variable</a>.</li>
+  <li><strong>What it does.</strong> A short text, from the code that reads the variable. "See ..." links to the concept page.</li>
+  <li><strong>Read in.</strong> The main places that read the variable, as 1 to 3 links. The link text is the file name. Point at a link to see the full path. "Read at import time" marks the variables of the import-time table.</li>
+</ul>
+<!-- BEGIN GENERATED env-tables -->
+<h3 id="g-platform">Platform (1)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_ACCELERATOR">DEEPINFER_<wbr>ACCELERATOR</code><br>str, default <code>&quot;nvidia&quot;</code><br>defined in {{cite deepinfer/environ.py:101 | <code>environ.py:101</code>}}</td><td>Selects the build folder <code>deepinfer/_so/&lt;value&gt;-&lt;arch&gt;/</code> at <code>import deepinfer</code>. It does not select the Platform class. See {{link concepts/hardware-platforms | NVIDIA and Ascend}}.<br>Read in: {{cite deepinfer/__init__.py:15-25 | <code>deepinfer/__init__.py:15-25</code>}}, {{cite deepinfer/__init__.py:30-32 | <code>deepinfer/__init__.py:30-32</code>}}. <em>Read at import time.</em></td></tr>
+  </tbody>
+</table>
+<h3 id="g-runtime">Runtime (2)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_COMPUTE_SUM_SMALLER_PROBS">DEEPINFER_<wbr>COMPUTE_<wbr>SUM_<wbr>SMALLER_<wbr>PROBS</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:104 | <code>environ.py:104</code>}}</td><td>When on, the sampler also returns <code>sum_smaller_probs</code>: the probability sum of the sampled token and all tokens that are less probable. See {{link concepts/sampler | The sampler}}.<br>Read in: {{cite deepinfer/model_executor/layers/sampler.py:104 | <code>sampler.py:104</code>}}, {{cite deepinfer/model_executor/layers/sampler.py:616-622 | <code>sampler.py:616-622</code>}}, {{cite deepinfer/model_executor/layers/tilelang_ops/sum_smaller_probs.py:14-24 | <code>sum_smaller_probs.py:14-24</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_JIT_CACHE_DIR">DEEPINFER_<wbr>JIT_<wbr>CACHE_<wbr>DIR</code><br>str or unset, default <code>None</code> (unset)<br>defined in {{cite deepinfer/environ.py:105 | <code>environ.py:105</code>}}</td><td>Root folder for compiled-kernel caches. When set, each worker sets <code>TILELANG_CACHE_DIR</code>, <code>DG_JIT_CACHE_DIR</code> and <code>EP_JIT_CACHE_DIR</code> to sub-folders of it. See {{link concepts/tilelang-kernels | TileLang kernels}}.<br>Read in: {{cite deepinfer/worker/runtime_config.py:45-51 | <code>runtime_config.py:45-51</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-distributed">Distributed Communication (4)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_NCCL_NUM_SMS">DEEPINFER_<wbr>NCCL_<wbr>NUM_<wbr>SMS</code><br>int, default <code>32</code><br>defined in {{cite deepinfer/environ.py:108 | <code>environ.py:108</code>}}</td><td>Sets <code>max_ctas</code> and <code>min_ctas</code> of each NCCL process group. This sets how many SMs one NCCL operation uses (NVIDIA only). See {{link concepts/hardware-platforms | NVIDIA and Ascend}}.<br>Read in: {{cite deepinfer/platform.py:80-82 | <code>platform.py:80-82</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_USERBUFFER_COMM_SMS">DEEPINFER_<wbr>USERBUFFER_<wbr>COMM_<wbr>SMS</code><br>int, default <code>0</code><br>defined in {{cite deepinfer/environ.py:109 | <code>environ.py:109</code>}}</td><td>Number of SMs for DeepEP dispatch and combine. With 0, the code calculates a value when it makes the EP buffer and writes it back into <code>envs</code>. See {{link concepts/expert-parallelism | Expert parallelism}}.<br>Read in: {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:86-90 | <code>userbuffer.py:86-90</code>}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:471 | <code>mlp.py:471</code>}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:602 | <code>mlp.py:602</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_GLOO_TIMEOUT">DEEPINFER_<wbr>GLOO_<wbr>TIMEOUT</code><br>seconds (float), converted to <code>timedelta</code>, default <code>14400</code> (4 hours)<br>defined in {{cite deepinfer/environ.py:110 | <code>environ.py:110</code>}}</td><td>Time-out of the default Gloo process group that each worker makes at start-up.<br>Read in: {{cite deepinfer/worker/base.py:334-340 | <code>base.py:334-340</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_REARRANGE_P2P_GROUPS">DEEPINFER_<wbr>REARRANGE_<wbr>P2P_<wbr>GROUPS</code><br>int, default <code>1</code><br>defined in {{cite deepinfer/environ.py:111 | <code>environ.py:111</code>}}</td><td>Number of buckets for the point-to-point sends and receives that move expert weights in EPLB. Each bucket is one <code>batch_isend_irecv</code> call. See {{link concepts/eplb | EPLB}}.<br>Read in: {{cite deepinfer/model_executor/eplb/shuffle.py:114 | <code>shuffle.py:114</code>}}, {{cite deepinfer/model_executor/eplb/shuffle.py:135-138 | <code>shuffle.py:135-138</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-moe">MoE &amp; Expert Parallelism (8)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS">DEEPINFER_<wbr>OVERRIDE_<wbr>NUM_<wbr>EXTRA_<wbr>EXPERTS</code><br>int, default <code>0</code><br>defined in {{cite deepinfer/environ.py:114 | <code>environ.py:114</code>}}</td><td>Lower limit for the number of redundant expert slots. The loader increases it until routed plus redundant experts divide by the EP size. See {{link concepts/eplb | EPLB}}.<br>Read in: {{cite deepinfer/model_executor/model_loader.py:122-123 | <code>model_loader.py:122-123</code>}}, {{cite deepinfer/model_executor/eplb/__init__.py:26-28 | <code>eplb/__init__.py:26-28</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_EXPERT_COUNT_WINDOW_SIZE">DEEPINFER_<wbr>EXPERT_<wbr>COUNT_<wbr>WINDOW_<wbr>SIZE</code><br>int, default <code>100</code><br>defined in {{cite deepinfer/environ.py:115 | <code>environ.py:115</code>}}</td><td>Number of past steps of token counts per expert that EPLB keeps. With rearrangement on, it must be from 1 to the rearrangement interval. See {{link concepts/eplb | EPLB}}.<br>Read in: {{cite deepinfer/model_executor/eplb/__init__.py:102-119 | <code>eplb/__init__.py:102-119</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL">DEEPINFER_<wbr>EXPERT_<wbr>REARRANGEMENT_<wbr>STEP_<wbr>INTERVAL</code><br>int, default <code>0</code><br>defined in {{cite deepinfer/environ.py:116 | <code>environ.py:116</code>}}</td><td>EPLB moves experts between devices every N steps. The value 0 turns rearrangement off. See {{link concepts/eplb | EPLB}}.<br>Read in: {{cite deepinfer/model_executor/eplb/__init__.py:103 | <code>eplb/__init__.py:103</code>}}, {{cite deepinfer/model_executor/eplb/__init__.py:147-148 | <code>eplb/__init__.py:147-148</code>}}, {{cite deepinfer/model_executor/eplb/__init__.py:161-165 | <code>eplb/__init__.py:161-165</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_REARRANGE_AFTER_PREFILL_IN_NORMAL_ENGINE">DEEPINFER_<wbr>REARRANGE_<wbr>AFTER_<wbr>PREFILL_<wbr>IN_<wbr>NORMAL_<wbr>ENGINE</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:117 | <code>environ.py:117</code>}}</td><td>NORMAL engine only. When on, EPLB rearranges at the first decode step after a prefill step. When off, prefill steps do not count. See {{link concepts/eplb | EPLB}}.<br>Read in: {{cite deepinfer/model_executor/eplb/__init__.py:83-84 | <code>eplb/__init__.py:83-84</code>}}, {{cite deepinfer/model_executor/eplb/__init__.py:149-159 | <code>eplb/__init__.py:149-159</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_MOE_LB_STAT_INTERVAL">DEEPINFER_<wbr>MOE_<wbr>LB_<wbr>STAT_<wbr>INTERVAL</code><br>int, default <code>128</code><br>defined in {{cite deepinfer/environ.py:118 | <code>environ.py:118</code>}}</td><td>Every N steps, the EP ranks all-gather their token counts and calculate the MoE load-balance ratio. See {{link concepts/eplb | EPLB}}.<br>Read in: {{cite deepinfer/model_executor/eplb/__init__.py:125-129 | <code>eplb/__init__.py:125-129</code>}}, {{cite deepinfer/model_executor/eplb/__init__.py:176-193 | <code>eplb/__init__.py:176-193</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_FORCE_IMBALANCE_RATIO">DEEPINFER_<wbr>FORCE_<wbr>IMBALANCE_<wbr>RATIO</code><br>float, default <code>0.0</code><br>defined in {{cite deepinfer/environ.py:119 | <code>environ.py:119</code>}}</td><td>Profiling setting. With an EP size above 1, a value above 0 replaces MoE routing with random choices that send more tokens to the first EP rank. The value must then be 1.0 or more (assertion). See {{link concepts/moe-routing | MoE routing}}.<br>Read in: {{cite deepinfer/model_executor/models/v4_modules/mlp.py:367-371 | <code>mlp.py:367-371</code>}}, {{cite deepinfer/worker/model_runner.py:509-512 | <code>model_runner.py:509-512</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_FORCE_LOAD_BALANCE">DEEPINFER_<wbr>FORCE_<wbr>LOAD_<wbr>BALANCE</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:120 | <code>environ.py:120</code>}}</td><td>Sets <code>gate_force_random</code> for every token. The MoE gate then uses random logits, so the load on the experts is balanced. See {{link concepts/moe-routing | MoE routing}}.<br>Read in: {{cite deepinfer/model_executor/model_metadata_utils.py:166 | <code>model_metadata_utils.py:166</code>}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:85 | <code>prepare_tensor_input_base.cpp:85</code>}}, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:48-50 | <code>input_metadata.py:48-50</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_SHOW_EPLB_DETAIL">DEEPINFER_<wbr>SHOW_<wbr>EPLB_<wbr>DETAIL</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:121 | <code>environ.py:121</code>}}</td><td>After each rearrangement, EP rank 0 also logs a table of expert loads for each layer. See {{link concepts/eplb | EPLB}}.<br>Read in: {{cite deepinfer/model_executor/eplb/__init__.py:327-335 | <code>eplb/__init__.py:327-335</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-attention">Attention (2)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K">DEEPINFER_<wbr>PREFILL_<wbr>MAX_<wbr>SUM_<wbr>SEQLEN_<wbr>K</code><br>int or unset, default <code>None</code> (unset)<br>defined in {{cite deepinfer/environ.py:124-125 | <code>environ.py:124-125</code>}}</td><td>Limit for the sum of the sequence lengths in one prefill batch. Unset or 0 sends <code>2**30</code> to the C++ scheduler, which means no limit. See {{link concepts/scheduler | The scheduler}}.<br>Read in: {{cite deepinfer/engine/llm_engine.py:317 | <code>llm_engine.py:317</code>}}, {{cite csrc/engine/scheduler.hpp:444-449 | <code>scheduler.hpp:444-449</code>}}, {{cite deepinfer/worker/model_runner.py:417-422 | <code>model_runner.py:417-422</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_INDEX_ATTN_MEMORY_LIMIT">DEEPINFER_<wbr>INDEX_<wbr>ATTN_<wbr>MEMORY_<wbr>LIMIT</code><br>int, default <code>10 * 2**30</code> = <code>10737418240</code> (10 GiB)<br>defined in {{cite deepinfer/environ.py:126 | <code>environ.py:126</code>}}</td><td>Byte budget for the indexer logits. The indexer splits the work into chunks of <code>min(8192, limit // row_bytes // 8 * 8)</code> rows. See {{link concepts/sparse-attention-indexer | Sparse attention}}.<br>Read in: {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:117-118 | <code>index_attn.py:117-118</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-mtp">MTP (4)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_USE_NEXTN_DECODE">DEEPINFER_<wbr>USE_<wbr>NEXTN_<wbr>DECODE</code><br>int, default <code>5</code><br>defined in {{cite deepinfer/environ.py:129-130 | <code>environ.py:129-130</code>}}</td><td>Maximum number of draft tokens for each request in one decode step. The value 0 turns speculative decoding off. Python and C++ read it separately. See {{link concepts/speculative-decoding | Speculative decoding}}.<br>Read in: {{cite deepinfer/config.py:224 | <code>config.py:224</code>}}, {{cite deepinfer/worker/worker.py:74 | <code>worker.py:74</code>}}, {{cite csrc/engine/utils.hpp:36-40 | <code>utils.hpp:36-40</code>}}. <em>Read at import time.</em></td></tr>
+    <tr><td><code id="DEEPINFER_ENABLE_MTP_VARLEN">DEEPINFER_<wbr>ENABLE_<wbr>MTP_<wbr>VARLEN</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:131 | <code>environ.py:131</code>}}</td><td>Each request verifies its own number of draft tokens, from the confidence rates. It also turns on the decode speed profile at start-up. See {{link concepts/dspark | DSpark}}.<br>Read in: {{cite deepinfer/worker/worker.py:218-219 | <code>worker.py:218-219</code>}}, {{cite deepinfer/worker/base.py:280-281 | <code>base.py:280-281</code>}}, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:93-95 | <code>prepare_tensor_input_zos.py:93-95</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_MAX_BACKTRACKING_TOKENS">DEEPINFER_<wbr>MAX_<wbr>BACKTRACKING_<wbr>TOKENS</code><br>int (derived), default <code>max(value, DEEPINFER_USE_NEXTN_DECODE + 1)</code>, so <code>6</code><br>defined in {{cite deepinfer/environ.py:132 | <code>environ.py:132</code>}}</td><td>Extra token slots in the sliding-window and compression state rings, so that a request can go back over rejected draft tokens. See {{link concepts/sliding-window-attention | Sliding-window attention}}.<br>Read in: {{cite deepinfer/worker/cache_engine.py:93 | <code>cache_engine.py:93</code>}}, {{cite deepinfer/worker/cache_engine.py:133 | <code>cache_engine.py:133</code>}}, {{cite deepinfer/model_executor/model_metadata_utils.py:178 | <code>model_metadata_utils.py:178</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE">DEEPINFER_<wbr>DFLASH_<wbr>CONFIDENCE_<wbr>HEAD_<wbr>TEMPERATURE</code><br>float, or comma-separated floats, default <code>1.0</code><br>defined in {{cite deepinfer/environ.py:134-143 | <code>environ.py:134-143</code>}}</td><td>Temperature of the DFlash confidence head: one value for all draft steps, or a list with exactly <code>DEEPINFER_USE_NEXTN_DECODE</code> values. See {{link concepts/dspark | DSpark}}.<br>Read in: {{cite deepinfer/model_executor/models/mtp/dflash.py:62-64 | <code>dflash.py:62-64</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-model-loading">Model Loading (2)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_ENGRAM_PAD_TOKEN">DEEPINFER_<wbr>ENGRAM_<wbr>PAD_<wbr>TOKEN</code><br>int, default <code>2</code><br>defined in {{cite deepinfer/environ.py:146 | <code>environ.py:146</code>}}</td><td>Raw token id that Engram uses as the pad token. After tokenizer compression, the code maps it through the lookup table. See {{link concepts/engram | Engram}}.<br>Read in: {{cite deepinfer/model_executor/models/v4_modules/engram.py:42 | <code>engram.py:42</code>}}, {{cite deepinfer/model_executor/models/v4_modules/engram.py:53 | <code>engram.py:53</code>}}. <em>Read at import time.</em></td></tr>
+    <tr><td><code id="DEEPINFER_ENGRAM_FORCE_GPU_STORAGE">DEEPINFER_<wbr>ENGRAM_<wbr>FORCE_<wbr>GPU_<wbr>STORAGE</code><br>bool (derived), default <code>False</code>; always <code>True</code> when <code>DEEPINFER_ACCELERATOR=ascend</code><br>defined in {{cite deepinfer/environ.py:147 | <code>environ.py:147</code>}}</td><td>Keeps the Engram tables in device memory, not in CPU memory. See {{link concepts/engram | Engram}}.<br>Read in: {{cite deepinfer/model_executor/models/deepseek.py:473 | <code>deepseek.py:473</code>}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:148 | <code>userbuffer.py:148</code>}}, {{cite deepinfer/worker/runtime_config.py:18-26 | <code>runtime_config.py:18-26</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-sampling">Sampling (2)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_SAMPLER_FORCE_TOPK">DEEPINFER_<wbr>SAMPLER_<wbr>FORCE_<wbr>TOPK</code><br>int, default <code>0</code><br>defined in {{cite deepinfer/environ.py:150 | <code>environ.py:150</code>}}</td><td>When above 0, the sampler and DFlash keep only the K largest logits of each token for softmax and sampling. The value 0 uses all tokens. See {{link concepts/sampler | The sampler}}.<br>Read in: {{cite deepinfer/model_executor/layers/sampler.py:91 | <code>sampler.py:91</code>}}, {{cite deepinfer/model_executor/layers/sampler.py:99 | <code>sampler.py:99</code>}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:102-105 | <code>dflash.py:102-105</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_DECODE_TOKEN_BLACKLIST">DEEPINFER_<wbr>DECODE_<wbr>TOKEN_<wbr>BLACKLIST</code><br>str, default <code>&quot;&quot;</code><br>defined in {{cite deepinfer/environ.py:151 | <code>environ.py:151</code>}}</td><td>Token ids, for example <code>0..3,7</code>. The sampler sets their logits to minus infinity before it samples. See {{link concepts/sampler | The sampler}}.<br>Read in: {{cite deepinfer/model_executor/layers/sampler.py:108-112 | <code>sampler.py:108-112</code>}}, {{cite deepinfer/model_executor/layers/sampler.py:168-169 | <code>sampler.py:168-169</code>}}, {{cite deepinfer/model_executor/utils.py:35 | <code>utils.py:35</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-cuda-graph">CUDA Graph (6)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_ENFORCE_EAGER">DEEPINFER_<wbr>ENFORCE_<wbr>EAGER</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:154 | <code>environ.py:154</code>}}</td><td>Turns off CUDA graph capture for the main model. Every decode step then runs in eager mode. See {{link concepts/cuda-graphs | CUDA graphs}}.<br>Read in: {{cite deepinfer/worker/model_runner.py:73 | <code>model_runner.py:73</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL">DEEPINFER_<wbr>CUDAGRAPH_<wbr>BATCH_<wbr>SIZE_<wbr>INTERVAL</code><br>int, default <code>8</code><br>defined in {{cite deepinfer/environ.py:155 | <code>environ.py:155</code>}}</td><td>Spacing of the captured graph batch sizes: powers of two below the interval, then each multiple of the interval, then the maximum. See {{link concepts/cuda-graphs | CUDA graphs}}.<br>Read in: {{cite deepinfer/worker/cuda_graph_runner.py:74 | <code>cuda_graph_runner.py:74</code>}}, {{cite deepinfer/worker/cuda_graph_runner.py:41-51 | <code>cuda_graph_runner.py:41-51</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_DFLASH_ENFORCE_EAGER">DEEPINFER_<wbr>DFLASH_<wbr>ENFORCE_<wbr>EAGER</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:156 | <code>environ.py:156</code>}}</td><td>Turns off CUDA graph capture for the DFlash draft model only. See {{link concepts/cuda-graphs | CUDA graphs}}.<br>Read in: {{cite deepinfer/worker/model_runner.py:80-85 | <code>model_runner.py:80-85</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL">DEEPINFER_<wbr>DFLASH_<wbr>CUDAGRAPH_<wbr>BATCH_<wbr>SIZE_<wbr>INTERVAL</code><br>int, default <code>8</code><br>defined in {{cite deepinfer/environ.py:157 | <code>environ.py:157</code>}}</td><td>The same spacing rule for the DFlash graphs. Their maximum batch size is <code>max_num_seqs</code>. See {{link concepts/cuda-graphs | CUDA graphs}}.<br>Read in: {{cite deepinfer/worker/dflash_cuda_graph_runner.py:36 | <code>dflash_cuda_graph_runner.py:36</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_DECODE_PERF_CACHE_DIR">DEEPINFER_<wbr>DECODE_<wbr>PERF_<wbr>CACHE_<wbr>DIR</code><br>str or unset, default <code>None</code> (unset)<br>defined in {{cite deepinfer/environ.py:158 | <code>environ.py:158</code>}}</td><td>Folder for the cached decode speed curve (milliseconds for each graph batch size). Unset means no cache: each start measures the curve again. See {{link concepts/dspark | DSpark}}.<br>Read in: {{cite deepinfer/worker/decode_perf_cache.py:34 | <code>decode_perf_cache.py:34</code>}}, {{cite deepinfer/worker/decode_perf_cache.py:126-128 | <code>decode_perf_cache.py:126-128</code>}}, {{cite deepinfer/worker/model_runner.py:576-579 | <code>model_runner.py:576-579</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_DECODE_PERF_CACHE_TTL_SEC">DEEPINFER_<wbr>DECODE_<wbr>PERF_<wbr>CACHE_<wbr>TTL_<wbr>SEC</code><br>int, default <code>60 * 60</code> = <code>3600</code><br>defined in {{cite deepinfer/environ.py:159 | <code>environ.py:159</code>}}</td><td>Maximum age in seconds of a cached decode speed curve. Files older than this value plus 2 hours are deleted.<br>Read in: {{cite deepinfer/worker/decode_perf_cache.py:105 | <code>decode_perf_cache.py:105</code>}}, {{cite deepinfer/worker/decode_perf_cache.py:138-139 | <code>decode_perf_cache.py:138-139</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-kv-store">KV Cache Store (3)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_NUM_STATE_SLOTS_RATIO">DEEPINFER_<wbr>NUM_<wbr>STATE_<wbr>SLOTS_<wbr>RATIO</code><br>float, default <code>1.2</code><br>defined in {{cite deepinfer/environ.py:162 | <code>environ.py:162</code>}}</td><td>Sets the number of {{term state-slot | state slots}} (one for each active sequence) to <code>int(max_num_seqs * ratio) + 1</code>. See {{link concepts/paged-kv-cache | Paged KV cache}}.<br>Read in: {{cite deepinfer/worker/cache_engine.py:201-202 | <code>cache_engine.py:201-202</code>}}, {{cite deepinfer/worker/cache_engine.py:650 | <code>cache_engine.py:650</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_PREFILL_STORE_EXTRA_STATE">DEEPINFER_<wbr>PREFILL_<wbr>STORE_<wbr>EXTRA_<wbr>STATE</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:163 | <code>environ.py:163</code>}}</td><td>Keeps more sliding-window state after prefill, so that the KV store can save state at its 128-token grain and later turns can hit it. See {{link concepts/sliding-window-attention | Sliding-window attention}}.<br>Read in: {{cite deepinfer/worker/cache_engine.py:101-110 | <code>cache_engine.py:101-110</code>}}, {{cite deepinfer/worker/cache_engine.py:788-790 | <code>cache_engine.py:788-790</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_PREFILL_STORE_EXTRA_SIZE">DEEPINFER_<wbr>PREFILL_<wbr>STORE_<wbr>EXTRA_<wbr>SIZE</code><br>int, default <code>128</code><br>defined in {{cite deepinfer/environ.py:164 | <code>environ.py:164</code>}}</td><td>Number of extra tokens that <code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code> adds to the KV-store sliding-window block.<br>Read in: {{cite deepinfer/worker/cache_engine.py:108-110 | <code>cache_engine.py:108-110</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-structured-output">Structured Output (5)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_XGRAMMAR_DEBUG">DEEPINFER_<wbr>XGRAMMAR_<wbr>DEBUG</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:167 | <code>environ.py:167</code>}}</td><td>Sends <code>debug_print=True</code> to xgrammar when the matcher accepts a token or fills a token bitmask. See {{link concepts/structured-outputs | Structured outputs}}.<br>Read in: {{cite deepinfer/structure_output/matcher.py:18 | <code>matcher.py:18</code>}}, {{cite deepinfer/structure_output/matcher.py:158 | <code>matcher.py:158</code>}}, {{cite deepinfer/structure_output/matcher.py:193 | <code>matcher.py:193</code>}}. <em>Read at import time.</em></td></tr>
+    <tr><td><code id="DEEPINFER_XGRAMMAR_TIMEOUT">DEEPINFER_<wbr>XGRAMMAR_<wbr>TIMEOUT</code><br>int, default <code>20</code><br>defined in {{cite deepinfer/environ.py:168 | <code>environ.py:168</code>}}</td><td>Seconds to wait for the xgrammar matcher of a request. After that, the request gets an aborted matcher. See {{link concepts/structured-outputs | Structured outputs}}.<br>Read in: {{cite deepinfer/structure_output/matcher.py:19 | <code>matcher.py:19</code>}}, {{cite deepinfer/structure_output/matcher.py:265 | <code>matcher.py:265</code>}}, {{cite deepinfer/structure_output/matcher.py:305-310 | <code>matcher.py:305-310</code>}}. <em>Read at import time.</em></td></tr>
+    <tr><td><code id="DEEPINFER_XGRAMMAR_DISABLE_CACHE">DEEPINFER_<wbr>XGRAMMAR_<wbr>DISABLE_<wbr>CACHE</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:169 | <code>environ.py:169</code>}}</td><td>Turns off the xgrammar compiler cache. The code comment calls it the kill switch. See {{link concepts/structured-outputs | Structured outputs}}.<br>Read in: {{cite deepinfer/structure_output/compiler.py:17-18 | <code>compiler.py:17-18</code>}}, {{cite deepinfer/structure_output/compiler.py:36 | <code>compiler.py:36</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_XGRAMMAR_CACHE_LIMIT_BYTES">DEEPINFER_<wbr>XGRAMMAR_<wbr>CACHE_<wbr>LIMIT_<wbr>BYTES</code><br>int, default <code>10 * 1024 * 1024 * 1024</code> = <code>10737418240</code> (10 GiB)<br>defined in {{cite deepinfer/environ.py:170 | <code>environ.py:170</code>}}</td><td>Size limit of the xgrammar compiler cache. A value of 0 or less means no limit and logs a warning. See {{link concepts/structured-outputs | Structured outputs}}.<br>Read in: {{cite deepinfer/structure_output/compiler.py:19-29 | <code>compiler.py:19-29</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_SO_BUILDER_CPUS">DEEPINFER_<wbr>SO_<wbr>BUILDER_<wbr>CPUS</code><br>int, default <code>4</code><br>defined in {{cite deepinfer/environ.py:171 | <code>environ.py:171</code>}}</td><td>Number of CPU cores that build structured-output matchers. <code>get_idle_cpus</code> raises <code>RuntimeError</code> if the physical cores for each GPU are fewer than this value. See {{link concepts/structured-outputs | Structured outputs}}.<br>Read in: {{cite deepinfer/utils.py:157-161 | <code>utils.py:157-161</code>}}, {{cite deepinfer/engine/llm_engine.py:334-340 | <code>llm_engine.py:334-340</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-scheduling">Scheduling (3)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_PREFILL_ATTEMPT_INTERVAL">DEEPINFER_<wbr>PREFILL_<wbr>ATTEMPT_<wbr>INTERVAL</code><br>int, default <code>70</code><br>defined in {{cite deepinfer/environ.py:174-176 | <code>environ.py:174-176</code>}}</td><td>NORMAL engine. Every N decode steps, the DP ranks vote. They do a prefill step only if all ranks have prefill work (the ALL point). See {{link concepts/dp-step-votes | DP step votes}}.<br>Read in: {{cite deepinfer/config.py:193 | <code>config.py:193</code>}}, {{cite csrc/engine/scheduler.hpp:308-318 | <code>scheduler.hpp:308-318</code>}}. <em>Read at import time.</em></td></tr>
+    <tr><td><code id="DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL">DEEPINFER_<wbr>PREFILL_<wbr>ANY_<wbr>ATTEMPT_<wbr>INTERVAL</code><br>int, default <code>100</code><br>defined in {{cite deepinfer/environ.py:177-178 | <code>environ.py:177-178</code>}}</td><td>NORMAL engine. Every N decode steps, the DP ranks do a prefill step if any rank has prefill work (the ANY point). See {{link concepts/dp-step-votes | DP step votes}}.<br>Read in: {{cite deepinfer/config.py:194 | <code>config.py:194</code>}}, {{cite csrc/engine/scheduler.hpp:308 | <code>scheduler.hpp:308</code>}}, {{cite csrc/engine/scheduler.hpp:315-316 | <code>scheduler.hpp:315-316</code>}}. <em>Read at import time.</em></td></tr>
+    <tr><td><code id="DEEPINFER_ZERO_OVERHEAD_SCHEDULING">DEEPINFER_<wbr>ZERO_<wbr>OVERHEAD_<wbr>SCHEDULING</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:179 | <code>environ.py:179</code>}}</td><td>Turns on zero-overhead scheduling (ZOS): the CPU schedules the next step while the device runs. <code>EngineArgs</code> sets <code>1</code> for NORMAL and COMPLETION engines. See {{link concepts/zero-overhead-scheduling | ZOS}}.<br>Read in: {{cite deepinfer/engine/arg_utils.py:51-55 | <code>arg_utils.py:51-55</code>}}, {{cite deepinfer/model_executor/model_metadata_utils.py:143 | <code>model_metadata_utils.py:143</code>}}, {{cite deepinfer/engine/llm_engine.py:313 | <code>llm_engine.py:313</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-logging">Logging (4)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_LOGGING_INTERVAL_STEP">DEEPINFER_<wbr>LOGGING_<wbr>INTERVAL_<wbr>STEP</code><br>int, default <code>100</code><br>defined in {{cite deepinfer/environ.py:182 | <code>environ.py:182</code>}}</td><td>Steps between two statistics log lines. The PROMPT engine uses one fifth of it. A value of 0 or less turns the log off.<br>Read in: {{cite deepinfer/engine/stats_logger.py:384-389 | <code>stats_logger.py:384-389</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_NCCL_MEMORY_SAMPLE_INTERVAL_STEPS">DEEPINFER_<wbr>NCCL_<wbr>MEMORY_<wbr>SAMPLE_<wbr>INTERVAL_<wbr>STEPS</code><br>int, default <code>1000</code><br>defined in {{cite deepinfer/environ.py:183 | <code>environ.py:183</code>}}</td><td>Steps between two samples of NCCL communicator memory. The driver logs a snapshot when the value changes.<br>Read in: {{cite deepinfer/model_executor/parallel_utils/nccl_memory.py:14-21 | <code>nccl_memory.py:14-21</code>}}, {{cite deepinfer/model_executor/parallel_utils/nccl_memory.py:83 | <code>nccl_memory.py:83</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_RINGBUFFER_WARNING_INTERVAL">DEEPINFER_<wbr>RINGBUFFER_<wbr>WARNING_<wbr>INTERVAL</code><br>int, default <code>60</code><br>defined in {{cite deepinfer/environ.py:184 | <code>environ.py:184</code>}}</td><td>Seconds between two debug messages while a shared-memory ring buffer waits for a free block.<br>Read in: {{cite deepinfer/distributed/shm_broadcast.py:313-315 | <code>shm_broadcast.py:313-315</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_GC_INTERVAL_STEP">DEEPINFER_<wbr>GC_<wbr>INTERVAL_<wbr>STEP</code><br>int, default <code>1000</code><br>defined in {{cite deepinfer/environ.py:185 | <code>environ.py:185</code>}}</td><td>Steps between two <code>gc.collect()</code> calls in a worker. Automatic garbage collection is off. COMPLETION engines use 10 times the value.<br>Read in: {{cite deepinfer/worker/base.py:102-106 | <code>base.py:102-106</code>}}, {{cite deepinfer/worker/base.py:153-157 | <code>base.py:153-157</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-yoco">YoCo (2)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE">DEEPINFER_<wbr>YOCO_<wbr>PREFILL_<wbr>TRUNCATION_<wbr>MODE</code><br>one of <code>off</code>, <code>mask</code>, <code>compact</code>, default <code>&quot;off&quot;</code><br>defined in {{cite deepinfer/environ.py:188-190 | <code>environ.py:188-190</code>}}</td><td>YOCO consumer prefill truncation. <code>mask</code> keeps all queries and narrows the sliding window. <code>compact</code> removes the truncated queries. See {{link concepts/yoco-swa-replay | YOCO}}.<br>Read in: {{cite deepinfer/model_executor/model_metadata_utils.py:90-92 | <code>model_metadata_utils.py:90-92</code>}}, {{cite deepinfer/model_executor/models/deepseek.py:126-128 | <code>deepseek.py:126-128</code>}}, {{cite deepinfer/engine/llm_engine.py:259-260 | <code>llm_engine.py:259-260</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_YOCO_PREFILL_KEEP_TOKENS">DEEPINFER_<wbr>YOCO_<wbr>PREFILL_<wbr>KEEP_<wbr>TOKENS</code><br>int, default <code>0</code><br>defined in {{cite deepinfer/environ.py:191-194 | <code>environ.py:191-194</code>}}</td><td>Number of last query tokens that truncation keeps. With truncation on, it must be at least <code>window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS</code>. See {{link concepts/yoco-swa-replay | YOCO}}.<br>Read in: {{cite deepinfer/worker/model_runner.py:110-113 | <code>model_runner.py:110-113</code>}}, {{cite deepinfer/model_executor/model_metadata_utils.py:92 | <code>model_metadata_utils.py:92</code>}}, {{cite deepinfer/engine/llm_engine.py:260 | <code>llm_engine.py:260</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-profiling">Profiling &amp; Debug (7)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_BATCH_INVARIANT">DEEPINFER_<wbr>BATCH_<wbr>INVARIANT</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:197 | <code>environ.py:197</code>}}</td><td>Makes model results independent of the batch: batch-invariant attention, deterministic DeepGEMM and TileKernels. NVIDIA only (asserted on NPU). See {{link concepts/determinism | Determinism}}.<br>Read in: {{cite deepinfer/worker/runtime_config.py:61-69 | <code>runtime_config.py:61-69</code>}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:666 | <code>attn.py:666</code>}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:79 | <code>userbuffer.py:79</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_DISABLE_SYNC_GUARD">DEEPINFER_<wbr>DISABLE_<wbr>SYNC_<wbr>GUARD</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:198-199 | <code>environ.py:198-199</code>}}</td><td>Turns off <code>forbid_cuda_sync</code>, the check that raises on a CPU-GPU synchronization in model forward and sampling launch. For debug.<br>Read in: {{cite deepinfer/utils.py:127-132 | <code>utils.py:127-132</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_PROFILE_TORCH_CUDA_MEMORY">DEEPINFER_<wbr>PROFILE_<wbr>TORCH_<wbr>CUDA_<wbr>MEMORY</code><br>str or unset, default <code>None</code> (unset)<br>defined in {{cite deepinfer/environ.py:200 | <code>environ.py:200</code>}}</td><td>When set to any value, each worker calls <code>torch.cuda.memory._record_memory_history(max_entries=100000)</code>. The code does not use the value.<br>Read in: {{cite deepinfer/worker/base.py:110-111 | <code>base.py:110-111</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_ENABLE_MEMORY_TRACING">DEEPINFER_<wbr>ENABLE_<wbr>MEMORY_<wbr>TRACING</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:201 | <code>environ.py:201</code>}}</td><td>Rank 0 records CUDA memory history in the profile run and writes <code>./tracing/profile_run_memory_snapshot.pickle</code>.<br>Read in: {{cite deepinfer/worker/base.py:223-227 | <code>base.py:223-227</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_PROFILE_HTTP_ENABLE">DEEPINFER_<wbr>PROFILE_<wbr>HTTP_<wbr>ENABLE</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:202 | <code>environ.py:202</code>}}</td><td>Starts an HTTP server in each engine process. <code>POST /profile</code> records a torch profile of some steps.<br>Read in: {{cite deepinfer/engine/llm_engine.py:237-239 | <code>llm_engine.py:237-239</code>}}, {{cite deepinfer/engine/profile_server.py:3-5 | <code>profile_server.py:3-5</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_PROFILE_HTTP_PORT_BASE">DEEPINFER_<wbr>PROFILE_<wbr>HTTP_<wbr>PORT_<wbr>BASE</code><br>int, default <code>6070</code><br>defined in {{cite deepinfer/environ.py:203 | <code>environ.py:203</code>}}</td><td>The profiling server listens on this port plus the driver GPU id.<br>Read in: {{cite deepinfer/engine/profile_server.py:117 | <code>profile_server.py:117</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_TORCH_PROFILER_DIR">DEEPINFER_<wbr>TORCH_<wbr>PROFILER_<wbr>DIR</code><br>str, default <code>&quot;/tmp&quot;</code><br>defined in {{cite deepinfer/environ.py:204 | <code>environ.py:204</code>}}</td><td>Output folder of the profiling server when the request gives no <code>output_dir</code>.<br>Read in: {{cite deepinfer/engine/profile_server.py:208 | <code>profile_server.py:208</code>}}.</td></tr>
+  </tbody>
+</table>
+<h3 id="g-multimodal">Multi-Modal (4)</h3>
+<table class="env-table">
+  <thead><tr><th>Variable</th><th>What it does, and where the code reads it</th></tr></thead>
+  <tbody>
+    <tr><td><code id="DEEPINFER_USE_MULTIMODAL_POOL">DEEPINFER_<wbr>USE_<wbr>MULTIMODAL_<wbr>POOL</code><br>bool, default <code>False</code><br>defined in {{cite deepinfer/environ.py:207 | <code>environ.py:207</code>}}</td><td>Uses one shared, pinned host-memory pool for multimodal (image) data. <code>EngineArgs</code> sets <code>1</code> for all engines except COMPLETION. See {{link concepts/vision-encoder | Vision encoder}}.<br>Read in: {{cite deepinfer/shared_memory.py:359-363 | <code>shared_memory.py:359-363</code>}}, {{cite deepinfer/engine/arg_utils.py:56-60 | <code>arg_utils.py:56-60</code>}}, {{cite deepinfer/ve/multimodal_processor.py:49-56 | <code>multimodal_processor.py:49-56</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_MULTIMODAL_POOL_SIZE_GB">DEEPINFER_<wbr>MULTIMODAL_<wbr>POOL_<wbr>SIZE_<wbr>GB</code><br>int, default <code>8</code><br>defined in {{cite deepinfer/environ.py:208 | <code>environ.py:208</code>}}</td><td>Size of the multimodal pool for each rank, in GiB. See {{link concepts/vision-encoder | Vision encoder}}.<br>Read in: {{cite deepinfer/shared_memory.py:363 | <code>shared_memory.py:363</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_MULTI_MODAL_BUFFER_SIZE">DEEPINFER_<wbr>MULTI_<wbr>MODAL_<wbr>BUFFER_<wbr>SIZE</code><br>int, default <code>512</code><br>defined in {{cite deepinfer/environ.py:209 | <code>environ.py:209</code>}}</td><td>Maximum number of items in the output queue of the multimodal preprocessing workers. See {{link concepts/vision-encoder | Vision encoder}}.<br>Read in: {{cite deepinfer/ve/multimodal_processor.py:96 | <code>multimodal_processor.py:96</code>}}.</td></tr>
+    <tr><td><code id="DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT">DEEPINFER_<wbr>MULTI_<wbr>MODAL_<wbr>WORKER_<wbr>TIMEOUT</code><br>float, default <code>1800.0</code><br>defined in {{cite deepinfer/environ.py:210 | <code>environ.py:210</code>}}</td><td>If the multimodal workers have pending requests and give no output for this many seconds, the process aborts. 0 or less turns the check off. See {{link concepts/vision-encoder | Vision encoder}}.<br>Read in: {{cite deepinfer/ve/multimodal_processor.py:266-275 | <code>multimodal_processor.py:266-275</code>}}.</td></tr>
+  </tbody>
+</table>
+<!-- END GENERATED env-tables -->
+
+<h2 id="other-deepinfer-names">Other DEEPINFER names outside environ.py</h2>
+<p>These five names are not attributes of <code>envs</code>. Code reads them directly, so the descriptor rules above do not apply.</p>
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>What it does</th><th>Read in</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_CPP_LOG_LEVEL</code></td><td><code>info</code></td><td>Log level of the C++ extension: <code>off</code>, <code>error</code>, <code>warn</code> or <code>info</code>. Other text gives <code>info</code>. A function-local <code>static</code> reads it one time per process.</td><td>{{cite csrc/utils/log.hpp:19-31 | <code>utils/log.hpp:19-31</code>}}</td></tr>
+    <tr><td><code>DEEPINFER_HF_MODEL_DIR</code></td><td>unset</td><td>Example scripts only. A local folder that replaces the default Hugging Face model id.</td><td>{{cite examples/_config.py:42-43 | <code>examples/_config.py:42</code>}}, {{cite README.md:67-69 | <code>README.md:67-69</code>}}</td></tr>
+    <tr><td><code>DEEPINFER_REPO</code></td><td>unset</td><td>Evaluation scripts only. The repository root, if <code>eval/</code> cannot find it.</td><td>{{cite eval/common/paths.py:24-25 | <code>common/paths.py:24-25</code>}}</td></tr>
+    <tr><td><code>DEEPINFER_FUSED_SAMPLE_STRESS_TEST</code></td><td><code>1</code></td><td>Kernel test only. Multiplies the 1024 rounds of the reject-sampling distribution test.</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:530 | <code>fused_sample.py:530</code>}}</td></tr>
+    <tr><td><code>DEEPINFER_FUSED_SAMPLE_DETAIL_LOG</code></td><td>unset</td><td>Kernel test only. A file to which the same test appends its counts.</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:601-603 | <code>fused_sample.py:601-603</code>}}</td></tr>
+  </tbody>
+</table>
+
+<h2>Other environment variables that DeepInfer sets or needs</h2>
+<p>DeepInfer also reads and writes variables that belong to CUDA, PyTorch, NCCL, HCCL and other libraries. This page tells only why DeepInfer sets them. It does not explain the libraries.</p>
+
+<h3>Read by DeepInfer</h3>
+<table>
+  <thead><tr><th>Variable</th><th>What DeepInfer does with it</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code></td><td>Must be set. The engine takes the first id as the driver GPU and counts the ids to get the local GPUs. If it is not set, <code>os.environ[...]</code> raises <code>KeyError</code>. DeepInfer also reads it on Ascend.</td><td>{{cite deepinfer/engine/llm_engine.py:188-189 | <code>engine/llm_engine.py:188</code>}}<br>{{cite deepinfer/engine/llm_engine.py:371 | <code>engine/llm_engine.py:371</code>}}<br>{{cite deepinfer/worker/base.py:127 | <code>worker/base.py:127</code>}}</td></tr>
+    <tr><td><code>ASCEND_RT_VISIBLE_DEVICES</code></td><td>Ascend only. <code>PlatformNPU</code> copies it to <code>CUDA_VISIBLE_DEVICES</code> if that is not set. If both are set and differ, it raises <code>RuntimeError</code>.</td><td>{{cite deepinfer/platform.py:92-102 | <code>deepinfer/platform.py:92-102</code>}}</td></tr>
+    <tr><td><code>MASTER_ADDR</code>, <code>MASTER_PORT</code></td><td>Address of the first Gloo connection. Defaults <code>localhost</code> and <code>23333</code>. The port that DeepInfer uses is <code>MASTER_PORT - 50 + engine_group_rank</code>.</td><td>{{cite deepinfer/utils.py:225-230 | <code>deepinfer/utils.py:225-230</code>}}</td></tr>
+    <tr><td><code>CONDA_PREFIX</code>, <code>VIRTUAL_ENV</code></td><td>Build time, NVIDIA only. <code>setup.py</code> stops if neither is set.</td><td>{{cite setup.py:55-57 | <code>setup.py:55-57</code>}}</td></tr>
+    <tr><td><code>DEVICE_OFFSET</code></td><td>Example scripts only. The first GPU id for <code>CUDA_VISIBLE_DEVICES</code>. Default <code>0</code>.</td><td>{{cite examples/_config.py:57 | <code>examples/_config.py:57</code>}}</td></tr>
+  </tbody>
+</table>
+
+<h3>Set by DeepInfer</h3>
+<p>"Always" means that DeepInfer overwrites your value. "Default" means that it uses <code>setdefault</code>, so your value wins.</p>
+<table>
+  <thead><tr><th>Variable and value</th><th>How</th><th>When and why</th></tr></thead>
+  <tbody>
+    <tr><td><code>TF_CPP_MIN_LOG_LEVEL=3</code></td><td>always</td><td>At <code>import deepinfer</code> ({{cite deepinfer/__init__.py:36 | <code>__init__.py:36</code>}}).</td></tr>
+    <tr><td><code>PYTORCH_NVML_BASED_CUDA_CHECK=1</code></td><td>always</td><td>At <code>import deepinfer</code>. Translated comment: <em>"Imported dependencies can call torch.cuda.is_available. If CUDA initializes early, a later CUDA_VISIBLE_DEVICES has no effect, so use NVML-based detection."</em> ({{cite deepinfer/__init__.py:37-39 | <code>__init__.py:37-39</code>}})</td></tr>
+    <tr><td><code>TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES=1</code></td><td>always</td><td>At <code>import deepinfer</code>. The comment says "EPLB shuffle symmem" ({{cite deepinfer/__init__.py:41-42 | <code>__init__.py:41-42</code>}}).</td></tr>
+    <tr><td><code>CUDA_SCALE_LAUNCH_QUEUES=4x</code></td><td>always</td><td>At <code>import deepinfer</code>. The code gives no reason ({{cite deepinfer/__init__.py:44 | <code>__init__.py:44</code>}}).</td></tr>
+    <tr><td><code>TOKENIZERS_PARALLELISM=false</code></td><td>default</td><td>In <code>LLM.__init__</code> ({{cite deepinfer/entrypoints/llm.py:69 | <code>llm.py:69</code>}}).</td></tr>
+    <tr><td><code>EP_AVOID_RECORD_STREAM=1</code></td><td>always</td><td>Each worker, in <code>configure_worker_environment()</code> ({{cite deepinfer/worker/runtime_config.py:33 | <code>runtime_config.py:33</code>}}).</td></tr>
+    <tr><td><code>NCCL_NVLS_ENABLE</code> (removed)</td><td>always</td><td>Each worker deletes it ({{cite deepinfer/worker/runtime_config.py:34 | <code>runtime_config.py:34</code>}}).</td></tr>
+    <tr><td><code>NCCL_NO_CACHE=…</code><br><code>NCCL_PXN_DISABLE=1</code><br><code>NCCL_CUMEM_ENABLE=1</code><br><code>NCCL_GIN_ERROR_QUERY_SEC=432000</code></td><td>always</td><td>Each worker, NVIDIA only. <code>NCCL_NO_CACHE</code> gets three names: <code>NCCL_WIN_STRIDE</code>, <code>NCCL_GIN_TYPE</code> and <code>NCCL_GIN_GDAKI_MAX_QP_RD_ATOMIC</code>. The comment for <code>NCCL_PXN_DISABLE</code> says "Disable peer access for NCCL for expert rearrangement" ({{cite deepinfer/worker/runtime_config.py:35-40 | <code>runtime_config.py:35-40</code>}}).</td></tr>
+    <tr><td><code>TILELANG_CACHE_DIR</code><br><code>DG_JIT_CACHE_DIR</code><br><code>EP_JIT_CACHE_DIR</code></td><td>always, if <code>DEEPINFER_JIT_CACHE_DIR</code> is set</td><td>Each worker. The values are sub-folders of <code>DEEPINFER_JIT_CACHE_DIR</code>. DeepGEMM and DeepEP also get two warm-up folders, separated by <code>:</code> ({{cite deepinfer/worker/runtime_config.py:45-51 | <code>runtime_config.py:45-51</code>}}).</td></tr>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code> (own ids plus all other GPUs)</td><td>always, then restored</td><td>NVIDIA with <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> only. The worker calls <code>cuInit</code> with all GPUs visible, then puts the old value back ({{cite deepinfer/worker/runtime_config.py:17-26 | <code>runtime_config.py:17-26</code>}}).</td></tr>
+    <tr><td><code>PYTORCH_NPU_ALLOC_CONF=</code><br><code>expandable_segments:True</code><br><code>TASK_QUEUE_ENABLE=0</code><br><code>HCCL_BUFFSIZE=16</code></td><td>always</td><td>Ascend only, when <code>PlatformNPU</code> is made ({{cite deepinfer/platform.py:104-111 | <code>platform.py:104-111</code>}}).</td></tr>
+    <tr><td><code>HCCL_CONNECT_TIMEOUT=240</code><br><code>HCCL_EXEC_TIMEOUT=200</code><br><code>HCCL_HOST_SOCKET_PORT_RANGE=auto</code><br><code>HCCL_NPU_SOCKET_PORT_RANGE=auto</code><br><code>TORCH_NPU_DEVICE_CAPABILITY=9.0</code><br><code>TILELANG_DEFAULT_TARGET=ascend</code></td><td>default</td><td>Ascend only ({{cite deepinfer/platform.py:112-118 | <code>platform.py:112-118</code>}}, {{cite deepinfer/platform.py:128 | <code>platform.py:128</code>}}). The page {{link concepts/hardware-platforms#npu-init | PlatformNPU.__init__, line by line}} explains each one.</td></tr>
+  </tbody>
+</table>
+
+<h2>Common recipes</h2>
+<p>These settings come from the feature list and the setup steps in <code>README.md</code>. Each recipe shows the exact values, then what the code does with them.</p>
+
+<h3>Choose the platform build</h3>
+<pre><code class="language-bash">export DEEPINFER_ACCELERATOR=nvidia   # or: ascend</code></pre>
+<p>Source: {{cite README.md:59-62}}. The README says: "Keep it exported in the environment where you run DeepInfer". <code>./build.sh</code> stops if the value is not <code>nvidia</code> or <code>ascend</code> ({{cite build.sh:5-10}}). At run time, <code>import deepinfer</code> uses it to find the folder <code>deepinfer/_so/nvidia-x86_64/</code> or similar ({{cite deepinfer/__init__.py:15-25}}).</p>
+
+<h3>Run the examples from a local model copy</h3>
+<pre><code class="language-bash">DEEPINFER_HF_MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017 python examples/offline_inference.py</code></pre>
+<p>Source: {{cite README.md:67-73}}. Only <code>examples/_config.py</code> reads this name ({{cite examples/_config.py:42-43}}). The <code>deepinfer</code> package does not read it.</p>
+
+<h3>DSpark: confidence-scheduled verification</h3>
+<pre><code class="language-bash">DEEPINFER_ENABLE_MTP_VARLEN=1
+DEEPINFER_USE_NEXTN_DECODE=5      # maximum draft length; 5 is the default</code></pre>
+<p>Source: {{cite README.md:24}}. With <code>MTP_VARLEN</code> on, each request gets its own number of query tokens from the confidence rates of its drafts ({{cite deepinfer/worker/worker.py:218-219}}). At start-up, the worker also measures the decode speed for each graph batch size ({{cite deepinfer/worker/base.py:280-281}}). Set <code>DEEPINFER_DECODE_PERF_CACHE_DIR</code> to keep that curve between starts. The evaluation script sets the two recipe variables, <code>DEEPINFER_USE_NEXTN_DECODE=5</code> and <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code> ({{cite eval/run_eval.py:120-121}}). See {{link concepts/dspark}}.</p>
+
+<h3>Decoder SWA bounded replay (YOCO)</h3>
+<pre><code class="language-bash">DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact
+DEEPINFER_YOCO_PREFILL_KEEP_TOKENS=140</code></pre>
+<p>Source: {{cite README.md:25}}: "the default V4.1 settings; the retained suffix must cover the SWA window plus the maximum backtracking length". The code checks this rule with an assertion: <code>window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS &lt;= DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code> ({{cite deepinfer/worker/model_runner.py:107-113}}). With the default 5 draft tokens, <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> is 6. The model config must have YOCO consumer layers, or an assertion fails ({{cite deepinfer/model_executor/model_metadata_utils.py:87-92}}). See {{link concepts/yoco-swa-replay}}.</p>
+
+<h3>Asynchronous scheduling</h3>
+<p>Source: {{cite README.md:26}}: "Enabled by default". You do not need to set anything. <code>environ.py</code> has the default <code>False</code>, but <code>EngineArgs</code> sets <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING=1</code> for NORMAL and COMPLETION engines if you did not set it ({{cite deepinfer/engine/arg_utils.py:51-55}}). To turn it off, export <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING=0</code>. See {{link concepts/zero-overhead-scheduling}}.</p>
+
+<h3>Batch-invariant inference</h3>
+<pre><code class="language-bash">DEEPINFER_BATCH_INVARIANT=1     # NVIDIA only</code></pre>
+<p>Source: {{cite README.md:27}}. The worker turns on deterministic algorithms in DeepGEMM and TileKernels ({{cite deepinfer/worker/runtime_config.py:67-69}}). Attention calls get <code>batch_invariant=True</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:666}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:1002}}). On an NPU, the worker stops with an assertion ({{cite deepinfer/worker/runtime_config.py:61-63}}). The offline example sets it by default on NVIDIA ({{cite examples/offline_inference.py:42-43}}). See {{link concepts/determinism}}.</p>
+
+<h3>Deterministic sampling</h3>
+<pre><code class="language-bash">DEEPINFER_BATCH_INVARIANT=1 DEEPINFER_ENABLE_MTP_VARLEN=0   # and a fixed seq_seed in SamplingParams</code></pre>
+<p>Source: {{cite README.md:28}}. The README does not give the reason for <code>MTP_VARLEN=0</code>. The code shows one batch dependency. With varlen on, the worker shares one budget of query tokens over all sequences of the batch, by confidence rate ({{cite deepinfer/worker/worker.py:218-219}}, {{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:17-25}}). So the number of tokens that one request verifies depends on the other requests. <code>ENABLE_MTP_VARLEN</code> is already off by default ({{cite deepinfer/environ.py:131}}). The explicit <code>0</code> also overrides a value that a script exported.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="One variable end to end: DEEPINFER_USE_NEXTN_DECODE">
+<p>This variable sets the maximum number of draft tokens for each request in one {{term decode}} step. A draft token is a guess for a later token. The model checks all guesses in one step (speculative decoding, see {{link concepts/speculative-decoding}}). We follow the value <code>3</code> from the shell to every place that uses it. The example uses <code>max_num_seqs = 4</code>, <code>max_model_len = 32768</code> and ZOS on.</p>
+<p><strong>Step 1: the definition.</strong></p>
+<x-code file="deepinfer/environ.py" lines="128-132" highlight="129,132">
+  <x-tr line="130">The maximum number of speculative tokens. Default 5. Set it to 0 explicitly to turn off speculative decoding.</x-tr>
+</x-code>
+<ol>
+  <li><strong>Shell.</strong> <code>export DEEPINFER_USE_NEXTN_DECODE=3</code>. The example scripts use <code>os.environ.setdefault(..., "5")</code>, so they keep your value ({{cite examples/_config.py:74-75}}).</li>
+  <li><strong><code>import deepinfer</code>.</strong> Line 6 of <code>deepinfer/__init__.py</code> imports <code>envs</code>. Python runs the class body. Line 129 makes an <code>EnvVar</code> with the parse function <code>lambda v: _int(v, 5)</code>. No value is read yet.</li>
+  <li><strong>First read.</strong> The first code that touches <code>envs.DEEPINFER_USE_NEXTN_DECODE</code> calls <code>__get__</code>. It calls <code>_int("3", 5)</code>, gets <code>3</code>, and stores <code>3</code> in the class. If <code>deepinfer.structure_output.matcher</code> is imported first, its module-level line <code>MAX_ROLLBACK_TOKENS = envs.DEEPINFER_USE_NEXTN_DECODE + 2</code> does this first read ({{cite deepinfer/structure_output/matcher.py:20}}).</li>
+  <li><strong>All later reads in this process</strong> get the plain int <code>3</code>.</li>
+</ol>
+<p><strong>Step 2: what the Python code does with 3.</strong></p>
+<table>
+  <thead><tr><th>Place</th><th>Formula</th><th>Value with 3</th></tr></thead>
+  <tbody>
+    <tr><td>Decode token budget<br>{{cite deepinfer/config.py:224 | <code>config.py:224</code>}}</td><td><code>max_num_seqs * (1 + nextn)</code></td><td><code>4 * 4 = 16</code></td></tr>
+    <tr><td>Position limit<br>{{cite deepinfer/config.py:13-16 | <code>config.py:13-16</code>}}</td><td><code>max_model_len</code> + <code>nextn</code> + <code>(nextn + 1)</code> + <code>nextn</code>; the third term only with ZOS</td><td><code>32768 + 3 + 4 + 3</code><br><code>= 32778</code></td></tr>
+    <tr><td>Largest CUDA graph<br>{{cite deepinfer/worker/model_runner.py:76-77 | <code>model_runner.py:76-77</code>}}</td><td><code>max_num_seqs * (1 + nextn)</code></td><td><code>16</code>; sizes<br><code>[1, 2, 4, 8, 16]</code></td></tr>
+    <tr><td>Rollback slots<br>{{cite deepinfer/environ.py:132 | <code>environ.py:132</code>}}</td><td><code>max(value, nextn + 1)</code> for <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td><code>4</code></td></tr>
+    <tr><td>SWA ring size<br>{{cite deepinfer/worker/cache_engine.py:93 | <code>cache_engine.py:93</code>}}</td><td><code>window_size + backtracking</code></td><td><code>window_size + 4</code></td></tr>
+    <tr><td>Draft pad tokens<br>{{cite deepinfer/model_executor/layers/mtp_info_pool.py:9-11 | <code>mtp_info_pool.py:9-11</code>}}</td><td><code>[vocab_size - 1] * nextn</code></td><td>3 pad ids</td></tr>
+    <tr><td>Structured-output rollback<br>{{cite deepinfer/structure_output/matcher.py:20 | <code>matcher.py:20</code>}}</td><td><code>nextn + 2</code></td><td><code>5</code></td></tr>
+    <tr><td>Model, worker, sampler<br>{{cite deepinfer/model_executor/models/deepseek.py:276 | <code>deepseek.py:276</code>}}, {{cite deepinfer/worker/worker.py:74 | <code>worker.py:74</code>}}, {{cite deepinfer/model_executor/layers/sampler.py:105 | <code>sampler.py:105</code>}}</td><td>copied into <code>self.load_nextn</code>, <code>self.nextn</code>, <code>self.max_MTP_value</code></td><td><code>3</code></td></tr>
+    <tr><td>Confidence-head temperature<br>{{cite deepinfer/environ.py:137-142 | <code>environ.py:137-142</code>}}</td><td>a list must have <code>nextn</code> values</td><td>for example <code>"1.0,0.9,0.8"</code></td></tr>
+  </tbody>
+</table>
+<p><strong>Step 3: the C++ scheduler reads it again.</strong> The C++ <code>Scheduler</code> does not get the Python value. Its constructor reads the process environment itself:</p>
+<x-code file="csrc/engine/utils.hpp" lines="36-40" />
+<p>The constructor stores <code>nextn = std::max(0, get_nextn_from_env())</code> ({{cite csrc/engine/scheduler.hpp:118}}). With the variable set to <code>3</code>, both sides get 3. The C++ comment asks to keep the unset default (5) equal in both places. After each step, Python gives the C++ function <code>process_MTPInfo</code> the flag <code>envs.DEEPINFER_USE_NEXTN_DECODE &gt; 0</code>, together with the draft token ids ({{cite deepinfer/engine/llm_engine.py:717-723}}).</p>
+<p><strong>Step 4: other processes.</strong> Context-parallel workers start as spawned processes ({{cite deepinfer/engine/llm_engine.py:389-395}}). Each one imports DeepInfer again and reads <code>3</code> from the environment that it got from the engine process.</p>
+<x-simplified>
+<p>The table shows the main uses only. The generator found 18 reads of this variable in <code>deepinfer/</code>, outside <code>environ.py</code>. Run <code>python3 tools/gen_env_vars.py --report</code> to see all of them.</p>
+</x-simplified>
+</x-deepdive>
+
+<x-deepdive title="EnvVar.__get__ in detail: lock, cache check and errors">
+<x-code file="deepinfer/environ.py" lines="44-57" highlight="45-48,53-55" />
+<ol>
+  <li><strong>Line 45.</strong> Each descriptor has its own <code>threading.Lock</code> (line 38). Two threads that read the same variable at the same time parse it only once.</li>
+  <li><strong>Lines 46-48.</strong> The thread that waited for the lock looks in <code>owner.__dict__</code>. If the first thread already stored the value, the entry is not the descriptor any more, and line 48 returns the stored value. Normal reads after the first one do not reach this code, because the class attribute is no longer a descriptor.</li>
+  <li><strong>Line 50.</strong> <code>os.getenv</code> returns <code>None</code> when the variable is not set. The parse function uses the default only for <code>None</code>. An empty text is a value: <code>DEEPINFER_NCCL_NUM_SMS=</code> calls <code>int("")</code> and raises <code>ValueError</code>.</li>
+  <li><strong>Lines 51-55.</strong> The error message gets the variable name in front. <code>raise ... from e</code> keeps the original traceback. If the exception class cannot take one text argument, the original exception is raised again.</li>
+  <li><strong>Line 56.</strong> <code>setattr</code> on the class stores the value for all readers in this process.</li>
+</ol>
+<p><strong>Why a non-data descriptor.</strong> <code>EnvVar</code> has <code>__get__</code> but no <code>__set__</code>. So <code>envs.X = 5</code> replaces the class attribute and does not call the descriptor. The code uses this for run-time changes (see <a href="#values-that-the-code-changes-at-run-time">Values that the code changes at run time</a>). <code>__slots__</code> on line 34 keeps each descriptor small: it has only <code>name</code>, <code>init</code> and <code>lock</code>.</p>
+<p><strong>Class, not instance.</strong> Nobody makes an instance of <code>envs</code>. All reads use the class, so <code>instance</code> is always <code>None</code> and <code>owner</code> is <code>envs</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Derived variables: values that read other variables">
+<p id="derived">Four definitions use their own parse function. Three of them read another variable, so the order of the first reads matters.</p>
+<x-code file="deepinfer/environ.py" lines="132-147" highlight="132,139-141,147" />
+<ul>
+  <li><strong><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></strong> is <code>max(_int(v), DEEPINFER_USE_NEXTN_DECODE + 1)</code>. Unset, with the default 5 draft tokens, it is <code>max(0, 6) = 6</code>. The value <code>1</code> that <code>examples/benchmark.py</code> sets is raised to 6 too ({{cite examples/benchmark.py:164}}). A comment in the YOCO script says the same ({{cite examples/yoco/yoco_equiv.py:473}}). So this variable can only make the rollback space larger.</li>
+  <li><strong><code>DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE</code></strong> is a decorated function, not an assignment. Without a comma, the result is one float. With commas, it is a tuple, and its length must equal <code>DEEPINFER_USE_NEXTN_DECODE</code>. With 5 draft tokens, <code>"1.0,1.0,0.9"</code> raises <code>ValueError: DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE: has 3 elements ('1.0,1.0,0.9') but DEEPINFER_USE_NEXTN_DECODE=5</code>. <code>ConfidenceHead</code> makes one temperature for each draft step and clamps each value to at least <code>SAMPLING_EPS</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:62-64}}).</li>
+  <li><strong><code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code></strong> is <code>_bool(v) or DEEPINFER_ACCELERATOR == "ascend"</code>. So on an Ascend build you cannot turn it off: Engram tables always go to device memory. On NVIDIA it is off by default, and the Engram parameters stay in CPU memory ({{cite deepinfer/model_executor/models/deepseek.py:473-477}}).</li>
+  <li><strong><code>DEEPINFER_GLOO_TIMEOUT</code></strong> parses a float number of seconds and makes <code>timedelta(seconds=...)</code>. The default 14400 seconds is 4 hours ({{cite deepinfer/environ.py:110}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Docstrings in environ.py, translated">
+<p>Seven variables have a docstring in Chinese under their definition. They are the only documentation in the file.</p>
+<x-code file="deepinfer/environ.py" lines="124-125">
+  <x-tr line="125">Unset means no limit on sum-K. When passed to the C++ Scheduler, DEFAULT_PREFILL_MAX_SUM_SEQLEN_K is used as a cap that is equal to no limit.</x-tr>
+</x-code>
+<x-code file="deepinfer/environ.py" lines="174-178">
+  <x-tr line="175-176">NORMAL engine prefill attempt interval (ALL point: the ranks do the prefill only if all of them have work; the logic is in scheduler.hpp _schedule). Each rank collects new prompts before the collective prefill.</x-tr>
+  <x-tr line="178">ANY fallback interval: if any rank has work, all ranks do a collective prefill. An isolated rank waits at most this many decode steps.</x-tr>
+</x-code>
+<x-code file="deepinfer/environ.py" lines="188-194">
+  <x-tr line="189-190">YoCo consumer prefill truncation mode: off turns it off; mask keeps all queries and only narrows the SWA visible range; compact really removes the queries of the truncated range, to reduce the compute of the consumer layers.</x-tr>
+  <x-tr line="192-194">The number of last query tokens that YoCo consumer prefill truncation keeps. For mask and compact, the SWA visible range is the intersection of the original sliding window and the rectangle of the last KEEP_TOKENS. It must satisfy KEEP_TOKENS &gt;= window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS. The default is 0; you must set it when truncation is on.</x-tr>
+</x-code>
+<x-code file="deepinfer/environ.py" lines="198-199">
+  <x-tr line="199">For debug: turns off the forbid_cuda_sync guard (the CPU-GPU synchronization check during model forward and sampling launch).</x-tr>
+</x-code>
+<p>The docstring for <code>DEEPINFER_USE_NEXTN_DECODE</code> (line 130) is in the first deep dive.</p>
+</x-deepdive>
+
+<x-deepdive title="Prefill vote points with real numbers (70 and 100)">
+<p>In a NORMAL engine with data parallelism, all DP ranks must do the same kind of step: all {{term prefill}} or all decode. The C++ scheduler counts decode steps in <code>decode_step</code>. A prefill step sets it back to 0. At some steps the ranks vote with an all-reduce:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="308-319" highlight="308-309,316,318" />
+<ol>
+  <li>Line 308: an ANY point is each multiple of <code>prefill_any_attempt_interval</code> (default 100), but not step 0.</li>
+  <li>Line 309: an ALL point is each multiple of <code>prefill_attempt_interval</code> (default 70), and also step 0.</li>
+  <li>Line 313: a rank "wants" prefill if its KV cache usage is at or below a watermark and a prefill request waits.</li>
+  <li>Line 316: at an ANY point, one rank that wants prefill is enough. When a step is both an ANY and an ALL point, the ANY rule applies ({{cite csrc/engine/scheduler.hpp:303}}).</li>
+  <li>Line 318: at an ALL point, every rank must want prefill.</li>
+</ol>
+<p>Use the defaults, with no prefill in between. Then the ranks vote at these decode steps: 0 (ALL), 70 (ALL), 100 (ANY), 140 (ALL), 200 (ANY), 210 (ALL), 280 (ALL), 300 (ANY) ... 700 (ANY, also an ALL point). So if only one rank has a request in its queue, that request waits at most 100 decode steps.</p>
+<x-warning title="Set the interval variables before deepinfer.config is imported">
+<p>Both values are default arguments of <code>SchedulerConfig.__init__</code> ({{cite deepinfer/config.py:193-194}}). Python computes them when it imports <code>deepinfer.config</code>. A value that you set after that import has no effect, and <code>rearm</code> does not help. Both must be at least 1 ({{cite deepinfer/config.py:213-216}}, {{cite csrc/engine/scheduler.hpp:105-108}}).</p>
+</x-warning>
+</x-deepdive>
+
+<x-deepdive title="CUDA graph batch sizes with real numbers">
+<p>A CUDA graph records the kernels of one decode step for one batch size. The engine pads each batch to the next captured size. <code>build_graph_batch_sizes</code> chooses the sizes:</p>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="41-51" />
+<ul>
+  <li>Offline example: <code>max_num_seqs = 4</code> ({{cite examples/offline_inference.py:54}}) and 5 draft tokens give a maximum of <code>4 * 6 = 24</code>. With the default interval 8: <code>[1, 2, 4, 8, 16, 24]</code>.</li>
+  <li>Benchmark: it sets the interval to 32 ({{cite examples/benchmark.py:169}}). Assume a maximum of 384, for example 64 sequences with 5 draft tokens. Then the 17 sizes are 1, 2, 4, 8, 16, 32, 64, ..., 352, 384.</li>
+  <li>DFlash graphs use <code>DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL</code> with the maximum <code>max_num_seqs</code> ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:36}}).</li>
+</ul>
+<p>A smaller interval makes more graphs. Each graph costs capture time and memory, but it gives less padding. <code>DEEPINFER_ENFORCE_EAGER=1</code> makes no graphs. The PROMPT engine never uses graphs ({{cite deepinfer/worker/model_runner.py:73}}).</p>
+</x-deepdive>
+
+<x-deepdive title="EPLB variables together, with real numbers">
+<p>Five variables control expert load balancing (EPLB). The example scripts set them as a group ({{cite examples/_config.py:77-83}}):</p>
+<pre><code class="language-bash">DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS=32           # setdefault, if set_override_experts
+DEEPINFER_EXPERT_COUNT_WINDOW_SIZE=3              # always
+DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL=30   # only with EPLB on
+DEEPINFER_REARRANGE_AFTER_PREFILL_IN_NORMAL_ENGINE=1   # only with EPLB on</code></pre>
+<ol>
+  <li><strong>Redundant experts.</strong> <code>resolve_num_extra_experts</code> adds padding so that routed plus extra experts divide by the EP size ({{cite deepinfer/model_executor/eplb/__init__.py:21-28}}). Assume 256 routed experts (a number for this example only), 32 extra and EP size 24: <code>-(256 + 32) % 24 = 0</code>, so 32 stays. With EP size 20: <code>-(288) % 20 = 12</code>, so the loader uses 44 and logs a warning ({{cite deepinfer/model_executor/model_loader.py:95-99}}).</li>
+  <li><strong>Window.</strong> The balancer keeps a ring of the last 3 steps of token counts, as an int tensor <code>[window, num_moe_layers, num_local_physical_experts]</code> ({{cite deepinfer/model_executor/eplb/__init__.py:113-119}}). The default 100 needs more memory, which is why the examples use 3.</li>
+  <li><strong>Interval.</strong> With interval 30, the step counter starts at <code>30 - max(1, 30 // 4) = 23</code>. So the first rearrangement comes after 7 steps, then one every 30 steps ({{cite deepinfer/model_executor/eplb/__init__.py:121-123}}, {{cite deepinfer/model_executor/eplb/__init__.py:161-165}}). The window (3) must be between 1 and the interval (30), or the constructor raises <code>ValueError</code> ({{cite deepinfer/model_executor/eplb/__init__.py:106-111}}).</li>
+  <li><strong>After prefill.</strong> In a NORMAL engine, a prefill step sets the counter to <code>interval - 1</code>. The next decode step reaches the interval and rearranges ({{cite deepinfer/model_executor/eplb/__init__.py:156-159}}).</li>
+  <li><strong>Statistics.</strong> Independent of rearrangement, every 128 steps (<code>DEEPINFER_MOE_LB_STAT_INTERVAL</code>) the EP ranks all-gather an int64 tensor <code>[ep_size, 128, num_moe_layers]</code> and compute mean and maximum tokens per rank ({{cite deepinfer/model_executor/eplb/__init__.py:181-193}}).</li>
+</ol>
+<p>With an EP size of 1, <code>step()</code> returns at once, and none of this runs ({{cite deepinfer/model_executor/eplb/__init__.py:133-134}}). See {{link concepts/eplb}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Automatic SM count for DeepEP (DEEPINFER_USERBUFFER_COMM_SMS=0)">
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="85-94" highlight="86-90" />
+<p>With the default 0, the code asks DeepEP for a theoretical SM count. It keeps <code>min(32, device_sms // 4)</code> SMs free for compute, and takes the smaller value. For example, on a device with 148 SMs, <code>compute_num_sms = min(32, 37) = 32</code>, so DeepEP gets at most 116 SMs. Line 90 writes the result into <code>envs</code>. Later dispatch and combine calls read it from there ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:471}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:504}}). Only <code>envs</code> changes, not <code>os.environ</code>.</p>
+<p>The shared-expert MLP runs inside <code>limit_num_sms(envs.DEEPINFER_USERBUFFER_COMM_SMS, enabled=PLATFORM.is_gpu)</code> while combine runs ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:600-603}}). This site does not explain the inside of DeepEP.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="&quot;off&quot; means on">
+<p>A <code>bool</code> variable is <code>False</code> only for <code>0</code>, an empty text, <code>false</code> and <code>False</code> ({{cite deepinfer/environ.py:12-13}}). <code>DEEPINFER_BATCH_INVARIANT=off</code> or <code>=no</code> turns the feature <em>on</em>. Use <code>0</code> and <code>1</code>.</p>
+</x-warning>
+<ul>
+  <li><strong>The value is set too late.</strong> After the first read, a process ignores changes to <code>os.environ</code> ({{cite deepinfer/environ.py:56}}). For import-time reads, the module import is the first read. No error tells you this. Set variables before <code>import deepinfer</code>.</li>
+  <li><strong>Empty text for a number.</strong> <code>export DEEPINFER_NCCL_NUM_SMS=</code> gives <code>ValueError</code>, not the default, because only an unset variable uses the default ({{cite deepinfer/environ.py:16-17}}). Use <code>unset</code> to go back to the default.</li>
+  <li><strong>Wrong case for a choice.</strong> <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=Compact</code> raises <code>ValueError: ... 'Compact', must be one of ('off', 'mask', 'compact')</code> ({{cite deepinfer/environ.py:90-91}}).</li>
+  <li><strong>YOCO keep tokens too small.</strong> With truncation on, <code>KEEP_TOKENS</code> must be above 0 and at least <code>window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS</code>. Otherwise an <code>AssertionError</code> stops start-up ({{cite deepinfer/model_executor/model_metadata_utils.py:92}}, {{cite deepinfer/worker/model_runner.py:110-113}}).</li>
+  <li><strong>Temperature list with the wrong length.</strong> The list for <code>DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE</code> must have <code>DEEPINFER_USE_NEXTN_DECODE</code> values ({{cite deepinfer/environ.py:140-141}}).</li>
+  <li><strong>EPLB window larger than the interval.</strong> With rearrangement on, <code>DEEPINFER_EXPERT_COUNT_WINDOW_SIZE</code> must be from 1 to the interval. The default window 100 with an interval of 30 raises <code>ValueError</code> ({{cite deepinfer/model_executor/eplb/__init__.py:106-111}}).</li>
+  <li><strong>A change in Python only.</strong> <code>envs.X = value</code> does not change <code>os.environ</code>. The C++ scheduler reads <code>DEEPINFER_USE_NEXTN_DECODE</code> from the environment ({{cite csrc/engine/scheduler.hpp:118}}). Spawned workers also read the environment. Change the environment, not <code>envs</code>, if other processes or C++ must see the value.</li>
+  <li><strong><code>CUDA_VISIBLE_DEVICES</code> not set.</strong> The engine reads it with <code>os.environ[...]</code> and stops with <code>KeyError</code> ({{cite deepinfer/engine/llm_engine.py:188}}). The example scripts set it for you ({{cite examples/_config.py:55-63}}).</li>
+  <li><strong>Cached results in tests.</strong> <code>get_inference_compress_block_size</code> has an <code>lru_cache</code>. After you change <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code>, call <code>clear_compress_block_size_cache()</code> ({{cite deepinfer/worker/cache_engine.py:130-138}}).</li>
+  <li><strong>Docs and code differ.</strong> <code>examples/README.md</code> says that <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code> defaults to 32 ({{cite examples/README.md:63}}). The default in <code>environ.py</code> is 0 ({{cite deepinfer/environ.py:114}}). The value 32 comes from the example scripts, only when the caller passes <code>set_override_experts=True</code> ({{cite examples/_config.py:77-79}}). <code>benchmark.py</code> always passes <code>True</code> ({{cite examples/benchmark.py:161}}). <code>offline_inference.py</code> passes <code>True</code> only with EPLB on ({{cite examples/offline_inference.py:35-40}}). In your own code, the default is 0 redundant experts.</li>
+</ul>
+<p><strong>Why it matters.</strong> A wrong variable rarely gives an error. It changes speed, memory or results without a message. When a run behaves in an unexpected way, print the values that the process really uses: <code>{k: getattr(envs, k) for k in environ._descriptors}</code>. This forces the first read of every variable in that process, so do it after the start-up code has set the environment.</p>
+
+<x-quiz>
+  <x-q level="easy">You run <code>DEEPINFER_ENFORCE_EAGER=false python3 my_script.py</code>. Does DeepInfer capture CUDA graphs? And with <code>DEEPINFER_ENFORCE_EAGER=no</code>?
+    <x-a><p>Assume a NORMAL engine (the PROMPT engine never captures graphs). With <code>false</code>: yes, it captures graphs. <code>"false"</code> is one of the four false texts. With <code>no</code>: no graphs. <code>_bool</code> treats every other text as true, so eager mode is on ({{cite deepinfer/environ.py:12-13}}, {{cite deepinfer/worker/model_runner.py:73}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What is the default of <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> in <code>environ.py</code>? Is ZOS on when you make an <code>LLM</code> with the default engine type and you set nothing?
+    <x-a><p>The default in <code>environ.py</code> is <code>False</code> ({{cite deepinfer/environ.py:179}}). But <code>EngineArgs.__post_init__</code> calls <code>os.environ.setdefault("DEEPINFER_ZERO_OVERHEAD_SCHEDULING", "1")</code> for NORMAL and COMPLETION engines and then <code>rearm</code> ({{cite deepinfer/engine/arg_utils.py:51-55}}). The default engine type is NORMAL ({{cite deepinfer/engine/arg_utils.py:41}}), so ZOS is on.</p></x-a>
+  </x-q>
+  <x-q level="medium">A script imports <code>deepinfer.config</code>, then sets <code>os.environ["DEEPINFER_PREFILL_ATTEMPT_INTERVAL"] = "10"</code> and calls <code>environ.rearm("DEEPINFER_PREFILL_ATTEMPT_INTERVAL")</code>. Which interval does a new <code>SchedulerConfig</code> get?
+    <x-a><p>Still 70. The value is a default argument of <code>SchedulerConfig.__init__</code> ({{cite deepinfer/config.py:193}}). Python computed it when it imported <code>deepinfer.config</code>. <code>rearm</code> puts the descriptor back into <code>envs</code>, but the function keeps its own copy of 70. Pass <code>prefill_attempt_interval=10</code> explicitly, or set the variable before the import.</p></x-a>
+  </x-q>
+  <x-q level="hard">You set nothing, and the model uses the default 5 draft tokens. What is <code>envs.DEEPINFER_MAX_BACKTRACKING_TOKENS</code>? Then you export <code>DEEPINFER_USE_NEXTN_DECODE=0</code> and <code>DEEPINFER_MAX_BACKTRACKING_TOKENS=1</code>. What is it now, and which state ring gets smaller?
+    <x-a><p>With nothing set: <code>max(0, 5 + 1) = 6</code> ({{cite deepinfer/environ.py:132}}). In the second case: <code>max(1, 0 + 1) = 1</code>. The sliding-window block becomes <code>window_size + 1</code> instead of <code>window_size + 6</code> ({{cite deepinfer/worker/cache_engine.py:93}}). The compression ring becomes <code>compress_ratio + 0</code> instead of <code>compress_ratio + 5</code> ({{cite deepinfer/worker/cache_engine.py:133}}). The C++ scheduler also reads 0 from the environment and makes no drafts ({{cite csrc/engine/scheduler.hpp:118}}).</p></x-a>
+  </x-q>
+</x-quiz>

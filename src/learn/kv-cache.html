@@ -1,0 +1,316 @@
+---
+title: The KV cache
+level: Beginner
+prerequisites: learn/attention, learn/prefill-decode
+related: concepts/paged-kv-cache, concepts/scheduler, concepts/kv-compression, concepts/sliding-window-attention, concepts/mla-attention, tours/startup, code/block-manager-hpp, code/cache-engine
+summary: The KV cache keeps the keys and values of earlier tokens, so each new token needs only its own keys and values. DeepInfer stores the cache in blocks of 128 tokens.
+scripts: viz/kv_allocator.js
+---
+<x-sentence>The KV cache keeps the keys and values of earlier tokens in device memory, so the model computes them only once for each token.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Why keep keys and values?</h3>
+<p>An {{term llm | LLM}} writes text one {{term token}} at a time. For each new token, every {{term attention}} layer compares the <em>query</em> of the new token with the <em>keys</em> of all earlier tokens. Then it mixes the <em>values</em> of those tokens ({{term query-key-value}}). The page {{link learn/attention}} shows this step by step.</p>
+<p>The keys and values of an earlier token never change. A token looks only at itself and at the tokens before it, so a later token cannot change them. Thus the model can compute them once and keep them. The device memory that keeps them is the {{term kv-cache}}.</p>
+<ul>
+  <li><strong>Without a cache</strong>, the model must compute the keys and values of the whole text again for each new token.</li>
+  <li><strong>With a cache</strong>, the model computes keys and values only for the new token. It reads the old ones from memory and adds the new ones at the end.</li>
+</ul>
+<p>The {{term prefill}} step fills the cache for all prompt tokens. Each {{term decode}} step then adds one token. The page {{link learn/prefill-decode}} explains the two phases.</p>
+
+<h3>A worked example</h3>
+<p>Take a prompt of 3 tokens, and let the model write 5 new tokens. The table counts how many key and value rows one layer computes in each step.</p>
+<table>
+  <thead><tr><th>Step</th><th>Tokens in the text</th><th>Rows computed, no cache</th><th>Rows computed, with cache</th></tr></thead>
+  <tbody>
+    <tr><td>prefill (writes token 4)</td><td>3</td><td>3</td><td>3</td></tr>
+    <tr><td>decode 1 (writes token 5)</td><td>4</td><td>4</td><td>1</td></tr>
+    <tr><td>decode 2 (writes token 6)</td><td>5</td><td>5</td><td>1</td></tr>
+    <tr><td>decode 3 (writes token 7)</td><td>6</td><td>6</td><td>1</td></tr>
+    <tr><td>decode 4 (writes token 8)</td><td>7</td><td>7</td><td>1</td></tr>
+    <tr><td><strong>Total</strong></td><td></td><td><strong>25</strong></td><td><strong>7</strong></td></tr>
+  </tbody>
+</table>
+<p>For a prompt of <em>p</em> tokens and <em>n</em> new tokens, the totals are:</p>
+<pre><code class="language-none">no cache:    n·p + n·(n − 1)/2
+with cache:  p + (n − 1)
+
+p = n = 1,000:
+no cache:    1,499,500 rows
+with cache:      1,999 rows</code></pre>
+<p>That is about 750 times less work for the keys and values, in every layer. The work without a cache grows with the square of the length.</p>
+<p><strong>What the cache holds.</strong> Here is one layer and one head, with vectors of 2 numbers. The prompt is "The cat sat". The next token is "on", and its query is q = (1, 2). The score of a row is q·k.</p>
+<table>
+  <thead><tr><th>Cache row</th><th>Token</th><th>Key</th><th>Value</th><th>Score q·k</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The</td><td><code>(1, 0)</code></td><td><code>(2, 0)</code></td><td>1·1 + 2·0 = 1</td></tr>
+    <tr><td>2</td><td>cat</td><td><code>(0, 1)</code></td><td><code>(0, 2)</code></td><td>1·0 + 2·1 = 2</td></tr>
+    <tr><td>3</td><td>sat</td><td><code>(1, 1)</code></td><td><code>(1, 1)</code></td><td>1·1 + 2·1 = 3</td></tr>
+    <tr><td>4 (new)</td><td>on</td><td><code>(2, 1)</code></td><td><code>(0, 3)</code></td><td>1·2 + 2·1 = 4</td></tr>
+  </tbody>
+</table>
+<p>In the decode step for "on", the model computes only row 4. It reads rows 1 to 3 from the cache. Softmax turns the four scores into weights, and the weights mix the four values. Rows 1 to 3 stay the same in every later step.</p>
+<x-simplified><p>The numbers are made up, and a real head has 64 to 512 numbers per vector. A real model also scales the scores before softmax. The page {{link learn/attention}} shows the full calculation.</p></x-simplified>
+
+<h3>An everyday comparison</h3>
+<p>Think of a long meeting with a secretary who writes the minutes. Before each new speaker talks, the speaker reads the minutes. Nobody repeats what they said before. The secretary only adds the new speech at the end. The minutes are the KV cache.</p>
+<p>The comparison stops here: minutes are a summary, but the KV cache is not. It keeps one entry for every token, in every layer. So it grows with the text, and each step still reads all of it.</p>
+
+<h3>How much memory does it use?</h3>
+<p>For standard multi-head attention, one layer stores one key and one value for each token and each {{term attention-head | KV head}}:</p>
+<pre><code class="language-none">bytes per token per layer = 2 × n_kv_heads × head_dim × bytes_per_number
+bytes for one sequence    = bytes per token per layer × n_layers × n_tokens</code></pre>
+<p>The 2 counts one key and one value. Here is a worked example for a generic model, <strong>not DeepInfer</strong>: 32 layers, 32 KV heads, <code>head_dim</code> 128, BF16 numbers (2 bytes).</p>
+<ol>
+  <li>One token, one layer: 2 × 32 × 128 × 2 = 16,384 bytes = 16 KiB.</li>
+  <li>One token, 32 layers: 16 KiB × 32 = 512 KiB.</li>
+  <li>One sequence of 4,096 tokens: 512 KiB × 4,096 = 2 GiB.</li>
+  <li>64 such sequences: 128 GiB. That is more than the memory of one 80 GB GPU.</li>
+</ol>
+<p>So device memory, not compute, often limits how many sequences can run at the same time. This is why engines save cache memory in many ways.</p>
+<x-note title="DeepInfer stores much less per token">
+<p>DeepInfer's model has one KV head ({{cite deepinfer/worker/cache_engine.py:624}}). It stores one entry of 512 numbers for each token, or for each 2 tokens, per layer. One entry takes 528 bytes in 8-bit format or 288 bytes in 4-bit format ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-128}}). See the deep dive and {{link concepts/kv-compression}}.</p>
+</x-note>
+
+<h3>Blocks and block tables</h3>
+<p>The engine does not know how long a sequence becomes. One simple plan is to reserve the maximum length for each sequence. But most sequences are shorter, so most of the reserved memory stays empty.</p>
+<p>A {{term paged-kv-cache}} solves this. It splits the cache memory into {{term kv-block | blocks}} of a fixed number of tokens. A sequence gets one block at a time, when it needs one. The block can be anywhere in the pool. A {{term block-table}} per sequence records which physical block holds which part of the sequence:</p>
+<pre><code class="language-none">logical block = position // block_size
+offset        = position %  block_size
+slot          = block_table[logical block] × block_size + offset</code></pre>
+<p>This gives two advantages:</p>
+<ul>
+  <li>Only the last block of a sequence can be partly empty. The waste is less than one block per sequence. This waste is called internal {{term fragmentation}}.</li>
+  <li>Any free block fits any sequence. So there are no free gaps that are too small to use.</li>
+</ul>
+<p>Operating systems use the same idea for virtual memory: a page table maps virtual pages to physical pages.</p>
+
+<h3>When the blocks run out: preemption</h3>
+<p>In each decode step, a sequence with a full last block needs one new block. If the pool has no free block, the scheduler must take blocks away from a running sequence. This is {{term preemption}}. The engine then has two choices for that sequence:</p>
+<ul>
+  <li><strong>Stop it.</strong> The request ends early, with an error reason.</li>
+  <li><strong>Recompute it later.</strong> The sequence goes back to the waiting queue. Later, a new prefill computes the keys and values of all its tokens again. The output stays correct, but the request takes more time.</li>
+</ul>
+<p>DeepInfer can do both. A configuration flag selects the behavior. The deep dive below shows which sequence DeepInfer selects, and the defaults.</p>
+
+<h2>The picture</h2>
+<x-diagram name="kv_paged_blocks" alt="Panel 1: sequence A has 10 tokens in three logical blocks; its block table maps them to physical blocks 5, 2 and 9. Sequence B has 6 tokens mapped to blocks 7 and 3. Block 0 is reserved; six other blocks are free. Panel 2: token position 10 goes to logical block 2, offset 2, which is physical block 9, slot 38; token 12 needs a new block, the first free block 1. Panel 3: a reservation of 16 tokens per sequence wastes 16 of 32 slots; blocks of 4 tokens waste only 4 slots and leave 3 blocks free." caption="A paged KV cache with toy numbers: 4 tokens per block and 12 blocks. DeepInfer uses 128 tokens per block. Click the diagram to zoom." />
+<p>Read panel 1 from left to right. The sequence sees its tokens in order. The block table sends each logical block to a physical block. Panel 2 shows the address rule for one new token. Panel 3 shows why blocks waste less memory than a fixed reservation.</p>
+
+<h3 id="try-it">Try it: a block allocator</h3>
+<p>The simulator below has a pool of 24 blocks of 4 tokens. Each colour is one request. Use it to see blocks fill up, see a request get a block from anywhere in the pool, and see preemption.</p>
+<x-viz id="kv-allocator" title="Paged KV cache: block allocator" caption="Keyboard: Tab to a button, then press Enter or Space. The same seed gives the same requests each time; Reset starts again." />
+<p>Things to try:</p>
+<ol>
+  <li>Click <em>Add request</em> four times. Each request gets all blocks for its prompt at once.</li>
+  <li>Click <em>Decode step</em> several times. A request gets a new block only when its last block is full.</li>
+  <li>Click <em>Finish oldest</em>. Its blocks go to the end of the free list. Add a new request and see where its blocks are.</li>
+  <li>Add requests and decode until the pool is full. Watch which request the scheduler preempts.</li>
+</ol>
+<x-simplified>
+<p>The simulator copies these DeepInfer rules:</p>
+<ul>
+  <li>Block 0 is never used.</li>
+  <li>A new block comes from the front of the free list. Freed blocks go to the back.</li>
+  <li>A prefill reserves all blocks of the prompt at once.</li>
+  <li>A new prefill starts only when cache usage is 90 % or less.</li>
+  <li>The preemption rule is the rule of the code (deep dive "Preemption in DeepInfer"). The toggle selects recompute or stop.</li>
+</ul>
+<p>The simulator leaves out: speculative (draft) tokens, in-flight tokens of zero-overhead scheduling, state slots, shared prefix blocks, the limits on batch size, and data parallelism. In DeepInfer a step is a prefill step or a decode step. In the toy, waiting requests start when you add or finish a request, and at the start of each decode step.</p>
+</x-simplified>
+
+<h2>In the code</h2>
+<p>This is a basics page, so this part is short. The pages {{link concepts/paged-kv-cache}} and {{link concepts/scheduler}} go further.</p>
+
+<h3>Step 1: one block holds 128 tokens</h3>
+<p>The block size is fixed in the model metadata. It is not a command-line choice:</p>
+<x-code file="deepinfer/model_executor/model_metadata_utils.py" lines="133-140" highlight="135" caption="<code>resolved_tokens_per_block</code> is always 128. The engine argument <code>tokens_per_block</code> (default <code>-1</code>) must be -1 or 128 ({{cite deepinfer/engine/arg_utils.py:84-86}})." />
+<p>The deployment notes use the same number: the prefix-cache hit length is "a multiple of the 128-token block size" ({{cite doc/inference_deployment_qa.md:191}}).</p>
+
+<h3>Step 2: the BlockManager hands out blocks</h3>
+<p>The C++ {{term block-manager}} keeps the free blocks in a linked list. <code>allocate()</code> takes the first free block. <code>free()</code> puts a block back when no sequence uses it:</p>
+<x-code file="csrc/engine/block_manager.hpp" lines="80-103" highlight="82-86,95-102" />
+<p>Each {{term sequence}} keeps its block table as a <code>std::vector&lt;int&gt;</code> ({{cite csrc/engine/sequence.hpp:200-207}}). The number of blocks that a sequence needs is a round-up division by the block size ({{cite csrc/engine/sequence.hpp:291-293}}).</p>
+
+<h3>Step 3: the cache has several parts</h3>
+<p><code>CacheEngine</code> allocates the memory. Then it gives each attention layer a <code>KVCache</code> object with views into that memory:</p>
+<x-code file="deepinfer/worker/cache_engine.py" lines="205-218" />
+<ul>
+  <li><code>ca_cache</code>: the main compressed cache. It is paged: one row per block.</li>
+  <li><code>ica_cache</code>: the keys of the indexer, for sparse layers. It is paged in the same blocks.</li>
+  <li><code>swa_cache</code>: the {{term sliding-window-attention}} cache. It is <em>not</em> paged. Each sequence has a fixed ring of recent tokens in its {{term state-slot}}.</li>
+  <li><code>ca_state</code> and <code>ica_state</code>: per-sequence float32 state for compression with ratio 2. It is also in the state slot.</li>
+</ul>
+<p>So DeepInfer has two pools: paged KV blocks, and one state slot per running sequence. It makes one <code>BlockManager</code> for each pool ({{cite deepinfer/engine/llm_engine.py:265-266}}).</p>
+
+<h3>Step 4: the cache size comes from a memory profile</h3>
+<p>At start-up, each rank runs the model once on dummy inputs and measures the peak memory. The rest of the memory budget becomes KV blocks:</p>
+<x-code file="deepinfer/worker/base.py" lines="234-246" highlight="235,243-245">
+<x-tr line="241">Subtract the reserved state cache, which has a fixed size.</x-tr>
+<x-tr line="243">State store and copy buffer, so it needs twice the size.</x-tr>
+</x-code>
+<p>The {{term memory-profiling}} step and the full start-up order are in {{link tours/startup}}.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail for DeepInfer. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Memory per token: the formulas with DeepInfer numbers">
+<p><strong>Standard attention.</strong> <code>2 × n_kv_heads × head_dim × bytes</code> per token and layer (section "How much memory does it use?").</p>
+<p><strong>DeepInfer.</strong> The cache code checks <code>num_key_value_heads == 1</code> ({{cite deepinfer/worker/cache_engine.py:624}}). Each entry of the main cache holds <code>kv_lora_rank + qk_rope_head_dim</code> numbers, and the code asserts that this sum is 512 ({{cite deepinfer/worker/cache_engine.py:46-56}}). The entry is stored as <code>[data | scales]</code>:</p>
+<table>
+  <thead><tr><th>Format</th><th>Data</th><th>Scales</th><th>Bytes per entry</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>V41_FORMAT</code> (MXFP8, main and SWA)</td><td>512 × FP8 e4m3 = 512 B</td><td>16 × UE8M0, one per 32 numbers = 16 B</td><td><strong>528</strong></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-118}}</td></tr>
+    <tr><td><code>V41_FP4_FORMAT</code> (main, if <code>use_fp4_sparse_kv</code>)</td><td>512 × FP4 e2m1 = 256 B</td><td>32 × E4M3, one per 16 numbers = 32 B</td><td><strong>288</strong></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:119-128}}</td></tr>
+  </tbody>
+</table>
+<p>The choice between the two main formats comes from the model config ({{cite deepinfer/model_executor/model_metadata_utils.py:37-39}}). The SWA cache always uses 528 bytes ({{cite deepinfer/worker/cache_engine.py:261-263}}).</p>
+<p><strong>Compression ratio.</strong> A layer with <code>kv_compress_ratio</code> <em>n</em> stores one entry for every <em>n</em> tokens. Only <em>n</em> = 1 and 2 are allowed; C4 and C128 were removed ({{cite deepinfer/model_executor/model_metadata_utils.py:51-53}}). So one block has <code>128 // n</code> entries per layer ({{cite deepinfer/worker/cache_engine.py:452-453}}):</p>
+<table>
+  <thead><tr><th>Layer kind</th><th>Entries per block</th><th>Bytes per block (MXFP8)</th><th>Bytes per token</th></tr></thead>
+  <tbody>
+    <tr><td>C1 (ratio 1)</td><td>128</td><td>128 × 528 = 67,584</td><td>528</td></tr>
+    <tr><td>C2 (ratio 2)</td><td>64</td><td>64 × 528 = 33,792</td><td>264</td></tr>
+    <tr><td>SWA-only (ratio 0)</td><td>0</td><td>0 (cache is in the state slot)</td><td>0 in blocks</td></tr>
+  </tbody>
+</table>
+<p>Compare 528 bytes per token and layer with 16,384 bytes in the generic example: about 31 times less.</p>
+<p><strong>Indexer keys.</strong> A sparse layer (<code>index_topk &gt; 0</code>) also stores FP4 indexer keys: <code>index_head_dim / 2 + index_head_dim / 32</code> bytes per entry, with the same <code>128 // n</code> entries per block ({{cite deepinfer/worker/cache_engine.py:73-80}}, {{cite deepinfer/worker/cache_engine.py:428-439}}). A layer can reuse the indexer keys or the main cache of an earlier layer. Then it adds no bytes ({{cite deepinfer/worker/cache_engine.py:429-431}}, {{cite deepinfer/worker/cache_engine.py:448-449}}); see {{link concepts/cross-layer-kv-sharing}}.</p>
+<p><strong>Sliding-window ring.</strong> Per sequence and SWA layer: <code>(window + backtracking) × 528</code> bytes, a fixed size, padded to 32 bytes ({{cite deepinfer/worker/cache_engine.py:88-93}}, {{cite deepinfer/worker/cache_engine.py:274-275}}). The backtracking value is at least <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> = 6 ({{cite deepinfer/environ.py:129-132}}). If <code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code> is on (default off), the ring in the state slot is longer by <code>DEEPINFER_PREFILL_STORE_EXTRA_SIZE</code> tokens, default 128 ({{cite deepinfer/worker/cache_engine.py:101-110}}). The deployment notes give 134 = 128 (window) + 6 (backtracking) ({{cite doc/inference_deployment_qa.md:191}}), and the stored total: 20 layers × 134 tokens × 528 B = 1,415,040 B per sequence ({{cite doc/inference_deployment_qa.md:169}}).</p>
+<x-diagram name="kv_deepinfer_layout" alt="Panel 1: one row of gpu_blocks holds a byte range for each layer: C1 layers 128 entries of 528 bytes, C2 layers 64 entries plus optional FP4 indexer keys, SWA-only layers nothing; the row is padded to a multiple of lcm(128, 528) = 4,224 bytes. Panel 2: one row of gpu_states holds the stored SWA rings (134 tokens of 528 bytes per layer), the dropped YOCO consumer SWA rings, and fp32 compression state; there are int(max_num_seqs × 1.2) + 1 slots." caption="DeepInfer's two cache buffers. Blue, violet: paged per block. Green, amber: one fixed slot per sequence." />
+</x-deepdive>
+
+<x-deepdive title="From token position to byte: the slot mapping">
+<p>Before each step, C++ code computes for each new token where the kernels must write its cache entry. For compressed layers:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="41-61" highlight="42,58,60" />
+<ol>
+  <li>Line 42: <code>compressed_block_size = block_size / n</code>, the entries per block (128 or 64).</li>
+  <li>Line 58: in a prefill, entry index <em>j</em> runs over the new compressed entries. Entry <em>j</em> covers tokens <code>j·n</code> to <code>j·n + n − 1</code>.</li>
+  <li>Line 60: <code>slot = block_table[j / compressed_block_size] × compressed_block_size + j % compressed_block_size</code>. This is the rule from "Blocks and block tables", in units of entries.</li>
+</ol>
+<p>In a decode step, a C2 layer writes a new entry only when <code>(position + 1) % n == 0</code>. Then the 2-token group is complete. Other tokens get slot <code>-1</code> (no write) ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:80-91}}).</p>
+<p><strong>Worked example.</strong> Position 1,000 in a C2 layer, with <code>block_table[7] = 42</code>:</p>
+<ol>
+  <li>(1,000 + 1) % 2 = 1, so a decode step writes nothing for this token. Position 1,001 completes the group.</li>
+  <li>Entry index: 1,001 // 2 = 500. Entries per block: 128 / 2 = 64.</li>
+  <li>Logical block: 500 // 64 = 7. Offset: 500 % 64 = 52.</li>
+  <li>Slot: 42 × 64 + 52 = 2,740. The row is <code>ca_cache[42, 52]</code>.</li>
+</ol>
+<p><strong>Sliding-window ring.</strong> The SWA slot uses the state slot, not the block table:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="98-108" highlight="104" />
+<p>Example: <code>state_id</code> 3, ring size 134, position 1,000: 3 × 134 + (1,000 % 134) = 402 + 62 = 464. Line 103 writes only the last 134 tokens of a long prefill. Older tokens fall out of the window, so the code does not write them.</p>
+<p><strong>How many blocks.</strong> <code>get_num_blocks()</code> is <code>ceil((len + in-flight tokens + draft tokens) / 128)</code> ({{cite csrc/engine/sequence.hpp:291-293}}). A prompt of 1,000 tokens with 5 draft tokens needs ceil(1,005 / 128) = 8 blocks: 1,024 token positions, 19 of them empty.</p>
+</x-deepdive>
+
+<x-deepdive title="The BlockManager, line by line">
+<p>The free list is a doubly linked list inside a <code>std::vector</code>. Index 0 is the "no block" marker, so block 0 is never given out:</p>
+<x-code file="csrc/engine/block_manager.hpp" lines="27-35" highlight="27-28">
+<x-tr line="27">NOTE: GPU block 0 is not used, so 0 here means "empty".</x-tr>
+<x-tr line="29">"Too few GPU blocks: ".</x-tr>
+</x-code>
+<ul>
+  <li><strong>Usable blocks</strong> = <code>num_gpu_blocks − 1</code>. The stats logger also subtracts 1 ({{cite deepinfer/engine/stats_logger.py:410}}).</li>
+  <li><strong>Order.</strong> <code>allocate()</code> pops the head; <code>free()</code> pushes the block to the tail (lines 82-103 above). <code>free_blocks_nolock</code> frees the block table in reverse order ({{cite csrc/engine/block_manager.hpp:147-149}}). So the first block of the table goes to the very back of the free list.</li>
+  <li><strong>Reference counts.</strong> A block can belong to more than one sequence. A forked sequence pins the blocks of its parent: <code>ref_count</code> goes up ({{cite csrc/engine/block_manager.hpp:88-93}}, {{cite csrc/engine/scheduler.hpp:1108-1114}}). A block goes back to the free list only at <code>ref_count == 0</code>.</li>
+  <li><strong>Can it fit?</strong> <code>can_allocate_nolock(n)</code> returns <code>NEVER</code> if <code>n &gt;= num_blocks</code>, <code>OK</code> if enough blocks are free, else <code>LATER</code> ({{cite csrc/engine/block_manager.hpp:128-136}}).</li>
+  <li><strong>Two managers.</strong> The engine makes one <code>BlockManager</code> for KV blocks and one for state slots ({{cite deepinfer/engine/llm_engine.py:265-266}}). A sequence needs a block budget <em>and</em> a free state slot: if the slot pool is empty, the block check also gives <code>LATER</code> ({{cite csrc/engine/scheduler.hpp:194-201}}).</li>
+  <li><strong>Locks.</strong> <code>BlockManagerMutexAcquire</code> locks the state manager first, then the block manager, and unlocks in the opposite order ({{cite csrc/engine/block_manager.hpp:189-204}}).</li>
+</ul>
+<p><strong>When does a sequence get blocks?</strong></p>
+<ol>
+  <li>Prefill: the first chunk of a prompt reserves blocks for the <em>whole</em> sequence at once with <code>allocate_seq</code> ({{cite csrc/engine/scheduler.hpp:516-520}}, {{cite csrc/engine/block_manager.hpp:207-214}}).</li>
+  <li>Decode: <code>_append_slot</code> adds one block when <code>get_num_blocks()</code> grows. It frees extra blocks when the count goes down, for example when the number of draft tokens goes down ({{cite csrc/engine/scheduler.hpp:816-828}}).</li>
+  <li>End: <code>finalize_seq</code> calls <code>scheduler.free_seq</code>, which frees the state slot and all blocks ({{cite deepinfer/engine/llm_engine.py:804-806}}, {{cite csrc/engine/scheduler.hpp:738-744}}).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Preemption in DeepInfer, step by step">
+<p>Preemption happens only in a decode step, in <code>_schedule_decode</code>:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="622-645" highlight="624-625,630-634,638-640" />
+<ol>
+  <li>Lines 624-625: sort <code>running</code> by the number of output tokens, the most first.</li>
+  <li>Line 629: take sequences from the <em>end</em> of the list: the sequence with the fewest output tokens goes first.</li>
+  <li>Lines 630-634: if the pool has <em>no</em> free block, the scheduler preempts sequences from the <em>front</em> of the list (the most output tokens). It stops when one block is free. The check runs before each sequence, also when that sequence does not need a new block.</li>
+  <li>Lines 635-637: if a block is free, <code>_append_slot</code> gives the sequence its block (if it needs one), and the sequence runs in this step.</li>
+  <li>Lines 638-640: if only this sequence is left and there is still no free block, the scheduler preempts this sequence.</li>
+</ol>
+<x-warning title="Comment and code do not agree">
+<p>The comment above the function says that the scheduler preempts the sequence with the <em>shortest</em> output (translated, {{cite csrc/engine/scheduler.hpp:557}}). The code preempts from the front of a list sorted with the <em>longest</em> output first. This page describes the code. The comment in <code>sequence.hpp</code> agrees with the code. Translated: <em>"If the KV cache is about to overflow, we stop the task that uses the most KV cache."</em> ({{cite csrc/engine/sequence.hpp:56}}).</p>
+</x-warning>
+<p><strong>What happens to the victim:</strong></p>
+<x-code file="csrc/engine/scheduler.hpp" lines="766-790" highlight="771,778-779,783-786">
+<x-tr line="768">COMPLETION together with !stop_preempted_request is already rejected in the constructor.</x-tr>
+<x-tr line="769">Preempted structured-output requests do not support recompute yet; they stop.</x-tr>
+<x-tr line="783-784">Reset the state of the sequence that changes in each step (cache.num_tokens, in-flight counts, MTP state); the list is in Sequence::reset_for_recompute.</x-tr>
+</x-code>
+<ul>
+  <li><strong>Stop</strong> (<code>stop_preempted_request</code> is true, or a structured output is active): status <code>FINISHED_PREEMPTED</code>, finish reason <code>"insufficient_system_resource"</code> ({{cite csrc/engine/sequence.hpp:55-56}}).</li>
+  <li><strong>Recompute</strong>: the sequence keeps its tokens (prompt and output so far), goes to the <em>front</em> of the waiting queue, and frees all blocks. The next prefill computes the cache for all its tokens again.</li>
+  <li>DeepInfer has no swap to CPU memory here. The status <code>SWAPPED</code> exists in the enum ({{cite csrc/engine/sequence.hpp:33}}), but <code>_preempt</code> never sets it.</li>
+</ul>
+<p><strong>Defaults of <code>stop_preempted_request</code>:</strong></p>
+<table>
+  <thead><tr><th>Where</th><th>Default</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>SchedulerConfig</code></td><td><code>False</code></td><td>{{cite deepinfer/config.py:191}}</td></tr>
+    <tr><td><code>EngineArgs</code> dataclass</td><td><code>True</code></td><td>{{cite deepinfer/engine/arg_utils.py:40}}</td></tr>
+    <tr><td>Offline <code>LLM</code> class</td><td><code>False</code> (recompute)</td><td>{{cite deepinfer/entrypoints/llm.py:68}}</td></tr>
+    <tr><td>COMPLETION (decode-only) engine</td><td>must be <code>True</code>, else start-up fails</td><td>{{cite csrc/engine/scheduler.hpp:101-104}}</td></tr>
+  </tbody>
+</table>
+<p><strong>A watermark protects decode.</strong> A NORMAL engine starts a new prefill only when cache usage is 90 % or less ({{cite csrc/engine/scheduler.hpp:80}}, {{cite csrc/engine/scheduler.hpp:313}}). Usage is <code>(num_blocks − free) / num_blocks</code>, so reserved block 0 counts as used ({{cite csrc/engine/scheduler.hpp:830-835}}).</p>
+<p><strong>Worked example.</strong> The pool has 0 free blocks. Three sequences run: R1 with 50 output tokens, R2 with 3, R3 with 20. The sorted list is [R1, R3, R2]. R2 goes first. No block is free, so the scheduler preempts R1. R1 frees its blocks. Then R2 and R3 run. With the offline <code>LLM</code> class, R1 waits at the front of the queue for a new prefill.</p>
+</x-deepdive>
+
+<x-deepdive title="Where the memory comes from: the profile run">
+<x-code file="deepinfer/worker/base.py" lines="211-268" highlight="225,235,243-246,264-266" />
+<ol>
+  <li>Lines 217-220: empty the PyTorch cache, reset the peak counter, read free and total device memory.</li>
+  <li>Line 225: <code>profile_run</code> runs one forward pass with <code>max_num_seqs</code> dummy sequences and a temporary KV cache ({{cite deepinfer/worker/model_runner.py:444-511}}).</li>
+  <li>Lines 228-234: peak = peak PyTorch memory + device memory that PyTorch does not manage.</li>
+  <li>Line 235: <code>available = total × gpu_memory_utilization − peak</code>. The default of <code>gpu_memory_utilization</code> is 0.90 ({{cite deepinfer/engine/arg_utils.py:34}}).</li>
+  <li>Lines 237-244: subtract two copies of the state buffer (store buffer and copy buffer).</li>
+  <li>Line 245: <code>num_gpu_blocks = available // bytes_per_block</code>.</li>
+  <li>Lines 264-266: all-reduce the counts of all ranks, take the <em>average</em>, and round down to an even number.</li>
+</ol>
+<x-note title="Docstring and code differ">
+<p>The docstring of <code>_init_cache</code> says that the engine takes the <em>minimum</em> number of blocks over all workers ({{cite deepinfer/engine/llm_engine.py:426-428}}). The code takes the sum divided by the world size, which is the average.</p>
+</x-note>
+<p><strong>Worked example.</strong> The numbers are made up, not measured. The device has 80 GiB, utilization is 0.90 and the peak is 52 GiB. One block takes 2 MiB, one state slot takes 1.5 MiB, and <code>max_num_seqs</code> is 256.</p>
+<ol>
+  <li>Budget: 80 × 0.90 − 52 = 20 GiB = 20,480 MiB.</li>
+  <li>State slots: int(256 × 1.2) + 1 = 308 ({{cite deepinfer/worker/cache_engine.py:201-202}}). Two copies: 2 × 308 × 1.5 MiB = 924 MiB.</li>
+  <li>Blocks: (20,480 − 924) / 2 = 9,778 blocks, or 9,778 × 128 = 1,251,584 token positions.</li>
+  <li>Check: the engine stops if <code>runtime_max_model_len</code> is more than 0.8 × 1,251,584 = 1,001,267 tokens ({{cite deepinfer/engine/llm_engine.py:445-451}}).</li>
+</ol>
+<p><strong>Allocation.</strong> <code>CacheEngine.allocate_gpu_cache</code> then makes two raw <code>uint8</code> buffers with <code>cuda_utils.alloc_tensor</code>: <code>gpu_blocks</code> with shape <code>[num_gpu_blocks, bytes_per_block]</code> and <code>gpu_states</code> with shape <code>[num_state_slots, state_bytes]</code> ({{cite deepinfer/worker/cache_engine.py:910-916}}, {{cite deepinfer/worker/cache_engine.py:937-958}}). The comment on line 936 shows a 6-D shape. It does not describe this layout. Each layer then gets strided views into one row per block, so one block id serves all layers ({{cite deepinfer/worker/cache_engine.py:452-458}}). The row length is padded to <code>lcm(128, bytes_per_token)</code> ({{cite deepinfer/worker/cache_engine.py:479-484}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>No memory for the cache.</strong> If the profile leaves no budget, start-up stops with <code>"No available memory for the cache blocks"</code> ({{cite deepinfer/engine/llm_engine.py:441-444}}). Increase <code>gpu_memory_utilization</code> or decrease <code>max_num_seqs</code>.</li>
+  <li><strong>Cache too small for the context length.</strong> Start-up stops if <code>runtime_max_model_len</code> is more than 80 % of all block tokens ({{cite deepinfer/engine/llm_engine.py:445-451}}).</li>
+  <li><strong>A prompt that can never fit.</strong> If a prompt needs <code>num_gpu_blocks</code> blocks or more, the scheduler logs <em>"exceeds the capacity of block_manager"</em> and ends the request as ignored ({{cite csrc/engine/scheduler.hpp:386-396}}).</li>
+  <li><strong>Preempted requests.</strong> With <code>stop_preempted_request</code> on, a long request can end early with the reason <code>insufficient_system_resource</code>. With recompute, it gets a new prefill, so its latency goes up. Structured-output requests always stop ({{cite csrc/engine/scheduler.hpp:770-779}}).</li>
+  <li><strong>Free blocks, but the request still waits.</strong> A new request also needs a free state slot, and a prefill starts only at 90 % cache usage or less ({{cite csrc/engine/scheduler.hpp:194-201}}, {{cite csrc/engine/scheduler.hpp:313}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The KV cache decides how many requests can run at the same time, and how long they can be. Most memory settings of an inference engine are really KV cache settings. When you read about compression, sliding windows or the scheduler, ask: how does this change the bytes per token, or the number of free blocks?</p>
+
+<x-quiz>
+  <x-q level="easy">Why can the model keep the keys and values of earlier tokens? Why does it not compute them again?
+    <x-a><p>A token looks only at itself and at earlier tokens. A later token cannot change the keys and values of an earlier token. So they stay correct, and the model can compute them once and keep them in the KV cache.</p></x-a>
+  </x-q>
+  <x-q level="medium">A generic model (not DeepInfer) has 40 layers, 8 KV heads, <code>head_dim</code> 128 and FP16 numbers. How much KV cache does one sequence of 8,192 tokens need?
+    <x-a><p>Per token and layer: 2 × 8 × 128 × 2 = 4,096 bytes. Per token: 4,096 × 40 = 163,840 bytes = 160 KiB. For 8,192 tokens: 160 KiB × 8,192 = 1,310,720 KiB = 1.25 GiB.</p></x-a>
+  </x-q>
+  <x-q level="medium">In DeepInfer, a C1 layer must write the cache entry of the token at position 1,000. The block table of the sequence has <code>block_table[7] = 42</code>. Which slot does the entry go to?
+    <x-a><p>Block size 128, ratio 1, so 128 entries per block. Logical block 1,000 // 128 = 7, offset 1,000 % 128 = 104. Slot = 42 × 128 + 104 = 5,480 ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:85-86}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A decode step starts with 0 free blocks. Three sequences run: R1 has 50 output tokens, R2 has 3, R3 has 20. Which sequence does DeepInfer preempt, and what happens to it in the offline <code>LLM</code> class?
+    <x-a><p>The scheduler sorts by output length, longest first: [R1, R3, R2]. It serves R2 first. No block is free, so it preempts from the front: R1 ({{cite csrc/engine/scheduler.hpp:624-634}}). The offline <code>LLM</code> class sets <code>stop_preempted_request=False</code> ({{cite deepinfer/entrypoints/llm.py:68}}). So R1 frees its blocks and goes to the front of the waiting queue, and a later prefill recomputes its cache ({{cite csrc/engine/scheduler.hpp:781-787}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The pool has many free KV blocks, but a new request does not start. Give two reasons from the DeepInfer code.
+    <x-a><p>(1) The request also needs a free state slot. If the state pool is empty, the scheduler treats the block check as <code>LATER</code> ({{cite csrc/engine/scheduler.hpp:194-201}}). (2) A NORMAL engine starts a prefill only when cache usage is 90 % or less ({{cite csrc/engine/scheduler.hpp:313}}). Other limits also apply, for example <code>max_num_seqs</code>.</p></x-a>
+  </x-q>
+</x-quiz>

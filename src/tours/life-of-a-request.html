@@ -1,0 +1,520 @@
+---
+title: Tour: Life of a request
+nav_title: Life of a request
+level: Beginner
+prerequisites: learn/what-an-llm-does, learn/tokens, learn/prefill-decode, learn/kv-cache
+related: concepts/engine-step-loop, concepts/request-lifecycle, concepts/scheduler, concepts/paged-kv-cache, concepts/input-metadata, concepts/zero-overhead-scheduling, concepts/sampler, concepts/speculative-decoding, tours/engine-step, tours/decoder-layer, tours/spec-decode-round
+summary: Follow one request from llm.generate() to its output tokens in 13 stops: tokenizer, admission, C++ scheduler, batch metadata, worker step, forward pass, KV cache, sampler, draft tokens and output objects.
+---
+<x-sentence>We follow one prompt from <code>llm.generate()</code> through the tokenizer, the C++ scheduler and the device, until its tokens come back as <code>RequestOutput</code> objects.</x-sentence>
+
+<h2>The idea</h2>
+<p>A {{term llm | large language model}} makes text one {{term token}} at a time. DeepInfer serves many requests at the same time. So it does not run one request from start to end. It runs <em>steps</em>. In each {{term engine-step | engine step}}, it selects a batch of requests, runs the model once for all of them, and adds new tokens to each request.</p>
+<p>This tour follows one real request from <code>examples/offline_inference.py</code>. The request is the second prompt of the example, so its request id is <code>"1"</code>:</p>
+<pre><code class="language-python">prompt = ("Question: What is the largest planet in the solar system?\nAnswer: Jupiter\n\n"
+          "Question: How many legs does a spider have?\nAnswer: Eight\n\n"
+          "Question: Who wrote Romeo and Juliet?\nAnswer:")
+params = SamplingParams(temperature=0.4, max_tokens=128, ignore_eos=False,
+                        first_n_token_no_eos=1, top_logprobs=4, seq_seed=1)</code></pre>
+<p>The prompt and the parameters come from {{cite examples/_prompts.py:72-77}} and {{cite examples/_prompts.py:106-116}}. The tour has 13 stops. Stops 1 to 4 run once per request. Stops 5 to 12 run in every engine step, for all requests in the batch. Stop 13 runs when the user script collects the results.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a restaurant kitchen. A waiter writes each order on a ticket (stop 4). The head chef looks at all tickets and decides which dishes the kitchen cooks in this round (stop 5). The cooks cook all selected dishes together (stops 7 to 11). After each round, the waiter carries finished plates to the tables (stops 12 and 13). The comparison stops being true in one place: a dish is not done after one round. Each round adds only one or a few tokens to each request, and a request needs many rounds.</p>
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Where (file and function)</th><th>Runs in</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The user script starts the engine and calls <code>generate()</code></td><td><code>examples/offline_inference.py</code>, <code>_config.create_llm</code>, <code>_launch.run_dp</code></td><td>Python</td></tr>
+    <tr><td>2</td><td>The public API adds one request per prompt</td><td><code>entrypoints/llm.py</code>: <code>LLM.generate</code>, <code>_add_request</code></td><td>Python</td></tr>
+    <tr><td>3</td><td>The tokenizer turns text into token ids</td><td><code>hugging_face/tokenizer.py</code>: <code>get_hf_tokenizer</code></td><td>Python</td></tr>
+    <tr><td>4</td><td>The engine checks the request and makes a C++ <code>Sequence</code></td><td><code>engine/llm_engine.py</code>: <code>add_request</code></td><td>Python, C++</td></tr>
+    <tr><td>5</td><td>The scheduler selects the batch and gives KV blocks</td><td><code>csrc/engine/scheduler.hpp</code>: <code>_schedule</code></td><td>C++</td></tr>
+    <tr><td>6</td><td>The batch becomes tensors (batch metadata)</td><td><code>Scheduler::schedule</code>, <code>prepare_tensor_input_v4.cpp</code>, <code>ModelRunner._prepare_input</code></td><td>C++, Python</td></tr>
+    <tr><td>7</td><td>The worker runs one step: forward, post-process, sample</td><td><code>worker/worker.py</code>: <code>execute_model_step</code></td><td>Python</td></tr>
+    <tr><td>8</td><td>The model runs on the device</td><td><code>ModelRunner.execute_main_model</code>, <code>DeepseekModel.forward</code></td><td>device</td></tr>
+    <tr><td>9</td><td>The forward pass writes the KV cache</td><td><code>worker/cache_engine.py</code>, slot maps from stop 6</td><td>device</td></tr>
+    <tr><td>10</td><td>The sampler selects the next tokens</td><td><code>layers/sampler.py</code>: <code>Sampler.forward</code></td><td>device</td></tr>
+    <tr><td>11</td><td>DFlash proposes draft tokens for the next step</td><td><code>models/mtp/dflash.py</code></td><td>device</td></tr>
+    <tr><td>12</td><td>The engine updates the sequence and builds outputs</td><td><code>LLMEngine._process_model_outputs</code>, <code>outputs.hpp</code></td><td>Python, C++</td></tr>
+    <tr><td>13</td><td>The user gets the tokens and the text</td><td><code>LLM._run_engine</code></td><td>Python</td></tr>
+  </tbody>
+</table>
+<x-note title="Changes from the first plan of this tour">
+<p>The KV cache stop comes after the forward pass stop, because the forward pass does the writes. The sampler and the draft tokens are separate stops, because DFlash runs inside the sampler call in decode steps only.</p>
+</x-note>
+
+<h2>The picture</h2>
+<x-diagram name="tour1_map_a" alt="Three columns: Python, C++ engine, helper processes. Stops 1 to 4 run in Python: user script, LLM.generate, tokenize, LLMEngine.add_request. The request goes into the C++ waiting queue. Stop 5, Scheduler::_schedule, votes for a prefill or decode step and gives KV blocks. Stop 6 builds SequenceMetadata and the input tensors, which go back to Python as InputMetadataV4." caption="Part 1: stops 1-6, from the call to a batch. Click to zoom." />
+<x-diagram name="tour1_map_b" alt="Three columns: Python, C++ engine, device. Stop 7, Worker.execute_model_step, starts the forward pass on the device (stop 8). The forward pass writes the KV cache (stop 9). The sampler selects tokens (stop 10) and DFlash proposes drafts (stop 11). The C++ engine updates the sequence and builds RequestOutput objects (stop 12). Python clones them and decodes the text (stop 13). The loop goes back to stop 5." caption="Part 2: stops 7-13, one engine step and the way back. Click to zoom." />
+<p>Read each diagram from top to bottom. The colour of a box shows where the code runs: blue is Python, violet is the C++ {{term extension-module}} <code>deepinfer._C</code>, green is the {{term accelerator | device}}. Solid arrows show the path of request <code>"1"</code>. Dashed boxes are side objects or helpers of a stop.</p>
+
+<h3>Processes and threads</h3>
+<p>The example starts more than one process. The diagram below shows which processes and threads touch the request, and how they talk to each other.</p>
+<x-diagram name="tour1_processes" alt="Panel 1: a launcher process spawns 8 DP replica processes. Each replica has a main thread with LLM, LLMEngine, the C++ scheduler and the driver worker. Optional helpers: SO builder threads, CP worker processes and a multimodal worker process. Panel 2: a table of channels: spawn and join, a shared-memory message queue, tensor broadcast, DP all-reduce, MoE dispatch and combine, multiprocessing queues, futures." caption="Processes and threads for the offline example with --ep 8 --cp 1. Click to zoom." />
+<ul>
+  <li>Each DP replica is a full engine with its own scheduler. Our request lives in exactly one replica, the one with <code>dp_rank</code> 0 in this tour.</li>
+  <li>The replicas are not independent. They vote on the step type ({{cite csrc/engine/scheduler.hpp:295-341}}) and exchange tokens in the MoE layers ({{term expert-parallelism}}).</li>
+  <li>All work of stops 2 to 13 runs in the main thread of the replica. That thread is the <em>{{term driver-worker | driver}}</em>.</li>
+</ul>
+
+<x-stop n="1" title="The user script starts the engine and calls generate()">
+<p>We are in <code>examples/offline_inference.py</code>. The script reads the parallel sizes from the command line. The defaults give 8 {{term data-parallelism | data-parallel}} (DP) ranks: <code>dp_size = ep // cp = 8 // 1</code> ({{cite examples/offline_inference.py:24-28}}). The last line calls <code>launch_dp(main, dp_size)</code> ({{cite examples/offline_inference.py:112-113}}).</p>
+<x-code file="examples/_launch.py" lines="26-50" highlight="35-44,50" caption="With more than one DP rank, run_dp starts one process per DP rank of this node with the <code>spawn</code> start method. With one DP rank, it calls <code>main</code> in the same process." />
+<p>Each child process runs <code>main(dp_size, dp_rank)</code>. It sets {{term environment-variable | environment variables}}, makes the <code>LLM</code> object, builds the prompts and calls <code>generate()</code>:</p>
+<x-code file="examples/offline_inference.py" lines="95-101" highlight="95" />
+<p>The order of the work in <code>create_llm</code> is important. It sets the visible devices first and imports <code>deepinfer</code> after that:</p>
+<x-code file="examples/_config.py" lines="104-125" highlight="106,110,113" />
+<p>The module docstring gives the rule. Translated: <em>"This module must not import deepinfer at the top level. The environment setup must finish before import deepinfer, so create_llm imports deepinfer lazily inside the function."</em> ({{cite examples/_config.py:1-7}}).</p>
+<p><strong>What the data looks like now</strong> (illustrative values):</p>
+<pre><code class="language-python"># in the process of dp_rank 0
+os.environ["CUDA_VISIBLE_DEVICES"] == "0"          # one device per process when cp = 1
+prompts          # 5 strings; prompts[1] is our request
+sampling_params  # 5 SamplingParams; sampling_params[1].seq_seed == 1
+multi_modal_data # 5 dicts; ours is {"image_bytes": [], "image_sizes": []}</code></pre>
+<x-deepdive title="Stop 1 in detail: processes, devices and settings">
+<p><strong>Which DP ranks run on this node.</strong> <code>launch_dp</code> sets <code>RANK=0</code> and <code>WORLD_SIZE=1</code> if they are not set ({{cite examples/_launch.py:15-23}}). <code>run_dp</code> starts the ranks with <code>dp_rank // (dp_size // num_nodes) == node_rank</code>. With 8 ranks and 1 node, the node starts all 8. It waits for them with <code>join()</code> and raises <code>RuntimeError</code> if one process fails ({{cite examples/_launch.py:41-48}}).</p>
+<p><strong>Which device a rank uses.</strong> <code>setup_cuda_visible_devices</code> computes <code>local_engine_rank = engine_rank * cp_size % device_count // cp_size</code>. It then makes a list of <code>cp_size</code> device ids that start at <code>DEVICE_OFFSET + local_engine_rank * cp_size</code>. <code>DEVICE_OFFSET</code> has the default 0 ({{cite examples/_config.py:55-64}}). On Ascend it copies the value to <code>ASCEND_RT_VISIBLE_DEVICES</code>. The docstring of <code>create_llm</code> gives the reason for the order. Translated: <em>"On Ascend NPU, import torch initializes the ACL environment, and then setting ASCEND_RT_VISIBLE_DEVICES fails"</em> ({{cite examples/_config.py:96-103}}).</p>
+<p><strong>Environment variables that the example sets.</strong></p>
+<table>
+  <thead><tr><th>Variable</th><th>Value</th><th>Where</th><th>Effect on this tour</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> (setdefault)</td><td>{{cite examples/_config.py:75}}</td><td>5 draft tokens per decode step (stop 11). The code default is also 5 ({{cite deepinfer/environ.py:129}}).</td></tr>
+    <tr><td><code>DEEPINFER_SAMPLER_FORCE_TOPK</code></td><td><code>4096</code> (from <code>--sampler_force_topk</code>)</td><td>{{cite examples/_config.py:76}}</td><td>The sampler works on the 4096 most likely tokens only (stop 10).</td></tr>
+    <tr><td><code>DEEPINFER_BATCH_INVARIANT</code></td><td><code>1</code> on NVIDIA (setdefault)</td><td>{{cite examples/offline_inference.py:42-43}}</td><td>Batch-invariant kernels, see {{link concepts/determinism}}.</td></tr>
+    <tr><td><code>DEEPINFER_LOGGING_INTERVAL_STEP</code></td><td><code>10</code></td><td>{{cite examples/offline_inference.py:50}}</td><td>Statistics every 10 steps.</td></tr>
+    <tr><td><code>DEEPINFER_EXPERT_*</code>, <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code></td><td>see source</td><td>{{cite examples/_config.py:77-83}}</td><td>Expert load balancing; not part of this tour.</td></tr>
+  </tbody>
+</table>
+<p><strong>Engine arguments.</strong> The example passes <code>max_num_batched_tokens=32768</code>, <code>max_model_len=32768</code>, <code>max_num_seqs=4</code> and <code>gpu_memory_utilization=0.85</code> ({{cite examples/offline_inference.py:45-57}}). <code>create_llm</code> adds <code>chunked_prefill=True</code> and <code>decode_sequence=False</code> ({{cite examples/_config.py:118-124}}). So <code>generate()</code> returns token objects, not text, and the script decodes the text itself (stop 13). <code>lookahead_tokens</code> is <code>min(1, nextn)</code>, so 1.</p>
+<p><strong>Start-up.</strong> <code>LLM(...)</code> builds the whole engine: workers, weights, KV cache, CUDA graphs. The tour {{link tours/startup}} explains it. This tour starts after start-up.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="2" title="The public API: LLM.generate() and _add_request()">
+<p>We are in <code>deepinfer/entrypoints/llm.py</code>. <code>LLM</code> is the offline API. It wraps one <code>LLMEngine</code>. <code>generate()</code> does two things: it adds every prompt as a request, then it runs the engine until all requests finish.</p>
+<x-code file="deepinfer/entrypoints/llm.py" lines="129-166" highlight="135,142,151-152,156-157,160" />
+<ol>
+  <li>Line 135: one <code>_add_request</code> call per prompt, in input order.</li>
+  <li>Line 151: a deep copy of the {{term sampling-params | SamplingParams}}. The engine later changes the copy (it sets <code>eos_id</code>), not the user object.</li>
+  <li>Line 152: the request id is a counter, as a string. The prompts get <code>"0"</code>, <code>"1"</code>, ... so our request is <code>"1"</code>.</li>
+  <li>Line 156: if the caller gave text, the tokenizer makes the ids (stop 3).</li>
+  <li>Line 157: the ids become a NumPy <code>int32</code> array.</li>
+  <li>Lines 158-159: a model with a vision part needs a multimodal dict, also for text. An empty dict is added if there is none.</li>
+  <li>Line 142: after all prompts are added, <code>_run_engine</code> runs the loop (stop 13 and <a href="#the-loop">The loop</a>).</li>
+</ol>
+<p><strong>What the data looks like now</strong> (illustrative values):</p>
+<pre><code class="language-python">request_id        = "1"
+sampling_params   = SamplingParams(temperature=0.4, top_p=1.0, top_k=-1, max_tokens=128,
+                                   first_n_token_no_eos=1, top_logprobs=4, seq_seed=1)  # a copy
+prompt_token_ids  = np.array([0, 15823, 25, 3085, ..., 25], dtype=np.int32)  # shape (41,)
+multi_modal_data  = {"image_bytes": [], "image_sizes": []}</code></pre>
+<x-deepdive title="Stop 2 in detail: defaults that LLM sets">
+<ul>
+  <li><code>LLM.__init__</code> sets <code>disable_log_stats=True</code> and <code>stop_preempted_request=False</code> as defaults, and <code>TOKENIZERS_PARALLELISM=false</code> ({{cite deepinfer/entrypoints/llm.py:67-69}}). <code>EngineArgs</code> has the default <code>stop_preempted_request=True</code> ({{cite deepinfer/engine/arg_utils.py:40}}). So the offline API changes the {{term preemption}} policy: a preempted request is computed again, not stopped (stop 5).</li>
+  <li>It always passes <code>offline_inference=True</code> and makes the engine with <code>LLMEngine.from_engine_args</code> ({{cite deepinfer/entrypoints/llm.py:70-84}}).</li>
+  <li><code>generate()</code> raises <code>ValueError</code> if both <code>prompts</code> and <code>prompt_token_ids</code> are <code>None</code>, or if their lengths are different ({{cite deepinfer/entrypoints/llm.py:117-124}}). With no <code>sampling_params</code>, it uses <code>SamplingParams()</code>: temperature 1.0, <code>max_tokens=16</code> ({{cite deepinfer/sampling_params.py:47-53}}).</li>
+  <li>A comment says that one shared <code>SamplingParams</code> object needs no copy in <code>generate()</code>, because <code>_add_request</code> makes a deep copy (Translated, {{cite deepinfer/entrypoints/llm.py:137}}).</li>
+  <li>The user id is always <code>"0"</code>. The code marks it as a hack (Translated: <em>"HACK: add some user_id"</em>, {{cite deepinfer/entrypoints/llm.py:161}}).</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="3" title="Tokenization: text becomes token ids">
+<p>A neural network works on numbers, not on letters. The {{term tokenizer}} cuts the text into tokens and gives each token an integer id. DeepInfer uses the Hugging Face tokenizer files of the checkpoint. <code>LLMEngine.__init__</code> loads it once with <code>get_hf_tokenizer</code> ({{cite deepinfer/engine/llm_engine.py:200-205}}). <code>_add_request</code> calls <code>tokenizer.encode(prompt)</code> (stop 2, line 156).</p>
+<x-code file="deepinfer/hugging_face/tokenizer.py" lines="25-28" caption="The release policy: BOS at id 0, PAD at id 2, and 21 multimodal tokens at ids 129280-129300." />
+<p>After loading, <code>_apply_release_fixups</code> checks the special tokens. With the default <code>"release"</code> policy, the checkpoint must have BOS (begin of sequence) at id 0 and the {{term eos-token | EOS token}} at id 1. If not, loading stops with <code>ValueError</code>. It also turns on <code>add_bos_token</code>, so <code>encode()</code> puts id 0 first:</p>
+<x-code file="deepinfer/hugging_face/tokenizer.py" lines="36-39" />
+<x-code file="deepinfer/hugging_face/tokenizer.py" lines="59-69" highlight="61,68" />
+<p><strong>What the data looks like now</strong> (illustrative ids; only the first id is fixed):</p>
+<pre><code class="language-python">tokenizer.encode(prompt)
+# [0, 15823, 25, 3085, 344, 270, 7426, ...,  6233, 25]      41 ids
+#  ^ BOS                                       "Answer" ":"
+tokenizer.eos_token_id   # 1
+tokenizer.pad_token_id   # 2</code></pre>
+<x-deepdive title="Stop 3 in detail: tokenizer class, vision models and Engram">
+<p><strong>Which tokenizer class.</strong> <code>get_hf_tokenizer</code> needs <code>tokenizer.json</code> and <code>tokenizer_config.json</code> in the model folder, else it raises <code>FileNotFoundError</code>. If the tokenizer config has an <code>auto_map</code>, it loads the class from the checkpoint. Else, with <code>tokenizer_compatibility: "native"</code> in <code>config.json</code>, it uses <code>AutoTokenizer</code>, and else <code>LlamaTokenizerFast</code>. The fix-ups above run for every class when the policy is <code>"release"</code>, the default ({{cite deepinfer/hugging_face/tokenizer.py:89-121}}).</p>
+<p><strong>Multimodal tokens.</strong> The 21 placeholder tokens must get the ids 129280 to 129300 ({{cite deepinfer/hugging_face/tokenizer.py:48-56}}). The comment says that inference computes the image token ids as <code>vocab_size + ImageTokenOffset</code> ({{cite deepinfer/hugging_face/tokenizer.py:25-28}}). The engine reads <code>vocab_size</code> from the model <code>config.json</code> ({{cite deepinfer/config.py:121-122}}), which is not in the repository. The two rules agree only if <code>vocab_size</code> is 129280, so this tour uses 129280 (text ids 0 to 129279). This is an inference from the code, not a value that the code sets. You will see 129279 (<code>vocab_size - 1</code>) again in stop 11.</p>
+<p><strong>A vision model changes the ids again.</strong> The only model class in this release, <code>DeepseekVLForCausalLM</code>, has a vision part. So a NORMAL engine always has a <code>MultimodalProcessor</code> ({{cite deepinfer/engine/llm_engine.py:209-221}}, {{cite deepinfer/model_executor/models/__init__.py:15-17}}). In stop 4, <code>overwrite_prompt</code> replaces each image placeholder with <code>vocab_size + IMAGE</code> and many <code>vocab_size + IMAGE_PAD</code> ids. Our prompt has no image, so the ids stay the same. The function always returns a new array ({{cite deepinfer/ve/multimodal_processor.py:105-162}}).</p>
+<p><strong>Engram models.</strong> A model with {{link concepts/engram | Engram n-gram memory}} also needs <em>compressed</em> ids. <code>add_request</code> maps each id through a lookup table with <code>CompressedTokenizer.encode</code> ({{cite deepinfer/engine/llm_engine.py:564-567}}). Ids outside the table, for example image ids, become <code>IMAGE_SENTINEL = -1</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:62-66}}). The sequence keeps both lists. Without Engram, the compressed list is the same as the normal list.</p>
+<p><strong>The way back.</strong> The same tokenizer object turns ids into text at the end (stop 13). <code>get_tokenizer()</code> returns it ({{cite deepinfer/entrypoints/llm.py:87-88}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="4" title="Admission: LLMEngine.add_request() makes a C++ Sequence">
+<p>We are in <code>deepinfer/engine/llm_engine.py</code>. <code>add_request</code> checks the request, makes the engine object for it, and puts it in the queue of the scheduler. The engine object is a {{term sequence}}. It is a C++ object (<code>deepinfer._C.engine.Sequence</code>), so the scheduler can read it without Python.</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="553-631" highlight="553-554,581-589,594-598,607-613,620-630">
+  <x-tr line="580">Token value check.</x-tr>
+  <x-tr line="610">The caller manages the schedule itself and cannot re-enter through pump, so build synchronously.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 553-554: an empty prompt raises <code>ValueError</code>.</li>
+  <li>Lines 581-589: every id must be in <code>[0, vocab_size)</code>. A multimodal request may also use the 5 image ids above <code>vocab_size</code>. A bad request is <em>dropped</em>: the function writes a log line and returns <code>None</code>. It does not raise.</li>
+  <li>Lines 594-598: the C++ <code>Sequence</code> copies the ids into a <code>std::vector&lt;int&gt;</code> and reads the sampling values once.</li>
+  <li>Lines 607-613: a request with {{term structured-output | structured output}} (<code>so_args</code>) needs a grammar matcher first. The engine gives this work to a thread pool and enqueues the request later (line 628).</li>
+  <li>Lines 620-626: <code>_enqueue</code> calls <code>scheduler.add_sequence</code>. For a vision model, it also sends the multimodal dict to the multimodal worker process.</li>
+</ol>
+<p><strong>What the data looks like now</strong> (illustrative values; field names from {{cite csrc/engine/sequence.hpp:168-321}}):</p>
+<pre><code class="language-python">Sequence  # C++, held by std::shared_ptr
+  request.seq_id          = 1            # next(self.seq_counter)
+  request.request_id      = "1"
+  input.tokens            = SequenceData(token_ids=[0, 15823, ..., 25], prompt_len=41)
+  input.compressed_tokens = same 41 ids  # no Engram in this example
+  generation.sampling     = {temperature: 0.4, top_p: 1.0, top_k: -1, seq_seed: 1,
+                             top_logprobs: 4, first_n_token_no_eos: 1, eos_id: 1}
+  generation.stopping     = {max_tokens: 128, ignore_eos: False}
+  cache                   = {block_size: 128, num_tokens: 0, block_table: [], state_id: -1}
+  mtp.last_output_token   = 25           # the last prompt id
+  schedule.status         = WAITING
+  schedule.schedulable    = False        # vision model: wait for the multimodal worker
+Scheduler.waiting         = deque([seq "0", seq "1", seq "2", seq "3", seq "4"])</code></pre>
+<x-deepdive title="Stop 4 in detail: the Sequence object, schedulable, and the helpers">
+<p><strong>Where the fields come from.</strong> The Python call passes flat arguments. <code>make_sequence_init</code> in the binding fills a <code>SequenceInit</code> ({{cite csrc/engine/pybind_sequence.cpp:25-38}}). The constructor reads the sampling values from the Python object once, into <code>SamplingScalars</code> and <code>StoppingCriteria</code> ({{cite csrc/engine/sequence.hpp:276-283}}). <code>add_request</code> sets <code>sampling_params.eos_id = self.eos_id</code>, the tokenizer EOS id ({{cite deepinfer/engine/llm_engine.py:527}}).</p>
+<p><strong>The schedulable flag.</strong> The binding sets <code>schedulable = multi_modal_data.is_none()</code> ({{cite csrc/engine/pybind_sequence.cpp:35}}). Our request has a multimodal dict, so it starts as not schedulable. The multimodal worker process prepares the request and sends it back through a queue. <code>fetch()</code> then calls <code>scheduler.set_schedulable(id)</code> ({{cite deepinfer/ve/multimodal_processor.py:281-305}}). A text-only model has no multimodal processor, so its sequences are schedulable at once.</p>
+<p><strong>Status values.</strong> A sequence is <code>WAITING</code>, <code>RUNNING</code>, <code>SWAPPED</code>, or one of seven <code>FINISHED_*</code> values ({{cite csrc/engine/sequence.hpp:30-43}}). Each finished value has a reason string: <code>"stop"</code>, <code>"length"</code>, <code>"abort"</code>, <code>"prompt_length_exceeded"</code>, <code>"insufficient_system_resource"</code>, <code>"xgrammar runtime errors or timeout"</code>, <code>"ve_error"</code> ({{cite csrc/engine/sequence.hpp:45-64}}).</p>
+<p><strong>Reserved memory.</strong> <code>add_sequence</code> reserves space in the token vector for <code>max_tokens</code> more ids, and in the block table for all blocks the request can need ({{cite csrc/engine/scheduler.hpp:135-142}}, {{cite csrc/engine/scheduler.hpp:190-192}}). For our request: <code>(41 + 128 + 127) // 128 + 1 = 3</code> block entries.</p>
+<p><strong>Structured output.</strong> The SO builder is made on first use. It is a <code>ThreadPoolExecutor</code> with one worker per idle CPU ({{cite deepinfer/engine/llm_engine.py:329-342}}). <code>get_idle_cpus</code> returns <code>DEEPINFER_SO_BUILDER_CPUS</code> CPUs (default 4) ({{cite deepinfer/utils.py:154-161}}). <code>submit()</code> starts the build. <code>pump()</code> runs in every step and enqueues the requests whose matcher is ready ({{cite deepinfer/structure_output/so_matcher_builder.py:97-121}}, {{cite deepinfer/engine/llm_engine.py:841-842}}). Our request has no <code>so_args</code>, so this path is not used.</p>
+<p><strong>Other admission rules.</strong> If <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code> is not <code>"off"</code>, <code>prompt_logprobs</code> is forced to <code>False</code> with a warning ({{cite deepinfer/engine/llm_engine.py:529-537}}). If the multimodal data has <code>image_bytes=None</code>, the sequence starts as <code>FINISHED_VE_FAILED</code> ({{cite deepinfer/engine/llm_engine.py:547-550}}, {{cite deepinfer/engine/llm_engine.py:603-604}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="5" title="Scheduling in C++: which requests run in this step">
+<p>From here, the code runs in every engine step. <code>LLMEngine.step()</code> first asks the C++ {{term scheduler}} for the batch ({{cite deepinfer/engine/llm_engine.py:881-887}}). The scheduler has three queues: <code>waiting</code>, <code>prompted</code> and <code>running</code> ({{cite csrc/engine/scheduler.hpp:1124-1126}}). It makes one decision first: is this step a {{term prefill}} step or a {{term decode}} step? DeepInfer never mixes the two in one batch.</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="295-341" highlight="308-309,313,315-319,332">
+  <x-tr line="296">NORMAL engine: decide whether the whole group does prompt or decode in this step. Inside DP the type must be the same; a vote makes it the same.</x-tr>
+  <x-tr line="298-303">Two kinds of attempt points. ALL point (every prefill_attempt_interval decode steps): do it only if all ranks have prefill work, so that one rank does not work while the others run empty prompt steps. ANY point (every prefill_any_attempt_interval decode steps): do it if one rank has work, as a fallback for an isolated rank. If both points fall on the same step, ANY wins.</x-tr>
+  <x-tr line="328-329">Second vote: confirm that some rank really scheduled a prefill. "want" only looked at a non-empty waiting queue, but _schedule_prefill can still come back empty (slots full, not enough KV blocks).</x-tr>
+  <x-tr line="339">Some rank in the group does a prompt step: this rank runs an empty prompt step to keep the step type the same.</x-tr>
+</x-code>
+<p>So a prefill can start only at an <em>attempt point</em>. <code>decode_step</code> counts decode steps since the last prefill step. With the defaults, every 70th decode step is an ALL point and every 100th is an ANY point ({{cite deepinfer/environ.py:174-178}}). The first step has <code>decode_step = 0</code>, which is an ALL point. A rank <em>wants</em> a prefill if its KV cache is at most 90 % full and the first waiting request is schedulable (line 313).</p>
+<p><strong>Prefill for our request.</strong> <code>_schedule_prefill</code> takes requests from the front of <code>waiting</code>. For each one, it checks the limits, gives it KV {{term kv-block | blocks}}, and decides the chunk size:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="470-475" caption="Chunked prefill: if the prompt does not fit in the token budget that is left, cut it to the budget." />
+<x-code file="csrc/engine/scheduler.hpp" lines="513-545" highlight="518-520,522-526,543-545">
+  <x-tr line="513">Decided to schedule this seq: all operations with side effects follow here.</x-tr>
+</x-code>
+<p>Our prompt has 41 tokens and the budget is 32768, so it is not chunked. Line 519 gives the blocks. Line 524 sets <code>RUNNING</code>. With {{term chunked-prefill}}, a long prompt runs in several prefill steps, and only the last chunk sets <code>RUNNING</code> (lines 522-526).</p>
+<p><strong>What the data looks like now</strong> (illustrative values; requests "0" to "3" are ready and go into one prefill step):</p>
+<pre><code class="language-python">seq "1":
+  cache.block_table = [2]    # ceil(41 / 128) = 1 block; block 0 is never used, "0" took block 1
+  cache.state_id    = 2      # one state slot for the sliding-window cache
+  mtp.info_slot     = 2      # one row group in the draft-token pool
+  schedule.status   = RUNNING
+SchedulerOutputs:
+  prompt_run = True,  scheduled_seqs = [seq "0", seq "1", seq "2", seq "3"]
+  seqlens_q  = [.., 41, .., ..],  num_batched_tokens = sum(seqlens_q)
+waiting = deque([seq "4"])   # max_num_seqs = 4: the fifth request waits</code></pre>
+<x-deepdive title="Stop 5 in detail: limits, blocks, decode steps and preemption">
+<p><strong>The prefill limits, in order</strong> ({{cite csrc/engine/scheduler.hpp:360-546}}):</p>
+<ol>
+  <li>A request that is already aborted or failed goes to <code>ignored_seqs</code>. It gets an output with its finish reason.</li>
+  <li>A request that is not schedulable stops the loop (<code>break</code>). The requests behind it also wait.</li>
+  <li>A prompt longer than <code>prompt_limit</code> becomes <code>FINISHED_IGNORED</code>. <code>prompt_limit</code> is <code>max_model_len</code> with chunked prefill, else <code>min(max_model_len, max_num_batched_tokens)</code> ({{cite csrc/engine/scheduler.hpp:112}}).</li>
+  <li>The {{term block-manager}} answers <code>OK</code>, <code>LATER</code> or <code>NEVER</code>. <code>NEVER</code> means that the request needs <code>num_blocks</code> or more blocks, so it can never fit, because block 0 is not used ({{cite csrc/engine/block_manager.hpp:128-136}}). <code>LATER</code> stops the loop.</li>
+  <li>At most <code>max_num_seqs</code> sequences run at the same time (lines 440-442).</li>
+  <li>The sum of the prompt lengths in one prefill step must stay under <code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code>. Unset means no limit (lines 444-449).</li>
+  <li>The chunk may not cut an image in the middle. <code>_adjust_chunk_size</code> moves the cut ({{cite csrc/engine/scheduler.hpp:235-260}}).</li>
+  <li>In a NORMAL engine, a chunked request is the last one in the step (lines 543-545).</li>
+</ol>
+<p><strong>How many blocks.</strong> <code>get_num_blocks()</code> is <code>ceil((len + inflight + drafts) / block_size)</code> ({{cite csrc/engine/sequence.hpp:291-293}}). The block size is 128 tokens ({{cite deepinfer/model_executor/model_metadata_utils.py:133-135}}). The free list starts at block 1, because block 0 means "empty" ({{cite csrc/engine/block_manager.hpp:27-35}}). The state manager uses the same class for the per-sequence {{term state-slot | state slots}}. <code>allocate_seq</code> takes the blocks and one state slot ({{cite csrc/engine/block_manager.hpp:207-214}}).</p>
+<p><strong>Decode steps.</strong> <code>_schedule_decode</code> runs when the step is not a prefill step ({{cite csrc/engine/scheduler.hpp:559-660}}):</p>
+<ol>
+  <li>It removes finished sequences from <code>running</code> and returns them as <code>finished_seqs</code>.</li>
+  <li>It sorts <code>running</code> by output length, longest first (lines 624-625).</li>
+  <li>It takes sequences from the end of the list, so the shortest output comes first. Before each one, the loop checks that at least one block is free. Then <code>_append_slot</code> adds a block only if the sequence needs one ({{cite csrc/engine/scheduler.hpp:628-640}}, {{cite csrc/engine/scheduler.hpp:817-828}}).</li>
+  <li>If no block is free, it preempts from the front of the list: the sequence with the <em>longest</em> output (lines 630-634).</li>
+  <li>It sorts the batch by total length and asks <code>MTPVarlen</code> for each <code>seqlen_q</code> (lines 648-652). Without a performance curve, <code>seqlen_q = 1 + number of drafts</code>, so 6 ({{cite csrc/engine/mtp_varlen.hpp:150-158}}).</li>
+</ol>
+<x-note title="Code and comment do not agree">
+<p>The comment above <code>_schedule_decode</code> says that the scheduler preempts the sequence with the shortest output ({{cite csrc/engine/scheduler.hpp:556-557}}). The code sorts by output length, longest first, and preempts <code>running[l]</code> from the front (lines 624-634). So the code preempts the longest output. The comment on <code>FINISHED_PREEMPTED</code> is closer to the code. Translated: <em>"the task that uses the most KV cache is stopped"</em> ({{cite csrc/engine/sequence.hpp:55-56}}). But the code sorts by output length only, not by total length with the prompt.</p>
+</x-note>
+<p><strong>Preemption.</strong> <code>_preempt</code> stops the request with <code>FINISHED_PREEMPTED</code> if <code>stop_preempted_request</code> is true, or if the request uses structured output. Else it resets the sequence, frees its blocks and puts it at the front of <code>waiting</code>. The request then runs its prefill again ({{cite csrc/engine/scheduler.hpp:766-790}}). The offline <code>LLM</code> uses the second policy (stop 2).</p>
+<p><strong>The vote and the DP group.</strong> <code>_dp_allreduce</code> runs an all-reduce on the DP group, also with one DP rank ({{cite csrc/engine/scheduler.hpp:169-182}}). With ZOS on, the group is the CPU (Gloo) DP group ({{cite deepinfer/engine/llm_engine.py:313}}).</p>
+<p><strong>A consequence for vision models.</strong> Read together, the lines above give the following sequence for one DP rank and the default intervals. This site derived it from the code and did not run it.</p>
+<ol>
+  <li>Every request starts with <code>schedulable=False</code>, because the engine has a <code>MultimodalProcessor</code> and the request has a multimodal dict (stop 4). Only <code>fetch()</code> sets <code>schedulable</code> ({{cite deepinfer/ve/multimodal_processor.py:281-303}}).</li>
+  <li>In each <code>step()</code>, <code>schedule()</code> runs first and <code>fetch()</code> runs later ({{cite deepinfer/engine/llm_engine.py:885}}, {{cite deepinfer/engine/llm_engine.py:939-941}}). So in step 1, the first waiting request is not schedulable, and no rank wants a prefill.</li>
+  <li>Step 1 has <code>decode_step = 0</code>, an ALL point. The vote fails, so step 1 is an empty decode step. <code>schedule()</code> then sets <code>decode_step</code> to 1 ({{cite csrc/engine/scheduler.hpp:676-681}}).</li>
+  <li>Steps 2 to 70 have <code>decode_step</code> 1 to 69. These are not attempt points, so they are empty decode steps too. Each one runs a placeholder forward pass ({{cite deepinfer/worker/worker.py:125-127}}).</li>
+  <li>Step 71 has <code>decode_step = 70</code>, the next ALL point. If the multimodal worker answered for the first waiting request before the <code>fetch()</code> of step 70, the prefill runs in step 71.</li>
+</ol>
+<p>So step 71 is the <em>earliest</em> prefill step. The code does not show how fast the worker process answers. If it is late, the next attempt points are <code>decode_step</code> 100 (ANY point, step 101) and 140 (ALL point, step 141). With one DP rank, ANY and ALL give the same result. With more DP ranks, the ALL point at 70 needs every rank to be ready. In this release the only model class has a vision part, so every request of a NORMAL engine goes through this wait. A model class without <code>multi_modal_mapper</code> would get no <code>MultimodalProcessor</code> and could prefill in step 1 ({{cite deepinfer/engine/llm_engine.py:210}}).</p>
+<p><strong>The output of this part.</strong> <code>SchedulerOutputs</code> holds <code>scheduled_seqs</code>, <code>prompt_run</code>, <code>num_batched_tokens</code>, <code>finished_seqs</code>, <code>ignored_seqs</code>, <code>seqlens_q</code> and statistics ({{cite csrc/engine/scheduler.hpp:45-77}}). <code>schedule()</code> checks that <code>num_batched_tokens &lt;= max_num_batched_tokens</code> ({{cite csrc/engine/scheduler.hpp:671-673}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="6" title="Batch metadata: from sequences to tensors">
+<p>The model cannot read C++ sequence objects. It needs flat tensors: one row per query token, for all requests of the batch together. This layout is called <em>varlen</em> (variable length): the requests have different lengths, and offset arrays mark where each request starts. The page {{link concepts/input-metadata}} explains it.</p>
+<p>The work has three parts. First, <code>Scheduler::schedule()</code> makes one <code>SequenceMetadata</code> per scheduled sequence. It is a small view of the sequence with the lengths of this step:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="692-707" highlight="696-697,706-707">
+  <x-tr line="698-699">Open upper bound of the positions in this step: prefill stops at seqlen_k; decode pads seqlen_q on the GPU to at most max_seqlen_q (as max_k in zos.cpp), and DFlash drafts go nextn further. Buffers indexed by position, such as the RoPE cache, have only runtime_max_model_len rows.</x-tr>
+</x-code>
+<p><code>seqlen_q</code> is the number of new tokens of the request in this step. <code>seqlen_k</code> is the number of tokens it can see: the cached ones plus the new ones. For our prefill, both are 41.</p>
+<p>Second, the worker turns the list into tensors. <code>ModelRunner._prepare_input_tensors</code> calls the C++ function <code>prepare_prompt_v4</code> or <code>prepare_decode_v4</code> through <code>ModelMetadata.prepare_inputmetadata_dict</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:146-188}}). The common part writes the positions and the input ids:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_base.cpp" lines="88-122" highlight="93-94,112,116-118" />
+<p>In a prefill step, line 112 copies <code>seqlen_q</code> prompt ids. In a decode step, it copies one id (the last real token), and lines 116-118 add the draft tokens. Third, Python wraps the dict in an <code>InputMetadataV4</code> (or <code>InputMetadataV4VL</code> for a vision model) and copies it to the device ({{cite deepinfer/worker/model_runner.py:142-146}}, {{cite deepinfer/worker/model_runner.py:192-198}}). In a decode step with a CUDA graph, the function writes into the buffers of the graph instead (deep dive).</p>
+<p><strong>What the data looks like now</strong> (prefill step; our request alone, illustrative):</p>
+<pre><code class="language-python">SequenceMetadata(request_id="1", is_prompt=True, seqlen_q=41, seqlen_k=41,
+                 block_table=[2], state_id=2, last_output_token=25)
+total_q          = 41
+positions        int32 [41]  = [0, 1, 2, ..., 40]
+input_ids        int32 [41]  = [0, 15823, 25, ..., 25]
+cu_seqlens_q     int32 [2]   = [0, 41]
+cu_seqlens_k     int32 [2]   = [0, 41]
+slot_mapping_store_swa int32 [41] = [268, 269, ..., 308]   # 2 * 134 + position
+slot_mapping_store_ca["2"] int32 [20] = [128, 129, ..., 147] # block 2 * 64 + index
+state_block_idx  int32 [1]   = [2]</code></pre>
+<x-deepdive title="Stop 6 in detail: the tensors of a prefill step and a decode step">
+<p>All tensors are in {{term pinned-memory | pinned}} CPU memory, made with <code>torch::TensorOptions(dtype).pinned_memory(true)</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:8}}). The arguments travel in one <code>PrepareArgs</code> struct ({{cite csrc/engine/input_metadata/prepare_tensor_input.hpp:20-50}}).</p>
+<table>
+  <thead><tr><th>Name</th><th>Shape, dtype</th><th>Meaning</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>positions</code></td><td><code>[total_q]</code> int32</td><td>Absolute position of each query token: <code>seqlen_k - seqlen_q</code> to <code>seqlen_k - 1</code>.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:88-96}}</td></tr>
+    <tr><td><code>input_ids</code></td><td><code>[total_q]</code> int32</td><td>Prefill: prompt ids. Decode: last token, then drafts.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:98-122}}</td></tr>
+    <tr><td><code>ngram_token_ids</code></td><td><code>[total_q, max_ngram]</code> int32</td><td>Engram only: the compressed ids of the last n tokens.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:124-137}}</td></tr>
+    <tr><td><code>cu_seqlens_q</code>, <code>cu_seqlens_k</code></td><td><code>[n_seq + 1]</code> int32</td><td>Prefill: start offset of each request.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:407-418}}</td></tr>
+    <tr><td><code>slot_mapping_store_ca[ratio]</code></td><td>prefill <code>[n_cq]</code>, decode <code>[total_q]</code> int32</td><td>Where each new compressed KV entry goes: <code>block * (128 / ratio) + index</code>. <code>-1</code> means no write.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:39-96}}</td></tr>
+    <tr><td><code>slot_mapping_store_swa</code></td><td><code>[total_q]</code> int32</td><td>Where each token goes in the sliding-window ring: <code>state_id * swa_block_size + pos % swa_block_size</code>.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:98-109}}</td></tr>
+    <tr><td><code>state_block_idx</code></td><td>prefill <code>[n_seq]</code>, decode <code>[total_q]</code> int32</td><td>The state slot of each request or token.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:111-126}}</td></tr>
+    <tr><td><code>block_tables</code></td><td>decode <code>[total_q, max_num_blocks]</code> int32</td><td>A copy of the block table for every query token.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:208-229}}</td></tr>
+    <tr><td><code>context_lens</code></td><td>decode <code>[total_q]</code> int32</td><td>Tokens visible to each query token, itself included.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:189-205}}</td></tr>
+    <tr><td><code>valid_token_mask</code></td><td>decode <code>[total_q]</code> bool</td><td><code>False</code> for placeholder (padding) rows.</td><td>{{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:173-182}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example, slot maps.</strong> With ratio 2, one block of 128 tokens holds 64 compressed entries. Our 41 tokens make <code>41 // 2 = 20</code> entries, at positions 0, 2, ..., 38. With block 2, they go to slots <code>2 * 64 + 0</code> to <code>2 * 64 + 19</code>, so 128 to 147. The sliding-window ring of one slot has <code>swa_block_size</code> rows. The docs give 128 + 6 = 134 for V4.1 ({{cite doc/inference_deployment_qa.md:191}}). The code computes window size plus <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code>, which is at least <code>nextn + 1</code> ({{cite deepinfer/worker/cache_engine.py:88-93}}, {{cite deepinfer/environ.py:132}}). A token goes to the ring only if it is one of the last <code>swa_block_size</code> tokens of the chunk. All 41 are, so the slots are <code>2 * 134 + 0</code> to <code>2 * 134 + 40</code>.</p>
+<p><strong>Decode with a CUDA graph.</strong> In a decode step, the worker selects a captured {{term cuda-graph | CUDA graph}} first. <code>prepare_decode_v4</code> then writes straight into the input buffers of that graph (<code>out_dict</code>). Placeholder sequences fill the rows up to the graph size ({{cite deepinfer/worker/model_runner.py:184-191}}). With ZOS, the decode path is <code>prepare_decode_v4_zos</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:142-144}}).</p>
+<p><strong>Context parallelism.</strong> With <code>--cp</code> above 1, only the driver builds the metadata. It sends it to the other {{term context-parallelism | CP}} ranks with <code>broadcast_tensor_dict</code> ({{cite deepinfer/worker/model_runner.py:200-230}}).</p>
+<p><strong>The metadata pool.</strong> <code>SequenceMetadata</code> objects come from an object pool. The engine gives them back one step later ({{cite deepinfer/engine/llm_engine.py:1013}}, {{cite deepinfer/engine/llm_engine.py:100-104}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="7" title="The worker step: forward N, post-process N-1, sample N">
+<p>After the schedule, <code>step()</code> calls the worker through <code>_run_workers("execute_model_step", ...)</code> ({{cite deepinfer/engine/llm_engine.py:961-975}}). The {{term driver-worker | driver worker}} runs in the same process. The function has a fixed order:</p>
+<x-code file="deepinfer/worker/worker.py" lines="113-189" highlight="122,144,154,164,183-187">
+  <x-tr line="146">3. Sample the current step (first correct the CPU metadata with the seqlens_q copied back from the device).</x-tr>
+  <x-tr line="182">4. A prompt step, or a non-ZOS configuration: post-process now. A ZOS decode step: keep it for the next step, to overlap with forward.</x-tr>
+</x-code>
+<ol>
+  <li>Line 122: start the forward pass of step N on the device (stop 8). The call returns at once; the device works in the background.</li>
+  <li>Line 144: post-process step N-1 (stop 12) while the device runs step N.</li>
+  <li>Line 154: start the sampler of step N (stops 10 and 11).</li>
+  <li>Line 164: <code>pre_sampler_sync</code> releases old objects and frees the blocks of finished sequences ({{cite deepinfer/engine/llm_engine.py:830-846}}).</li>
+  <li>Lines 183-187: a prefill step is post-processed at once. A decode step with {{term zos | zero-overhead scheduling}} (ZOS) is kept for the next step.</li>
+</ol>
+<p>ZOS is on by default for the NORMAL engine ({{cite deepinfer/engine/arg_utils.py:51-55}}, {{cite deepinfer/engine/engine_type.py:15-17}}). With ZOS, the CPU and the device work at the same time. The cost: <code>step()</code> returns the tokens of the <em>previous</em> decode step.</p>
+<p><strong>What the data looks like now</strong> (after the call returns, illustrative):</p>
+<pre><code class="language-python">self.prev_step_state = WorkerStepState(        # None after a prefill step
+    seq_metadata_list=[...], scheduler_outputs=..., sampler_output=SamplerOutput(...),
+    is_prompt=False, is_placeholder=False, sample_end_evt=torch.cuda.Event(), graph_size=8)
+request_outputs = np.array([140231233421312, ...], dtype=np.uint64)  # pointers to C++ objects</code></pre>
+<x-deepdive title="Stop 7 in detail: why the CPU is one step behind, and how the device catches up">
+<p><strong>The problem.</strong> With ZOS, step N+1 is scheduled before step N is post-processed. So the CPU does not yet know how many drafts of step N the sampler accepted. The scheduler assumes the most: it adds <code>nextn + 1</code> to <code>total_inflight_tokens</code> for each scheduled sequence ({{cite csrc/engine/scheduler.hpp:689}}, {{cite csrc/engine/scheduler.hpp:726}}). <code>seqlen_k</code> includes that number ({{cite csrc/engine/scheduler.hpp:697}}).</p>
+<p><strong>The fix on the device.</strong> <code>_correct_seqlens_qk</code> matches the sequences of step N+1 with those of step N by <code>seq_id</code> (<code>prepare_zos_inputs</code>, {{cite csrc/engine/zos.cpp:142-196}}). Then a kernel corrects <code>seqlens_k</code> on the device: <code>seqlens_k[i] += seqlens_q[i] - (nextn - accepted[j])</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/compute_seqlens_k_zos.py:10-31}}). The real input ids come from the sampled tokens of step N, which are still on the device (<code>MetadataZOS</code>, {{cite deepinfer/worker/zos_status.py:23-40}}). With the default settings, this correction needs no CPU-device sync. With DSpark (<code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>), the worker copies the corrected <code>seqlens_q</code> back and waits for that copy before it samples ({{cite deepinfer/worker/worker.py:146-152}}, {{cite deepinfer/worker/worker.py:229-234}}).</p>
+<p><strong>No sync rule.</strong> <code>execute_main_model</code> and <code>execute_sample</code> run inside <code>forbid_cuda_sync()</code>. Their docstrings say: "This function must NOT contain any cuda synchronize" ({{cite deepinfer/worker/model_runner.py:315-324}}). The main wait of a step is <code>sample_end_evt.synchronize()</code> in <code>_post_process_step</code>, one step later ({{cite deepinfer/worker/worker.py:262-263}}).</p>
+<p><strong>Placeholder steps.</strong> If the batch is empty, the worker still runs a forward pass on one dummy sequence (<code>_placeholder_seq_metadata</code>, {{cite deepinfer/worker/model_runner.py:386-403}}).</p>
+<p><strong>CP workers.</strong> <code>run_workers</code> sends the method name to the CP worker processes before it calls the method on the driver ({{cite deepinfer/worker/base.py:290-302}}). The CP workers run the same method in <code>start_slave_worker_loop</code> ({{cite deepinfer/worker/base.py:129-133}}). They get only <code>is_prompt</code> and <code>is_placeholder</code>; the sequence list stays on the driver.</p>
+<p><strong>Settings.</strong> <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING=0</code> turns ZOS off; then each step post-processes itself ({{cite deepinfer/environ.py:179}}). <code>DEEPINFER_GC_INTERVAL_STEP</code> (default 1000) sets how often the worker runs Python garbage collection ({{cite deepinfer/environ.py:185}}, {{cite deepinfer/worker/base.py:153-157}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="8" title="The forward pass: the model runs on the device">
+<p><code>ModelRunner.execute_main_model</code> builds the input (stop 6) and runs the model. A decode step replays a CUDA graph. A prefill step calls the model directly ("eager"):</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="319-335" highlight="326-329" />
+<p>A CUDA graph is a recording of all kernel launches of one forward pass, for one fixed batch size. A replay starts all of them with one call, so the CPU cost is small. The graph sizes for this example are 1, 2, 4, 8, 16 and 24 tokens ({{cite deepinfer/worker/cuda_graph_runner.py:41-51}}). One decode request with 6 tokens uses the graph of size 8 ({{cite deepinfer/worker/cuda_graph_runner.py:143-148}}).</p>
+<p>The model object is a <code>DeepseekVLForCausalLM</code>, a subclass of <code>DeepseekForCausalLM</code>. It is the only class that the model registry knows ({{cite deepinfer/model_executor/models/__init__.py:15-17}}). <code>DeepseekForCausalLM.forward</code> passes the call to the inner <code>DeepseekModel.forward</code> ({{cite deepinfer/model_executor/models/deepseek.py:374-381}}). That function is short at the top level:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="154-164" highlight="161-162" />
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="190-248" highlight="210-218,220-223,239,246-248" />
+<ol>
+  <li>Lines 161-162: the embedding table turns each input id into a vector (a {{term hidden-state}}). In a prefill step, <code>DeepseekVLForCausalLM</code> makes these vectors itself and passes them in, so these lines do not run (deep dive).</li>
+  <li>Lines 210-218: each decoder layer runs {{term attention}} and then the MLP or {{term moe | MoE}} block ({{cite deepinfer/model_executor/models/decoder_layer.py:155-173}}). Each layer gets its part of the KV cache, <code>kv_caches[i]</code> (stop 9).</li>
+  <li>Lines 220-223: the model writes input for DFlash (stop 11) into its cache.</li>
+  <li>Line 239: a final norm.</li>
+  <li>Lines 246-248: the result is the hidden states, not the {{term logits}}. The sampler computes the logits only for the rows that it needs (stop 10).</li>
+</ol>
+<p><strong>What the data looks like now</strong> (illustrative):</p>
+<pre><code class="language-python">prefill:  hidden_states  [41, hidden_size]    # one row per prompt token
+decode:   hidden_states  [8, hidden_size]     # graph size 8: 6 real rows + 2 padding rows</code></pre>
+<x-deepdive title="Stop 8 in detail: what this tour does not open">
+<p>The inside of a decoder layer is the subject of {{link tours/decoder-layer}}. The parts, with their concept pages:</p>
+<ul>
+  <li>mHC residual mixing: <code>attn_norm_forward</code> and <code>ffn_norm_forward</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:143}}, {{cite deepinfer/model_executor/models/decoder_layer.py:162}}). See {{link concepts/mhc-residual}}.</li>
+  <li>Attention with MLA, a sparse indexer, a sliding window and compressed KV. See {{link concepts/mla-attention}}, {{link concepts/sparse-attention-indexer}}, {{link concepts/sliding-window-attention}}, {{link concepts/kv-compression}}.</li>
+  <li>MoE with expert parallelism: tokens go to the devices of their experts and come back. See {{link concepts/moe-routing}}.</li>
+  <li>Vision: in a prefill step, <code>DeepseekVLForCausalLM.forward</code> makes the input embeddings with the image features first ({{cite deepinfer/model_executor/models/deepseek_vl.py:226-234}}). See {{link concepts/vision-encoder}}.</li>
+  <li>Context parallelism in prefill: the model reorders the tokens for the CP ranks before the layers and gathers the result after the norm ({{cite deepinfer/model_executor/models/deepseek.py:168-170}}, {{cite deepinfer/model_executor/models/deepseek.py:241-244}}). See {{link concepts/context-parallelism}}.</li>
+</ul>
+<p><strong>Graph settings.</strong> CUDA graphs are off for a PROMPT engine and with <code>DEEPINFER_ENFORCE_EAGER=1</code>. The largest graph has <code>max_num_seqs * (1 + nextn)</code> tokens: <code>4 * 6 = 24</code> here ({{cite deepinfer/worker/model_runner.py:73-79}}). <code>DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL</code> (default 8) sets the step between graph sizes ({{cite deepinfer/environ.py:155}}). A batch larger than the largest graph raises <code>ValueError</code> in <code>select</code>.</p>
+<p><strong>Logits are float32.</strong> <code>get_logits</code> makes a float32 tensor <code>[rows, vocab_size]</code> and fills it with a BF16 matrix multiply against the LM head weights ({{cite deepinfer/model_executor/layers/sampler_utils.py:20-28}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="9" title="The KV cache: what this step writes">
+<p>Attention needs the keys and values of all earlier tokens. The {{term kv-cache}} keeps them, so the model does not compute them again in each step. In DeepInfer, the cache for one request has two parts:</p>
+<ul>
+  <li><strong>Paged blocks</strong> for the compressed KV entries: one entry for every 1 or 2 tokens ({{term kv-compression}}). The {{term block-table}} of the sequence lists its blocks (stop 5).</li>
+  <li><strong>A state slot</strong> for the {{term sliding-window-attention | sliding-window}} KV: a ring with room for the last 134 tokens per layer. The docs say: "The SWA KV cache does not go into paged KV blocks; it lives in the state cache" ({{cite doc/inference_deployment_qa.md:163}}).</li>
+</ul>
+<x-code file="deepinfer/worker/cache_engine.py" lines="205-218" caption="The cache views of one layer. All are uint8 tensors with a packed layout, except the fp32 compression states." />
+<p>The forward pass does the writes. The kernels of each attention layer use the slot maps from stop 6. No Python code runs per token. The block and state ids come from the scheduler; the device only follows them.</p>
+<p><strong>What the data looks like now</strong> (after the prefill step, illustrative):</p>
+<pre><code class="language-python">ca_cache[ratio 2]   block 2, rows 0..19     # 20 compressed entries for positions 0..39
+swa_cache           state slot 2, rows 0..40 # ring rows = position % 134
+ca_state            state slot 2             # the half-done pair: position 40 waits for 41
+Sequence "1": cache.num_tokens = 41  (set in stop 12)</code></pre>
+<x-deepdive title="Stop 9 in detail: sizes, slots and what a decode step writes">
+<p><strong>Sizes.</strong> A compressed entry uses 528 bytes in MXFP8 or 288 bytes in FP4: data plus scale factors ({{cite deepinfer/worker/cache_engine.py:211-213}}). A sliding-window entry uses 528 bytes ({{cite deepinfer/worker/cache_engine.py:216-218}}). The docs give the stored part of one state slot as "20 layers × 134 tokens × 528 B = 1,415,040 B per sequence" ({{cite doc/inference_deployment_qa.md:169}}).</p>
+<p><strong>How many slots and blocks.</strong> The number of state slots is <code>int(max_num_seqs * DEEPINFER_NUM_STATE_SLOTS_RATIO) + 1</code>: <code>int(4 * 1.2) + 1 = 5</code> here ({{cite deepinfer/worker/cache_engine.py:201-202}}, {{cite deepinfer/environ.py:162}}). Slot 0 is never given out (stop 5). The memory profile at start-up sets the number of blocks. It takes <code>total memory * gpu_memory_utilization</code> and subtracts the peak use of a test run and two times the state cache. It divides the rest by the size of one block ({{cite deepinfer/worker/base.py:228-245}}). Then all ranks use the same value: the mean over all ranks, rounded down to an even number ({{cite deepinfer/worker/base.py:264-266}}).</p>
+<p><strong>A decode step.</strong> The 6 query tokens of one request write 6 ring rows. A compressed entry is written only where <code>(position + 1) % ratio == 0</code>; other rows get slot <code>-1</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:70-95}}). The step writes entries for draft tokens too. If the sampler rejects a draft, its entries are wrong. They do no harm: <code>cache.num_tokens</code> counts only accepted tokens (stop 12), and the next step writes over the same rows. The DFlash docstring uses the same argument for its own cache ({{cite deepinfer/model_executor/models/mtp/dflash.py:204-209}}).</p>
+<p><strong>A new block.</strong> When the sequence grows past the end of its last block, <code>_append_slot</code> adds one block in the next decode schedule ({{cite csrc/engine/scheduler.hpp:817-828}}).</p>
+<p><strong>The end.</strong> When the request finishes, <code>finalize_seq</code> calls <code>scheduler.free_seq</code>, which frees the blocks and the state slot ({{cite deepinfer/engine/llm_engine.py:804-806}}, {{cite csrc/engine/scheduler.hpp:738-750}}). The pages {{link learn/kv-cache}} and {{link concepts/paged-kv-cache}} explain the cache in full.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="10" title="Sampling: the sampler selects the next token">
+<p>After the forward pass, <code>execute_sample</code> calls <code>DeepseekForCausalLM.sample</code>, which calls <code>Sampler.forward</code> with the LM head weights ({{cite deepinfer/worker/model_runner.py:337-367}}, {{cite deepinfer/model_executor/models/deepseek.py:383-400}}). The sampler first takes only the rows that need a token, and computes the logits for them:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="140-143" />
+<p>In a <strong>prefill</strong> step, the selected row is the last token of the prompt: row 40 of the 41 rows of our request ({{cite csrc/engine/prepare_sample.cpp:197-198}}). In the batch, the row number also includes the rows of the requests before it. Our request has <code>first_n_token_no_eos=1</code>, so the sampler first sets the logit of EOS to minus infinity in that row:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="183-193" highlight="184-185,190">
+  <x-tr line="183">first_n_token_no_eos can forbid EOS as the first output; the target rows are computed in the preparation step.</x-tr>
+</x-code>
+<p><code>_prefill_golden_gen</code> applies temperature 0.4, top-p and top-k, and samples one token with the seed of the request ({{cite deepinfer/model_executor/layers/sampler.py:597-634}}). It also computes the {{term logprob}} of the sampled token, and the 4 most likely tokens with their logprobs (<code>top_logprobs=4</code>) ({{cite deepinfer/model_executor/layers/sampler.py:609-613}}).</p>
+<p>In a <strong>decode</strong> step, all <code>seqlen_q</code> rows of the request are selected ({{cite csrc/engine/prepare_sample.cpp:202-206}}). The sampler does not only sample. It <em>verifies</em> the draft tokens: row <code>j</code> predicts the token after input <code>j</code>, so it can accept or reject draft <code>j + 1</code> ({{cite deepinfer/model_executor/layers/sampler.py:74-81}}). This is {{term speculative-decoding}}.</p>
+<p><strong>What the data looks like now</strong> (prefill, illustrative):</p>
+<pre><code class="language-python">logits                      float32 [1, vocab_size] # our row only; vocab_size 129280 inferred (stop 3)
+sampled_token.token_ids     int32   [1] = [14200] # " William"
+sampled_token.token_logprobs float32 [1] = [-0.02]
+topk_tokens.logps / tokens  [1, 4]                 # top_logprobs = 4
+next_n_token_ids            None                   # no drafts in a prefill step</code></pre>
+<x-deepdive title="Stop 10 in detail: inputs, force-top-k, and results on the CPU">
+<p><strong>Sampler inputs.</strong> <code>prepare_sampler_inputs</code> (C++) builds arrays with one entry per sequence: <code>temperatures</code>, <code>top_ps</code>, <code>top_ks</code>, <code>seq_seeds</code> and <code>sample_positions</code> ({{cite csrc/engine/prepare_sample.cpp:80-88}}). It also builds <code>selected_token_indices</code>, with one entry per sampled row. In a prefill step, <code>sample_positions</code> is <code>seqlen_k</code>, so 41 for our request ({{cite csrc/engine/prepare_sample.cpp:197-198}}). The seed and the position go to the sampling kernel, so a fixed <code>seq_seed</code> can give the same result again. See {{link concepts/determinism}}.</p>
+<p><strong>Force top-k.</strong> With <code>DEEPINFER_SAMPLER_FORCE_TOPK=4096</code>, the sampler keeps only the 4096 largest logits per row and works on them. A <code>token_index</code> tensor maps back to vocabulary ids ({{cite deepinfer/model_executor/layers/sampler.py:90-91}}, {{cite deepinfer/model_executor/layers/sampler.py:650-683}}).</p>
+<p><strong>Decode verification.</strong> <code>_verification</code> maps each row to its request and to its draft index. It reads the draft logprobs of the previous step from the MTP info pool and decides the accepted prefix ({{cite deepinfer/model_executor/layers/sampler.py:411-457}}). In the result, <code>verified_tokens.token_ids</code> has one entry per row, with <code>-1</code> after the first rejected draft. The tour {{link tours/spec-decode-round}} reads it line by line.</p>
+<p><strong>Results go to the CPU without a wait.</strong> <code>sampler_epilogue()</code> starts <code>non_blocking</code> copies of the results to the CPU ({{cite deepinfer/sequence.py:130-139}}). The CPU reads them only after <code>sample_end_evt</code> is done (stop 12). A GPU copy stays on the device for ZOS: <code>sampled_token_ids_gpu</code>, <code>predict_token_ids_gpu</code> and <code>num_accepted_tokens_gpu</code> ({{cite deepinfer/model_executor/layers/sampler.py:258-291}}).</p>
+<p><strong>Other options.</strong> <code>DEEPINFER_DECODE_TOKEN_BLACKLIST</code> sets the logits of the listed ids to minus infinity ({{cite deepinfer/model_executor/layers/sampler.py:107-112}}, {{cite deepinfer/model_executor/layers/sampler.py:167-169}}). Structured output applies a token bit mask to the logits ({{cite deepinfer/model_executor/layers/sampler.py:187-188}}). See {{link concepts/sampler}} and {{link concepts/structured-outputs}}.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="11" title="Draft tokens: DFlash guesses the next tokens">
+<p>A decode step that makes only one token per request is slow, because the whole model runs for one token. DeepInfer adds a small {{term mtp | multi-token prediction}} module, {{term dflash | DFlash}}. It guesses the next 5 tokens: the {{term draft-token | draft tokens}}. In the next step, the main model checks all 5 at the same time (stop 10).</p>
+<p>The sampler calls DFlash only in decode steps, after the verification:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="235-251" highlight="237,244" />
+<p>DFlash starts from the token that the sampler just made (<code>golden_tokens</code>). It runs its own layers once and samples 5 drafts. It stores their ids and logprobs in the MTP info pool, in the slot of the request ({{cite deepinfer/model_executor/models/mtp/dflash.py:279-345}}). In a prefill step, there is no DFlash pass. The comment says that the main model forward already updated the DFlash cache ({{cite deepinfer/model_executor/layers/sampler.py:69-72}}).</p>
+<p><strong>What the data looks like now</strong> (illustrative):</p>
+<pre><code class="language-python"># after the prefill step: no drafts; the engine pads (stop 12)
+seq.mtp.draft_tokens = [129279, 129279, 129279, 129279, 129279]   # vocab_size - 1 (vocab_size 129280 inferred, stop 3)
+# after a decode step:
+predict_tokens.token_ids        int32   [1, 5] = [[41813, 198, 198, 21265, 25]]
+predict_tokens.confidence_rates float32 [1, 5] or None</code></pre>
+<x-deepdive title="Stop 11 in detail: placeholder drafts, confidence and DSpark">
+<p><strong>Placeholder drafts.</strong> After a prefill step, <code>next_n_token_ids</code> is <code>None</code>. The NORMAL engine then uses <code>get_nextn_pad_token_ids()</code>: 5 copies of <code>vocab_size - 1</code> ({{cite deepinfer/engine/llm_engine.py:706-713}}, {{cite deepinfer/model_executor/layers/mtp_info_pool.py:9-11}}). Pool slot 0 is the padding slot ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:14-23}}). So the first decode step after prefill also sends 6 tokens: the real token and 5 placeholder drafts.</p>
+<p><strong>Into the sequence.</strong> <code>process_MTPInfo</code> copies the new drafts into <code>seq.mtp.draft_tokens</code>. If the model has a confidence head, it also stores the running product of the confidences as <code>accept_rates</code> ({{cite csrc/engine/scheduler.hpp:1232-1260}}).</p>
+<p><strong>DSpark.</strong> With <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>, the scheduler uses the accept rates and a measured cost curve. It then sends fewer drafts for requests whose drafts are likely to fail ({{cite csrc/engine/mtp_varlen.hpp:160-267}}). The README describes this feature ({{cite README.md:24}}). See {{link concepts/dspark}}.</p>
+<p><strong>Graph.</strong> With CUDA graphs on, the whole DFlash decode pass is a second graph ({{cite deepinfer/model_executor/models/mtp/dflash.py:347-387}}). Turn it off with <code>DEEPINFER_DFLASH_ENFORCE_EAGER=1</code> ({{cite deepinfer/worker/model_runner.py:80-85}}).</p>
+<p>The tour {{link tours/spec-decode-round}} follows one full round: draft, verify, accept, next drafts.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="12" title="Output assembly: the engine updates the sequence and builds outputs">
+<p>Now the engine reads the results on the CPU. In a prefill step this happens in the same step. In a ZOS decode step it happens during the next step (stop 7). <code>_post_process_step</code> waits for <code>sample_end_evt</code> and calls <code>LLMEngine.post_process</code> ({{cite deepinfer/worker/worker.py:247-272}}). That calls <code>_process_model_outputs</code>, which makes three C++ calls:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="717-761" highlight="718,727,743">
+  <x-tr line="725">Update the state of the requests in the scheduler.</x-tr>
+</x-code>
+<ol>
+  <li><code>process_MTPInfo</code> stores the new drafts in each sequence (stop 11).</li>
+  <li><code>scheduler.process_outputs</code> appends the accepted drafts and the new token to each sequence and checks the stop conditions.</li>
+  <li><code>build_request_outputs</code> makes one <code>RequestOutput</code> object per new token.</li>
+</ol>
+<p>The stop check runs after each appended token:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="1035-1052" />
+<p><strong>What the data looks like now</strong> (after the prefill step, illustrative):</p>
+<pre><code class="language-python">Sequence "1":
+  input.tokens.token_ids = [0, 15823, ..., 25, 14200]   # 42 ids, prompt_len 41
+  cache.num_tokens       = 41
+  mtp.last_output_token  = 14200
+  scheduler.running      = [..., seq "1", ...]
+RequestOutput(request_id="1", prompt_len=41, token_id=14200, finished=False,
+              finish_reason="", token_logprobs=-0.02, top_logprobs=[4 floats],
+              top_token_ids=[4 ids], num_output_tokens=1, draft_tok=1, accept_tok=1)</code></pre>
+<x-deepdive title="Stop 12 in detail: process_outputs line by line, and the output pool">
+<x-code file="csrc/engine/scheduler.hpp" lines="927-1000" highlight="927,940,952,967-971,982-990,999" />
+<ol>
+  <li><strong>Line 927.</strong> <code>advance_optimistically(seqlen_q)</code>: <code>num_tokens += seqlen_q</code>, and the old value is kept.</li>
+  <li><strong>Line 940.</strong> If <code>num_tokens</code> is still below the token count, this was a prefill chunk that is not the last one. The sequence goes back to the front of <code>waiting</code> (lines 1011-1020).</li>
+  <li><strong>Line 952.</strong> After a full prefill, the sequence goes into <code>running</code>.</li>
+  <li><strong>Lines 955-967.</strong> The accepted drafts are read from the flat <code>accepted_token_ids</code> array, until the first <code>-1</code>.</li>
+  <li><strong>Lines 969-971.</strong> The list to append is: accepted drafts, then the sampled token.</li>
+  <li><strong>Lines 982-990.</strong> Each token goes into both id lists. <code>_check_stop</code> runs after each one, so a stop inside the accepted drafts drops the rest.</li>
+  <li><strong>Line 999.</strong> In decode, <code>commit_processed_tokens(token_cnt)</code> sets <code>num_tokens</code> to the old value plus the number of appended tokens. Rejected drafts do not count.</li>
+</ol>
+<p><strong>Worked example.</strong> A decode step with input positions 49 to 54 accepts 2 drafts. The sequence gets 3 tokens: d1, d2 and the new sample. Its length goes from 50 to 53 and <code>num_tokens</code> from 49 to 52. Panel 3 of the diagram in <a href="#the-loop">The loop</a> shows the same step.</p>
+<p><strong>One output per token.</strong> <code>build_request_outputs</code> makes one object for each accepted draft and one for the sampled token. The last one gets <code>draft_tok = drafts + 1</code> and <code>accept_tok = accepted + 1</code> ({{cite csrc/engine/outputs.hpp:199-294}}). Ignored sequences get one output with their finish reason ({{cite csrc/engine/outputs.hpp:297-304}}). A prefill chunk that is not the last one gets no output. Logprobs below -9999 are clamped to -9999 ({{cite csrc/engine/outputs.hpp:182-192}}).</p>
+<p><strong>The output pool.</strong> The objects live in a {{term request-output-pool | RequestOutputPool}} with room for 10000 outputs. Python gets only <code>uint64</code> pointers ({{cite csrc/engine/outputs.hpp:45-81}}). The engine collects the pointers and releases them in the next <code>pre_sampler_sync</code> ({{cite deepinfer/engine/llm_engine.py:92-107}}, {{cite deepinfer/engine/llm_engine.py:830-831}}). The docstring of <code>step()</code> gives the rule:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="860-871" highlight="867-870" />
+<p><strong>A finished request.</strong> When <code>_check_stop</code> sets a <code>FINISHED_*</code> status, the sequence stays in <code>running</code> until the next decode schedule. <code>free_finished_seqs</code> then moves it to <code>finished_seqs</code> ({{cite csrc/engine/scheduler.hpp:752-763}}). <code>pre_sampler_sync</code> of that step calls <code>finalize_seq</code>, which frees the blocks ({{cite deepinfer/engine/llm_engine.py:844-846}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="13" title="Back to the user: tokens and text">
+<p>The last stop is the loop in <code>LLM._run_engine</code>. It calls <code>step()</code> while a request is unfinished, and once more <code>flush_inflight_reqs()</code> at the end:</p>
+<x-code file="deepinfer/entrypoints/llm.py" lines="175-190" highlight="178,181,187,189-190" />
+<ol>
+  <li>Line 178: <code>step()</code> while there is work, then one <code>flush_inflight_reqs()</code>. The flush post-processes the last ZOS step, which no later step would do ({{cite deepinfer/engine/llm_engine.py:977-982}}).</li>
+  <li>Line 181: <code>RequestOutput.clone(ptr)</code> copies the C++ object into a new Python-owned object ({{cite csrc/engine/pybind_output.cpp:17-18}}). This copy is necessary because of the pool rule in stop 12.</li>
+  <li>Line 187: the results are sorted by request id as an integer, so the order is the order of the prompts.</li>
+  <li>Lines 189-190: with <code>decode_sequence=True</code>, the token ids become text with <code>tokenizer.decode</code>.</li>
+</ol>
+<p>The example uses <code>decode_sequence=False</code> (stop 1). So it gets lists of <code>RequestOutput</code> objects and decodes the text itself ({{cite examples/offline_inference.py:78-81}}).</p>
+<p><strong>What the data looks like now</strong> (illustrative):</p>
+<pre><code class="language-python">outputs[1]                          # list of RequestOutput, one per token, up to 128
+[x.token_id for x in outputs[1]]    # [14200, 41813, 198, 198, 21265, 25, ...]
+outputs[1][-1].finished             # True
+outputs[1][-1].finish_reason        # "length" (128 tokens) or "stop" (EOS id 1)
+tokenizer.decode(ids)               # " William Shakespeare\n\nQuestion: ..."</code></pre>
+<x-deepdive title="Stop 13 in detail: has_unfinished_requests and the end of the loop">
+<p><code>has_unfinished_requests()</code> asks the scheduler for the number of sequences in <code>waiting</code>, <code>running</code> and <code>prompted</code>, plus requests that wait for an SO matcher ({{cite deepinfer/engine/llm_engine.py:665-679}}, {{cite csrc/engine/scheduler.hpp:165-167}}). With more than one DP rank, it takes the maximum over the DP group. So a rank with no work runs placeholder steps until all ranks finish. This keeps the collective operations of all ranks in the same order.</p>
+<p>A finished sequence still counts while it is in <code>running</code>. So the loop runs one more step after the last token: that step frees the blocks (stop 12). The ZOS step that was in flight at that time had our request in its batch. Its result is dropped: <code>process_outputs</code> skips finished sequences ({{cite csrc/engine/scheduler.hpp:905-915}}).</p>
+<p>In the example, <code>print_output</code> also computes the acceptance rate from <code>draft_tok</code> and <code>accept_tok</code>, and a perplexity from <code>token_logprobs</code> ({{cite examples/offline_inference.py:79-86}}). <code>llm.close()</code> stops the workers ({{cite examples/offline_inference.py:109}}).</p>
+</x-deepdive>
+</x-stop>
+
+<h2 id="the-loop">The loop: many steps for one request</h2>
+<p>Stops 5 to 12 repeat for every engine step. One request sees one prefill step (or more with chunked prefill) and then many decode steps. Each decode step adds 1 to 6 tokens. The diagram shows the steps of request <code>"1"</code> alone. It counts the steps from the first prefill step and leaves out the empty steps before it (stop 5, deep dive).</p>
+<x-diagram name="tour1_loop" alt="Panel 1: a row of engine steps: step 1 prefill with 41 query tokens, then decode steps with 6 query tokens each, then a step that frees the blocks, then the flush. Under each step: what step() returns; with ZOS a decode step returns the tokens of the step before it. Panel 2: a timeline with a CPU row and a device row; the CPU post-processes step N-1 while the device runs forward N. Panel 3: one decode step with positions 49 to 54, input the last token and 5 drafts; drafts 1 and 2 are accepted, draft 3 is rejected, so 3 tokens are appended." caption="The step loop for one request (illustrative counts). Click to zoom." />
+<ul>
+  <li><strong>Panel 1.</strong> The prefill step returns the first token in the same step. Each decode step returns the tokens of the step before it (stop 7). For 128 output tokens with about 3 tokens per step, the request needs about 40 decode steps.</li>
+  <li><strong>Panel 2.</strong> This overlap is the reason for ZOS. The CPU work of the scheduler and of the output assembly hides behind the forward pass on the device.</li>
+  <li><strong>Panel 3.</strong> The accepted drafts and the new sample are appended. The KV cache counts only them (stop 12).</li>
+</ul>
+<x-simplified>
+<p>The diagram shows one request. In the example, four requests share each step, and the fifth request starts when one of them finishes. In this release, empty steps come before the first prefill, because the model class has a vision part (stop 5, deep dive). With DSpark, a decode step can have fewer than 6 query tokens.</p>
+</x-simplified>
+
+<h2>What can go wrong</h2>
+<x-warning title="Clone each RequestOutput before the next step()">
+<p>If you call <code>LLMEngine.step()</code> yourself, the returned pointers are valid only until the next step. Copy them with <code>RequestOutput.clone()</code> first ({{cite deepinfer/engine/llm_engine.py:866-870}}). <code>LLM.generate()</code> does this for you.</p>
+</x-warning>
+<ul>
+  <li><strong>A request disappears.</strong> A token id outside <code>[0, vocab_size)</code> makes <code>add_request</code> drop the request with an info log line, not an error ({{cite deepinfer/engine/llm_engine.py:581-589}}). <code>generate()</code> then returns fewer results than prompts. The example checks this with an <code>assert</code> ({{cite examples/offline_inference.py:102}}).</li>
+  <li><strong>An empty prompt.</strong> <code>ValueError("prompt must not be empty")</code> ({{cite deepinfer/engine/llm_engine.py:553-554}}).</li>
+  <li><strong>A prompt that is too long.</strong> The request finishes at once with <code>"prompt_length_exceeded"</code> and no tokens ({{cite csrc/engine/scheduler.hpp:377-385}}).</li>
+  <li><strong>The KV cache is full.</strong> The scheduler preempts the running request with the longest output. In the offline API, the request runs its prefill again later. A structured-output request stops instead ({{cite csrc/engine/scheduler.hpp:766-790}}).</li>
+  <li><strong>The pool is exhausted.</strong> Code that never releases outputs gets <code>RequestOutputPool exhausted (max_size=10000)</code> ({{cite csrc/engine/outputs.hpp:65}}).</li>
+  <li><strong>A hung multimodal worker.</strong> If the worker makes no progress for <code>DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT</code> seconds, the engine calls <code>os.abort()</code> ({{cite deepinfer/ve/multimodal_processor.py:264-275}}).</li>
+  <li><strong>Devices set too late.</strong> Set <code>CUDA_VISIBLE_DEVICES</code> before you import <code>deepinfer</code> or <code>torch</code> ({{cite examples/_config.py:1-7}}). See {{link concepts/hardware-platforms}}.</li>
+</ul>
+<p><strong>Why it matters.</strong> The tour shows the full path of the data in one picture. Most questions about DeepInfer behaviour start with "which stop is it?". A slow first token can be a schedule question (stop 5). A wrong token can be a sampler question (stop 10). Lost output can be an output-pool question (stops 12 and 13).</p>
+
+<x-quiz>
+  <x-q level="easy">Which function turns the prompt text into token ids, and which id is always first?
+    <x-a><p><code>LLM._add_request</code> calls <code>self.llm_engine.tokenizer.encode(prompt)</code> ({{cite deepinfer/entrypoints/llm.py:156}}). The release fix-ups turn on <code>add_bos_token</code> and check that BOS has id 0, so the list always starts with 0 ({{cite deepinfer/hugging_face/tokenizer.py:59-69}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">In a decode step with the defaults of the example, how many query tokens does one request send, and what are they?
+    <x-a><p>6: the last real token and 5 draft tokens. Without a performance curve, <code>seqlen_q = 1 + number of drafts</code> ({{cite csrc/engine/mtp_varlen.hpp:153-157}}). <code>prepare_common_base</code> copies the last token and then the drafts into <code>input_ids</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:112-119}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>LLM._run_engine</code> call <code>RequestOutput.clone()</code> for every output?
+    <x-a><p><code>step()</code> returns pointers into a C++ <code>RequestOutputPool</code>. The engine releases them in the next <code>pre_sampler_sync</code>, so the objects become invalid in the next step ({{cite deepinfer/engine/llm_engine.py:100-107}}, {{cite deepinfer/engine/llm_engine.py:830-831}}, {{cite csrc/engine/outputs.hpp:72-80}}). <code>clone</code> makes an independent copy ({{cite csrc/engine/pybind_output.cpp:17-18}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With ZOS on, step N is a decode step. Which tokens does <code>step()</code> return? And why does a request that finished in step N's post-process still appear in the batch of step N+1?
+    <x-a><p>It returns the tokens of step N-1: the worker post-processes the previous step after it starts forward N, and keeps step N for later ({{cite deepinfer/worker/worker.py:143-144}}, {{cite deepinfer/worker/worker.py:182-187}}). Step N+1 is scheduled before the post-process of step N runs, so the scheduler does not know yet that the request is finished. <code>process_outputs</code> later skips the finished sequence, and the result of that extra step is dropped ({{cite csrc/engine/scheduler.hpp:905-915}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The model has a vision part and DP size is 1. You add one text request and call <code>generate()</code>. Why is step 1 not the prefill step? With default settings, which is the earliest step that can be the prefill step?
+    <x-a><p>The sequence starts with <code>schedulable=False</code>, because it has a multimodal dict ({{cite csrc/engine/pybind_sequence.cpp:35}}). <code>set_schedulable</code> runs in <code>fetch()</code>, after <code>schedule()</code> in the same step ({{cite deepinfer/engine/llm_engine.py:885}}, {{cite deepinfer/engine/llm_engine.py:939-941}}). So step 1 is an empty decode step, and <code>decode_step</code> becomes 1. The next prefill attempt point is <code>decode_step = 70</code>, the default <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> ({{cite csrc/engine/scheduler.hpp:308-319}}, {{cite deepinfer/environ.py:174}}). So step 71 is the earliest prefill step. It is the prefill step only if the multimodal worker answered before the <code>fetch()</code> of step 70. Else the next try is step 101 (<code>decode_step = 100</code>, ANY point). (This answer is derived from the code; see the deep dive of stop 5.)</p></x-a>
+  </x-q>
+</x-quiz>
