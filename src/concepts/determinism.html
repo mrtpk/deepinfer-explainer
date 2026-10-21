@@ -1,0 +1,177 @@
+---
+title: Determinism and batch invariance
+nav_title: Determinism
+level: Advanced
+prerequisites: learn/number-formats, learn/sampling, concepts/sampler, learn/batching
+related: concepts/dspark, concepts/speculative-decoding, concepts/mla-attention, concepts/eplb, code/sampling-params, reference/env-vars
+summary: Floating-point sums depend on their order, and many kernels choose the order from the batch. DEEPINFER_BATCH_INVARIANT=1 (NVIDIA only) fixes this. Deterministic sampling also needs DEEPINFER_ENABLE_MTP_VARLEN=0 and a fixed seq_seed.
+---
+<x-sentence>With one switch, a request gets the same logits in any batch; with two more settings, it also gets the same tokens.</x-sentence>
+
+<h2>The idea</h2>
+<p>Run the same prompt twice. The first time it is alone; the second time it shares a {{term batch}} with 63 other requests. Many inference engines give a slightly different answer the second time. The reason is not a random bug. It is the arithmetic of {{term floating-point}} numbers.</p>
+<p>Each floating-point addition rounds its result. So <code>(a + b) + c</code> and <code>a + (b + c)</code> can give different last bits. A {{term kernel}} that adds thousands of numbers must choose an order. Many fast kernels choose it from the size of the batch. With a large batch, they add in one way. With a small batch, they split the sum into parts to keep the device busy. So the {{term reduction-order}} depends on the other requests, and so do the last bits of the {{term logits}}. One different bit can change one sampled token, and after that token the two texts differ.</p>
+<p>DeepInfer has two levels of control ({{cite README.md:27-28}}):</p>
+<ol>
+  <li><strong>{{term batch-invariance | Batch invariance}}</strong>: <code>DEEPINFER_BATCH_INVARIANT=1</code> (NVIDIA only). A request gets the same model results in any batch composition.</li>
+  <li><strong>Deterministic sampling</strong>: batch invariance, plus <code>DEEPINFER_ENABLE_MTP_VARLEN=0</code>, plus a fixed {{term seq-seed | seq_seed}}. The same input tokens and sampling parameters give the same output tokens.</li>
+</ol>
+
+<p><strong>An everyday comparison.</strong> Think of a long shopping receipt and a cheap calculator that shows only 8 digits. One cashier adds the items from top to bottom. A second cashier splits the receipt into four parts, adds each part, and then adds the four subtotals. Each cashier is correct by the rules of the calculator. But the totals can differ in the last digit, because the calculator rounds at different moments. Batch invariance tells every cashier to use one fixed way to split the receipt, whatever the length of the queue. The comparison stops being true in one point: a real cashier can redo the sum on paper and get the exact total. A kernel cannot. Each order gives a different rounded result, and no order is "the correct one".</p>
+
+<h2>The picture</h2>
+<x-diagram name="b10a_batch_invariance" alt="Panel 1: three BF16 boxes. Order A, left to right: 256 plus 1 rounds to 256 twice, result 256. Order B, pairs first: 1 plus 1 is 2, 256 plus 2 is 258. A third box says that a kernel splits a long sum into parts by the batch size, so another order gives other bits. Panel 2: three switches of DEEPINFER_BATCH_INVARIANT=1: deterministic DeepGEMM and tile_kernels algorithms (runtime_config.py 67 to 69), FlashMLA enable_batch_invariant on the non-fused decode attention path (attention_backend.py 141), and DeepEP allow_multiple_reduction False when expert rearrangement is on (userbuffer.py 79). Panel 3: deterministic sampling = fixed logits + fixed random numbers from seq_seed and the position + fixed number of drafts with MTP_VARLEN=0." caption="Figure: panel 1 shows why the order of a sum matters. Panel 2 shows what the switch changes in DeepInfer. Panel 3 shows the two extra settings for deterministic sampling. Click to zoom." />
+<p>Read panel 1 first: the same three numbers give 256 or 258. Panel 2 shows the three kernel switches. The code reads <code>DEEPINFER_BATCH_INVARIANT</code> in only two other places: the Ascend assert (step 2) and the fused-path choice of a PROMPT engine (step 3). Panel 3 adds the settings that make the random part of {{term sampling}} independent of the batch.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the switch</h3>
+<p><code>DEEPINFER_BATCH_INVARIANT</code> is a bool with default off ({{cite deepinfer/environ.py:197}}). It is in the group "Profiling &amp; Debug" of <code>environ.py</code> ({{cite deepinfer/environ.py:196}}). Some scripts turn it on for you:</p>
+<ul>
+  <li><code>examples/offline_inference.py</code> sets it to 1 on NVIDIA, unless the variable is already set ({{cite examples/offline_inference.py:42-43}}).</li>
+  <li><code>eval/run_eval.py --batch-invariant</code> sets it. The help text says the result is "independent of batch composition (slower)" ({{cite eval/run_eval.py:73-75}}, {{cite eval/run_eval.py:130-131}}).</li>
+  <li>The model tests set it too (see step 6).</li>
+</ul>
+
+<h3>Step 2: deterministic GEMM kernels</h3>
+<p>Each worker configures its kernel libraries once, at start-up ({{cite deepinfer/worker/base.py:188}}):</p>
+<x-code file="deepinfer/worker/runtime_config.py" lines="54-69" highlight="61-63,67-69">
+  <x-tr line="62">TODO(NPU): remove after batch invariance is fully supported.</x-tr>
+  <x-tr line="67">TODO(NPU): prevent numerical instability in CI.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 61-63: on Ascend, the switch must be off. The worker stops with <code>AssertionError</code> if it is on. This is the code behind "NVIDIA only".</li>
+  <li>Lines 67-69: with the switch on, both {{term deepgemm | DeepGEMM}} and <code>tile_kernels</code> get <code>use_deterministic_algorithms(True)</code>. On Ascend, this call runs always, for stable CI numbers.</li>
+</ol>
+<x-simplified><p>What "deterministic algorithms" means inside DeepGEMM and <code>tile_kernels</code> is not in this repository. DeepInfer only sets the flag.</p></x-simplified>
+
+<h3>Step 3: batch-invariant decode attention</h3>
+<p>Each attention layer decides once, when it is built, if it uses the fused norm-RoPE-attention kernels or the plain path with {{term flashmla | FlashMLA}}. The decision applies to prefill and decode ({{cite deepinfer/model_executor/models/v4_modules/attn.py:615-624}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:656-669}}):</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="87-92" highlight="89" />
+<p>The switch appears only in the first term, which is about the prefill-only engine type (<code>EngineType.PROMPT</code>). The offline <code>LLM</code> uses the <code>NORMAL</code> engine ({{cite deepinfer/engine/arg_utils.py:41}}), so there the choice does not depend on the switch. Take a NORMAL engine on GPU with 64 or 128 heads. There, sparse layers and layers without packed KV use the fused kernel, and dense packed-KV layers use the plain call.</p>
+<p>The decode call passes the switch on ({{cite deepinfer/model_executor/models/v4_modules/attn.py:660-669}}). Only the plain path forwards it to FlashMLA:</p>
+<x-code file="deepinfer/model_executor/layers/attention_backend.py" lines="123-142" highlight="141" />
+<p>The fused path, a few lines higher, has no batch-invariant argument ({{cite deepinfer/model_executor/layers/attention_backend.py:107-121}}). The draft model DFlash calls the same function with the switch ({{cite deepinfer/model_executor/models/v4_modules/attn.py:994-1007}}).</p>
+
+<h3>Step 4: the MoE combine</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="72-80" highlight="79" />
+<p>DeepInfer turns off <code>allow_multiple_reduction</code> of the {{term deepep | DeepEP}} buffer only when the switch is on <em>and</em> {{term eplb | EPLB}} moves experts (<code>DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL &gt; 0</code>, default 0: {{cite deepinfer/environ.py:116}}). The code gives no reason for the second condition. The KL test in the deep dive below turns on both conditions.</p>
+<x-simplified><p>The DeepEP source is not checked out, so this site does not say what <code>allow_multiple_reduction</code> does inside DeepEP. Its name suggests a reduction order, but the repository does not say so.</p></x-simplified>
+
+<h3>Step 5: deterministic sampling</h3>
+<p>Batch invariance fixes the logits. The sampler adds two more sources of difference: the random numbers and the number of verified drafts.</p>
+<p><strong>Random numbers.</strong> The sampling kernels do not use a global random generator. They hash the seed of the request with the position of the token:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/random_sampling.py" lines="17-20" />
+<p>The PyTorch reference shows the hash input: <code>(3 × position + case)</code> mixed with <code>seq_seed</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:76-81}}). The row index and the batch size do not appear. But the seed must be the same in both runs. Without <code>seq_seed</code>, <code>SamplingParams</code> draws a new 64-bit seed ({{cite deepinfer/sampling_params.py:85-91}}).</p>
+<p><strong>Number of drafts.</strong> With {{term dspark | DSpark}} (<code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>), the batch shares one budget of query tokens. A kernel ranks the drafts of <em>all</em> requests by confidence and gives the budget to the best ones ({{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:11-32}}). Its PyTorch reference shows the rule:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py" lines="70-98" highlight="72,85,95,98" />
+<p>So the {{term verification-length}} of one request depends on the other requests. A different number of verified drafts changes which random numbers the sampler uses, and so the tokens. The README does not give this reason; it gives only the recipe ({{cite README.md:28}}). The variable is off by default ({{cite deepinfer/environ.py:131}}); the explicit <code>0</code> also overrides a value that a script exported.</p>
+
+<h3>Step 6: the tests</h3>
+<p>The main test runs 64 random prompts in one batch, then each prompt alone, and compares everything bit for bit:</p>
+<x-code file="tests/models/test_batch_invariant.py" lines="87-105" highlight="100-105" />
+<ol>
+  <li>Lines 87-94: sampling with temperature 1.0 and top-p 0.7, 50 tokens, 5 top logprobs.</li>
+  <li>Line 96: the batched run.</li>
+  <li>Lines 100-102: each prompt alone, with {{term golden-tokens | golden tokens}}: the single run must output the tokens of the batched run. So the test compares the model numbers, not the random draws.</li>
+  <li>Line 105: token ids, logprobs, top token ids and top logprobs must be equal. There is no tolerance.</li>
+</ol>
+<p>The case uses EP 8 and 5 drafts ({{cite tests/models/test_batch_invariant.py:32-34}}). The deep dive below describes three more tests.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: one sum, three orders, three results">
+<p>Take four FP32 numbers: <code>x = [1e8, 1, −1e8, 1]</code>. The exact sum is 2. Near 10<sup>8</sup>, FP32 values are 8 apart (2<sup>26</sup> × 2<sup>−23</sup>), so <code>1e8 + 1</code> rounds back to <code>1e8</code>.</p>
+<table>
+  <thead><tr><th>Order</th><th>Like a kernel that…</th><th>Steps</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>A</td><td>adds one row from left to right</td><td>1e8 + 1 → 1e8; 1e8 − 1e8 = 0; 0 + 1 = 1</td><td>1</td></tr>
+    <tr><td>B</td><td>splits K into 2 halves</td><td>(1e8 + 1 → 1e8) + (−1e8 + 1 → −1e8) = 0</td><td>0</td></tr>
+    <tr><td>C</td><td>splits K by stride 2</td><td>(1e8 − 1e8 = 0) + (1 + 1 = 2) = 2</td><td>2</td></tr>
+  </tbody>
+</table>
+<p>Real kernels add thousands of products in FP32. So the differences are much smaller than in this example: usually a few units in the last place. But they are not zero.</p>
+<p><strong>From one bit to one token.</strong> Suppose two tokens have the logits 12.500000 and 12.499999 in run 1. In run 2, another order of a sum moves the second one up by 2 × 10<sup>−6</sup>. Greedy decoding now picks the other token. With random sampling, the seed fixes the draw <code>u</code>. But the running sum of the probabilities moves a little, and <code>u</code> can fall on the other side of a boundary. After one different token, the two runs see different inputs, so all later tokens can differ.</p>
+<p><strong>Where batch size enters.</strong> A kernel library tunes its work split for each problem shape. In a GEMM, the token count M is part of the shape. In decode attention, the number of requests and their lengths set how the key range is split across SMs. A batch-invariant kernel uses one split for every batch, and may be slower for some shapes.</p>
+<x-simplified><p>The last paragraph is general knowledge about GPU kernels, not a description of DeepGEMM or FlashMLA: their sources are not in this repository.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="What the switch covers, and what it does not">
+<table>
+  <thead><tr><th>Part</th><th>With DEEPINFER_BATCH_INVARIANT=1</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Dense GEMMs and grouped expert GEMMs (DeepGEMM)</td><td>deterministic algorithms on</td><td>{{cite deepinfer/worker/runtime_config.py:67-69}}</td></tr>
+    <tr><td><code>tile_kernels</code> (for example <code>per_token_cast</code>)</td><td>deterministic algorithms on</td><td>{{cite deepinfer/worker/runtime_config.py:69}}</td></tr>
+    <tr><td>Decode attention, plain path</td><td><code>enable_batch_invariant=True</code></td><td>{{cite deepinfer/model_executor/layers/attention_backend.py:141}}</td></tr>
+    <tr><td>Decode attention, fused path</td><td>no argument; the kernel gets no flag</td><td>{{cite deepinfer/model_executor/layers/attention_backend.py:107-121}}</td></tr>
+    <tr><td>Fused path choice in a PROMPT engine</td><td>dense packed-KV layers do not use the fused path</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:89}}</td></tr>
+    <tr><td>DeepEP combine with EPLB moves</td><td><code>allow_multiple_reduction=False</code></td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:79}}</td></tr>
+    <tr><td>Random numbers of the sampler</td><td>not changed: always hash(seed, position)</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:17-20}}</td></tr>
+    <tr><td>DSpark draft budget</td><td>not changed: set MTP_VARLEN=0 yourself</td><td>{{cite README.md:28}}</td></tr>
+    <tr><td>Ascend</td><td>not supported: assert</td><td>{{cite deepinfer/worker/runtime_config.py:61-63}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Scope of the promise.</strong> The README promises identical results "across different batch compositions" ({{cite README.md:27}}). It does not promise equal results for another EP size, another GPU model, or another library version. The tests compare runs of one deployment only.</p>
+<p><strong>Cost.</strong> The repository gives no number. The only statement is the word "slower" in the help text of <code>eval/run_eval.py</code> ({{cite eval/run_eval.py:74}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The four tests, in detail">
+<p><strong>1. Batched against single</strong> (<code>tests/models/test_batch_invariant.py</code>). 64 prompts of random non-special tokens, with lengths from a normal distribution (mean 2,500, standard deviation 1,000, at least 1) ({{cite tests/models/test_batch_invariant.py:72-85}}). <code>ignore_eos=True</code>, so every request makes 50 tokens. The engine gets <code>max_num_seqs=64</code> and 16,384 batched tokens ({{cite tests/models/test_batch_invariant.py:54-68}}). The single runs use golden tokens, so the comparison covers the logprobs of the same token sequence.</p>
+<p><strong>2. Decode against prefill</strong> (<code>tests/models/test_kl.py</code>). It checks a stronger property: the logprobs of decode steps must equal the logprobs that a full prefill of the same text gives.</p>
+<ol>
+  <li>Pass 1: 3 image-and-text prompts of 16,384 tokens, 1,024 golden output tokens, with <code>prompt_logprobs=True</code> ({{cite tests/models/test_kl.py:127-151}}).</li>
+  <li>Pass 2: each prompt plus its 1,024 output tokens as a new prompt, 1 new token ({{cite tests/models/test_kl.py:153-173}}).</li>
+  <li>The prompt logprobs of the two passes must be equal ({{cite tests/models/test_kl.py:194-196}}). For the output part, the test computes a {{term kl-divergence}} estimate and requires it to be at most <code>max_kl</code>, which is 0.0 by default ({{cite tests/models/test_kl.py:30}}, {{cite tests/models/test_kl.py:197-206}}).</li>
+</ol>
+<p>The environment also turns on EPLB moves every 1,000 steps with 32 extra experts. So the DeepEP flag of step 4 is active. The case uses CP 2 and 5 drafts ({{cite tests/models/test_kl.py:33-35}}, {{cite tests/models/test_kl.py:102-110}}). <code>cal_diff</code> returns 0 at once for equal tensors; otherwise it computes <code>mean(exp(x − y) − 1 − (x − y))</code> ({{cite deepinfer/testing.py:4-12}}).</p>
+<p><strong>3. Vision encoder</strong> (<code>tests/models/test_ve_batch_invariant.py</code>). It encodes fixed random images in batches of 1, 2, 64 and 256 copies, and in random mixes of shapes ({{cite tests/models/test_ve_batch_invariant.py:47-49}}). Every image's embeddings must be bitwise equal to a batch with only that image ({{cite tests/models/test_ve_batch_invariant.py:1-14}}, {{cite tests/models/test_ve_batch_invariant.py:113-144}}). This test does not set the variable; it checks the encoder alone.</p>
+<p><strong>4. Random sampling kernel</strong>. The same probabilities give the same tokens after a permutation of the rows, and row by row ({{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:308-332}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Seeds: one SamplingParams for many prompts">
+<p><code>SamplingParams</code> makes its seed in the constructor: <code>random.getrandbits(64)</code> when <code>seq_seed</code> is None, else the value masked to 64 bits ({{cite deepinfer/sampling_params.py:74}}, {{cite deepinfer/sampling_params.py:85-91}}).</p>
+<p><code>LLM.generate</code> accepts one <code>SamplingParams</code> for all prompts. <code>_add_request</code> makes a deep copy for each request ({{cite deepinfer/entrypoints/llm.py:137-138}}, {{cite deepinfer/entrypoints/llm.py:151}}). A deep copy does not run the constructor again, so every request of that call gets the same seed. So, with the settings of this page, two requests with the same prompt in one call get the same tokens, also without a fixed seed. Across two calls of <code>generate</code> with two new <code>SamplingParams</code> objects, the seeds differ, unless you pass <code>seq_seed</code>.</p>
+<p>Two requests with the same seed get the same random number <code>u</code> at the same position. Their tokens still differ when their probabilities differ.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect here</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_BATCH_INVARIANT</code></td><td>False ({{cite deepinfer/environ.py:197}})</td><td>{{cite deepinfer/worker/runtime_config.py:63-67}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:89}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:666}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:79}}</td><td>The switches of steps 2-4.</td></tr>
+    <tr><td><code>DEEPINFER_ENABLE_MTP_VARLEN</code></td><td>False ({{cite deepinfer/environ.py:131}})</td><td>{{cite deepinfer/worker/worker.py:218-219}}</td><td>Must be 0 for deterministic sampling.</td></tr>
+    <tr><td><code>DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL</code></td><td>0 ({{cite deepinfer/environ.py:116}})</td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:79}}</td><td>Above 0, the switch also turns off DeepEP multiple reduction.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>many places</td><td>The batch test uses 5 drafts and requires equal results ({{cite tests/models/test_batch_invariant.py:33}}).</td></tr>
+  </tbody>
+</table>
+<p>A bool variable is false only for <code>0</code>, an empty text, <code>false</code> and <code>False</code> ({{cite deepinfer/environ.py:12-13}}). The page {{link reference/env-vars}} has the recipes.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The switch on Ascend.</strong> The worker stops with <code>AssertionError</code> at start-up ({{cite deepinfer/worker/runtime_config.py:61-63}}).</li>
+  <li><strong><code>=off</code> turns it on.</strong> Only <code>0</code>, empty, <code>false</code> and <code>False</code> are false ({{cite deepinfer/environ.py:12-13}}). Use <code>0</code> and <code>1</code>.</li>
+  <li><strong>DSpark is on.</strong> The logits stay batch-invariant, but the draft budget depends on the batch ({{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:70-98}}), so the tokens can differ.</li>
+  <li><strong>No fixed seed.</strong> Two separate <code>SamplingParams</code> objects get two random seeds ({{cite deepinfer/sampling_params.py:87-88}}).</li>
+  <li><strong>Different deployment.</strong> Another EP size or GPU model is outside the promise of the README ({{cite README.md:27}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Bit-identical results make bugs reproducible, make A/B evaluations fair, and let a test compare a batched run with a single run without a tolerance. DeepInfer's own regression tests depend on this: they compare logprobs with <code>==</code>.</p>
+
+<x-quiz>
+  <x-q level="easy">Which three settings does the README give for deterministic sampling, and on which hardware?
+    <x-a><p><code>DEEPINFER_BATCH_INVARIANT=1</code>, <code>DEEPINFER_ENABLE_MTP_VARLEN=0</code> and a fixed <code>seq_seed</code> in <code>SamplingParams</code>, on NVIDIA only ({{cite README.md:28}}). On Ascend the worker asserts that the switch is off ({{cite deepinfer/worker/runtime_config.py:61-63}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">In FP32, what is <code>(1e8 + 1) − 1e8</code>, and why?
+    <x-a><p>0. FP32 values near 10<sup>8</sup> are 8 apart, so <code>1e8 + 1</code> rounds to <code>1e8</code> before the subtraction. In the other order, <code>(1e8 − 1e8) + 1 = 1</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>test_batch_invariant.py</code> pass the batched output as <code>golden_token_ids</code> to the single runs?
+    <x-a><p>So that both runs process the same token sequence. The test then compares the model numbers (logprobs and top logprobs) exactly, and a single different sample cannot make all later positions different ({{cite tests/models/test_batch_invariant.py:99-105}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With the offline <code>LLM</code> (NORMAL engine), does <code>DEEPINFER_BATCH_INVARIANT</code> change which attention kernel a dense packed-KV layer uses in decode?
+    <x-a><p>No. The switch appears only in the term for the PROMPT engine type ({{cite deepinfer/model_executor/models/v4_modules/attn.py:87-92}}). In a NORMAL engine, a dense packed-KV layer uses the plain FlashMLA call in any case. The switch changes the argument <code>enable_batch_invariant</code> of that call ({{cite deepinfer/model_executor/layers/attention_backend.py:141}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The KL test sets <code>DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL=1000</code>. Which batch-invariance switch does that turn on, and what does the test require of the output logprobs?
+    <x-a><p>With both variables on, the DeepEP buffer gets <code>allow_multiple_reduction=False</code> ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:79}}, {{cite tests/models/test_kl.py:105-107}}). The prompt logprobs must be equal. The KL estimate between the decode logprobs and the logprobs of a full prefill must be at most <code>max_kl = 0.0</code> ({{cite tests/models/test_kl.py:194-206}}).</p></x-a>
+  </x-q>
+</x-quiz>

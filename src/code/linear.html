@@ -1,0 +1,178 @@
+---
+title: linear.py: ReplicatedLinear and the FP8 GEMM path
+nav_title: linear.py
+level: Intermediate
+prerequisites: learn/number-formats, concepts/low-precision-formats
+related: concepts/low-precision-formats, concepts/weight-loading, code/hf-weights, code/v4-mlp, code/v4-attn, concepts/mega-moe, concepts/expert-parallelism
+summary: Two files share the name linear.py. v4_modules/linear.py describes checkpoint weights (ReplicatedLinear and ParallelRoutedLinear containers). layers/linear.py holds the runtime ReplicatedLinear, which runs a BF16 GEMM or casts its input to FP8 and runs DeepGEMM's FP8 GEMM, plus the FP8 cast parameters that the whole model shares.
+---
+<h2>Purpose</h2>
+<p><code>layers/linear.py</code> runs the dense, non-expert linear layers of the model and the logits {{term gemm}} on DeepGEMM, in BF16 or FP8; <code>v4_modules/linear.py</code> only describes the shapes of the checkpoint weights.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/model_executor/layers/linear.py</code> (185 lines) and <code>deepinfer/model_executor/models/v4_modules/linear.py</code> (34 lines).</td></tr>
+    <tr><th>Main classes</th><td>Runtime: <code>ReplicatedLinear(torch.nn.Module)</code> ({{cite deepinfer/model_executor/layers/linear.py:36}}). Containers: <code>ReplicatedLinear(nn.Linear)</code> ({{cite deepinfer/model_executor/models/v4_modules/linear.py:8}}) and <code>ParallelRoutedLinear(nn.Linear)</code> ({{cite deepinfer/model_executor/models/v4_modules/linear.py:23}}). Two classes have the same name; this page says "runtime" or "container" each time.</td></tr>
+    <tr><th>Runs in</th><td>The worker process of each rank, on the current device stream. Decode steps run inside CUDA graphs.</td></tr>
+    <tr><th>Called by</th><td>Runtime class: attention projections, the compressor, the MoE gate and shared expert, DFlash. <code>bf16_gemm_nt</code>: the logits. <code>get_fp8_cast_params</code>: norms, attention output, expert SwiGLU. Containers: the HF model builders and the loader.</td></tr>
+    <tr><th>Calls</th><td>{{term deepgemm | DeepGEMM}}: <code>bf16_gemm_nt</code>, <code>fp8_fp4_gemm_nt</code>, <code>transform_sf_into_required_layout</code>. <code>tile_kernels.quant.per_token_cast</code>.</td></tr>
+    <tr><th>Not in these files</th><td>Routed experts (grouped GEMM and mega-MoE in <code>v4_modules/mlp.py</code>), the attention einsum (<code>attn.py</code>), and weight loading (<code>hugging_face/</code>). There is no column- or row-parallel linear: no tensor parallelism exists.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b10a_linear_paths" alt="Panel 1: v4_modules/linear.py defines ReplicatedLinear (nn.Linear with use_fp8_gemm) and ParallelRoutedLinear (weight n_local times h_in by h_out). Loading turns FP8 weights into E4M3 with FP32 scales of shape ceil(N/32) by ceil(K/32), and experts into packed FP4 int8 of shape n_local, h_out, h_in/2. Runtime users: layers/linear.py ReplicatedLinear(weight=...) for attention, compressor, gate, shared expert and DFlash; experts use the DeepseekMoE grouped GEMM. Panel 2: apply_weight sends a BF16 weight to deep_gemm.bf16_gemm_nt with BF16 or FP32 output, and a one-byte weight to the FP8 path: per_token_cast unless the input is already a tuple, a scale dtype assert, and deep_gemm.fp8_fp4_gemm_nt with recipe 1, 1, 32 and BF16 output. Other dtypes raise TypeError." caption="Figure: the path of a weight from the container to the runtime layer (panel 1), and the two GEMM paths of the runtime class (panel 2). Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Attention</strong> makes runtime layers from merged container weights, for example <code>q_a_kv_swa_proj</code> and <code>q_b_proj</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:284-304}}) and <code>out_proj</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:152-156}}). It calls them in the forward pass ({{cite deepinfer/model_executor/models/v4_modules/attn.py:394}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:458}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:225}}).</li>
+  <li><strong>Packed-KV projections</strong> use <code>use_fp32_output</code> where needed ({{cite deepinfer/model_executor/models/v4_modules/attn.py:337-343}}). The <strong>compressor</strong> wraps its key projection ({{cite deepinfer/model_executor/models/v4_modules/compress.py:42-46}}).</li>
+  <li><strong>MoE.</strong> The gate is a BF16 runtime layer with FP32 output ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:222-227}}). The shared expert uses <code>_replicated_linear</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:144-145}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:244-245}}) and adds its output into the MoE output with <code>out_acc</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:561-562}}).</li>
+  <li><strong>DFlash</strong>, the draft model, makes four runtime layers ({{cite deepinfer/model_executor/models/mtp/dflash.py:57}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:119}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:148}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:171}}).</li>
+  <li><strong>The sampler</strong> computes the logits with <code>bf16_gemm_nt</code> into an FP32 tensor ({{cite deepinfer/model_executor/layers/sampler_utils.py:20-28}}).</li>
+  <li><strong>FP8 producers</strong> share <code>get_fp8_cast_params</code>: RMSNorm ({{cite deepinfer/model_executor/layers/layernorm.py:50}}), the attention output ({{cite deepinfer/model_executor/models/v4_modules/attn.py:200}}), and the SwiGLU of the experts ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:140-141}}). mHC also calls it, but only in a branch for a group size other than 32, which does not run in this release ({{cite deepinfer/model_executor/models/v4_modules/hc.py:311-313}}).</li>
+  <li><strong>Containers.</strong> The MoE container uses <code>ParallelRoutedLinear</code> for the routed experts and the container <code>ReplicatedLinear</code> for the gate ({{cite deepinfer/model_executor/models/v4_modules/moe.py:67}}, {{cite deepinfer/model_executor/models/v4_modules/moe.py:97-108}}). <code>prepare_meta_fp8</code> reads <code>use_fp8_gemm</code> ({{cite deepinfer/model_executor/models/v4_modules/containers.py:128}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>deep_gemm.bf16_gemm_nt(a, b, d, c)</code> ({{cite deepinfer/model_executor/layers/linear.py:33}}).</li>
+  <li><code>tile_kernels.quant.per_token_cast(x, **get_fp8_cast_params())</code> ({{cite deepinfer/model_executor/layers/linear.py:150}}).</li>
+  <li><code>deep_gemm.fp8_fp4_gemm_nt(x, weight, out, out_acc, recipe=(1, 1, 32))</code> ({{cite deepinfer/model_executor/layers/linear.py:165}}).</li>
+  <li><code>deep_gemm.transform_sf_into_required_layout(sf, n, k, recipe=(1, 32, 32), is_sfa=False)</code> at construction ({{cite deepinfer/model_executor/layers/linear.py:70-76}}).</li>
+</ul>
+<p>This page describes only the arguments. The kernels are in DeepGEMM and <code>tile_kernels</code>, which this site does not explain.</p>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_OUTPUT_ALIGNMENT_BYTES</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:10}}</td><td>32: every output row starts on a 32-byte boundary.</td></tr>
+    <tr><td><code>get_fp8_casting_granularity</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:13}}</td><td>Returns 32, the FP8 group size of the whole model.</td></tr>
+    <tr><td><code>get_fp8_cast_params</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:17}}</td><td>The cast settings: E4M3, 32 per scale, power-of-two scales, packed UE8M0, column-major scales.</td></tr>
+    <tr><td><code>bf16_gemm_nt</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:27}}</td><td>Thin wrapper of the DeepGEMM BF16 GEMM.</td></tr>
+    <tr><td><code>ReplicatedLinear.__init__</code> (runtime)</td><td>{{cite deepinfer/model_executor/layers/linear.py:47}}</td><td>Takes a loaded weight; prepares FP8 scales.</td></tr>
+    <tr><td><code>_allocate_output</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:83}}</td><td>Output with a padded row stride.</td></tr>
+    <tr><td><code>_has_aligned_output_stride</code>, <code>_flatten_output</code>, <code>_align_output</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:97-114}}</td><td>Stride checks and a 2-D view of the output.</td></tr>
+    <tr><td><code>apply_weight_bf16</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:116}}</td><td>BF16 GEMM, optional bias, optional accumulator.</td></tr>
+    <tr><td><code>apply_weight_fp8</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:140}}</td><td>Cast the input to FP8 if needed; FP8 GEMM; BF16 output.</td></tr>
+    <tr><td><code>apply_weight</code>, <code>forward</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:168-185}}</td><td>Select the path by the weight dtype.</td></tr>
+    <tr><td><code>ReplicatedLinear</code> (container)</td><td>{{cite deepinfer/model_executor/models/v4_modules/linear.py:8-20}}</td><td><code>nn.Linear</code> plus the flag <code>use_fp8_gemm</code>.</td></tr>
+    <tr><td><code>ParallelRoutedLinear</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/linear.py:23-34}}</td><td>All local experts of one projection in one 2-D weight.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The two containers</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/linear.py" lines="8-34" highlight="20,31-34" />
+<ol>
+  <li>Lines 8-20: an ordinary <code>nn.Linear</code> with weight <code>[out, in]</code>, plus <code>use_fp8_gemm</code>. The model is built on the meta device, so no memory is used yet ({{cite deepinfer/model_executor/models/v4_modules/containers.py:1-5}}).</li>
+  <li>Line 31: <code>nn.Linear(h_out, h_in * n_local_experts)</code> has the weight shape <code>[h_in · n_local, h_out]</code>: the experts are stacked along the first axis. The docstring calls this the "expert-major" 2-D metadata.</li>
+  <li>Line 34: the weight carries <code>n_experts</code>. The loader needs it to allocate the packed FP4 layout <code>int8 [n_local, h_out, h_in / 2]</code> ({{cite deepinfer/model_executor/models/v4_modules/containers.py:72-87}}).</li>
+</ol>
+<p>Each rank holds only its own experts, so the split is by expert, not inside one matrix. <code>n_local = n_physical / ep_size</code> ({{cite deepinfer/model_executor/models/v4_modules/moe.py:94-95}}).</p>
+
+<h3>Runtime <code>__init__</code>: prepare the scales once</h3>
+<x-code file="deepinfer/model_executor/layers/linear.py" lines="47-81" highlight="61-62,65-76" />
+<ol>
+  <li>Lines 61-62: <code>use_fp32_output</code> is allowed only for a BF16 weight.</li>
+  <li>Line 65: the weight must be <code>[output_size, input_size]</code>.</li>
+  <li>Line 66: <code>reconstruct_param</code> makes a new parameter on the same data and keeps <code>sf</code> ({{cite deepinfer/model_executor/utils.py:22-26}}).</li>
+  <li>Lines 67-76: a one-byte weight is FP8. If its scale is not yet in the platform dtype (int32 on NVIDIA, int16 on Ascend), DeepGEMM transforms it once, with the recipe <code>(1, 32, 32)</code>. A loaded weight arrives with FP32 scales, one per 32 × 32 block ({{cite deepinfer/hugging_face/weights.py:418-420}}), so this transform runs at model build.</li>
+</ol>
+
+<h3><code>apply_weight_fp8</code>: cast, check, multiply</h3>
+<x-code file="deepinfer/model_executor/layers/linear.py" lines="140-166" highlight="146,148-150,164-165" />
+<ol>
+  <li>Line 146: FP8 layers have no bias.</li>
+  <li>Lines 148-150: a BF16 input must be 2-D and is cast here: one E4M3 row per token and one UE8M0 scale per 32 values. An input that is already a tuple <code>(fp8, sf)</code> skips the cast. For example, the attention gives <code>q_b_proj</code> the FP8 output of its norm ({{cite deepinfer/model_executor/models/v4_modules/attn.py:458}}, {{cite deepinfer/model_executor/layers/layernorm.py:49-50}}).</li>
+  <li>Lines 154-162: the output is BF16. With <code>out_acc</code>, the GEMM writes into that tensor.</li>
+  <li>Line 164: the scales of the input and of the weight must both have the platform dtype.</li>
+  <li>Line 165: <code>out_acc</code> is also passed as the accumulator argument <code>c</code>. The MoE uses this to add the shared expert to the routed output in one GEMM ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:526}}).</li>
+</ol>
+
+<h3><code>apply_weight_bf16</code> and <code>apply_weight</code></h3>
+<x-code file="deepinfer/model_executor/layers/linear.py" lines="116-138" highlight="127,135-137" />
+<ol>
+  <li>Line 127: the output dtype is FP32 with <code>use_fp32_output</code>, else the input dtype.</li>
+  <li>Line 135: the GEMM sees a 2-D view <code>[m, k]</code> of the input and a 2-D view of the output.</li>
+  <li>Lines 136-137: the bias, if any, is added after the GEMM with a normal tensor add.</li>
+</ol>
+<p><code>apply_weight</code> selects the path: BF16 weight → line 175; one-byte weight → line 177; anything else → <code>TypeError</code> ({{cite deepinfer/model_executor/layers/linear.py:168-178}}).</p>
+
+<h3>Output allocation and the 32-byte row stride</h3>
+<x-code file="deepinfer/model_executor/layers/linear.py" lines="83-99" highlight="92-95,99" />
+<p>The output row stride must be a multiple of 32 bytes. <code>_allocate_output</code> rounds the physical row length up and returns a narrower view. The GEMM paths assert the stride before they run ({{cite deepinfer/model_executor/layers/linear.py:134}}, {{cite deepinfer/model_executor/layers/linear.py:163}}).</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data flow: types and shapes">
+<table>
+  <thead><tr><th>Tensor</th><th>BF16 layer</th><th>FP8 layer</th></tr></thead>
+  <tbody>
+    <tr><td>weight</td><td>bf16 <code>[N, K]</code></td><td>float8_e4m3fn <code>[N, K]</code></td></tr>
+    <tr><td>weight.sf (at load)</td><td>—</td><td>float32 <code>[ceil(N/32), ceil(K/32)]</code> ({{cite deepinfer/model_executor/models/v4_modules/containers.py:128-135}})</td></tr>
+    <tr><td>weight.sf (after <code>__init__</code>)</td><td>—</td><td>platform dtype, layout from DeepGEMM</td></tr>
+    <tr><td>input</td><td>bf16 <code>[..., K]</code></td><td>bf16 <code>[M, K]</code>, or <code>(e4m3 [M, K], packed sf)</code></td></tr>
+    <tr><td>packed input sf</td><td>—</td><td><code>K / 32</code> scales per token, 4 per int32 (NVIDIA) or 2 per int16 (Ascend)</td></tr>
+    <tr><td>output</td><td>bf16 or float32 <code>[..., N]</code></td><td>bf16 <code>[M, N]</code></td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example</strong> (example sizes, not from the repository). An FP8 layer with N = 1,000, K = 7,168, and M = 256 tokens:</p>
+<ul>
+  <li>Weight: 7,168,000 bytes. Load-time scales: ceil(1,000/32) × 224 = 32 × 224 = 7,168 FP32 values.</li>
+  <li>Input cast: 256 × 7,168 bytes of E4M3, and 256 × 224 scale bytes = 256 × 56 int32 on NVIDIA.</li>
+  <li>Output: BF16, 16 values per 32 bytes, so the physical row is ceil(1,000 / 16) × 16 = 1,008 values. The tensor is <code>[256, 1008]</code>, and the layer returns the view <code>[256, 1000]</code> with a row stride of 2,016 bytes.</li>
+  <li>The same layer with <code>use_fp32_output</code> (BF16 weight only): 8 values per 32 bytes; 1,000 is a multiple of 8, so there is no padding.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Merged weights">
+<p>Attention merges several container weights into one runtime layer, for example <code>Wq.A</code> and <code>Wkv.A</code> into <code>q_a_kv_swa_proj</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:281-288}}). <code>merge_linear_weights</code> concatenates the weights and their scales along the output axis, and frees the parts:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/utils.py" lines="51-61" highlight="54-56" />
+<p>Line 55: every part except the last must have a multiple of 128 rows. Because 128 is a multiple of 32, each part then starts on a new 32-row scale block, so the concatenated scales (line 56) still belong to the right rows. The comment on line 54 says only that the last weight need not be a multiple of 128; the code does not say why the limit is 128 and not 32.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Condition</th><th>Result</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>use_fp32_output</code> with a non-BF16 weight</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:61-62}}</td></tr>
+    <tr><td>Weight shape is not <code>[output_size, input_size]</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:65}}</td></tr>
+    <tr><td>Bias on an FP8 layer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:146}}</td></tr>
+    <tr><td>BF16 input of an FP8 layer is not 2-D</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:149}}</td></tr>
+    <tr><td><code>out_acc</code> with a wrong shape, dtype or device</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:130-132}}, {{cite deepinfer/model_executor/layers/linear.py:159-161}}</td></tr>
+    <tr><td>Output row stride not a multiple of 32 bytes</td><td><code>AssertionError("unaligned output ...")</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:134}}, {{cite deepinfer/model_executor/layers/linear.py:163}}</td></tr>
+    <tr><td>Scale dtype is not the platform dtype</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:164}}</td></tr>
+    <tr><td>Weight dtype is neither BF16 nor one byte</td><td><code>TypeError("unsupported weight dtype")</code></td><td>{{cite deepinfer/model_executor/layers/linear.py:178}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Configuration">
+<p>These files read no environment variable. The FP8 group size is a constant: <code>get_fp8_casting_granularity()</code> returns 32 ({{cite deepinfer/model_executor/layers/linear.py:13-14}}). Other code asserts this value, for example the packed FP4 expert layout ({{cite deepinfer/model_executor/models/v4_modules/containers.py:82}}). The platform scale dtype comes from <code>PLATFORM.fp8_sf_type</code> ({{cite deepinfer/platform.py:63}}, {{cite deepinfer/platform.py:138}}). Whether a layer is FP8 comes from the checkpoint, through <code>use_fp8_gemm</code> on the container.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/low-precision-formats}}: the formats, the scale rule and the packing.</li>
+  <li>{{link learn/number-formats}}: E4M3, E2M1 and UE8M0 from the start.</li>
+  <li>{{link concepts/weight-loading}} and {{link code/hf-weights}}: how the weights and scales arrive.</li>
+  <li>{{link concepts/mega-moe}} and {{link code/v4-mlp}}: the expert GEMMs, which do not use this class.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which DeepGEMM function does the runtime <code>ReplicatedLinear</code> call for an FP8 weight, and with which recipe?
+    <x-a><p><code>deep_gemm.fp8_fp4_gemm_nt(x, weight, out, out_acc, recipe=(1, 1, 32))</code> ({{cite deepinfer/model_executor/layers/linear.py:165}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What is the weight shape of <code>ParallelRoutedLinear(h_in=7168, h_out=4096, n_local_experts=8)</code> on meta?
+    <x-a><p><code>nn.Linear(4096, 7168 × 8)</code> gives the weight <code>[57344, 4096]</code>: the 8 experts are stacked along the first axis ({{cite deepinfer/model_executor/models/v4_modules/linear.py:31}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">When does <code>apply_weight_fp8</code> skip <code>per_token_cast</code>, and why is that useful?
+    <x-a><p>When the input is already a tuple <code>(fp8, sf)</code> ({{cite deepinfer/model_executor/layers/linear.py:148-150}}). A kernel that runs just before the GEMM, such as an FP8 RMSNorm, can write FP8 output directly, so the layer does not read the BF16 data again ({{cite deepinfer/model_executor/layers/layernorm.py:49-50}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A BF16 layer has <code>output_size = 1000</code> and returns BF16. What is the physical row length of its output, and what row stride does the returned view have?
+    <x-a><p>32 bytes hold 16 BF16 values, so the row is rounded up to 1,008 values ({{cite deepinfer/model_executor/layers/linear.py:90-95}}). The view has 1,000 columns and a row stride of 1,008 elements = 2,016 bytes, which is a multiple of 32.</p></x-a>
+  </x-q>
+</x-quiz>

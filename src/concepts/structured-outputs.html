@@ -1,0 +1,228 @@
+---
+title: Structured outputs
+level: Intermediate
+prerequisites: learn/sampling, concepts/sampler, concepts/speculative-decoding
+related: code/structure-output, code/sampler, code/sampling-params, concepts/request-lifecycle, concepts/zero-overhead-scheduling, reference/env-vars
+summary: A structured-output request carries a grammar (regex, JSON schema or EBNF). DeepInfer compiles it with xgrammar on a pinned CPU thread pool, then masks every token that the grammar does not allow, also on each draft row.
+---
+<x-sentence>A grammar matcher tells the sampler which tokens may come next, and a mask sets all other logits to minus infinity.</x-sentence>
+
+<h2>The idea</h2>
+<p>A {{term llm}} writes free text. Many programs need text with a fixed shape: JSON with known keys, a product code, or "yes" or "no". A {{term structured-output}} request carries a grammar that sets this shape. DeepInfer accepts three grammar types ({{cite README.md:29}}):</p>
+<ul>
+  <li>a {{term regular-expression}}, for example <code>[A-Z]{2}-[0-9]{3}</code>;</li>
+  <li>a {{term json-schema}}, which sets the keys, types and allowed values of a JSON object;</li>
+  <li>an {{term ebnf}} grammar, for example <code>root ::= "answer=" ("yes" | "no")</code>.</li>
+</ul>
+<p>The model does not learn the grammar. The engine forces it at each {{term sampling}} step. A {{term grammar-matcher}} follows the tokens of the request through the grammar. Before each sample, it gives a {{term token-bitmask}}: one bit per vocabulary token. A kernel sets the {{term logits | logit}} of every forbidden token to minus infinity. Softmax turns minus infinity into probability 0, so the sampler can only pick an allowed token.</p>
+<p>DeepInfer adds three things to this basic idea:</p>
+<ol>
+  <li><strong>Compilation off the step.</strong> {{term xgrammar}} compiles the grammar on a {{term thread-pool}} that runs on its own CPU cores. The request enters the scheduler only when its matcher is ready.</li>
+  <li><strong>Masks for drafts.</strong> With {{term speculative-decoding}}, one decode step checks up to 5 {{term draft-token | draft tokens}}. So the CPU fills one mask for each draft row, and then rolls the matcher back.</li>
+  <li><strong>Failure stays local.</strong> A grammar error ends only its own request, with the finish reason <code>"xgrammar runtime errors or timeout"</code> ({{cite csrc/engine/sequence.hpp:57-58}}).</li>
+</ol>
+
+<p><strong>An everyday comparison.</strong> Think of a form with boxes: "date: __ / __ / ____". You can write any digit in a box, but you cannot write a letter. The form does not tell you which date to write; it only blocks the wrong kind of mark. The grammar mask works in the same way: the model still chooses, but only among allowed tokens. The comparison stops being true in one point. A paper form shows all boxes at once. The matcher knows only the next step, and the set of allowed tokens changes after each token.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b10a_so_flow" alt="Panel 1, top row: LLMEngine.add_request marks so_pending; SOMatcherBuilder.submit checks the keys and submits a build task; a pool thread on pinned CPUs compiles the grammar with xgrammar and makes an XGrammarMatcher. Bottom row, right to left: pump in pre_sampler_sync checks the future each step; on_ready attaches the matcher and either marks the request FINISHED_SO_FAILED or adds it to the scheduler; the C++ scheduler runs prefill, or ignores a failed request. A note says that after 20 seconds the future gives an aborted matcher. Panel 2: so_status 0 (not started) goes to 1 (boundary, set on the last prompt chunk) and then to 2 (running). Errors from status 1 or 2 go to status -1, which ends the request with FINISHED_SO_FAILED. A preempted request with status not 0 stops." caption="Figure: the path of a structured-output request. Panel 1 shows that the grammar compiles on a pool thread and that the engine thread polls it once per step. Panel 2 shows the status number that the C++ sequence keeps. Click to zoom." />
+<p>Read panel 1 along the arrows: across the top row, then down, then back to the left. Steps 1, 2, 4, 5 and 6 run on the engine thread (step 6 is C++ code). Only step 3 runs on a pool thread. Panel 2 is the ledger that the sampler and the scheduler share: the sampler reads the status, and <code>process_outputs</code> writes the new value back.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the request names its grammar</h3>
+<p>A caller puts the grammar into <code>SamplingParams(so_args=...)</code>. The example script sends one request of each type. Each prompt asks for long free text on purpose, so that the test shows the grammar, not the prompt, sets the shape:</p>
+<x-code file="examples/_structured_output.py" lines="14-41" highlight="26,30,34,39">
+  <x-tr line="25">A fridge that can sing flew to the moon. Please continue with a very long story; do not use numbering.</x-tr>
+  <x-tr line="29">Why do noodles on Mars dance? Please daydream in natural language; do not output JSON or code.</x-tr>
+  <x-tr line="33">Please write a long poem about purple slippers and time travel; do not use English, and do not give a short answer.</x-tr>
+</x-code>
+<p>The script then checks that each request stops with finish reason <code>"stop"</code> and the EOS token, and that the text matches the grammar ({{cite examples/_structured_output.py:43-63}}). <code>SamplingParams</code> stores the dict and does not check it ({{cite deepinfer/sampling_params.py:82}}). Two optional keys add a trigger: the docstring explains them in Chinese ({{cite deepinfer/sampling_params.py:39-43}}). Translated: <em>"optional "trigger_token_ids" (one list[int]): the token id sequence that starts the grammar. When it appears in full, the grammar starts; before that, generation is free. Optional "bound_token_id": a non-negative int (0 is valid). Missing or None means no bound. It needs a non-empty trigger_token_ids, and a list is not valid. After the bound, no free token is allowed. First the trigger sequence is forced token by token, then the grammar starts."</em></p>
+
+<h3>Step 2: add_request starts the build and returns</h3>
+<p><code>LLMEngine.add_request</code> makes the sequence first. Then, for a request with <code>so_args</code>, it hands the sequence to the builder instead of to the scheduler:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="606-630" highlight="611,621-622,628">
+  <x-tr line="610">The caller manages scheduling itself and cannot re-enter through pump, so keep the synchronous build.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 609-611: with <code>enqueue=False</code>, the engine waits for the matcher at once.</li>
+  <li>Lines 620-623: <code>_enqueue</code> is the callback that runs later. An aborted matcher changes the status to <code>FINISHED_SO_FAILED</code> before the sequence enters the scheduler.</li>
+  <li>Line 628: the normal path. <code>submit</code> starts the build and keeps <code>(seq, future, on_ready)</code> in a pending list ({{cite deepinfer/structure_output/so_matcher_builder.py:97-107}}).</li>
+</ol>
+<p>The builder is a property that the engine makes on first use. It gets <code>DEEPINFER_SO_BUILDER_CPUS</code> cores (default 4) of the share of this GPU, and one pool thread per core ({{cite deepinfer/engine/llm_engine.py:329-342}}, {{cite deepinfer/utils.py:154-161}}). Each pool thread pins itself to these cores when it starts ({{cite deepinfer/structure_output/so_matcher_builder.py:33-48}}).</p>
+
+<h3>Step 3: a pool thread compiles the grammar</h3>
+<p>The build task calls the compiler and wraps the result in a matcher ({{cite deepinfer/structure_output/so_matcher_builder.py:78-92}}). The compiler selects the xgrammar function by <code>schema_type</code>:</p>
+<x-code file="deepinfer/structure_output/compiler.py" lines="54-71" highlight="56-61,63" />
+<p>Every error becomes a <code>RuntimeError</code> with a short prefix. An unknown <code>schema_type</code> raises <code>ValueError</code> inside the <code>try</code>, so it also becomes <code>RuntimeError("xgrammar invalid input: ...")</code>. The engine thread does not see this exception directly: it sees an aborted matcher (step 5).</p>
+
+<h3>Step 4: pump() moves ready requests into the scheduler</h3>
+<p>Once per step, <code>pre_sampler_sync</code> calls <code>pump()</code> ({{cite deepinfer/engine/llm_engine.py:841-842}}). <code>pump()</code> never blocks:</p>
+<x-code file="deepinfer/structure_output/so_matcher_builder.py" lines="109-121">
+  <x-tr line="110">Poll the pending list. Take each sequence whose matcher is compiled out of the list, and put it into scheduling with on_ready.</x-tr>
+  <x-tr line="115">Non-blocking. On timeout it returns an aborted matcher.</x-tr>
+</x-code>
+<p><code>try_result()</code> returns <code>None</code> while the task runs. After <code>DEEPINFER_XGRAMMAR_TIMEOUT</code> seconds (default 20) it returns an aborted matcher ({{cite deepinfer/structure_output/matcher.py:319-338}}, {{cite deepinfer/environ.py:168}}). The scheduler then skips the prefill of the request and reports it as finished ({{cite csrc/engine/scheduler.hpp:362-367}}).</p>
+
+<h3>Step 5: the sampler fills one mask per draft row</h3>
+<p>At the end of the prompt, the engine sets the status from 0 to 1 ({{cite deepinfer/engine/llm_engine.py:913-915}}). From then on, <code>Sampler._get_so_mask</code> works for this request in every step. It runs on the CPU. The comment at line 135 says that this work runs while the logits are computed. In the code, the sampler calls <code>_get_so_mask</code> before it calls <code>get_logits</code>, so the CPU work overlaps the device work that was launched before ({{cite deepinfer/model_executor/layers/sampler.py:135-142}}). The core of it:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="351-376" highlight="352-355,361-364,368-372,376" />
+<ol>
+  <li>Lines 352-355: status 2 means "running". The matcher first accepts the tokens that the previous step committed: the accepted drafts and the new output token. A rejection here is a bug, so it raises.</li>
+  <li>Lines 356-357: status 1 means "first sample after the prompt". There are no old tokens to accept. The status becomes 2.</li>
+  <li>Lines 361-364: mask 0 is the grammar state now. It applies to row 0 of the request.</li>
+  <li>Lines 367-375: the matcher accepts the drafts one by one. After draft <em>k</em> (counted from 1), it fills mask <em>k</em>. The loop stops at the first draft that the grammar rejects.</li>
+  <li>Line 376: <code>rollback</code> undoes the accepted drafts. The drafts are only guesses; the device decides later which of them stay.</li>
+</ol>
+<x-diagram name="b10a_so_masks" alt="Panel 1: six step cards for one request. 1, accept the last step's tokens. 2, fill mask 0 for row 0; the grammar allows red, green or blue. 3, accept draft 1 red, fill mask 1. 4, accept draft 2, a quote, fill mask 2. 5, draft 3 is an exclamation mark, the grammar rejects it, stop; rows 3 to 5 get no mask. 6, rollback 2. A side column lists the pinned masks, six arrays of shape num_seqs by ceil of V over 32 int32, and the rollback depth of nextn plus 2. Panel 2: the masks are copied on a side stream; one TileLang kernel per step sets disallowed logits to minus infinity in row ftp of r plus k; verification then rejects draft 3 because its masked probability is 0." caption="Figure: structured output with drafts. See that the CPU fills a mask only up to the first draft that the grammar rejects, and that the masked logit makes the device reject that draft too. Click to zoom." />
+<p>The draft model does not use the grammar, so it can propose an illegal token. The mask catches it at verification. The illegal draft has target probability 0, so the sampler rejects it. Then it samples a new token from the allowed ones.</p>
+
+<h3>Step 6: one kernel sets forbidden logits to minus infinity</h3>
+<p>A side stream copies the pinned masks to the device ({{cite deepinfer/model_executor/layers/sampler.py:391-407}}). In decode, the sampler then calls one kernel per draft step <em>k</em> ({{cite deepinfer/model_executor/layers/sampler.py:433-437}}). In prefill, there is only mask 0 ({{cite deepinfer/model_executor/layers/sampler.py:187-188}}). The CUDA kernel:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/cuda/structure_output.py" lines="39-57" highlight="44-47,55-56" />
+<ol>
+  <li>Line 39: a grid of <code>ceil(V / 8192)</code> × <code>len(indices)</code> blocks. Each block handles 8,192 vocabulary columns of one request.</li>
+  <li>Lines 44-47: the logits row is the first row of the request (<code>ftp</code>) plus <em>k</em>. If the request has fewer rows in this step, the block returns.</li>
+  <li>Lines 55-56: a 0 bit sets the logit to minus infinity.</li>
+</ol>
+
+<h3>Step 7: the status goes back to C++</h3>
+<p>The sampler returns its <code>so_status</code> list with the step output. <code>process_outputs</code> copies it into the C++ sequence ({{cite csrc/engine/scheduler.hpp:928-929}}). Then it checks the stored value, not the value of this step:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="974-980">
+  <x-tr line="974-975">Decide on failure from the ledger structured_output.status, not from this step's report. The sampler returns None for a step with no active SO in the batch; trusting only the report would let a sequence whose ledger is already -1 (for example a copy that the prefill engine marked dead and moved to the completion engine) generate freely with no constraint.</x-tr>
+</x-code>
+<p>A failed request gets one filler token, id 0, and the status <code>FINISHED_SO_FAILED</code>.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="XGrammarMatcher: trigger, bound, grammar and EOS">
+<p><code>XGrammarMatcher</code> wraps one xgrammar <code>GrammarMatcher</code> and adds a small state machine in front of it ({{cite deepinfer/structure_output/matcher.py:58-85}}). Its fields:</p>
+<table>
+  <thead><tr><th>Field</th><th>Start value</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>trigger_progress</code></td><td>0</td><td>How many tokens of the trigger sequence match now.</td></tr>
+    <tr><td><code>_trigger_failure</code></td><td>KMP table</td><td>Fallback lengths for a mismatch ({{cite deepinfer/structure_output/matcher.py:24-33}}).</td></tr>
+    <tr><td><code>_progress_history</code></td><td>[]</td><td>Old <code>trigger_progress</code> values, for rollback. At most <code>MAX_ROLLBACK_TOKENS</code> entries.</td></tr>
+    <tr><td><code>tokens_after_bound</code></td><td>−1</td><td>−1 until the bound token appears; then the count of tokens after it.</td></tr>
+    <tr><td><code>tokens_in_matcher</code></td><td>0</td><td>Tokens that the inner xgrammar matcher accepted.</td></tr>
+    <tr><td><code>tokens_after_eos</code></td><td>−1</td><td>−1 until EOS; then the count of tokens after EOS.</td></tr>
+  </tbody>
+</table>
+<p><strong>Three phases.</strong> <code>constrained()</code> is true when the bound fired or the trigger is complete ({{cite deepinfer/structure_output/matcher.py:115-125}}). The sampler fills a mask only for a constrained matcher ({{cite deepinfer/model_executor/layers/sampler.py:361-364}}).</p>
+<ol>
+  <li><strong>Free phase</strong> (trigger pending, no bound): every token is accepted. KMP updates the trigger progress. The bound token, if it appears, starts the forced phase ({{cite deepinfer/structure_output/matcher.py:141-153}}).</li>
+  <li><strong>Forced phase</strong> (bound fired, trigger pending): only the next trigger token is accepted ({{cite deepinfer/structure_output/matcher.py:136-140}}). The mask has exactly one bit set ({{cite deepinfer/structure_output/matcher.py:183-187}}).</li>
+  <li><strong>Grammar phase</strong> (trigger complete, or no trigger): xgrammar accepts or rejects the token. EOS starts the count <code>tokens_after_eos</code> ({{cite deepinfer/structure_output/matcher.py:157-168}}). After EOS, the mask allows every token: <code>mask_after_eos</code> is a full mask ({{cite deepinfer/structure_output/matcher.py:105}}, {{cite deepinfer/structure_output/matcher.py:189-191}}).</li>
+</ol>
+<p><strong>Worked example: why KMP.</strong> Trigger <code>[5, 5, 7]</code>, input tokens <code>5 5 5 7</code>.</p>
+<ol>
+  <li>The failure table is <code>[0, 1, 0]</code>: after a mismatch at position 2, the last 5 can still be the first 5 of the trigger.</li>
+  <li>Tokens 5, 5: progress 1, then 2.</li>
+  <li>Token 5: it does not match <code>trigger[2] = 7</code>. Progress falls back to <code>failure[1] = 1</code>. Now 5 matches <code>trigger[1]</code>, so progress is 2 again.</li>
+  <li>Token 7: progress 3 = complete. The grammar starts with the next token.</li>
+</ol>
+<p>A simple "reset to 0 on a mismatch" would end step 3 at progress 1 and miss the trigger.</p>
+<x-simplified><p>The table shows the logic of <code>accept_token</code>. What xgrammar does inside <code>accept_token</code> and <code>fill_next_token_bitmask</code> is not in this repository.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Rollback: why the depth is nextn + 2">
+<p>The matcher keeps a limited history:</p>
+<x-code file="deepinfer/structure_output/matcher.py" lines="18-20" />
+<p>xgrammar gets the same limit: <code>InnerMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)</code> ({{cite deepinfer/structure_output/matcher.py:83}}). With the default <code>DEEPINFER_USE_NEXTN_DECODE = 5</code>, the limit is 7.</p>
+<p>Why rollback at all? In one step the sampler accepts up to <code>nextn</code> drafts to fill the masks, and then undoes exactly those drafts ({{cite deepinfer/model_executor/layers/sampler.py:366-376}}). The committed tokens of the previous step are never rolled back. So the largest rollback is <code>nextn</code> = 5. The code keeps 2 more; it does not say why.</p>
+<p><code>rollback(steps)</code> undoes the phases in reverse order ({{cite deepinfer/structure_output/matcher.py:206-232}}):</p>
+<ol>
+  <li>First the tokens after EOS, which only lower the counter.</li>
+  <li>Then up to <code>tokens_in_matcher</code> tokens in xgrammar.</li>
+  <li>Then <code>trigger_progress</code> from the history. A rollback deeper than the history raises <code>RuntimeError</code>.</li>
+  <li>Then <code>tokens_after_bound</code>, which can fall back to −1.</li>
+</ol>
+<p>The sampler catches every exception in this code and kills only the request ({{cite deepinfer/model_executor/layers/sampler.py:377-386}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Mask shapes and bytes, with numbers">
+<p>The sampler keeps <code>max_MTP_value + 1</code> pinned CPU masks. It makes them again only when the batch is larger than all earlier batches ({{cite deepinfer/model_executor/layers/sampler.py:323-327}}). So <code>num_seqs</code> below is the largest batch so far, not always the current batch:</p>
+<pre><code class="language-none">bitmasks_cpu[k]   int32 [num_seqs, ceil(V / 32)]     k = 0 .. nextn   (pinned)
+so_indices[k]     int32 [n_k]                         requests that use mask k
+logits            float32 [total_q, V]               row ftp[r] + k belongs to request r, step k</code></pre>
+<p>Bit <em>j</em> of word <em>w</em> stands for token <code>32·w + j</code>: the kernel tests <code>bitmask[w] &amp; (1 &lt;&lt; (i % 32))</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/cuda/structure_output.py:55}}). The forced-phase code writes one bit in the same way: word <code>expected &gt;&gt; 5</code>, bit <code>expected &amp; 31</code> ({{cite deepinfer/structure_output/matcher.py:186}}).</p>
+<p><strong>Worked example.</strong> The vocabulary size comes from the checkpoint; this example uses V = 129,280, the value in the kernel benchmark ({{cite deepinfer/model_executor/layers/tilelang_ops/structure_output.py:106}}).</p>
+<ul>
+  <li>One mask row: ceil(129,280 / 32) = 4,040 int32 = 16,160 bytes.</li>
+  <li>64 rows (the largest batch so far), nextn = 5: 6 masks × 64 rows × 16,160 B = 6,205,440 B (about 5.9 MiB).</li>
+  <li>The copy sends all 6 full masks every step, also when only one request uses a grammar ({{cite deepinfer/model_executor/layers/sampler.py:398}}). A step with no active grammar sends nothing ({{cite deepinfer/model_executor/layers/sampler.py:318-319}}).</li>
+  <li>Kernel grid: ceil(129,280 / 8,192) = 16 blocks per listed request and step.</li>
+</ul>
+<p><strong>Streams.</strong> The copy stream first waits for an event that the main stream records at this point. Then it copies the masks and records <code>so_mask_ready</code>. The main stream waits for that event before the mask kernels ({{cite deepinfer/model_executor/layers/sampler.py:391-407}}, {{cite deepinfer/model_executor/layers/sampler.py:163-164}}). The code gives no comment about the first wait.</p>
+</x-deepdive>
+
+<x-deepdive title="The thread pool, the compiler cache and the timeout">
+<p><strong>Threads.</strong> The engine thread calls <code>submit</code> and <code>pump</code>; pool threads only fill futures. A translated comment says: <em>"submit and pump are both called on the main thread. The worker thread only fills the future. It does not touch the seq or the scheduling logic."</em> ({{cite deepinfer/structure_output/so_matcher_builder.py:50}}). Even the compiler object is made on a pool thread, with <code>num_threads=2</code> ({{cite deepinfer/structure_output/so_matcher_builder.py:49}}). The xgrammar compiler gets this value as <code>max_threads</code> ({{cite deepinfer/structure_output/compiler.py:34-39}}).</p>
+<p><strong>Pinning.</strong> <code>get_idle_cpus</code> returns the first <code>DEEPINFER_SO_BUILDER_CPUS</code> physical cores of the share of this GPU: <code>range(local_rank × cores_per_gpu, … + 4)</code>. It raises <code>RuntimeError</code> if a GPU has fewer cores ({{cite deepinfer/utils.py:154-161}}). Each pool thread calls <code>os.sched_setaffinity(0, …)</code>, which pins only the calling thread ({{cite deepinfer/structure_output/so_matcher_builder.py:37-41}}). Translated: <em>"0 = the calling thread itself: this binds the worker thread that runs the initializer, not the whole process or the main thread."</em></p>
+<p><strong>Compiler cache.</strong> xgrammar can keep compiled grammars in a cache ({{cite deepinfer/structure_output/compiler.py:15-39}}):</p>
+<ul>
+  <li><code>DEEPINFER_XGRAMMAR_DISABLE_CACHE</code> (default off) turns the cache off. The comment calls it a kill switch after production incidents with xgrammar 0.1.x.</li>
+  <li><code>DEEPINFER_XGRAMMAR_CACHE_LIMIT_BYTES</code> (default 10 GiB) limits it. For a value of 0 or less, the code logs a warning. The warning says that the cache then has no size limit and can run out of memory with many different schemas (it names CVE-2025-32381).</li>
+</ul>
+<p><strong>Timeout.</strong> The clock starts when the future is made ({{cite deepinfer/structure_output/matcher.py:262-271}}). <code>try_result()</code> has three outcomes ({{cite deepinfer/structure_output/matcher.py:319-338}}):</p>
+<ol>
+  <li>The task finished: return its matcher, or an aborted matcher if the task raised.</li>
+  <li>The task still runs and the time is up: return an aborted matcher. The task is not cancelled here.</li>
+  <li>The task still runs within the time: return <code>None</code>.</li>
+</ol>
+<p>The messages can mislead: a compile error that arrives in time gets the text <code>"xgrammar timeout when try_result, ..."</code> ({{cite deepinfer/structure_output/matcher.py:328-329}}).</p>
+<p><strong>Counting.</strong> Pending requests count as unfinished, so <code>LLM.generate</code> keeps the loop alive while a grammar compiles ({{cite deepinfer/engine/llm_engine.py:658-663}}, {{cite deepinfer/engine/llm_engine.py:673-674}}). <code>examples/benchmark.py</code> calls <code>pump()</code> in a loop until no build is pending, before it allocates its sequences ({{cite examples/benchmark.py:311-313}}).</p>
+<p><strong>The QA document.</strong> It says that compilation runs "on a dedicated SO machine" and that a request gets the compiled result before it enters the engine ({{cite doc/inference_deployment_qa.md:284-288}}). The offline code in this repository compiles on the same machine and refuses a <code>"serialized"</code> grammar ({{cite deepinfer/structure_output/so_matcher_builder.py:60-61}}). The production setup is not in this release.</p>
+</x-deepdive>
+
+<x-deepdive title="Interaction with ZOS, preemption and forks">
+<p><strong>Zero-overhead scheduling.</strong> With {{term zos}}, the CPU schedules step N + 1 before the outputs of step N are processed. So, just before sampling, C++ refreshes the metadata of each sequence that was also in the previous step (<code>remap</code> ≥ 0). It copies the last output token, <code>so_status</code> and the matcher ({{cite csrc/engine/zos.cpp:300-302}}, {{cite csrc/engine/sequence.hpp:408-417}}). A middle prompt chunk has <code>last_output_token = -1</code>, and the sampler skips it ({{cite csrc/engine/sequence.hpp:387}}, {{cite deepinfer/model_executor/layers/sampler.py:339}}).</p>
+<p><strong>Preemption.</strong> A recompute would have to replay the matcher. DeepInfer does not do this: a preempted request with <code>so_status != 0</code> stops with <code>FINISHED_PREEMPTED</code>, also when the engine would recompute other requests ({{cite csrc/engine/scheduler.hpp:766-780}}). The builder has a <code>replay_tokens</code> argument that would restore the state ({{cite deepinfer/structure_output/so_matcher_builder.py:87-91}}), but no caller in this release passes it.</p>
+<p><strong>Forks.</strong> <code>fork_seq</code> gives the new sequence a fresh copy of the matcher with <code>copy_without_status()</code>, and status 1 when the prompt is complete ({{cite csrc/engine/scheduler.hpp:1097-1100}}). The <code>deepinfer</code> package does not call <code>fork_seq</code>; <code>examples/benchmark.py</code> does.</p>
+<p><strong>Golden tokens.</strong> The masks apply before the sampler picks a token. Teacher forcing with <code>golden_token_ids</code> happens later: after the sampling kernels, the sampler replaces the sampled tokens with the golden tokens. So a golden token that the grammar forbids makes the matcher reject it at the next step, and that request fails.</p>
+<x-simplified><p>The last paragraph follows from the order of the calls in <code>Sampler.forward</code> (masks at {{cite deepinfer/model_executor/layers/sampler.py:187-190}}, golden tokens at {{cite deepinfer/model_executor/layers/sampler.py:469-490}} and {{cite deepinfer/model_executor/layers/sampler.py:671}}) and from the raise at {{cite deepinfer/model_executor/layers/sampler.py:354-355}}. No test in the repository runs this case.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_XGRAMMAR_TIMEOUT</code></td><td>20 ({{cite deepinfer/environ.py:168}})</td><td>{{cite deepinfer/structure_output/matcher.py:19}} (import time)</td><td>Seconds before a pending build gives an aborted matcher.</td></tr>
+    <tr><td><code>DEEPINFER_XGRAMMAR_DISABLE_CACHE</code></td><td>False ({{cite deepinfer/environ.py:169}})</td><td>{{cite deepinfer/structure_output/compiler.py:18}}</td><td>Turns off the xgrammar compiler cache.</td></tr>
+    <tr><td><code>DEEPINFER_XGRAMMAR_CACHE_LIMIT_BYTES</code></td><td>10 GiB ({{cite deepinfer/environ.py:170}})</td><td>{{cite deepinfer/structure_output/compiler.py:19}}</td><td>Cache size limit; for 0 or less, a warning says that the cache has no limit.</td></tr>
+    <tr><td><code>DEEPINFER_SO_BUILDER_CPUS</code></td><td>4 ({{cite deepinfer/environ.py:171}})</td><td>{{cite deepinfer/utils.py:157}}</td><td>Pool threads and pinned cores.</td></tr>
+    <tr><td><code>DEEPINFER_XGRAMMAR_DEBUG</code></td><td>False ({{cite deepinfer/environ.py:167}})</td><td>{{cite deepinfer/structure_output/matcher.py:18}} (import time)</td><td>Passes <code>debug_print=True</code> to xgrammar.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/structure_output/matcher.py:20}} (import time)</td><td>Number of draft masks; rollback depth = value + 2.</td></tr>
+  </tbody>
+</table>
+<p>The full list is on {{link reference/env-vars}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Wrong keys raise at once.</strong> <code>"serialized"</code> or the plural <code>"bound_token_ids"</code> raise <code>ValueError</code> inside <code>build()</code>, so <code>add_request</code> raises to the caller ({{cite deepinfer/structure_output/so_matcher_builder.py:60-63}}). A missing <code>"schema"</code> key raises <code>KeyError</code> the same way ({{cite deepinfer/structure_output/so_matcher_builder.py:64}}).</li>
+  <li><strong>A bad trigger or bound does not raise.</strong> The builder returns an aborted matcher ({{cite deepinfer/structure_output/so_matcher_builder.py:71-76}}), and the request ends without a prefill.</li>
+  <li><strong>Compile errors and slow grammars end the request.</strong> The finish reason is <code>"xgrammar runtime errors or timeout"</code> for both ({{cite csrc/engine/sequence.hpp:57-58}}). A large JSON schema can need more than 20 seconds; raise <code>DEEPINFER_XGRAMMAR_TIMEOUT</code> for it.</li>
+  <li><strong>Preemption stops a grammar request.</strong> It does not recompute, even in the offline <code>LLM</code>, which recomputes other requests ({{cite csrc/engine/scheduler.hpp:770-780}}).</li>
+  <li><strong>A matcher error in the sampler kills one request.</strong> A translated comment explains why: <em>"This is the sampling main path on CP rank 0. A raise would take down all requests and time out the NCCL barrier."</em> ({{cite deepinfer/model_executor/layers/sampler.py:377-386}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> A grammar makes the output machine-readable, but it costs CPU time in every step: one matcher walk and up to 6 masks per request. DeepInfer keeps the slow part, the compile, off the step loop, and keeps the per-step part on the CPU while the device computes the logits.</p>
+
+<x-quiz>
+  <x-q level="easy">Which three grammar types can <code>so_args["schema_type"]</code> name, and which xgrammar call does each one use?
+    <x-a><p><code>"json"</code> uses <code>compile_json_schema(schema, strict_mode=True)</code>, <code>"regex"</code> uses <code>compile_regex</code>, and <code>"ebnf"</code> uses <code>compile_grammar</code> ({{cite deepinfer/structure_output/compiler.py:56-61}}). Any other value raises inside the compiler and gives an aborted matcher.</p></x-a>
+  </x-q>
+  <x-q level="easy">A request with <code>so_args</code> comes in. When does it enter the scheduler's waiting queue?
+    <x-a><p>Not in <code>add_request</code>. The builder compiles the grammar on a pool thread. <code>pump()</code>, which <code>pre_sampler_sync</code> calls once per step, sees the finished future and calls <code>_enqueue</code>, which calls <code>scheduler.add_sequence</code> ({{cite deepinfer/structure_output/so_matcher_builder.py:109-121}}, {{cite deepinfer/engine/llm_engine.py:620-628}}, {{cite deepinfer/engine/llm_engine.py:841-842}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With 5 drafts, the grammar accepts drafts 1 and 2 and rejects draft 3. Which rows of the request get a mask, and what happens to draft 3 on the device?
+    <x-a><p>Rows 0, 1 and 2 get masks 0, 1 and 2. Rows 3 to 5 get none, because the loop stops at the first rejected draft ({{cite deepinfer/model_executor/layers/sampler.py:367-375}}). Row 2 checks draft 3 with mask 2, which has a 0 bit for draft 3. Its logit becomes minus infinity, so its probability is 0 and the verification rejects it. The sampler draws a new token from the allowed ones.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the scheduler decide on <code>FINISHED_SO_FAILED</code> from the stored status, and not from the status of this step?
+    <x-a><p>The sampler returns no status list for a step in which no request has an active grammar. A sequence whose stored status is already −1 would then generate freely. So <code>process_outputs</code> checks <code>seq.structured_output.status == -1</code> ({{cite csrc/engine/scheduler.hpp:974-980}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The matcher keeps a rollback history of <code>nextn + 2</code> tokens. Take 64 sequences (also the largest batch so far) and nextn = 5. How many bytes of masks does one decode step copy, and what is the largest rollback?
+    <x-a><p>Six masks of <code>[64, ceil(V/32)]</code> int32. With V = 129,280: 6 × 64 × 4,040 × 4 B = 6,205,440 B ({{cite deepinfer/model_executor/layers/sampler.py:323-327}}, {{cite deepinfer/model_executor/layers/sampler.py:398}}). The largest rollback is 5, one per accepted draft ({{cite deepinfer/model_executor/layers/sampler.py:376}}); the limit is 7 ({{cite deepinfer/structure_output/matcher.py:20}}).</p></x-a>
+  </x-q>
+</x-quiz>

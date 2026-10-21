@@ -1,0 +1,230 @@
+---
+title: structure_output/: grammar compiler, matcher and builder
+nav_title: structure_output/
+level: Intermediate
+prerequisites: concepts/structured-outputs, concepts/sampler
+related: concepts/structured-outputs, code/sampler, code/sampling-params, code/llm-engine, code/scheduler-hpp, reference/env-vars
+summary: The structure_output package wraps xgrammar for DeepInfer. XGrammarCompiler compiles a grammar, XGrammarMatcher follows one request with trigger, bound and rollback, SOMatcherBuilder compiles on a pinned thread pool, and mask.py connects the sampler to the TileLang bitmask kernel.
+---
+<h2>Purpose</h2>
+<p>The package turns <code>so_args</code> into a {{term grammar-matcher}} for each request, and gives the sampler the functions that make and apply {{term token-bitmask | token bitmasks}}.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/structure_output/</code>: <code>compiler.py</code> (74 lines), <code>matcher.py</code> (347), <code>so_matcher_builder.py</code> (138), <code>mask.py</code> (36). <code>__init__.py</code> is empty.</td></tr>
+    <tr><th>Main classes</th><td><code>XGrammarCompiler</code> ({{cite deepinfer/structure_output/compiler.py:14}}), <code>XGrammarMatcher</code> ({{cite deepinfer/structure_output/matcher.py:58}}), <code>XGrammarMatcherFuture</code> ({{cite deepinfer/structure_output/matcher.py:261}}), <code>SOMatcherBuilder</code> ({{cite deepinfer/structure_output/so_matcher_builder.py:19}}), <code>XGrammarUtils</code> ({{cite deepinfer/structure_output/mask.py:23}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process of each data-parallel rank. Compilation runs on the builder's {{term thread-pool}} threads, pinned to their own CPU cores. <code>submit</code>, <code>pump</code> and all matcher calls in the sampler run on the engine thread. Only context-parallel rank 0 fills masks ({{cite deepinfer/model_executor/layers/sampler.py:313-315}}).</td></tr>
+    <tr><th>Called by</th><td><code>LLMEngine</code> (builder), <code>Sampler</code> (matcher, masks), the C++ scheduler (<code>copy_without_status</code> in <code>fork_seq</code>).</td></tr>
+    <tr><th>Calls</th><td>{{term xgrammar}}: <code>GrammarCompiler</code>, <code>GrammarMatcher</code>, <code>TokenizerInfo</code> and its bitmask helpers. The TileLang kernel <code>apply_token_bitmask_by_step_inplace</code>.</td></tr>
+    <tr><th>Not in this package</th><td>The mask kernel (<code>tilelang_ops/structure_output.py</code>), the per-step mask logic (<code>Sampler._get_so_mask</code>), and the status ledger (<code>csrc/engine/sequence.hpp</code>, <code>scheduler.hpp</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b10a_so_flow" alt="Panel 1: add_request marks so_pending; SOMatcherBuilder.submit starts a build on a pinned pool thread, which compiles with xgrammar and makes an XGrammarMatcher; pump in pre_sampler_sync checks the future every step; on_ready attaches the matcher and adds the sequence to the scheduler, or marks it FINISHED_SO_FAILED. Panel 2: so_status goes from 0 to 1 at the last prompt chunk and to 2 after the first sample; errors give -1 and FINISHED_SO_FAILED; a preempted request with status not 0 stops." caption="Figure: the builder path (panel 1) and the status ledger (panel 2). The same figure is on {{link concepts/structured-outputs}}. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>LLMEngine.so_matcher_builder</code></strong>, a property, makes the builder on first use with the tokenizer, the vocabulary size, the EOS id and the pinned cores ({{cite deepinfer/engine/llm_engine.py:329-342}}).</li>
+  <li><strong><code>LLMEngine.add_request</code></strong> calls <code>submit</code>, or <code>build(...).result()</code> when <code>enqueue=False</code> ({{cite deepinfer/engine/llm_engine.py:606-630}}).</li>
+  <li><strong><code>LLMEngine.pre_sampler_sync</code></strong> calls <code>pump()</code> once per step ({{cite deepinfer/engine/llm_engine.py:841-842}}). <code>get_num_unfinished_requests</code> and <code>has_unfinished_requests</code> count pending builds ({{cite deepinfer/engine/llm_engine.py:658-663}}, {{cite deepinfer/engine/llm_engine.py:673-674}}). <code>close()</code> calls <code>shutdown()</code> ({{cite deepinfer/engine/llm_engine.py:357-361}}).</li>
+  <li><strong><code>Sampler</code></strong> imports <code>XGrammarUtils</code> and <code>allocate_vocab_mask</code> ({{cite deepinfer/model_executor/layers/sampler.py:49}}) and calls <code>accept_token</code>, <code>constrained</code>, <code>fill_vocab_mask</code>, <code>rollback</code> and <code>set_aborted</code> on the matcher ({{cite deepinfer/model_executor/layers/sampler.py:347-386}}).</li>
+  <li><strong>C++ <code>Scheduler::fork_seq</code></strong> calls <code>copy_without_status()</code> through pybind11 ({{cite csrc/engine/scheduler.hpp:1097-1100}}).</li>
+  <li><strong><code>examples/benchmark.py</code></strong> calls <code>pump()</code> in a loop until no build is pending ({{cite examples/benchmark.py:311-313}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>xgrammar.</strong> <code>TokenizerInfo.from_huggingface</code> ({{cite deepinfer/structure_output/so_matcher_builder.py:29}}), <code>GrammarCompiler</code> and its three compile functions ({{cite deepinfer/structure_output/compiler.py:34-39}}, {{cite deepinfer/structure_output/compiler.py:56-61}}), <code>GrammarMatcher</code> ({{cite deepinfer/structure_output/matcher.py:83}}), and <code>get_bitmask_shape</code>, <code>bitmask_dtype</code>, <code>_FULL_MASK</code> ({{cite deepinfer/structure_output/matcher.py:14}}). This site does not explain xgrammar internals.</li>
+  <li><strong>The TileLang kernel</strong> through <code>apply_token_bitmask_by_step_inplace</code> ({{cite deepinfer/structure_output/mask.py:5-7}}, {{cite deepinfer/structure_output/mask.py:33}}).</li>
+  <li><strong>The OS.</strong> <code>os.sched_setaffinity</code> pins each pool thread ({{cite deepinfer/structure_output/so_matcher_builder.py:40}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>XGrammarCompiler.__init__</code></td><td>{{cite deepinfer/structure_output/compiler.py:15}}</td><td>Makes the xgrammar compiler with the cache settings.</td></tr>
+    <tr><td><code>XGrammarCompiler.dispatch_and_compile</code></td><td>{{cite deepinfer/structure_output/compiler.py:54}}</td><td>Calls the compile function for <code>json</code>, <code>regex</code> or <code>ebnf</code>; wraps every error in <code>RuntimeError</code>.</td></tr>
+    <tr><td><code>_kmp_failure</code></td><td>{{cite deepinfer/structure_output/matcher.py:24}}</td><td>KMP failure table for the trigger sequence.</td></tr>
+    <tr><td><code>allocate_vocab_mask</code></td><td>{{cite deepinfer/structure_output/matcher.py:36}}</td><td>An int32 mask <code>[batch, ceil(V/32)]</code>, optionally pinned, optionally full.</td></tr>
+    <tr><td><code>validate_trigger_bound</code></td><td>{{cite deepinfer/structure_output/matcher.py:48}}</td><td>Checks the types and the rule "bound needs a trigger".</td></tr>
+    <tr><td><code>XGrammarMatcher.aborted_matcher</code></td><td>{{cite deepinfer/structure_output/matcher.py:88}}</td><td>A matcher with no grammar and an error message.</td></tr>
+    <tr><td><code>XGrammarMatcher.from_compiled</code></td><td>{{cite deepinfer/structure_output/matcher.py:95}}</td><td>A matcher for a compiled grammar, with a full mask for after EOS.</td></tr>
+    <tr><td><code>XGrammarMatcher.constrained</code></td><td>{{cite deepinfer/structure_output/matcher.py:121}}</td><td>True when the bound fired or the trigger is complete.</td></tr>
+    <tr><td><code>XGrammarMatcher.accept_token</code></td><td>{{cite deepinfer/structure_output/matcher.py:134}}</td><td>Moves the state by one token; returns False for a forbidden token.</td></tr>
+    <tr><td><code>XGrammarMatcher.fill_vocab_mask</code></td><td>{{cite deepinfer/structure_output/matcher.py:181}}</td><td>Writes the allowed set into one row of a mask.</td></tr>
+    <tr><td><code>XGrammarMatcher.rollback</code></td><td>{{cite deepinfer/structure_output/matcher.py:206}}</td><td>Undoes the last <em>n</em> tokens.</td></tr>
+    <tr><td><code>XGrammarMatcher.copy_without_status</code></td><td>{{cite deepinfer/structure_output/matcher.py:234}}</td><td>A fresh matcher on the same compiled grammar (for forks).</td></tr>
+    <tr><td><code>XGrammarMatcherFuture.result</code></td><td>{{cite deepinfer/structure_output/matcher.py:297}}</td><td>Blocking wait, up to the timeout.</td></tr>
+    <tr><td><code>XGrammarMatcherFuture.try_result</code></td><td>{{cite deepinfer/structure_output/matcher.py:319}}</td><td>Non-blocking check; None while the build runs.</td></tr>
+    <tr><td><code>SOMatcherBuilder.__init__</code></td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:20}}</td><td>Pinned thread pool; the compiler is made on a pool thread.</td></tr>
+    <tr><td><code>SOMatcherBuilder.build</code></td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:58}}</td><td>Checks <code>so_args</code>, submits the compile task, returns a future.</td></tr>
+    <tr><td><code>SOMatcherBuilder.submit</code></td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:97}}</td><td><code>build</code> plus a pending entry <code>(seq, future, on_ready)</code>.</td></tr>
+    <tr><td><code>SOMatcherBuilder.pump</code></td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:109}}</td><td>Hands every ready matcher to its sequence and calls <code>on_ready</code>.</td></tr>
+    <tr><td><code>SOMatcherBuilder.shutdown</code></td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:129}}</td><td>Waits for the pool, releases futures, closes the compiler.</td></tr>
+    <tr><td><code>XGrammarUtils.apply_vocab_mask_by_step_inplace</code></td><td>{{cite deepinfer/structure_output/mask.py:25}}</td><td>Checks the index tensor, then calls the TileLang kernel.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>XGrammarCompiler.__init__</code>: the cache</h3>
+<x-code file="deepinfer/structure_output/compiler.py" lines="15-39" highlight="18-19,23-29,34-39" />
+<ol>
+  <li>Line 17 (comment): xgrammar 0.1.x and older had production incidents with the cache on; the variable stays as a kill switch.</li>
+  <li>Lines 18-19: two settings from the environment: <code>DEEPINFER_XGRAMMAR_DISABLE_CACHE</code> and <code>DEEPINFER_XGRAMMAR_CACHE_LIMIT_BYTES</code> (default 10 GiB, {{cite deepinfer/environ.py:169-170}}).</li>
+  <li>Lines 23-29: for a limit of 0 or less, the code logs a warning: the cache then has no size limit and can grow with many schemas.</li>
+  <li>Lines 34-39: the xgrammar compiler gets the tokenizer info, the cache settings and <code>max_threads</code> (2, from the builder).</li>
+</ol>
+
+<h3><code>SOMatcherBuilder.build</code>: checks, then a task</h3>
+<x-code file="deepinfer/structure_output/so_matcher_builder.py" lines="58-95" highlight="60-63,71-76,79,88-91,94" />
+<ol>
+  <li>Lines 60-63: <code>"serialized"</code> and <code>"bound_token_ids"</code> raise <code>ValueError</code> on the engine thread. The caller of <code>add_request</code> sees it.</li>
+  <li>Line 64: a missing <code>"schema"</code> key raises <code>KeyError</code> here, too.</li>
+  <li>Lines 71-76: a bad trigger or bound does not raise. A finished <code>Future</code> holds an aborted matcher.</li>
+  <li>Lines 78-92: the task, which runs on a pool thread: compile, make the matcher, then replay old tokens. No caller in this release passes <code>replay_tokens</code>.</li>
+  <li>Line 79: <code>schema_type</code> is read only inside the task, so a missing <code>schema_type</code> gives an aborted matcher, not an exception. Line 94 submits the task to the pool.</li>
+</ol>
+
+<h3><code>SOMatcherBuilder.pump</code>: hand over ready matchers</h3>
+<x-code file="deepinfer/structure_output/so_matcher_builder.py" lines="109-121">
+  <x-tr line="110">Poll the pending list. Take each sequence whose matcher is compiled out of the list, and put it into scheduling with on_ready.</x-tr>
+  <x-tr line="115">Non-blocking. On timeout it returns an aborted matcher.</x-tr>
+</x-code>
+<ol>
+  <li>Line 111: an empty list returns at once. This is the common case.</li>
+  <li>Lines 115-118: <code>try_result()</code> returns None while the build runs; the entry stays.</li>
+  <li>Lines 119-120: a matcher (good or aborted) goes to the sequence, and <code>on_ready</code> runs. In the engine, <code>on_ready</code> is <code>_enqueue</code> ({{cite deepinfer/engine/llm_engine.py:620-625}}).</li>
+</ol>
+
+<h3><code>XGrammarMatcher.accept_token</code>: three phases</h3>
+<x-code file="deepinfer/structure_output/matcher.py" lines="134-179" highlight="135-153,154-156,158-168,171-174" />
+<ol>
+  <li>Lines 135-153: the trigger is not complete. With a fired bound (lines 136-140), only the next trigger token is accepted. Without a bound (lines 141-148), every token is accepted and KMP updates the progress. Lines 149-152 count tokens after the bound, or start the count at the bound token.</li>
+  <li>Lines 154-156: after EOS every token is accepted. This happens when a draft is EOS: the sampler still accepts the later drafts to fill their masks ({{cite deepinfer/model_executor/layers/sampler.py:367-373}}).</li>
+  <li>Lines 158-168: the grammar phase. xgrammar decides. An accepted EOS starts <code>tokens_after_eos</code>; the assert at line 166 guards against a second EOS.</li>
+  <li>Lines 170-174: an xgrammar error that mentions "regarded as a special token" means "reject"; other errors are logged and raised again. The sampler catches them ({{cite deepinfer/model_executor/layers/sampler.py:377-386}}).</li>
+</ol>
+
+<h3><code>XGrammarMatcher.fill_vocab_mask</code> and <code>rollback</code></h3>
+<x-code file="deepinfer/structure_output/matcher.py" lines="181-232" highlight="183-187,189-191,193,207-216,223-230" />
+<ol>
+  <li>Lines 183-187: forced phase. The row is set to zero, and only the bit of the expected trigger token is set: word <code>expected &gt;&gt; 5</code>, bit <code>expected &amp; 31</code>.</li>
+  <li>Lines 189-191: after EOS, the row is the full mask.</li>
+  <li>Line 193: else xgrammar fills the row.</li>
+  <li>Lines 196-199: the error <code>!IsStopTokenAccepted()</code> returns False. The sampler asserts on False ({{cite deepinfer/model_executor/layers/sampler.py:362-363}}).</li>
+  <li>Lines 207-216: rollback removes tokens after EOS first.</li>
+  <li>Lines 218-221: then tokens in xgrammar, at most <code>tokens_in_matcher</code>.</li>
+  <li>Lines 223-230: then the trigger progress from the history. Too deep a rollback raises <code>RuntimeError</code>.</li>
+</ol>
+
+<h3><code>XGrammarMatcherFuture.try_result</code>: the timeout</h3>
+<x-code file="deepinfer/structure_output/matcher.py" lines="319-338" highlight="325-331,332-335" />
+<ol>
+  <li>Line 325: the task finished. <code>_resolve</code> reads the result; an exception in the task becomes an aborted matcher (lines 328-331).</li>
+  <li>Lines 332-335: the task still runs, but the time from the creation of the future is above <code>DEEPINFER_XGRAMMAR_TIMEOUT</code> (default 20 s, {{cite deepinfer/environ.py:168}}). The result is an aborted matcher. The task keeps its thread until it ends.</li>
+  <li>Line 337: <code>_log_abort</code> logs the message once, at debug level ({{cite deepinfer/structure_output/matcher.py:288-291}}).</li>
+</ol>
+
+<h3><code>mask.py</code>: a thin layer for the sampler</h3>
+<x-code file="deepinfer/structure_output/mask.py" lines="10-33">
+  <x-tr line="16-17">Lazy import: this module is in the import closure of the sampler. A top-level import would pull xgrammar into deployments that do not use SO. A so_status check comes before every real call, so only SO requests trigger it.</x-tr>
+</x-code>
+<p>Line 32 asserts that the index tensor is on the logits device and is int32. The kernel itself is described on {{link concepts/structured-outputs}}.</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data flow: types and shapes">
+<table>
+  <thead><tr><th>Object</th><th>Type / shape</th><th>Made by</th><th>Used by</th></tr></thead>
+  <tbody>
+    <tr><td><code>so_args</code></td><td><code>dict</code>: <code>schema_type</code>, <code>schema</code>, optional <code>trigger_token_ids</code> (list[int]), <code>bound_token_id</code> (int)</td><td>caller</td><td><code>build</code></td></tr>
+    <tr><td><code>CompiledGrammar</code></td><td>xgrammar object</td><td><code>dispatch_and_compile</code></td><td><code>from_compiled</code></td></tr>
+    <tr><td><code>XGrammarMatcherFuture</code></td><td>wraps <code>concurrent.futures.Future</code></td><td><code>build</code></td><td><code>pump</code>, <code>add_request</code></td></tr>
+    <tr><td><code>_pending</code></td><td><code>list[(seq, future, on_ready)]</code></td><td><code>submit</code></td><td><code>pump</code>, <code>shutdown</code></td></tr>
+    <tr><td><code>mask_after_eos</code></td><td>int32 <code>[ceil(V/32)]</code>, all bits 1</td><td><code>from_compiled</code></td><td><code>fill_vocab_mask</code></td></tr>
+    <tr><td>sampler masks</td><td>int32 <code>[num_seqs, ceil(V/32)]</code>, pinned, nextn + 1 of them</td><td><code>allocate_vocab_mask</code></td><td><code>fill_vocab_mask</code>, kernel</td></tr>
+    <tr><td><code>seq.so_matcher</code></td><td><code>XGrammarMatcher</code> in a C++ <code>py::object</code></td><td><code>pump</code></td><td>sampler (through <code>SequenceMetadata</code>)</td></tr>
+  </tbody>
+</table>
+<p><code>mask_after_eos</code> costs one mask row per request: with V = 129,280 (the kernel benchmark value, {{cite deepinfer/model_executor/layers/tilelang_ops/structure_output.py:106}}), 4,040 int32 = 16,160 bytes.</p>
+</x-deepdive>
+
+<x-deepdive title="Threads and processes">
+<ul>
+  <li><strong>Pool threads.</strong> <code>max_workers = len(idle_cpus)</code>, which is <code>DEEPINFER_SO_BUILDER_CPUS</code> (default 4) ({{cite deepinfer/engine/llm_engine.py:334-340}}, {{cite deepinfer/utils.py:154-161}}). The initializer pins each thread with <code>sched_setaffinity(0, …)</code>; 0 means the calling thread ({{cite deepinfer/structure_output/so_matcher_builder.py:37-41}}).</li>
+  <li><strong>The compiler</strong> is made on a pool thread with <code>num_threads=2</code>, and the engine waits for it once ({{cite deepinfer/structure_output/so_matcher_builder.py:49}}).</li>
+  <li><strong>The engine thread</strong> calls <code>submit</code> and <code>pump</code>. Translated comment: <em>"submit and pump are both called on the main thread; the worker thread only fills the future and does not touch the seq or the scheduling logic"</em> ({{cite deepinfer/structure_output/so_matcher_builder.py:50}}).</li>
+  <li><strong>The matcher</strong> is used only on the engine thread of CP rank 0, inside the sampler. The sampler fills the masks before it calls <code>get_logits</code> ({{cite deepinfer/model_executor/layers/sampler.py:135-142}}).</li>
+  <li><strong>Shutdown.</strong> <code>close()</code> stops the pool and the compiler on purpose. Translated: <em>"Shut down the thread pool and the compiler actively; with only GC, nanobind reports a leak at atexit"</em> ({{cite deepinfer/engine/llm_engine.py:357-361}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one request from add_request to the first token">
+<ol>
+  <li>Step 0: <code>add_request(so_args={"schema_type": "regex", "schema": "[A-Z]{2}-[0-9]{3}"})</code>. <code>submit</code> adds a pending entry. The scheduler does not know the request yet.</li>
+  <li>The pool thread compiles the regex and makes the matcher.</li>
+  <li>Each step, <code>pump()</code> runs in <code>pre_sampler_sync</code>. The first <code>pump()</code> after the build ends calls <code>_enqueue</code>: the sequence enters the waiting queue with <code>so_status = 0</code>.</li>
+  <li>At a prefill attempt point, the prompt runs. On the last prompt chunk the engine sets <code>so_status = 1</code> ({{cite deepinfer/engine/llm_engine.py:913-915}}).</li>
+  <li>The sampler sees status 1: no token to accept. It sets status 2 and fills mask 0 from the start state. Only tokens whose text can start the pattern are allowed, for example <code>A</code> or <code>AB</code>.</li>
+  <li>The mask kernel changes the logits row of the prefill, so the first output token fits the start of the pattern. <code>process_outputs</code> stores status 2 ({{cite csrc/engine/scheduler.hpp:928-929}}).</li>
+  <li>Next decode step: the matcher accepts that token, fills mask 0 for the next part of the pattern and masks for the drafts, then rolls back.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Condition</th><th>What happens</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>"serialized"</code> or <code>"bound_token_ids"</code> in so_args</td><td><code>ValueError</code> from <code>add_request</code></td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:60-63}}</td></tr>
+    <tr><td>No <code>"schema"</code></td><td><code>KeyError</code> from <code>add_request</code></td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:64}}</td></tr>
+    <tr><td>Bad trigger or bound</td><td>aborted matcher → <code>FINISHED_SO_FAILED</code>, no prefill</td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:71-76}}, {{cite csrc/engine/scheduler.hpp:363-367}}</td></tr>
+    <tr><td>Unknown <code>schema_type</code>, compile error</td><td><code>RuntimeError</code> in the task → aborted matcher</td><td>{{cite deepinfer/structure_output/compiler.py:62-69}}, {{cite deepinfer/structure_output/matcher.py:328-331}}</td></tr>
+    <tr><td>Build slower than 20 s</td><td>aborted matcher "timeout"</td><td>{{cite deepinfer/structure_output/matcher.py:332-335}}</td></tr>
+    <tr><td>Replayed token rejected</td><td><code>RuntimeError("SO replay failed ...")</code> → aborted matcher</td><td>{{cite deepinfer/structure_output/so_matcher_builder.py:87-91}}</td></tr>
+    <tr><td>Rollback deeper than the history</td><td><code>RuntimeError</code>, caught by the sampler → status −1</td><td>{{cite deepinfer/structure_output/matcher.py:223-228}}</td></tr>
+    <tr><td>Other xgrammar errors in accept or fill</td><td>logged at info level, raised, caught by the sampler → status −1</td><td>{{cite deepinfer/structure_output/matcher.py:175-179}}, {{cite deepinfer/structure_output/matcher.py:200-204}}</td></tr>
+  </tbody>
+</table>
+<p>The first two rows raise to the caller, so no request starts. Every other row ends the request with the finish reason <code>"xgrammar runtime errors or timeout"</code> ({{cite csrc/engine/sequence.hpp:57-58}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_XGRAMMAR_TIMEOUT</code></td><td>20 ({{cite deepinfer/environ.py:168}})</td><td>{{cite deepinfer/structure_output/matcher.py:19}}, import time</td><td>Default <code>timeout</code> of every future.</td></tr>
+    <tr><td><code>DEEPINFER_XGRAMMAR_DEBUG</code></td><td>False ({{cite deepinfer/environ.py:167}})</td><td>{{cite deepinfer/structure_output/matcher.py:18}}, import time</td><td><code>debug_print</code> for xgrammar; extra info logs.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/structure_output/matcher.py:20}}, import time</td><td><code>MAX_ROLLBACK_TOKENS</code> = value + 2.</td></tr>
+    <tr><td><code>DEEPINFER_XGRAMMAR_DISABLE_CACHE</code></td><td>False ({{cite deepinfer/environ.py:169}})</td><td>{{cite deepinfer/structure_output/compiler.py:18}}</td><td>No compiler cache.</td></tr>
+    <tr><td><code>DEEPINFER_XGRAMMAR_CACHE_LIMIT_BYTES</code></td><td>10 GiB ({{cite deepinfer/environ.py:170}})</td><td>{{cite deepinfer/structure_output/compiler.py:19}}</td><td>Cache limit; for 0 or less, a warning says that there is no limit.</td></tr>
+    <tr><td><code>DEEPINFER_SO_BUILDER_CPUS</code></td><td>4 ({{cite deepinfer/environ.py:171}})</td><td>{{cite deepinfer/utils.py:157}}</td><td>Pool size and pinned cores.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/structured-outputs}}: the full story, with the per-step masks and drafts.</li>
+  <li>{{link concepts/sampler}} and {{link code/sampler}}: where the masks are filled and applied.</li>
+  <li>{{link code/sampling-params}}: the <code>so_args</code> field.</li>
+  <li>{{link concepts/speculative-decoding}}: why there is one mask per draft row.</li>
+  <li>{{link reference/env-vars}}: all variables.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">On which thread does a grammar compile, and on which thread does <code>pump()</code> run?
+    <x-a><p>The compile runs on a builder pool thread ({{cite deepinfer/structure_output/so_matcher_builder.py:94}}). <code>pump()</code> runs on the engine thread, in <code>pre_sampler_sync</code> ({{cite deepinfer/engine/llm_engine.py:841-842}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A caller passes <code>{"schema": "...", "bound_token_ids": [5]}</code>. What happens, and how is it different from <code>{"schema": "...", "schema_type": "regex", "bound_token_id": 5}</code> without a trigger?
+    <x-a><p>The first raises <code>ValueError</code> from <code>add_request</code> ({{cite deepinfer/structure_output/so_matcher_builder.py:62-63}}). The second passes the key checks but fails <code>validate_trigger_bound</code> ("bound_token_id requires non-empty trigger_token_ids"), so the request gets an aborted matcher and ends with <code>FINISHED_SO_FAILED</code> without a prefill ({{cite deepinfer/structure_output/matcher.py:54-55}}, {{cite deepinfer/structure_output/so_matcher_builder.py:71-76}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In the forced phase, the expected trigger token is 70. Which word and bit of the mask row does <code>fill_vocab_mask</code> set?
+    <x-a><p>Word <code>70 &gt;&gt; 5 = 2</code>, bit <code>70 &amp; 31 = 6</code>; all other bits are 0 ({{cite deepinfer/structure_output/matcher.py:185-186}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The trigger is <code>[9, 4]</code> with no bound. The matcher has accepted <code>9, 4, x</code> (x accepted by the grammar). The sampler now calls <code>rollback(2)</code>. What are <code>tokens_in_matcher</code> and <code>trigger_progress</code> after it?
+    <x-a><p>Before the rollback: <code>tokens_in_matcher = 1</code> (only <code>x</code> went to xgrammar), and the history holds the progress values recorded before each token: <code>[0, 1, 2]</code> ({{cite deepinfer/structure_output/matcher.py:127-132}}). <code>rollback(2)</code> rolls back <code>min(2, 1) = 1</code> token in xgrammar, so <code>tokens_in_matcher = 0</code>. Then <code>trigger_progress = history[-2] = 1</code>, and the history becomes <code>[0]</code> ({{cite deepinfer/structure_output/matcher.py:218-230}}). The matcher is back after token 9, with the trigger half matched.</p></x-a>
+  </x-q>
+</x-quiz>

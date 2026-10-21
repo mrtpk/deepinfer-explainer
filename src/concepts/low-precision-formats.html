@@ -1,0 +1,195 @@
+---
+title: Low-precision formats in DeepInfer
+nav_title: Low-precision formats
+level: Advanced
+prerequisites: learn/number-formats, learn/kv-cache, concepts/hardware-platforms
+scripts: viz/number_format.js
+related: code/linear, concepts/weight-loading, code/hf-weights, concepts/kv-compression, concepts/sparse-attention-indexer, concepts/mega-moe, concepts/tilelang-kernels
+summary: DeepInfer keeps most weights in FP8 E4M3 with 32 × 32 block scales, routed experts in MXFP4, activations in FP8 with one scale per 32 values, the compressed KV in FP4 and the window KV in MXFP8. Scales are UE8M0 bytes, packed 4 per int32 on NVIDIA and 2 per int16 on Ascend.
+---
+<x-sentence>DeepInfer stores and computes most tensors in FP8 or FP4, and every scale except one is a power of two.</x-sentence>
+
+<h2>The idea</h2>
+<p>The page {{link learn/number-formats}} explains the formats in general: bit layouts, rounding and block scales. This page shows what DeepInfer does with them. It tells which tensor uses which format and how a kernel chooses a scale. It also shows how the scale bytes are packed, and what the loader does with the scales of the checkpoint.</p>
+<p>The short version, for a V4.1 checkpoint with the default config:</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Values</th><th>Scale</th><th>Values per scale</th></tr></thead>
+  <tbody>
+    <tr><td>Most linear weights</td><td>{{term fp8}} {{term e4m3}}</td><td>{{term ue8m0}}</td><td>32 × 32 block</td></tr>
+    <tr><td>Routed expert weights</td><td>{{term fp4}} E2M1 ({{term mxfp4}})</td><td>UE8M0</td><td>1 × 32</td></tr>
+    <tr><td>Inputs of FP8 GEMMs</td><td>FP8 E4M3</td><td>UE8M0</td><td>1 × 32, per token</td></tr>
+    <tr><td>Compressed (main) KV</td><td>FP4 E2M1</td><td>E4M3</td><td>16</td></tr>
+    <tr><td>Sliding-window KV</td><td>FP8 E4M3 ({{term mxfp8}})</td><td>UE8M0</td><td>32</td></tr>
+    <tr><td>Indexer keys and queries</td><td>FP4 E2M1</td><td>UE8M0</td><td>32</td></tr>
+    <tr><td>Gate, compressor, head, embedding</td><td>{{term bf16}}</td><td>none</td><td>—</td></tr>
+  </tbody>
+</table>
+<p>Two rules hold almost everywhere. First, a scale is a power of two, stored as one UE8M0 byte. Multiplying by a power of two changes only the exponent, so the scale adds no rounding error of its own. Second, the kernels compute the {{term amax}} of each group and round the scale <em>up</em> to the next power of two. So the largest value of a group never passes the format maximum. The FP4 main KV is the only exception: it uses an E4M3 scale per 16 values.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a set of maps. Each sheet has its own scale bar. The scale must be a power of two: 1 : 1,024, 1 : 2,048, and so on. The mapmaker picks the finest scale on which the whole area still fits the sheet. A town fits a fine scale; a country needs a coarse one. A block of 32 values is one sheet, and the UE8M0 byte is its scale bar. The comparison stops being true in one point: on a real map you can draw a point anywhere. An FP4 value can only sit on one of 8 marks per sign: 0, 0.5, 1, 1.5, 2, 3, 4 and 6. So small values on a coarse sheet fall onto the mark 0.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b10a_lp_map" alt="Three columns. Weights: most linear layers in FP8 E4M3 with one scale per 32 by 32 block; routed experts in MXFP4, two codes per int8 byte, one UE8M0 scale per 32 values; BF16 for the MoE gate, compressor A and Gate, indexer weights_proj and k_proj, embedding and head. Activations and GEMMs: the input of an FP8 linear becomes FP8 E4M3 per token row with a UE8M0 scale per 32 values; the FP8 GEMM is deep_gemm.fp8_fp4_gemm_nt with recipe 1, 1, 32 and BF16 output; the expert GEMM is FP8 times FP4, as a grouped GEMM or in mega-MoE; logits are a BF16 GEMM with FP32 output. KV cache: main compressed KV in FP4 with 32 E4M3 scales, 288 bytes; option MXFP8, 528 bytes; sliding-window KV in MXFP8, 528 bytes; indexer keys in MXFP4, 68 bytes." caption="Figure: the format of each tensor in DeepInfer. Blue boxes hold FP8 values, pink boxes FP4 values, green boxes BF16 or FP32. Click to zoom." />
+<p>Read each column from top to bottom. The weights column is fixed at load time. The middle column runs in every step: each FP8 GEMM first casts its BF16 input to FP8. The right column shows the bytes of one KV entry per token.</p>
+
+<h3 id="converter">Try it: one number, three formats, one block</h3>
+<x-viz id="number-format" title="Number-format converter" caption="Type a number, or pick an example. Part 2 encodes a block of up to 32 values with one shared UE8M0 scale, with the same scale rule as DeepInfer's kernels. Press <em>Add an outlier</em> and see how many small values become 0.">
+  <p>Example: 0.3 is <code>0x3E9A</code> = 0.30078125 in BF16, <code>0x2A</code> = 0.3125 in E4M3, and code <code>0001</code> = 0.5 in E2M1. In an MXFP4 block with amax 2.9, the scale is 2<sup>−1</sup> (UE8M0 byte 126).</p>
+</x-viz>
+<x-simplified><p>The visual is a model of the arithmetic, not of the kernels. It rounds from the exact decimal input; in the model the inputs are already BF16. It uses round to nearest, ties to even, for all three formats. For E4M3 overflow it offers both OCP conversion modes: {{term saturation}} and NaN. DeepInfer's scale rule keeps scaled values at or below 448, so the kernels do not depend on that choice. The block part uses the kernel rule: <code>exp = ceil(log2(max(amax, margin) × (1 / max)))</code> in FP32 ({{cite deepinfer/model_executor/layers/tilelang_ops/cuda/fused_transform.py:514-520}}). It does not show the byte order of packed codes or the E4M3-scaled FP4 format of the main KV.</p></x-simplified>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the checkpoint fixes the formats</h3>
+<p>The config loader accepts exactly one quantization setup. It raises <code>ValueError</code> for any other:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="253-264" highlight="255-259" />
+<p>So the flags <code>fp8_attn</code>, <code>fp8_mlp</code>, <code>mxfp8</code> and <code>mxfp4</code> are always true ({{cite deepinfer/hugging_face/config.py:301-306}}). "Dynamic" activation scheme means that the checkpoint stores no activation scales: the kernels compute them at run time. Only the KV format of the main cache is a choice: <code>use_fp4_sparse_kv</code> is True unless config.json says otherwise ({{cite deepinfer/hugging_face/config.py:302-303}}). The loader logs the result:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="459-460" />
+
+<h3>Step 2: FP8 and FP4 weights are declared on meta</h3>
+<p>The model is first built on the meta device, with no data. <code>prepare_meta_fp8</code> then changes the dtype of each FP8 linear weight and adds a scale tensor:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/containers.py" lines="113-135" highlight="122,128-130,134-135" />
+<ol>
+  <li>Line 122: the embedding (<code>tok_emb</code>), the heads and the FP4 experts (<code>mxfp4</code>) keep their own paths.</li>
+  <li>Lines 128-130: a linear with <code>use_fp8_gemm</code> gets one scale per 32 × 32 block: <code>sf [ceil(N/32), ceil(K/32)]</code>.</li>
+  <li>Lines 134-135: the weight becomes <code>float8_e4m3fn</code>, and the scale is FP32 on meta.</li>
+</ol>
+<p>Some projections stay in BF16 on purpose: the MoE gate ({{cite deepinfer/model_executor/models/v4_modules/moe.py:66-67}}), the compressor <code>A</code> and <code>Gate</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:79-95}}), and the indexer <code>weights_proj</code> and <code>k_proj</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:131-142}}). The routed experts get their final packed layout when memory is allocated:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/containers.py" lines="72-87" highlight="78-80,85,87" />
+<p>Line 85: two FP4 codes share one <code>int8</code>, so the last dimension is <code>k // 2</code>. Lines 78-80 and 87: the scales are packed in the platform scale dtype. So one element covers <code>32 × itemsize</code> values of K: 128 values in an int32, 64 in an int16. The scale tensor is column-major inside each expert (<code>.mT</code>).</p>
+
+<h3>Step 3: the loader keeps the checkpoint scales</h3>
+<p>The checkpoint stores scales as <code>F8_E8M0</code> bytes. For ordinary FP8 weights, the loader turns each byte into an FP32 power of two:</p>
+<x-code file="deepinfer/hugging_face/weights.py" lines="163-167" />
+<p>Then it attaches the FP32 scales to the weight ({{cite deepinfer/hugging_face/weights.py:418-422}}). For the routed experts it does not decode anything. It views the bytes as int32 or int16 and copies them into the column-major scale tensor ({{cite deepinfer/hugging_face/weights.py:315-323}}). The docstring says that this changes no value and does no requantization ({{cite deepinfer/hugging_face/weights.py:283-288}}).</p>
+<x-diagram name="b10a_lp_scales" alt="Panel 1: an MXFP8 block with values 3.1, 0.05, minus 1.2 and 0.7. amax is 3.1; 3.1 divided by 448 is 0.006920; log2 is minus 7.18, ceiling minus 7; the scale is 2 to the minus 7, UE8M0 byte 120. Each value times 128 is rounded to E4M3: 396.8 to 384 (3.0), 6.4 to 6.5 (0.0508), minus 153.6 to minus 160 (minus 1.25), 89.6 to 88 (0.6875). Panel 2: on NVIDIA one int32 holds 4 scale bytes for 128 values of K; on Ascend one int16 holds 2 scale bytes for 64 values. Panel 3: FP8 linear weights decode F8_E8M0 to FP32 at load and get the GEMM layout at layer build; MXFP4 expert scales are viewed as int32 or int16 and copied into a column-major tensor." caption="Figure: how a scale is chosen (panel 1), packed (panel 2) and loaded (panel 3). Click to zoom." />
+<p>When a runtime <code>ReplicatedLinear</code> receives an FP8 weight with FP32 scales, it asks DeepGEMM to transform them into its required layout ({{cite deepinfer/model_executor/layers/linear.py:67-76}}). The page {{link code/linear}} walks through this class.</p>
+
+<h3>Step 4: activations are cast to FP8 in every GEMM</h3>
+<p>All FP8 GEMMs share one set of cast parameters:</p>
+<x-code file="deepinfer/model_executor/layers/linear.py" lines="13-24" />
+<ol>
+  <li><code>"fmt": "e4m3"</code> and 32 values per scale: one scale per 32 values of a token row. This is {{term per-token-quantization}}.</li>
+  <li><code>round_sf</code>: the scale is a power of two.</li>
+  <li><code>use_packed_ue8m0</code>: the scale bytes come packed in the platform dtype.</li>
+  <li><code>use_tma_aligned_col_major_sf</code>: the scale tensor is column-major and padded for the GEMM library.</li>
+</ol>
+<p>The same parameters appear in the attention output, the norms and the SwiGLU of the experts ({{cite deepinfer/model_executor/models/v4_modules/attn.py:200}}, {{cite deepinfer/model_executor/layers/layernorm.py:50}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:140-141}}). Before the GEMM, the code checks that both scale tensors have the platform dtype ({{cite deepinfer/model_executor/layers/linear.py:164}}). The routed experts multiply FP8 inputs with FP4 weights. In the grouped-GEMM path, both sides have a scale per 32 values ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:118-128}}). With mega-MoE, DeepInfer calls <code>deep_gemm.fp8_fp4_mega_moe</code> instead ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:255}}).</p>
+
+<h3>Step 5: three KV cache formats</h3>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/cache_common.py" lines="109-137" highlight="111-112,115,121-122,125,130-132,135" />
+<ol>
+  <li><code>V41_FORMAT</code>: 512 E4M3 values, a UE8M0 scale per 32. 512 + 16 = 528 bytes. Used by the sliding-window cache, and by the main cache when FP4 is off.</li>
+  <li><code>V41_FP4_FORMAT</code>: 512 E2M1 values, an E4M3 scale per 16. 256 + 32 = 288 bytes. The default main cache.</li>
+  <li><code>FP4_INDEX_KV_FORMAT</code>: 128 E2M1 values, a UE8M0 scale per 32. 64 + 4 = 68 bytes. The indexer always uses it: <em>"Indexer Q/K always use FP4 (E2M1 + UE8M0 scale)"</em> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:85-86}}).</li>
+</ol>
+<p>The group size of the main cache comes from one helper: 16 for the FP4 main cache, else 32 ({{cite deepinfer/model_executor/model_metadata_utils.py:37-39}}). The window cache always casts to E4M3 with UE8M0 scales ({{cite deepinfer/model_executor/models/v4_modules/attn.py:412-428}}). The file defines two more index formats; outside the tests, no model code selects them.</p>
+
+<h3>Step 6: how a kernel chooses a UE8M0 scale</h3>
+<p>The KV store kernel shows the rule in four lines:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/cuda/store_kv_cache.py" lines="9-16" />
+<ol>
+  <li>Line 13: <code>scale = max(amax, 1e-4) / 448</code>. The floor <code>FP8_AMAX_MARGIN = 1e-4</code> avoids a zero scale for a block of zeros ({{cite deepinfer/model_executor/layers/tilelang_ops/common.py:25-26}}).</li>
+  <li>Line 14: <code>ue8m0_exp_scale</code> returns <code>−ceil(log2(scale))</code>, the exponent of the multiplier.</li>
+  <li>Line 15: the multiplier <code>2^exp_scale</code>, built directly from its exponent bits.</li>
+  <li>Line 16: the stored byte is <code>−exp_scale + 127</code> = <code>ceil(log2(scale)) + 127</code>.</li>
+</ol>
+<p>The general cast kernel uses the same rule for FP8 and FP4, with 448 or 6 as the maximum and its own floor ({{cite deepinfer/model_executor/layers/tilelang_ops/cuda/fused_transform.py:180-182}}, {{cite deepinfer/model_executor/layers/tilelang_ops/cuda/fused_transform.py:514-520}}). For the FP4 main cache with E4M3 scales, it stores the E4M3 value of <code>amax / 6</code> instead ({{cite deepinfer/model_executor/layers/tilelang_ops/cuda/fused_transform.py:521-530}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The ceil(log2) bit trick, step by step">
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/cuda/quant.py" lines="4-9" />
+<p>An FP32 value is <code>sign | 8 exponent bits | 23 mantissa bits</code>. For a positive normal number, <code>bits &gt;&gt; 23</code> is the biased exponent <code>e + 127</code>, where <code>2^e ≤ scale &lt; 2^(e+1)</code>.</p>
+<ol>
+  <li><code>scale_bits − 1</code>: if the scale is an exact power of two, its mantissa is 0, and subtracting 1 borrows from the exponent. So the exponent field drops by one. For any other scale, the mantissa is not 0 and the exponent field stays.</li>
+  <li><code>&gt;&gt; 23</code>, <code>+ 1</code>, <code>− 127</code>: this gives <code>e + 1</code> for a non-power, and <code>e</code> for an exact power of two. That is <code>ceil(log2(scale))</code>.</li>
+  <li>The function returns the negative, the exponent of the multiplier.</li>
+</ol>
+<p><strong>Worked example.</strong> <code>scale = 3.1 / 448 = 0.0069196</code>. Its FP32 bits are <code>0x3BE2BE2C</code>. Exponent field <code>0x77</code> = 119, so <code>e = −8</code> (2<sup>−8</sup> = 0.0039 ≤ 0.0069 &lt; 0.0078). The trick gives <code>−8 + 1 = −7</code>. The multiplier is 2<sup>7</sup> = 128 and the byte is 127 − 7 = 120. For <code>scale = 2^−7</code> exactly (amax = 3.5), the trick gives −7 too, and 3.5 × 128 = 448 fits exactly.</p>
+<p><strong>The floors.</strong> FP8: amax ≥ 10<sup>−4</sup>, so the smallest scale is 2<sup>ceil(log2(10<sup>−4</sup>/448))</sup> = 2<sup>−22</sup>. FP4: amax ≥ 6 × 2<sup>−126</sup>, so the smallest scale is 2<sup>−126</sup>, byte 1 ({{cite deepinfer/model_executor/layers/tilelang_ops/common.py:23-27}}).</p>
+<p><strong>Compared to the OCP MX rule.</strong> The OCP MX specification takes <code>floor(log2(amax))</code> minus the largest exponent of the element format, and lets the largest values saturate. DeepInfer's rule rounds up instead, so no value saturates, at the cost of up to one exponent step of precision for the other values.</p>
+</x-deepdive>
+
+<x-deepdive title="Packed scale layouts, with shapes">
+<p><code>PLATFORM.fp8_sf_type</code> is <code>torch.int32</code> on NVIDIA and <code>torch.int16</code> on Ascend ({{cite deepinfer/platform.py:63}}, {{cite deepinfer/platform.py:138}}). Every packed UE8M0 tensor uses it.</p>
+<p>The first two rows use example sizes. The real sizes come from the checkpoint.</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Logical scales</th><th>Packed (NVIDIA)</th><th>Packed (Ascend)</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>FP8 GEMM input, M tokens, K = 7,168</td><td>[M, 224] bytes</td><td>[M, 56] int32, column-major</td><td>[M, 112] int16</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:202}}</td></tr>
+    <tr><td>One expert, h_out = 4,096, h_in = 4,096</td><td>[4096, 128] bytes</td><td>[4096, 32] int32</td><td>[4096, 64] int16</td><td>{{cite deepinfer/model_executor/models/v4_modules/containers.py:78-87}}</td></tr>
+    <tr><td>One SWA KV entry</td><td>16 bytes</td><td>4 int32</td><td>8 int16</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:244-248}}</td></tr>
+    <tr><td>One indexer key</td><td>4 bytes</td><td>1 int32</td><td>2 int16</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:244-248}}</td></tr>
+  </tbody>
+</table>
+<p>Line 202 of <code>attn.py</code> shows the packing in one expression: the number of packed scale elements per row is <code>dim // 32 // itemsize</code>. The scale tensor of a GEMM output is made column-major with a TMA-aligned row count ({{cite deepinfer/model_executor/models/v4_modules/attn.py:206-211}}).</p>
+<p><strong>KV entries.</strong> Main and window caches store <code>[data | scales]</code> for each token ("token-interleaved"); index caches keep block-wide data and scale sections ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:28-32}}). The helper <code>alloc_kv_cache</code> rounds the block stride up to a multiple of <code>lcm(32, bytes per token)</code> for token-interleaved caches, else of 32 ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:264-266}}). Only the kernel tests call this helper. For 128 entries, no padding is necessary. The sizes are 36,864 B (128 × 288, FP4 main), 67,584 B (128 × 528, MXFP8) and 8,704 B (128 × 68, indexer). The runtime cache uses one shared byte buffer for all layers; see {{link concepts/kv-compression}}.</p>
+<x-simplified><p>The bit order inside one packed int32 and the exact TMA padding are set by DeepGEMM and <code>tile_kernels</code>. The expert loader views row-major bytes as int32, so on a little-endian machine one int32 holds 4 consecutive K groups of one row. Other tensors are packed by library kernels.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Load paths: ordinary FP8, experts and dummy weights">
+<p><strong>Ordinary FP8 weights.</strong></p>
+<ol>
+  <li>Read the weight bytes and the <code>.scale</code> tensor ({{cite deepinfer/hugging_face/weights.py:414-419}}).</li>
+  <li>Decode the scale: <code>2 ** (byte − 127)</code> with <code>torch.ldexp</code> ({{cite deepinfer/hugging_face/weights.py:163-167}}).</li>
+  <li><code>set_ue8m0_sf</code> packs the FP32 scales again with <code>tile_kernels.quant.batched_transpose_weight_sf</code> and stores them as <code>param.ue8m0_sf</code> ({{cite deepinfer/hugging_face/parameters.py:30-70}}).</li>
+  <li>The runtime layer transforms <code>param.sf</code> (FP32) with <code>deep_gemm.transform_sf_into_required_layout</code>, recipe <code>(1, 32, 32)</code> ({{cite deepinfer/model_executor/layers/linear.py:67-76}}).</li>
+</ol>
+<p>Note: in this release no code outside <code>hugging_face/</code> reads <code>ue8m0_sf</code>; the runtime layers use <code>sf</code>.</p>
+<p><strong>Routed experts.</strong> Each expert's <code>w1</code> and <code>w3</code> are concatenated into <code>linear1</code>; <code>w2</code> becomes <code>linear2</code> ({{cite deepinfer/hugging_face/weights.py:285}}). The scale bytes are copied without a decode, and <code>param.mxfp4 = True</code> keeps them out of the generic FP8 path ({{cite deepinfer/hugging_face/weights.py:318-325}}). With mega-MoE, DeepGEMM converts weights and scales once more into its own layout ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:93-106}}).</p>
+<p><strong>Dummy weights.</strong> Without a checkpoint, the loader fills random BF16 values and casts them to FP8. For FP4 experts, it clears the two low mantissa bits of each byte ({{cite deepinfer/model_executor/models/v4_modules/utils.py:64-67}}). Then <code>process_moe_weight</code> converts the FP8 values to packed FP4 ({{cite deepinfer/model_executor/models/deepseek.py:493-494}}). It first checks that the low two bits are 0:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="59-71" highlight="60" />
+<p>An E4M3 byte with both low mantissa bits at 0 has a 1-bit mantissa, the same precision as E2M1. The assert message names a {{term qat}} checkpoint. With a real checkpoint, this function never sees FP4 experts: <code>DeepseekMoE</code> uses the packed tensors directly ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:207-213}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The QA document, and FLOP counting">
+<p>The QA document has a short low-precision section ({{cite doc/inference_deployment_qa.md:213-221}}):</p>
+<table>
+  <thead><tr><th>QA document</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td>Main KV: per-16, e4m3, "like NVFP4 but without the global scale"</td><td><code>V41_FP4_FORMAT</code>: 16 values per E4M3 scale ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:119-128}})</td></tr>
+    <tr><td>Indexer KV: per-32, ue8m0, MXFP4</td><td><code>FP4_INDEX_KV_FORMAT</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:129-137}})</td></tr>
+    <tr><td>MoE routed-expert weights: per-32, ue8m0, MXFP4</td><td>expert GEMM <code>recipe_b = (1, 32)</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:125}})</td></tr>
+  </tbody>
+</table>
+<p>The code and the document agree. The document lists only the FP4 uses; the FP8 parts are in the code only.</p>
+<p><strong>FLOP counting.</strong> The scheduler's FLOP estimator counts the expert GEMMs at the FP8 rate: <em>"FP4 weight storage alone does not imply FP4 × FP4 compute"</em> ({{cite csrc/engine/flops_estimator.hpp:84-86}}). The indexer is counted at the FP4 rate, because its queries and keys are both FP4 ({{cite csrc/engine/flops_estimator.hpp:156}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Ascend differences">
+<ul>
+  <li>Packed scales use int16: 2 UE8M0 bytes per element ({{cite deepinfer/platform.py:138}}).</li>
+  <li>The KV format with FP32 scales per token is not supported on NPU ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:160}}).</li>
+  <li>The Ascend kernels use the same amax floors ({{cite deepinfer/model_executor/layers/tilelang_ops/asc/kv_quant.py:53}}).</li>
+  <li>Mega-MoE runs on Ascend only with FP8 × FP4 ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:184-188}}), which is always the case with the released checkpoint format.</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Another checkpoint format.</strong> A different quantization method, expert dtype, block size, scale format or activation scheme raises <code>ValueError("Unsupported HF ...")</code> ({{cite deepinfer/hugging_face/config.py:254-262}}).</li>
+  <li><strong>Wrong scale dtype.</strong> An FP8 GEMM asserts that both scale tensors have the platform dtype ({{cite deepinfer/model_executor/layers/linear.py:164}}). A scale tensor from the other platform fails here.</li>
+  <li><strong>Experts that are not FP4.</strong> A checkpoint with another <code>expert_dtype</code> fails the config check above. The assert <em>"Only support FP4-QAT checkpoint"</em> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:60}}) runs only for dummy weights, and the dummy loader clears the two low bits first ({{cite deepinfer/model_executor/models/v4_modules/utils.py:64-67}}).</li>
+  <li><strong>Outliers.</strong> One large value sets a coarse scale for its whole group. With FP4, small values of that group round to 0. Try <em>Add an outlier</em> in the converter.</li>
+</ul>
+<p><strong>Why it matters.</strong> Format choices set memory and speed. FP4 experts use about a quarter of the BF16 bytes. FP8 GEMM inputs halve the input traffic. The 288-byte FP4 entry lets the main cache hold 1.8 times more entries than the 528-byte MXFP8 entry in the same memory.</p>
+
+<x-quiz>
+  <x-q level="easy">Which KV cache format is the only one with a scale that is not a power of two?
+    <x-a><p>The FP4 main cache, <code>V41_FP4_FORMAT</code>: 512 E2M1 values with one E4M3 scale per 16 values, 288 bytes ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:119-128}}). The window cache and the indexer use UE8M0.</p></x-a>
+  </x-q>
+  <x-q level="easy">How many UE8M0 bytes does one packed scale element hold on NVIDIA, and on Ascend?
+    <x-a><p>4 in an int32 on NVIDIA, 2 in an int16 on Ascend ({{cite deepinfer/platform.py:63}}, {{cite deepinfer/platform.py:138}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A block of an MXFP8 KV entry has amax = 3.1. Which UE8M0 byte does the store kernel write, and what does 3.1 become?
+    <x-a><p>3.1 / 448 = 0.00692; ceil(log2) = −7; byte = 120 ({{cite deepinfer/model_executor/layers/tilelang_ops/cuda/store_kv_cache.py:13-16}}). 3.1 × 2<sup>7</sup> = 396.8, which rounds to the E4M3 value 384, so the stored value is 384 × 2<sup>−7</sup> = 3.0.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the loader decode the scales of ordinary FP8 weights to FP32, but copy the expert scales as raw bytes?
+    <x-a><p>Ordinary FP8 weights go through a generic path that transforms FP32 scales into the GEMM layout ({{cite deepinfer/hugging_face/weights.py:418-427}}, {{cite deepinfer/model_executor/layers/linear.py:67-76}}). The expert scales are already packed UE8M0 bytes in the needed order. So the loader views them as int32 or int16 and copies them into the column-major tensor. The flag <code>mxfp4</code> keeps them out of the generic path ({{cite deepinfer/hugging_face/weights.py:315-325}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">An FP8 GEMM input has 512 tokens and K = 7,168. How many packed scale elements does it need on Ascend, and why does the scale never let a value overflow 448?
+    <x-a><p>7,168 / 32 = 224 scale bytes per token; 2 per int16 gives 112 per token, 57,344 in all ({{cite deepinfer/platform.py:138}}). The kernel rounds <code>amax / 448</code> up to a power of two, so <code>amax / scale ≤ 448</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/cuda/quant.py:4-9}}).</p></x-a>
+  </x-q>
+</x-quiz>

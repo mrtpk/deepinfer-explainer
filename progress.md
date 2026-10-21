@@ -28,7 +28,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B7 MoE + EP | done | done (40 defects fixed) | yes |
 | B8 Scale | done | done (27 defects fixed) | yes |
 | B9 Decoding | done | done (25 defects fixed) | yes |
-| B10a SO + precision | done | running | — |
+| B10a SO + precision | done | done (37 defects fixed) | yes |
 | B10b Kernels + loading | running (6 pages; 2 TileLang pages DEFERRED by user) | — | — |
 | B11 Start-up + reference | done | running | — |
 | D Diagrams to 1100 | done | n/a | yes |
