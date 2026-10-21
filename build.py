@@ -1360,26 +1360,28 @@ def main() -> int:
               + (" (--strict: warnings count as errors)" if strict_fail and not R.errors else ""))
         return 1
 
-    # write
-    if SITE.exists():
-        shutil.rmtree(SITE)
-    SITE.mkdir(parents=True)
-    shutil.copytree(ASSETS, SITE / "assets")
+    # write into a private temp folder, then swap it in, so that parallel builds do not clash
+    out = ROOT / f".site-tmp-{os.getpid()}"
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    shutil.copytree(ASSETS, out / "assets")
     for img in sorted(REPO_IMAGES):
-        dest = SITE / "assets" / "repo" / img
+        dest = out / "assets" / "repo" / img
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO / img, dest)
-    (SITE / "diagrams").mkdir()
+    (out / "diagrams").mkdir()
     for name, path in diagrams.items():
-        shutil.copy2(path, SITE / "diagrams" / f"{name}.svg")
+        shutil.copy2(path, out / "diagrams" / f"{name}.svg")
     for out_rel, doc in rendered.items():
-        dest = SITE / out_rel
+        dest = out / out_rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(doc, encoding="utf-8")
-    (SITE / "assets" / "search-index.js").write_text(
+    (out / "assets" / "search-index.js").write_text(
         "window.DI_SEARCH_INDEX = " + json.dumps(index, ensure_ascii=False, separators=(",", ":")) + ";\n",
         encoding="utf-8",
     )
+    swap_in_site(out)
 
     for w in R.warnings:
         print(w)
@@ -1388,6 +1390,24 @@ def main() -> int:
           f"{len(glossary)} glossary terms, {len(diagrams)} diagrams in {time.time() - t0:.1f}s.")
     print(f"{len(R.warnings)} warning(s), 0 errors. Open site/index.html in a browser.")
     return 0
+
+
+def swap_in_site(new: Path) -> None:
+    """Replace site/ with `new`. Retries, because another build can swap at the same time."""
+    old = ROOT / f".site-old-{os.getpid()}"
+    for attempt in range(20):
+        try:
+            if SITE.exists():
+                os.replace(SITE, old)
+            os.replace(new, SITE)
+            break
+        except OSError:
+            time.sleep(0.25 * (attempt + 1))
+    else:
+        # last resort (e.g. a file in site/ is locked): copy over the old folder
+        shutil.copytree(new, SITE, dirs_exist_ok=True)
+        shutil.rmtree(new, ignore_errors=True)
+    shutil.rmtree(old, ignore_errors=True)
 
 
 if __name__ == "__main__":

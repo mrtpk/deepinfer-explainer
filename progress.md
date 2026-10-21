@@ -11,7 +11,35 @@ Current phase: **Full build — wave 1** (plan section 13)
 | 1 Foundation | done | User reviewed and approved: "I like it. build for all. fact check it as well." |
 | Full build (plan §13) | running | Batches B1–B11, D, F. Writer → fact check → commit per batch. |
 
+## Full build — batch status
+
+| Batch | Writer | Fact check | Committed |
+|---|---|---|---|
+| B1 Basics I | done | running | — |
+| B2 Basics II | running | — | — |
+| B3a Engine + scheduler | running | — | — |
+| B3b API + cache | running | — | — |
+| B4a Inputs + graphs | running | — | — |
+| B4b Worker + ZOS | wave 2 | — | — |
+| B5a Attention I | running | — | — |
+| B5b Attention II | wave 2 | — | — |
+| B6a Layer + mHC | wave 2 | — | — |
+| B6b Engram + VL | wave 2 | — | — |
+| B7 MoE + EP | running | — | — |
+| B8 Scale | wave 3 | — | — |
+| B9 Decoding | running | — | — |
+| B10a SO + precision | wave 3 | — | — |
+| B10b Kernels + loading | wave 3 | — | — |
+| B11 Start-up + reference | wave 3 | — | — |
+| D Diagrams to 1100 | done | n/a | yes |
+| F Final pass | later | — | — |
+
 ## Done
+
+- 2026-10-21: User asked to change the commit email to contact@thomaspaul.dev; history rewritten (backup ref refs/backup/before-email-rewrite, not pushed). Repo-local user.email set.
+- 2026-10-21: User pushed main to https://github.com/mrtpk/deepinfer-explainer (origin). RULE from now: never rewrite pushed history; only add new local commits; push only when the user asks (works with: git -c credential.helper= -c credential.helper="/mnt/c/Program\ Files/Git/mingw64/bin/git-credential-manager.exe" push origin main).
+
+- 2026-10-21: D done: 12 diagrams at 1100 (in-page scale 0.86). Supervisor CSS fix: figures nested in deep dives/stops break out to full width (container query units).
 
 - 2026-10-21: Codebase survey by a subagent (directory map, request flow, architecture, 30 concepts, 20 central files). Results are in `plan.md` section 3.
 - 2026-10-21: User decisions: Python-level reader, local site with CDN, concepts + tours + file index, folder `deepinfer-explainer/`.
