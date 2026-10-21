@@ -1,0 +1,223 @@
+---
+title: model_executor/eplb/: the expert load balancer
+nav_title: eplb/
+level: Advanced
+prerequisites: concepts/eplb, concepts/expert-parallelism
+related: concepts/eplb, concepts/moe-routing, code/v4-mlp, code/model-loader, code/userbuffer, reference/env-vars
+summary: The eplb package keeps the per-step token counts of every expert slot, recomputes the expert placement every N steps with a greedy policy, and moves expert weights in place with batched point-to-point transfers or a symmetric-memory mirror.
+---
+<h2>Purpose</h2>
+<p>The <code>eplb</code> package keeps the expert tables that the gate reads, counts the tokens of every slot, and every N steps moves expert copies so that the EP ranks get about the same work.</p>
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/model_executor/eplb/__init__.py</code> (434 lines): state, timing, statistics, manager. <code>policy.py</code> (140 lines): the placement algorithm. <code>shuffle.py</code> (218 lines): the weight moves. Most comments and docstrings are in Chinese; this page translates them.</td></tr>
+    <tr><th>Main class</th><td><code>ExpertLoadBalancer</code> ({{cite deepinfer/model_executor/eplb/__init__.py:42}}), one per group of MoE layers with the same layout. <code>ExpertLoadBalancerManager</code> ({{cite deepinfer/model_executor/eplb/__init__.py:352}}) holds them all.</td></tr>
+    <tr><th>Runs in</th><td>Every rank process. The counting is on the device. The policy runs on the device tensors with a Python loop. A rearrangement synchronizes the device.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekForCausalLM</code> (set-up and <code>step</code> after sampling), <code>DeepseekMoE</code> (tables and counters), the model loader (extra-slot rounding), the HF weight loader (first layout), <code>examples/benchmark.py</code>.</td></tr>
+    <tr><th>Calls</th><td><code>torch.distributed</code> (all-reduce, all-gather, batched P2P, barriers), <code>torch.distributed._symmetric_memory</code>, <code>PG.is_within_nvl_domain</code>.</td></tr>
+    <tr><th>Not in this package</th><td>The token counting itself (DeepEP and DeepGEMM kernels add into <code>expert_count</code>), and the choice of one copy per token (the gate kernel).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b7_eplb_cycle" alt="Panel 1: MoE kernels add to expert_count, sample() calls eplb step, the balancer windows, rearranges, gathers statistics and clears. Panel 2: rearrangements at counted steps 7, 37, 67 for N = 30. Panel 3: an old and a new layout on two ranks with three remote weight copies, and the two shuffle methods." caption="Figure: the cycle of the package: count in every step, rearrange every N steps, move only the changed slots." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Model loader.</strong> <code>_configure_moe_redundancy</code> calls <code>resolve_num_extra_experts</code> for the main and DFlash layouts ({{cite deepinfer/model_executor/model_loader.py:83-106}}).</li>
+  <li><strong>HF weight loader.</strong> <code>_local_expert_ids</code> calls <code>get_initial_global_physical_to_logical_map</code> to know which checkpoint experts go into each local slot ({{cite deepinfer/hugging_face/weights.py:248-271}}).</li>
+  <li><strong>Model set-up.</strong> <code>DeepseekForCausalLM._init_eplb</code> groups the MoE layers by layout, makes one <code>ExpertLoadBalancer</code> per group, and installs the manager with <code>set_current</code> ({{cite deepinfer/model_executor/models/deepseek.py:323-365}}).</li>
+  <li><strong>Every step.</strong> <code>DeepseekForCausalLM.sample</code> calls <code>eplb.current().step(is_prompt)</code> and later moves the load ratio into the sampler output ({{cite deepinfer/model_executor/models/deepseek.py:402-409}}).</li>
+  <li><strong>Every MoE layer.</strong> <code>DeepseekMoE._eplb_layer()</code> reads the tables and the counter of its layer ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:326-327}}).</li>
+  <li><strong>Benchmark.</strong> <code>steps_until_lb_stat_flush</code> lets the benchmark avoid the statistics all-gather in its measurement window ({{cite examples/benchmark.py:411-415}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>dist.all_reduce</code> of the window counts over the EP group ({{cite deepinfer/model_executor/eplb/__init__.py:254}}) and <code>dist.all_gather_into_tensor</code> for statistics ({{cite deepinfer/model_executor/eplb/__init__.py:188}}).</li>
+  <li><code>symm_mem.empty</code> and <code>symm_mem.rendezvous</code> for the mirror ({{cite deepinfer/model_executor/eplb/__init__.py:206-209}}).</li>
+  <li><code>dist.batch_isend_irecv</code> in the P2P shuffle ({{cite deepinfer/model_executor/eplb/shuffle.py:135-138}}), and <code>ep.barrier()</code> in the intranode shuffle ({{cite deepinfer/model_executor/eplb/shuffle.py:192-195}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>resolve_num_extra_experts</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:21}}</td><td>Rounds the lower limit up so that routed + extra divides by the EP size.</td></tr>
+    <tr><td><code>get_initial_global_physical_to_logical_map</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:31}}</td><td><code>[0 … E−1, then e % E]</code>.</td></tr>
+    <tr><td><code>ExpertLoadBalancer.__init__</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:61}}</td><td>Tables, window, timing, statistics buffers; checks the settings.</td></tr>
+    <tr><td><code>step</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:131}}</td><td>Once per step: rearrangement timing, statistics, clear the counter.</td></tr>
+    <tr><td><code>_update_rearrangement</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:146}}</td><td>Window ring and the step counter.</td></tr>
+    <tr><td><code>_update_load_balance_stats</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:167}}</td><td>Rows per step; all-gather every <code>I</code> steps.</td></tr>
+    <tr><td><code>_initialize_shuffle</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:195}}</td><td>First rearrangement: free cache; on GPU in one NVLink domain, make the mirror.</td></tr>
+    <tr><td><code>_rearrange_experts</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:223}}</td><td>Counts per logical expert, policy, shuffle, new tables, log.</td></tr>
+    <tr><td><code>_log_rearrangement_metrics</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:290}}</td><td>Rank 0 log line, optional per-expert table.</td></tr>
+    <tr><td><code>ExpertLoadBalancerLayerState</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:346}}</td><td>The three tensors of one layer.</td></tr>
+    <tr><td><code>ExpertLoadBalancerManager</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:352}}</td><td>Maps global layer index to (balancer, local index); collects ratios.</td></tr>
+    <tr><td><code>current</code>, <code>set_current</code>, <code>destroy_current</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:404-420}}</td><td>The process-wide manager.</td></tr>
+    <tr><td><code>rebalance_experts_global</code></td><td>{{cite deepinfer/model_executor/eplb/policy.py:73}}</td><td>Greedy replication, then placement.</td></tr>
+    <tr><td><code>_batch_greedy_indices</code></td><td>{{cite deepinfer/model_executor/eplb/policy.py:12}}</td><td>Greedy placement that minimizes the sum over steps of the busiest rank.</td></tr>
+    <tr><td><code>expert_model_parallel_shuffle_inplace</code></td><td>{{cite deepinfer/model_executor/eplb/shuffle.py:65}}</td><td>Weight moves with batched P2P of <code>torch.distributed</code> (the docstring says NCCL; on Ascend the group is HCCL).</td></tr>
+    <tr><td><code>expert_model_parallel_shuffle_inplace_intranode</code></td><td>{{cite deepinfer/model_executor/eplb/shuffle.py:150}}</td><td>Weight moves through the symmetric-memory mirror.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<x-warning title="Rearrangement is off by default">
+<p><code>DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL</code> defaults to 0 ({{cite deepinfer/environ.py:116}}). Then <code>_update_rearrangement</code> returns at once, and only counting and statistics run.</p>
+</x-warning>
+
+<h3><code>ExpertLoadBalancer.__init__</code></h3>
+<x-code file="deepinfer/model_executor/eplb/__init__.py" lines="83-129" highlight="83-84,86-95,98-100,104-111,122-123,125-129">
+<x-tr line="97">All layers copy the same initial map.</x-tr>
+<x-tr line="121">Bring the first rearrange forward to 1/4 of the period, to correct the cold-start imbalance early.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 83-84: two flags for a NORMAL engine: rearrange after prefill, or skip prefill steps.</li>
+  <li>Lines 86-95: build <code>logical_to_physical_map</code> from the first layout. Each logical expert lists its slots; unused entries stay <code>-1</code>.</li>
+  <li>Lines 98-100: one copy of the tables per layer, made contiguous so that each layer can change its own row later.</li>
+  <li>Lines 104-111: the window must be from 1 to the interval when rearrangement is on.</li>
+  <li>Lines 122-123: the first rearrangement after a quarter of the interval.</li>
+  <li>Lines 125-129: the statistics interval must be positive.</li>
+</ol>
+
+<h3><code>step</code> and <code>_update_rearrangement</code></h3>
+<x-code file="deepinfer/model_executor/eplb/__init__.py" lines="131-165" highlight="133-134,136-138,147-150,152-154,156-159,161-165">
+<x-tr line="132">Called by DeepseekForCausalLM.sample in every step; updates the rearrangement and the load statistics.</x-tr>
+<x-tr line="141">Steps until the next LB statistics flush (EP all_gather); None when EP = 1 and there are no statistics.</x-tr>
+<x-tr line="157">Rearrange at once in the next non-prefill step.</x-tr>
+</x-code>
+<p>The order matters: the rearrangement reads the window before line 138 clears <code>expert_count</code>. The concept page {{link concepts/eplb}} explains the timing with an example.</p>
+
+<h3><code>_rearrange_experts</code></h3>
+<x-code file="deepinfer/model_executor/eplb/__init__.py" lines="222-278" highlight="222,227,230-232,238-254,256-260,261-275,276-278">
+<x-tr line="234">Token counts of each logical expert in the window: aggregate the local physical slots, then all-reduce over the EP group.</x-tr>
+</x-code>
+<ol>
+  <li>Line 222: <code>@allow_cuda_sync()</code> lifts DeepInfer's guard against device synchronization for this method ({{cite deepinfer/utils.py:135-140}}).</li>
+  <li>Line 227: rank 0 synchronizes first, to time the method.</li>
+  <li>Lines 238-253: <code>scatter_add_</code> turns the local slot counts <code>[W, Lm, n_loc]</code> into logical counts <code>[W, Lm, E]</code>, with the current layout.</li>
+  <li>Line 254: the all-reduce adds the counts of all EP ranks. All ranks then run the policy on the same input and get the same layout.</li>
+  <li>Lines 261-275: the shuffle moves the weights while the old layout is still in <code>physical_to_logical_map</code>.</li>
+  <li>Lines 276-278: <code>copy_</code> writes the new tables into the same tensors, so the views that the MoE layers hold stay valid.</li>
+</ol>
+
+<h3><code>rebalance_experts_global</code></h3>
+<x-code file="deepinfer/model_executor/eplb/policy.py" lines="73-97" highlight="89-90,93-97">
+<x-tr line="79">Global load balancing: give redundant copies to hot logical experts, then balance all copies over the GPUs.</x-tr>
+<x-tr line="86">[num_moe_layers, num_logical_experts, num_redundant_experts + 1], unused entries -1</x-tr>
+<x-tr line="87">[num_moe_layers, num_logical_experts], copies of each logical expert</x-tr>
+</x-code>
+<p>The replication loop is at lines 105-123 and the placement at lines 125-138. The concept page reads both line by line, with a worked example and the diagram of the policy.</p>
+<x-diagram name="b7_eplb_policy" alt="Step A: two rounds of replication give the extra slots to expert 0 and expert 4. Step B: eight copies go to rank 0 or rank 1 by the lowest score. Result: moe_lb 1.153 before and 1.041 after." caption="Figure: the policy on 6 experts, 2 extra slots and 2 ranks." />
+
+<h3>The two shuffle functions</h3>
+<x-code file="deepinfer/model_executor/eplb/shuffle.py" lines="94-147" highlight="108-111,114,117-124,127-133,135-138,141-147">
+<x-tr line="107">Copies on this device: origin to buffer.</x-tr>
+<x-tr line="113">Cross-device P2P, bucketed by (peer rank difference mod number of groups), each bucket sent in one batch. TODO: prefer intra-machine traffic and broadcast here.</x-tr>
+<x-tr line="116">Send: for each expert that this device holds, send it to the receivers that are paired with this device.</x-tr>
+<x-tr line="126">Receive: for each missing expert, receive from the paired sender into the buffer (one expert with several slots is received once).</x-tr>
+<x-tr line="140">Finish: buffer to the slots of this device.</x-tr>
+</x-code>
+<p>The intranode version has the same plan, but reads the peer mirrors directly ({{cite deepinfer/model_executor/eplb/shuffle.py:178-218}}). The concept page has the step list of both.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<p><code>Lm</code> = layers in this balancer, <code>E</code> = logical experts, <code>P</code> = physical slots, <code>n_loc = P / ep_size</code>, <code>W</code> = window, <code>I</code> = statistics interval.</p>
+<table>
+  <thead><tr><th>Object</th><th>Type and shape</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td><code>expert_count</code></td><td>int32 <code>[Lm, n_loc]</code></td><td>kernels add, <code>step</code> clears</td></tr>
+    <tr><td><code>_expert_count_window</code></td><td>int32 <code>[W, Lm, n_loc]</code></td><td>ring, index <code>_expert_count_window_index</code></td></tr>
+    <tr><td><code>logical_expert_token_counts</code></td><td>int32 <code>[W, Lm, E]</code></td><td>after scatter-add and all-reduce</td></tr>
+    <tr><td><code>physical_to_logical_map</code></td><td>int32 <code>[Lm, P]</code></td><td>old layout during the shuffle</td></tr>
+    <tr><td><code>logical_to_physical_map</code></td><td>int32 <code>[Lm, E, P − E + 1]</code></td><td>gate input</td></tr>
+    <tr><td><code>logical_count</code></td><td>int32 <code>[Lm, E]</code></td><td>gate input; sum per layer = <code>P</code></td></tr>
+    <tr><td><code>_local_tokens_per_step</code></td><td>int64 <code>[I, Lm]</code></td><td>rows that this rank received</td></tr>
+    <tr><td><code>gathered_tokens</code></td><td>int64 <code>[ep_size, I, Lm]</code> on the device</td><td>then float; sums go to the CPU with <code>non_blocking=True</code></td></tr>
+    <tr><td>expert weights</td><td>per layer: a list of tensors with dim 0 = local slot</td><td>{{cite deepinfer/model_executor/models/deepseek.py:324-329}}</td></tr>
+  </tbody>
+</table>
+<p>The unit test checks the table invariants: <code>logical_count</code> equals the valid entries of <code>logical_to_physical_map</code>, every slot is in the list of its expert, and the counts add up to <code>P</code> ({{cite tests/models/test_eplb_policy.py:27-42}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, devices and synchronization">
+<ul>
+  <li>Each rank has its own balancers. All EP ranks call <code>step</code> in the same order, because the all-reduce and all-gather are collectives.</li>
+  <li><code>steps_until_lb_stat_flush</code> asserts that all balancers of the manager have the same countdown ({{cite deepinfer/model_executor/eplb/__init__.py:397-401}}).</li>
+  <li>The statistics sums move to the CPU with <code>non_blocking=True</code>. They are read later, in a post function of the sampler output ({{cite deepinfer/model_executor/models/deepseek.py:406-409}}).</li>
+  <li>The rearrangement uses <code>.tolist()</code> on the layouts in the shuffle ({{cite deepinfer/model_executor/eplb/shuffle.py:84-88}}), which synchronizes. This is why the method runs under <code>allow_cuda_sync</code>.</li>
+  <li><code>_initialize_shuffle</code> calls <code>torch.cuda.empty_cache()</code> before the first move, "to prevent OOM" (translated, {{cite deepinfer/model_executor/eplb/__init__.py:196-198}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="A worked example: settings of the example scripts">
+<p><code>examples/_config.py</code> with EPLB on: window 3, interval 30, after-prefill on, lower limit 32 ({{cite examples/_config.py:77-83}}). EP 8, a NORMAL engine, and a toy expert count of 64.</p>
+<ol>
+  <li>Extra slots: <code>-(64 + 32) % 8 = 0</code>, so 32. Slots: 96, 12 per rank. The first layout copies experts 0 to 31 into slots 64 to 95.</li>
+  <li>Window <code>[3, Lm, 12]</code> int32 per rank. <code>Lm</code> is the number of main MoE layers. DFlash layers with a different layout have their own balancer.</li>
+  <li>Counter start: <code>30 − max(1, 7) = 23</code>.</li>
+  <li>A prefill step: the window gets the prefill counts, the counter becomes 29. The next decode step: the window gets its counts, the counter reaches 30, and the layout is recomputed from the last 3 steps.</li>
+  <li>The policy gives the 32 extra slots to the experts with the highest load per copy, then places 96 copies on 8 ranks.</li>
+  <li>Every 128 steps (the default), the ranks all-gather <code>[8, 128, Lm]</code> int64 and the logger can show <code>moe_lb</code>.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Fewer physical than logical experts, or slots not divisible by the EP size</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:74-75}}</td></tr>
+    <tr><td>Negative window</td><td><code>ValueError</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:104-105}}</td></tr>
+    <tr><td>Interval on, window not in <code>1 … interval</code></td><td><code>ValueError</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:106-111}}</td></tr>
+    <tr><td>Statistics interval ≤ 0</td><td><code>ValueError</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:126-127}}</td></tr>
+    <tr><td>Manager installed twice</td><td><code>AssertionError: EPLB is already initialized</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:414}}</td></tr>
+    <tr><td>Layer index used twice, or missing</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:357-362}}</td></tr>
+    <tr><td>Balancers with different statistics countdowns</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:400}}</td></tr>
+    <tr><td>Layout size does not match <code>ep_size × n_loc</code> in the shuffle</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/eplb/shuffle.py:76-79}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_EXPERT_COUNT_WINDOW_SIZE</code></td><td>100 ({{cite deepinfer/environ.py:115}})</td><td>{{cite deepinfer/model_executor/eplb/__init__.py:102}}</td><td>Steps in the window.</td></tr>
+    <tr><td><code>DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL</code></td><td>0 = off ({{cite deepinfer/environ.py:116}})</td><td>{{cite deepinfer/model_executor/eplb/__init__.py:103}}</td><td>Counted steps between rearrangements.</td></tr>
+    <tr><td><code>DEEPINFER_REARRANGE_AFTER_PREFILL_IN_NORMAL_ENGINE</code></td><td>off ({{cite deepinfer/environ.py:117}})</td><td>{{cite deepinfer/model_executor/eplb/__init__.py:83}}</td><td>NORMAL engine: rearrange after each prefill; off: skip prefill steps.</td></tr>
+    <tr><td><code>DEEPINFER_MOE_LB_STAT_INTERVAL</code></td><td>128 ({{cite deepinfer/environ.py:118}})</td><td>{{cite deepinfer/model_executor/eplb/__init__.py:125}}</td><td>Steps between statistics all-gathers.</td></tr>
+    <tr><td><code>DEEPINFER_SHOW_EPLB_DETAIL</code></td><td>off ({{cite deepinfer/environ.py:121}})</td><td>{{cite deepinfer/model_executor/eplb/__init__.py:327}}</td><td>Per-expert load table in the log (needs <code>tabulate</code>).</td></tr>
+    <tr><td><code>DEEPINFER_REARRANGE_P2P_GROUPS</code></td><td>1 ({{cite deepinfer/environ.py:111}})</td><td>{{cite deepinfer/model_executor/eplb/shuffle.py:114}}</td><td>Number of P2P buckets.</td></tr>
+    <tr><td><code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code></td><td>0 ({{cite deepinfer/environ.py:114}})</td><td>{{cite deepinfer/model_executor/model_loader.py:122}}</td><td>Lower limit of extra slots; rounded by <code>resolve_num_extra_experts</code>.</td></tr>
+  </tbody>
+</table>
+<p>The class docstring says: "All environment settings are read and fixed at construction" (translated, {{cite deepinfer/model_executor/eplb/__init__.py:43-45}}). Two variables are read later, at first use: <code>DEEPINFER_SHOW_EPLB_DETAIL</code> in the log method and <code>DEEPINFER_REARRANGE_P2P_GROUPS</code> in the P2P shuffle. <code>envs</code> keeps the first value that it reads ({{cite deepinfer/environ.py:44-57}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/eplb}}: the idea, the timing, both policy steps line by line, and the interactive visual.</li>
+  <li>{{link concepts/moe-routing}}: how the gate uses <code>logical_to_physical_map</code>.</li>
+  <li>{{link concepts/expert-parallelism}}: why the busiest rank sets the step time.</li>
+  <li>{{link code/v4-mlp}}: the layer that reads the tables and passes the counter.</li>
+  <li>{{link reference/env-vars}}: all EPLB variables.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which function rounds <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code>, and who calls it?
+    <x-a><p><code>resolve_num_extra_experts</code> ({{cite deepinfer/model_executor/eplb/__init__.py:21-28}}). The model loader calls it in <code>_configure_moe_redundancy</code>, once for the main layers and once for DFlash ({{cite deepinfer/model_executor/model_loader.py:93-106}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why do all EP ranks compute the same new layout without sending it to each other?
+    <x-a><p>Line 254 all-reduces the window counts, so every rank has the same input. The policy has no randomness and fixed tie rules, so every rank gets the same output ({{cite deepinfer/model_executor/eplb/__init__.py:254-260}}, {{cite tests/models/test_eplb_policy.py:53-62}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The main model and the DFlash layers have different expert counts. How many balancers are there?
+    <x-a><p>One per layout, so at least two. <code>_init_eplb</code> groups layers by the layout key (expert counts, EP group, weight shapes and types) and makes one <code>ExpertLoadBalancer</code> per group ({{cite deepinfer/model_executor/models/deepseek.py:331-364}}). Different expert counts give different keys.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why can <code>_rearrange_experts</code> overwrite the maps with <code>copy_</code> instead of new tensors?
+    <x-a><p>The MoE layers hold views of the balancer tensors: <code>ExpertLoadBalancerLayerState</code> returns row <code>i</code> of each tensor ({{cite deepinfer/model_executor/eplb/__init__.py:370-376}}). A new tensor would leave the layers with the old one. <code>copy_</code> changes the data in place ({{cite deepinfer/model_executor/eplb/__init__.py:276-278}}). A captured CUDA graph also keeps the device addresses of its inputs, so the data must change in place.</p></x-a>
+  </x-q>
+</x-quiz>

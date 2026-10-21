@@ -1,0 +1,150 @@
+---
+title: Mega-MoE: the whole MoE layer in one call
+nav_title: Mega-MoE
+level: Advanced
+prerequisites: concepts/moe-routing, concepts/expert-parallelism
+related: concepts/eplb, concepts/hardware-platforms, concepts/low-precision-formats, concepts/mhc-residual, code/v4-mlp, code/userbuffer
+summary: Inside one NVLink domain, DeepInfer replaces dispatch, the expert GEMMs, the shared expert and combine with one DeepGEMM mega-MoE call that works on a symmetric buffer. The choice is fixed per layer at start-up.
+---
+<x-sentence>Mega-MoE does a whole MoE layer, from dispatch to combine, in one DeepGEMM call. DeepInfer uses it when the EP group fits in one NVLink domain.</x-sentence>
+
+<h2>The idea</h2>
+<p>On the {{link concepts/expert-parallelism | DeepEP path}}, one MoE layer is a chain of separate steps. They are dispatch, a {{term grouped-gemm}}, the {{term swiglu | SwiGLU}} activation, a second grouped GEMM, the {{term shared-expert}}, and combine. Each step is at least one {{term kernel}} launch, and the two communication steps go through a DeepEP buffer.</p>
+<p>In one {{term nvlink-domain}}, every GPU can read and write the memory of the other GPUs directly. A {{term symmetric-memory}} buffer has the same layout on every rank, so a kernel on one rank knows where to write on another rank. {{term mega-moe | Mega-MoE}} uses this. One DeepGEMM call moves the tokens, runs both expert GEMMs and the shared expert, and adds the results. DeepInfer prepares the inputs in the symmetric buffer and makes this one call.</p>
+<p>The docs answer the question "When is Mega MoE used?" with two claims ({{cite doc/inference_deployment_qa.md:229-231}}):</p>
+<ul>
+  <li>"Mega MoE is the general solution within a scale-up domain".</li>
+  <li>"regardless of EP size or batch size, Mega MoE is significantly faster than unfused MoE".</li>
+</ul>
+
+<p><strong>An everyday comparison.</strong> Think of a team that writes a report together. On the DeepEP path, each writer mails pages to the others, waits for answers, edits, and mails the pages back. With mega-MoE, the team works in one shared document. Each writer edits the right place directly, and nobody waits for the mail. The comparison stops here: the shared document works only for people in the same building. Mega-MoE works only inside one NVLink domain.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7_mega_moe" alt="Panel 1: two conditions, A: PLATFORM.is_gpu or mma_type fp8xfp4, and B: the EP group fits in one NVLink domain; both true gives mega-MoE, else the DeepEP path. With the released checkpoint, A is always true. Panel 2: the DeepEP path has eight steps and an EPBuffer; the mega path has the ffn norm and the gate writing into a SymmBuffer, then one fp8_fp4_mega_moe call." caption="Figure: when a layer uses mega-MoE (panel 1), and which steps the one call replaces (panel 2)." />
+<p>Panel 1 is the start-up decision of each layer. Panel 2 compares the two paths. On the mega path, the first two steps already write into the symmetric buffer, so the one call needs no extra copy.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the decision</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="177-188" highlight="181-182,184-188" />
+<ol>
+  <li>Lines 177-181: <code>mma_type</code> joins the activation type and the weight type, for example <code>"fp8xfp4"</code>. Line 182 allows only three values.</li>
+  <li>Line 185: on GPU, the type does not matter. On Ascend, only <code>"fp8xfp4"</code> qualifies.</li>
+  <li>Line 186 repeats the check of line 182, so it is always true here.</li>
+  <li>Line 187: the EP group must fit in one NVLink domain.</li>
+</ol>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="130-134" caption="On Ascend the answer is always <code>True</code>. On GPU, an EP group of size 1 fits, and a larger group fits if DeepEP reports a large enough physical domain." />
+<p>The checkpoint loader accepts only FP8 checkpoints with FP4 experts ({{cite deepinfer/hugging_face/config.py:254-262}}). So <code>fp8_mlp</code> and <code>mxfp4</code> are both true ({{cite deepinfer/hugging_face/config.py:300-305}}), and <code>mma_type</code> is <code>"fp8xfp4"</code>. In practice:</p>
+<ul>
+  <li>On NVIDIA, a layer uses mega-MoE when its EP group fits in the NVLink domain.</li>
+  <li>On Ascend, a layer always uses mega-MoE.</li>
+</ul>
+
+<h3>Step 2: the weights get a new layout at start-up</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="254-272" highlight="255-256,262,264-266" />
+<p>Line 255 picks the kernel: <code>fp8_fp4_mega_moe</code> for FP8 activations, else <code>bf16_mega_moe</code>. Line 256 puts the shared expert into the same call when the layer has one. <code>_convert_mega_moe_weight</code> calls <code>deep_gemm.transform_weights_for_mega_moe</code>, keeps a copy, and frees the old storage ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:93-106}}).</p>
+
+<h3>Step 3: a symmetric buffer instead of an EP buffer</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="303-315" />
+<p>A mega layer asks the {{term userbuffer}} manager for a <code>deep_gemm.SymmBuffer</code>. DeepInfer uses its fields for the token rows (<code>x</code>), their scales (<code>x_sf</code>), and the top-k ids and weights. The manager makes the buffer for the first spec and gives later layers views of it ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:183-225}}). A mega layer never makes a DeepEP <code>EPBuffer</code>.</p>
+
+<h3>Step 4: the norm writes into the buffer</h3>
+<p>Before the MoE layer, the FFN norm casts the hidden states to FP8. On the mega path, the layer asks the norm to write the result straight into the symmetric buffer:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="274-301" highlight="281,283-288,291-300" />
+<p>The decoder layer calls this method through <code>_fused_cast_kwargs</code> before the norm ({{cite deepinfer/model_executor/models/v4_modules/hc.py:52-54}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:146}}). Lines 283-288 set the FP8 format: e4m3, a UE8M0 scale for each 32 values, packed, in row-major order. With a fused shared expert on GPU, the norm also writes the scales that the shared expert needs (lines 291-300).</p>
+
+<h3>Step 5: mega_moe_forward</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="528-563" highlight="537-541,543-546,549-559" />
+<ol>
+  <li>Lines 537-541: the gate writes <code>topk_idx</code> and <code>topk_weights</code> into the buffer (<code>out=</code>).</li>
+  <li>Lines 542-546: with FP8, the code only checks that the norm wrote into the buffer. With BF16, it copies the input in.</li>
+  <li>Lines 549-559: the one call. It also gets the EPLB counter of the layer, so EPLB works on both paths.</li>
+  <li>Lines 561-562: only a layer with no fused shared expert runs <code>shared_forward</code> after the call. With <code>out_acc=out</code>, the shared output is added into <code>out</code>.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Decision table for every case">
+<table>
+  <thead><tr><th><code>mma_type</code></th><th>Platform</th><th>EP group fits in the NVLink domain?</th><th>Path</th></tr></thead>
+  <tbody>
+    <tr><td><code>fp8xfp4</code> (released checkpoints)</td><td>NVIDIA</td><td>yes</td><td>mega-MoE (<code>fp8_fp4_mega_moe</code>)</td></tr>
+    <tr><td><code>fp8xfp4</code></td><td>NVIDIA</td><td>no</td><td>DeepEP</td></tr>
+    <tr><td><code>fp8xfp4</code></td><td>Ascend</td><td>always yes</td><td>mega-MoE</td></tr>
+    <tr><td><code>fp8xfp8</code> or <code>bf16xbf16</code></td><td>NVIDIA</td><td>yes / no</td><td>mega-MoE / DeepEP</td></tr>
+    <tr><td><code>fp8xfp8</code> or <code>bf16xbf16</code></td><td>Ascend</td><td>always yes</td><td>DeepEP (condition A is false)</td></tr>
+  </tbody>
+</table>
+<p>The rows with <code>fp8xfp8</code> and <code>bf16xbf16</code> need a checkpoint that the loader of this release does not accept ({{cite deepinfer/hugging_face/config.py:254-262}}). The code still supports them in <code>DeepseekMoE</code>.</p>
+<p><strong>No log line names the path.</strong> You can see it in the start-up log. The first symmetric buffer logs "Created DeepGEMM ... SymmetricBuffer" ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:222-223}}). The first EP buffer logs "Created DeepEP-V2 ... EPBuffer" ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:91-94}}). Later layers that get the same buffer, or a view of it, log nothing.</p>
+<p><strong>The docs and deployment sizes.</strong> The docs recommend EP2–8 for prefill and EP64–128 for decode ({{cite doc/inference_deployment_qa.md:47-49}}). Whether a given EP size fits in one NVLink domain depends on the hardware. DeepInfer asks DeepEP for the domain size at start-up and does not hard-code it.</p>
+</x-deepdive>
+
+<x-deepdive title="The SymmBuffer: spec, base and views">
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="21-32" />
+<p>A spec has exactly the arguments of <code>deep_gemm.SymmBuffer</code>. The manager keeps one buffer per spec in a dict:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="195-225" highlight="195,210-212,214,221" />
+<ol>
+  <li>Line 210: an equal spec gets the same buffer object.</li>
+  <li>Line 214: the first buffer in the dict is the <em>base</em>. It owns the memory.</li>
+  <li>Lines 215-220: before the first buffer on GPU, DeepInfer starts DeepGEMM's SM locality probe. The comment says that the probe synchronizes, so it must run before CUDA-graph capture.</li>
+  <li>Line 221: a later spec becomes a view of the base (<code>base=base</code>).</li>
+</ol>
+<p>The docstring gives a rule: "The first spec allocated must be the largest" (line 195). The model allocates the main layers first and the DFlash draft layers after them ({{cite deepinfer/model_executor/models/deepseek.py:422-428}}). The unit test checks that a smaller spec becomes a view of the first one ({{cite tests/worker/test_userbuffer.py:66-73}}).</p>
+<p><strong>Size inputs.</strong> <code>num_max_tokens_per_rank</code> is <code>max_num_tokens</code>: the prefill limit for a NORMAL engine, the decode limit for a COMPLETION engine ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:175}}). <code>intermediate_hidden</code> is <code>prod(gate_up_proj_weight.shape[1:-1]) // 2</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:311}}). <code>num_shared_experts</code> is the real count only when the shared expert is fused.</p>
+</x-deepdive>
+
+<x-deepdive title="mega_moe_forward: arguments of the one call">
+<table>
+  <thead><tr><th>Argument</th><th>Value</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>out</code></td><td>new bf16 <code>[T, H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:547}}</td></tr>
+    <tr><td>l1, l2 weights</td><td><code>(weight, weight.sf)</code> with FP8 activations, else the weight only</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:403-404}}</td></tr>
+    <tr><td><code>sym_buffer</code></td><td>holds <code>x</code>, <code>x_sf</code>, <code>topk_idx</code>, <code>topk_weights</code> for this step</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:553}}; filled at {{cite deepinfer/model_executor/models/v4_modules/mlp.py:537-546}}</td></tr>
+    <tr><td><code>shared_l1_weights</code>, <code>shared_l2_weights</code></td><td>only when the shared expert is fused</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:267-270}}</td></tr>
+    <tr><td><code>cumulative_local_expert_recv_stats</code></td><td>the EPLB counter of this layer</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:555}}</td></tr>
+    <tr><td><code>activation</code>, <code>activation_clamp</code></td><td><code>"swiglu"</code> and <code>swiglu_limit</code> from the config</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:556-557}}</td></tr>
+    <tr><td><code>fast_math</code></td><td><code>True</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:558}}</td></tr>
+  </tbody>
+</table>
+<p>The call has no <code>num_sms</code> argument. On the DeepEP path, DeepInfer splits the SMs between communication and compute itself. On the mega path, that choice is inside DeepGEMM.</p>
+</x-deepdive>
+
+<x-deepdive title="The fused norm: what it writes, byte by byte">
+<p>On the mega path with FP8 activations, the norm gets three extra arguments ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:280-290}}):</p>
+<ul>
+  <li><code>out = (sym_buffer.x[:T], sym_buffer.x_sf[:T])</code>: the first <code>T</code> rows of the buffer.</li>
+  <li><code>fp8_cast_params</code>: format <code>e4m3</code>, 32 values per scale, rounded scales, packed UE8M0, and <em>not</em> the TMA-aligned column-major layout.</li>
+  <li><code>extra_sf_layout = "mega_moe"</code>.</li>
+</ul>
+<p>Packed UE8M0 means that one {{term scale-factor}} byte covers 32 values, and 4 bytes (NVIDIA, int32) or 2 bytes (Ascend, int16) share one integer ({{cite deepinfer/platform.py:63}}, {{cite deepinfer/platform.py:138}}). The norm module documents this layout as "the mega-MoE x_sf layout" (translated, {{cite deepinfer/model_executor/layers/tilelang_ops/norm.py:34-36}}). Example with a toy hidden size 4096: one token has <code>4096 / 32 = 128</code> scale bytes. On NVIDIA, that is 32 int32 values per row.</p>
+<p>On GPU with a fused shared expert, the norm also writes <code>shared_l1_acts_sf</code>. Its block size comes from <code>deep_gemm.get_block_m_for_mega_moe(ep_size, num_physical_experts, num_max_tokens_per_rank, T, k, mma_type)</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:291-300}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A larger EP group silently uses the other path">
+<p>If the EP group grows past the NVLink domain on NVIDIA, the layer uses the DeepEP path. Nothing fails, and no message names the path. Check the start-up log for "SymmetricBuffer" or "EPBuffer".</p>
+</x-warning>
+<ul>
+  <li><strong>The norm did not write into the buffer.</strong> With FP8, <code>mega_moe_forward</code> asserts that the input tensors are the buffer tensors ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:543-544}}). If <code>sym_buffer</code> was not made yet, <code>fused_norm_cast_kwargs</code> returns <code>{}</code> and the assertion fails ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:277-279}}). The model makes the buffers in its constructor, before any forward pass ({{cite deepinfer/model_executor/models/deepseek.py:319-321}}).</li>
+  <li><strong>Buffer order.</strong> The first <code>SymmBuffer</code> spec must be the largest. DeepInfer does not check this rule; it is only in the docstring ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:195}}).</li>
+  <li><strong>Ascend with other data types.</strong> On Ascend, only <code>fp8xfp4</code> layers use mega-MoE. Other types use DeepEP-Ascend.</li>
+  <li><strong>Memory.</strong> The weights are converted with <code>clone()</code>, and the old storage is freed after the copy ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:99-105}}). For a short time, a layer needs memory for both layouts.</li>
+</ul>
+<p><strong>Why it matters.</strong> For the released checkpoint format, mega-MoE is the normal path for prefill and for decode inside one NVLink domain. The DeepEP page describes the steps that the one call replaces.</p>
+
+<x-quiz>
+  <x-q level="easy">What replaces dispatch, the two grouped GEMMs, the shared expert and combine on the mega path?
+    <x-a><p>One call of <code>deep_gemm.fp8_fp4_mega_moe</code> (or <code>bf16_mega_moe</code> for BF16 activations) ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:255}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:549-559}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A deployment runs the released checkpoint on Ascend with EP 16. Which path does each MoE layer use? Why?
+    <x-a><p>Mega-MoE. <code>mma_type</code> is <code>"fp8xfp4"</code>, so condition A is true, and <code>is_within_nvl_domain</code> always returns <code>True</code> on NPU ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:132-133}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Where does the FFN norm put its FP8 output on the mega path?
+    <x-a><p>Straight into <code>sym_buffer.x</code> and <code>sym_buffer.x_sf</code>, through the <code>out</code> argument of <code>fused_norm_cast_kwargs</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:281}}). <code>mega_moe_forward</code> checks the pointers ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:543-544}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Does EPLB still get token counts when a layer uses mega-MoE? Which argument carries them?
+    <x-a><p>Yes. The mega call gets <code>cumulative_local_expert_recv_stats=self._eplb_layer().expert_count</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:555}}), the same counter that DeepEP dispatch gets on the other path ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:474}}). Also, the gate gets the EPLB tables on both paths.</p></x-a>
+  </x-q>
+</x-quiz>

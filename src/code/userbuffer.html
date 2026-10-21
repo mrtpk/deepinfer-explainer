@@ -1,0 +1,181 @@
+---
+title: parallel_utils/userbuffer.py: the communication buffer manager
+nav_title: userbuffer.py
+level: Advanced
+prerequisites: concepts/expert-parallelism, concepts/mega-moe
+related: concepts/expert-parallelism, concepts/mega-moe, concepts/context-parallelism, concepts/engram, code/v4-mlp, code/parallel-state, reference/env-vars
+summary: userbuffer.py owns all long-lived communication buffers of one loaded model: the DeepEP buffer for MoE, the DeepGEMM symmetric buffers for mega-MoE, the context-parallel bucket buffer, and the Engram buffer. It also limits the SMs of compute kernels while DeepEP runs.
+---
+<h2>Purpose</h2>
+<p><code>userbuffer.py</code> makes each large communication buffer once per process, gives the same buffer to every layer that asks, and frees all of them at shutdown.</p>
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/parallel_utils/userbuffer.py</code>, 240 lines of Python.</td></tr>
+    <tr><th>Main object</th><td>The module-level instance <code>userbuffer = _UserBufferManager()</code> ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:240}}). Also the context manager <code>limit_num_sms</code> ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:39-51}}) and the key type <code>_SymBufferSpec</code> ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:21-32}}).</td></tr>
+    <tr><th>Runs in</th><td>Every rank process. The buffers are device memory (the Engram buffer can also use CPU storage).</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekMoE</code>, <code>DeepseekForCausalLM</code>, the attention and YOCO code (CP all-gather), <code>EngramRuntime</code>, <code>Worker.stop</code>.</td></tr>
+    <tr><th>Calls</th><td>DeepEP (<code>EPBuffer</code>, <code>EngramBuffer</code>, and <code>BucketBuffer</code> through <code>CPManager</code>), DeepGEMM (<code>SymmBuffer</code>, SM count), tile_kernels (SM count).</td></tr>
+    <tr><th>Not in this file</th><td>No communication itself: the layers call <code>dispatch</code>, <code>combine</code> and <code>all_gather</code> on the buffers. The CP session logic is in <code>cp.py</code>.</td></tr>
+  </tbody>
+</table>
+<p>The class docstring: "Owns all process-wide communication buffers used by one loaded model" ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:55}}).</p>
+
+<h2>Where it sits</h2>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>MoE layers.</strong> <code>DeepseekMoE.allocate_userbuffer</code> calls <code>allocate_sym_buffer</code> on the mega path, else <code>allocate_ep</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:303-324}}). The DeepEP path runs the shared expert inside <code>limit_num_sms</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:602-603}}).</li>
+  <li><strong>The model.</strong> <code>DeepseekForCausalLM.allocate_userbuffer</code> asks every MoE layer for its buffer, then calls <code>allocate_cp</code> with the largest all-gather size of all attention layers ({{cite deepinfer/model_executor/models/deepseek.py:412-442}}). The constructor calls it after <code>torch.cuda.empty_cache()</code> ({{cite deepinfer/model_executor/models/deepseek.py:319-321}}).</li>
+  <li><strong>Context parallelism.</strong> Attention, YOCO and the model use <code>userbuffer.cp_session()</code> and <code>userbuffer.cp.all_gather</code> (for example {{cite deepinfer/model_executor/models/deepseek.py:242-243}}, {{cite deepinfer/model_executor/models/v4_modules/yoco.py:71-73}}).</li>
+  <li><strong>Engram.</strong> <code>EngramRuntime.allocate</code> calls <code>allocate_engram</code>, and the runtime reads <code>userbuffer.engram</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:166-189}}).</li>
+  <li><strong>Shutdown.</strong> <code>Worker.stop</code> calls <code>userbuffer.close()</code> between two barriers ({{cite deepinfer/worker/base.py:135-140}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li>DeepEP: <code>EPBuffer</code>, <code>EngramBuffer</code>, and the alignment helpers <code>get_num_rdma_alignment</code> and <code>get_num_allocation_alignment</code> ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:7}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:12}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:108-109}}).</li>
+  <li><code>CPManager</code>, which wraps a DeepEP <code>BucketBuffer</code> ({{cite deepinfer/model_executor/parallel_utils/cp.py:16-17}}).</li>
+  <li>DeepGEMM: <code>SymmBuffer</code>, <code>get_num_sms</code>, <code>set_num_sms</code>; tile_kernels: <code>set_num_sms</code>.</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<p>The file is short, so this part walks through every method.</p>
+
+<h3><code>limit_num_sms</code></h3>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="39-51" highlight="44-46,49-51" />
+<ol>
+  <li>Lines 41-43: with <code>enabled=False</code> (Ascend, in the only caller), nothing changes.</li>
+  <li>Lines 44-46: DeepGEMM and tile_kernels may use <code>prev_sms − num_sms</code>, where <code>prev_sms</code> is the current SM count of DeepGEMM. The SMs that DeepEP uses stay free.</li>
+  <li>Lines 49-51: the old value comes back, also after an exception.</li>
+</ol>
+
+<h3><code>allocate_ep</code>: the DeepEP buffer</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="63-95" highlight="72-80,81-83,85,86-90" />
+<ol>
+  <li>Lines 72-80: the buffer arguments. <code>allow_hybrid_mode=True</code>. <code>allow_multiple_reduction</code> is false only with batch invariance and EPLB rearrangement both on.</li>
+  <li>Lines 81-83: a second call returns the same buffer. It only asserts that the buffer is large enough for the new arguments. So all MoE layers, also the DFlash layers, share one <code>EPBuffer</code>.</li>
+  <li>Line 85: <code>explicitly_destroy=True</code>: <code>close()</code> must free it.</li>
+  <li>Lines 86-90: with <code>DEEPINFER_USERBUFFER_COMM_SMS = 0</code>, DeepInfer computes the SM count once and writes it back into <code>envs</code>.</li>
+</ol>
+
+<h3><code>allocate_cp</code> and <code>cp_session</code></h3>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="97-125" highlight="104-106,107-110,111-113,121-123" />
+<ol>
+  <li>Lines 104-106: with CP size 1 there is no CP buffer; <code>cp_session</code> then does nothing (lines 121-123).</li>
+  <li>Lines 107-110: size = tokens × bytes per token × CP size, plus room for 8 all-gathers of RDMA alignment, rounded up to the allocation alignment.</li>
+  <li>Lines 111-113: a later call only checks the size.</li>
+</ol>
+<p><code>CPManager</code> notes: "Gathered tensors alias the buffer storage, which is reused by the next session" ({{cite deepinfer/model_executor/parallel_utils/cp.py:10-14}}). The page {{link concepts/context-parallelism}} explains CP.</p>
+
+<h3><code>allocate_engram</code></h3>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="127-181" highlight="137,148,155,156-166">
+<x-tr line="155">EP traffic goes over NVLink. Here the Engram SL keeps the default sl3 (sl2 is kept for the isolation of KV-cache traffic).</x-tr>
+</x-code>
+<p>Only one Engram buffer can exist (line 137). The table storage is on the CPU (RDMA) unless <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> is on (line 148). On Ascend that variable is always on ({{cite deepinfer/environ.py:147}}). The page {{link concepts/engram}} explains Engram.</p>
+
+<h3><code>allocate_sym_buffer</code>: DeepGEMM symmetric buffers</h3>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="183-225" highlight="195,210-212,214,215-220,221,224" />
+<ol>
+  <li>Line 195: the first spec must be the largest. It owns the memory; later specs are views of it.</li>
+  <li>Lines 210-212: an equal spec returns the cached buffer. The docstring says that this is safe, because a <code>SymmBuffer</code> never changes after it is made.</li>
+  <li>Lines 215-220: before the first buffer on GPU, DeepInfer starts DeepGEMM's SM locality probe if DeepGEMM has it. The comment: the probe synchronizes, so it must run "before guarded forward and CUDA graph capture".</li>
+  <li>Line 221: <code>base=base</code> makes a view for every spec after the first.</li>
+</ol>
+
+<h3><code>close</code></h3>
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="227-237" />
+<p>The EP, CP and Engram buffers are destroyed first. Then the symmetric buffers, in reverse order, so views go before their base. <code>vars(buffer).clear()</code> drops the tensor references of each buffer. A second call does nothing. The unit test checks the order and the second call ({{cite tests/worker/test_userbuffer.py:76-92}}).</p>
+
+<h2>Walk through the main methods</h2>
+<p>The previous part covers every method. One order matters at start-up:</p>
+<ol>
+  <li>The model is built, and the MoE layers convert their weights ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:254-257}}).</li>
+  <li><code>_init_eplb</code> makes the balancers ({{cite deepinfer/model_executor/models/deepseek.py:310-317}}).</li>
+  <li><code>torch.cuda.empty_cache()</code>, then <code>allocate_userbuffer()</code> ({{cite deepinfer/model_executor/models/deepseek.py:319-321}}). The main layers come first in the list, then the DFlash layers ({{cite deepinfer/model_executor/models/deepseek.py:423-425}}). So the first <code>SymmBuffer</code> spec is a main layer.</li>
+  <li>After the weights load, the engine measures the KV-cache size, with these buffers already in memory ({{cite deepinfer/engine/llm_engine.py:241-244}}).</li>
+</ol>
+<x-note title="Why one place for all buffers">
+<p>A DeepEP or DeepGEMM buffer is large and needs all ranks of its group to take part. One manager makes each buffer once, shares it between layers, and frees everything in a fixed order at shutdown. The comment in <code>Worker.stop</code> gives one reason for the explicit close: <code>os._exit(0)</code> skips destructors, "which would leave the driver worker's UB stuck at its destructor barrier" ({{cite deepinfer/worker/base.py:136-137}}).</p>
+</x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data: what each buffer holds and who sizes it">
+<table>
+  <thead><tr><th>Attribute</th><th>Type</th><th>Size inputs</th><th>Made</th></tr></thead>
+  <tbody>
+    <tr><td><code>ep</code></td><td><code>deep_ep.EPBuffer</code></td><td>EP group, <code>max_num_tokens</code> per rank, hidden size, k, FP8 dispatch</td><td>first DeepEP-path MoE layer</td></tr>
+    <tr><td><code>_sym_buffers</code></td><td>dict <code>_SymBufferSpec → deep_gemm.SymmBuffer</code></td><td>group, slots, tokens per rank, k, hidden, intermediate, shared experts, <code>mma_type</code>, activation</td><td>each mega-path MoE layer (equal specs shared)</td></tr>
+    <tr><td><code>cp</code></td><td><code>CPManager</code> (DeepEP <code>BucketBuffer</code>)</td><td>CP group, prefill tokens per rank, largest all-gather bytes per token</td><td>once, only with CP size above 1</td></tr>
+    <tr><td><code>engram</code></td><td><code>deep_ep.EngramBuffer</code></td><td>Engram group, entries per layer, hidden, tokens, entries per token, dtype, scale packs</td><td>once, by <code>EngramRuntime</code></td></tr>
+  </tbody>
+</table>
+<p>The start-up log has one line for each buffer that owns memory (the base <code>SymmBuffer</code>, not its views): "Created DeepEP-V2 … EPBuffer", "Created DeepGEMM … SymmetricBuffer", "Created DeepEP-V2-CP … BucketBuffer", and "Created DeepEP-V2-Engram … GPU EngramBuffer" ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:91-94}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:222-223}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:116}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:176-180}}). Sizes print in GiB with two decimals ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:35-36}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked examples with numbers">
+<p><strong>CP buffer.</strong> Toy values: hidden size 4096, CP size 2, <code>max_num_batched_tokens = 32768</code>. Then <code>max_num_prefilling_tokens = 32768 // 2 = 16384</code> ({{cite deepinfer/model_executor/model_loader.py:120}}). The smallest bytes per token is <code>hidden × 2 = 8192</code> ({{cite deepinfer/model_executor/models/deepseek.py:415}}); attention layers can raise it.</p>
+<ol>
+  <li><code>16384 × 8192 × 2 = 268,435,456</code> bytes (256 MiB).</li>
+  <li>Plus <code>8 × get_num_rdma_alignment()</code>.</li>
+  <li>Round up to a multiple of <code>get_num_allocation_alignment()</code>. DeepEP gives both alignment values; the repository does not show them.</li>
+</ol>
+<p><strong>SM count.</strong> For a GPU with 148 SMs and <code>DEEPINFER_USERBUFFER_COMM_SMS=0</code>:</p>
+<ol>
+  <li><code>compute_num_sms = min(32, 148 // 4) = 32</code>.</li>
+  <li>The comm SMs are <code>min(theoretical, 148 − 32)</code>. DeepEP computes <code>theoretical</code> from the expert count and k.</li>
+  <li>If DeepEP gives 24, dispatch and combine use 24 SMs. If DeepGEMM uses all 148 SMs before, the shared expert runs with <code>148 − 24 = 124</code> SMs inside <code>limit_num_sms</code>.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Second <code>allocate_ep</code> needs a larger buffer than the first</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:81-82}}</td></tr>
+    <tr><td><code>allocate_cp</code> with CP size 1 after a multi-rank CP buffer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:104-105}}</td></tr>
+    <tr><td>Second <code>allocate_cp</code> needs more bytes</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:111-112}}</td></tr>
+    <tr><td>Second <code>allocate_engram</code></td><td><code>AssertionError: allocate_engram can only be called once</code></td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:137}}</td></tr>
+    <tr><td>Nested CP session, or all-gather outside a session</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/parallel_utils/cp.py:28}}, {{cite deepinfer/model_executor/parallel_utils/cp.py:44}}</td></tr>
+    <tr><td>Later <code>SymmBuffer</code> spec larger than the first</td><td>Not checked here; only the docstring rule</td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:195}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USERBUFFER_COMM_SMS</code></td><td>0 ({{cite deepinfer/environ.py:109}})</td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:86-92}}</td><td>0: computed and written back. Else: SMs for DeepEP dispatch and combine.</td></tr>
+    <tr><td><code>DEEPINFER_BATCH_INVARIANT</code></td><td>off ({{cite deepinfer/environ.py:197}})</td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:79}}</td><td>With rearrangement on: <code>allow_multiple_reduction=False</code>.</td></tr>
+    <tr><td><code>DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL</code></td><td>0 ({{cite deepinfer/environ.py:116}})</td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:79}}</td><td>Same line.</td></tr>
+    <tr><td><code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code></td><td>off; always on with <code>DEEPINFER_ACCELERATOR=ascend</code> ({{cite deepinfer/environ.py:147}})</td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:148}}</td><td>Engram table storage on the GPU instead of CPU RDMA storage.</td></tr>
+  </tbody>
+</table>
+<p>The SM value is written to <code>envs</code>, not to <code>os.environ</code>. Child processes and C++ code do not see it.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/expert-parallelism}}: the DeepEP path that uses <code>ep</code> and <code>limit_num_sms</code>.</li>
+  <li>{{link concepts/mega-moe}}: the mega path that uses the symmetric buffers.</li>
+  <li>{{link concepts/context-parallelism}}: the CP all-gather on <code>cp</code>.</li>
+  <li>{{link concepts/engram}}: the Engram buffer.</li>
+  <li>{{link code/v4-mlp}}: the MoE layer that asks for the buffers.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">How many DeepEP <code>EPBuffer</code> objects does one process have when 40 MoE layers use the DeepEP path?
+    <x-a><p>One. The first <code>allocate_ep</code> makes it; later calls return the same object after a size check ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:81-85}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What does <code>limit_num_sms(24)</code> do on a GPU with 148 SMs, and when is it off?
+    <x-a><p>If DeepGEMM uses all 148 SMs before the call, it sets DeepGEMM and tile_kernels to 124 SMs and restores 148 at the end ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:44-51}}). The MoE layer passes <code>enabled=PLATFORM.is_gpu</code>, so it is off on Ascend ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:602}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Which buffers does a CP-size-1 deployment on Ascend have, with the released checkpoint and no Engram?
+    <x-a><p>Only DeepGEMM symmetric buffers. On Ascend, every <code>fp8xfp4</code> MoE layer uses mega-MoE, so no <code>EPBuffer</code> is made ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:184-188}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:303-315}}). <code>allocate_cp</code> returns <code>None</code> for CP size 1 ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:104-106}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>close()</code> destroy the symmetric buffers in reverse order?
+    <x-a><p>Later buffers are views of the first buffer, which owns the memory ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:195}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:221}}). Reverse order destroys the views before their base. The test expects <code>[view, base]</code> ({{cite tests/worker/test_userbuffer.py:86}}).</p></x-a>
+  </x-q>
+</x-quiz>

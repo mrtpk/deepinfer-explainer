@@ -1,0 +1,216 @@
+---
+title: v4_modules/mlp.py: the DeepseekMoE layer
+nav_title: v4_modules/mlp.py
+level: Advanced
+prerequisites: concepts/moe-routing, concepts/expert-parallelism
+related: concepts/moe-routing, concepts/expert-parallelism, concepts/mega-moe, concepts/eplb, code/eplb, code/userbuffer, code/decoder-layer, code/linear
+summary: DeepseekMoE is the runtime MoE layer of DeepInfer. It converts the moe.py containers into the runtime layout, runs the gate, and then either DeepEP dispatch, grouped GEMMs and combine, or one mega-MoE call.
+---
+<h2>Purpose</h2>
+<p><code>DeepseekMoE</code> runs one MoE layer: it scores the experts for each token, sends the tokens to the expert slots, computes the routed and shared experts, and returns one hidden vector per token.</p>
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/v4_modules/mlp.py</code>, 616 lines of Python. The parameter containers are in <code>v4_modules/moe.py</code>, 112 lines. The package docstring pairs them: "<code>moe.py</code>: routed experts, shared expert, gate" with "<code>mlp.py</code> (<code>DeepseekMoE</code>)" ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:28}}).</td></tr>
+    <tr><th>Main class</th><td><code>DeepseekMoE</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:148}}). Also the functions <code>process_moe_weight</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:41}}) and <code>_convert_mega_moe_weight</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:93}}).</td></tr>
+    <tr><th>Runs in</th><td>Every rank process, on the device. Each decoder layer and each DFlash layer has one instance.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekDecoderLayer</code> and <code>DFlashDecoderLayer</code> (forward), the FFN norm (fused cast), <code>DeepseekForCausalLM</code> (EPLB set-up, buffers).</td></tr>
+    <tr><th>Calls</th><td>DeepGEMM, DeepEP (through <code>userbuffer</code>), <code>tile_kernels</code>, the EPLB state, <code>ReplicatedLinear</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The kernels themselves (vendor libraries), the EPLB policy (<code>eplb/</code>), the buffer manager (<code>userbuffer.py</code>), and the FFN norm (<code>hc.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The module docstring states the role: "<code>DeepseekMoE</code> adapts the <code>moe.py</code> container into the runtime expert layout and implements EPLB-aware routing" ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:1-6}}).</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b7_code_mlp_place" alt="Three lanes. Callers: DeepseekDecoderLayer, DFlashDecoderLayer, HCLayerMixin.ffn_norm_forward, DeepseekForCausalLM.__init__, dummy weight loading. This file: DeepseekMoE.__init__, forward and mega_moe_forward, fused_norm_cast_kwargs, allocate_userbuffer, process_moe_weight. Callees: moe.py containers, deep_ep and eplb, deep_gemm, userbuffer.py, tile_kernels." caption="Figure: who calls <code>mlp.py</code>, its main methods, and what each method calls." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Build.</strong> <code>_build_mlp_and_layernorms</code> makes a <code>DeepseekMoE</code> for every <code>MoeDecoderBlockHC</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:38-45}}). DFlash layers use the same function with their own MoE config ({{cite deepinfer/model_executor/models/decoder_layer.py:198-200}}).</li>
+  <li><strong>Forward.</strong> <code>DeepseekDecoderLayer.forward</code> calls <code>self.mlp(hidden_states, hidden_states_bf16, input_metadata)</code> after the FFN norm ({{cite deepinfer/model_executor/models/decoder_layer.py:169-173}}). The DFlash layer does the same ({{cite deepinfer/model_executor/models/decoder_layer.py:238}}).</li>
+  <li><strong>Fused cast.</strong> The FFN norm asks the layer for <code>fused_norm_cast_kwargs</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:52-54}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:146}}).</li>
+  <li><strong>Set-up.</strong> <code>DeepseekForCausalLM.__init__</code> collects all MoE layers, builds the EPLB balancers from their weights, and calls <code>allocate_userbuffer</code> on each ({{cite deepinfer/model_executor/models/deepseek.py:308-321}}, {{cite deepinfer/model_executor/models/deepseek.py:422-428}}).</li>
+  <li><strong>Dummy weights.</strong> With <code>load_format="dummy"</code>, <code>process_moe_weight(..., use_fp4=True)</code> converts synthetic expert weights ({{cite deepinfer/model_executor/models/deepseek.py:494}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>DeepGEMM</strong> (<code>import deep_gemm</code>, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:14}}): the mega gate, the mega-MoE kernels, the grouped GEMMs, the weight and scale layout transforms.</li>
+  <li><strong>DeepEP</strong> types (<code>EPBuffer</code>, <code>EPHandle</code>, <code>EventHandle</code>, <code>EventOverlap</code>, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:17}}). The buffer itself comes from <code>userbuffer</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:34}}).</li>
+  <li><strong>tile_kernels</strong>: <code>moe_topk_gate</code> and <code>swiglu_forward_and_per_token_cast</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:18-19}}), and <code>quant.per_token_cast</code> for FP4.</li>
+  <li><strong>EPLB</strong>: <code>eplb.current().layer(self.layer_idx)</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:326-327}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>process_moe_weight</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:41}}</td><td>HF 2-D expert weight to <code>[E, n, k]</code> plus scales; BF16, FP8 or (dummy) FP4.</td></tr>
+    <tr><td><code>_convert_mega_moe_weight</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:93}}</td><td>Converts l1/l2 weights into the mega-MoE layout and frees the old storage.</td></tr>
+    <tr><td><code>_grouped_gemm</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:109}}</td><td>FP8×FP4 (or FP8×FP8) or BF16 grouped GEMM with the psum layout.</td></tr>
+    <tr><td><code>DeepseekMoE.__init__</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:149}}</td><td>Expert counts, <code>mma_type</code>, mega decision, gate, biases, shared expert, weights.</td></tr>
+    <tr><td><code>post_load_weights</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:259}}</td><td>Mega layers only: converts routed (and fused shared) weights.</td></tr>
+    <tr><td><code>fused_norm_cast_kwargs</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:274}}</td><td>Tells the FFN norm to write FP8 output into the symmetric buffer.</td></tr>
+    <tr><td><code>allocate_userbuffer</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:303}}</td><td>Gets a <code>SymmBuffer</code> (mega) or the <code>EPBuffer</code> (DeepEP).</td></tr>
+    <tr><td><code>_get_selections_by_factor</code>, <code>_map_unbalanced_ratio_to_factor</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:329-357}}</td><td>Random routing for the forced-imbalance profile.</td></tr>
+    <tr><td><code>gate_forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:359}}</td><td>Top-k physical slots and weights per token.</td></tr>
+    <tr><td><code>routed_experts_forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:406}}</td><td>Two grouped GEMMs with SwiGLU between them.</td></tr>
+    <tr><td><code>dispatch</code>, <code>combine</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:461}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:493}}</td><td>DeepEP calls with DeepInfer's arguments.</td></tr>
+    <tr><td><code>shared_forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:513}}</td><td>Shared expert: linear, SwiGLU, linear.</td></tr>
+    <tr><td><code>mega_moe_forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:528}}</td><td>Gate into the buffer, then one mega-MoE call.</td></tr>
+    <tr><td><code>forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:565}}</td><td>Mega path or DeepEP path.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The containers in moe.py</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/moe.py" lines="70-112" highlight="77-78,91-95,97-108,110" />
+<ol>
+  <li>Line 77-78: logical experts come from <code>n_routed_experts</code>; physical = logical + <code>n_redundant_experts</code>, which the loader writes ({{cite deepinfer/model_executor/model_loader.py:102}}).</li>
+  <li>Lines 91-95: each rank holds <code>physical // ep_size</code> experts; the division must be exact.</li>
+  <li>Lines 97-108: <code>linear1</code> has width <code>2 × moe_intermediate_size</code> (gate and up), <code>linear2</code> goes back to the hidden size. Both hold only the local experts.</li>
+  <li>Line 110: the gate container (see {{link concepts/moe-routing}}).</li>
+</ol>
+
+<h3><code>__init__</code>: counts, types and the mega decision</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="159-213" highlight="161-162,175,177-182,184-188,199-205,207-213" />
+<ol>
+  <li>Lines 161-162: routed = logical experts; extra = physical − logical.</li>
+  <li>Line 175: <code>max_num_tokens</code> is the decode limit for a COMPLETION engine and the prefill limit for all others. It sizes the buffers.</li>
+  <li>Lines 177-182: <code>mma_type</code> is <code>"fp8xfp4"</code> for the released checkpoint format.</li>
+  <li>Lines 184-188: the mega decision ({{link concepts/mega-moe}}).</li>
+  <li>Lines 199-205: physical slots split evenly over the EP ranks.</li>
+  <li>Lines 207-213: FP4 weights are already in the runtime layout; other types go through <code>process_moe_weight</code>.</li>
+</ol>
+<p>The rest of <code>__init__</code> builds the gate and the biases ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:221-238}}), the shared expert as two <code>ReplicatedLinear</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:240-248}}), and sets the DeepGEMM row alignment for the contiguous layout in DeepGEMM and tile_kernels ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:250-252}}). Mega layers then convert their weights (lines 254-257).</p>
+
+<h3><code>forward</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="571-610" highlight="571-572,574,578-585,593-598,601-610" />
+<ol>
+  <li>Lines 571-572: mega layers return from <code>mega_moe_forward</code>.</li>
+  <li>Line 574: the gate uses the BF16 hidden states.</li>
+  <li>Lines 578-585: dispatch, then wait on the compute stream. The handle carries <code>psum_num_recv_tokens_per_expert</code>.</li>
+  <li>Lines 593-598: the routed experts on the received rows.</li>
+  <li>Lines 601-610: event, shared expert with fewer SMs, combine with the shared output as <code>bias</code>, wait.</li>
+</ol>
+<p>The page {{link concepts/expert-parallelism}} reads <code>dispatch</code>, <code>routed_experts_forward</code> and <code>combine</code> in detail.</p>
+
+<h3><code>mega_moe_forward</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="534-563" highlight="537-541,543-546,549-559,561-562" />
+<p>The gate writes into the buffer (lines 537-541). With FP8, the norm already wrote <code>x</code> and <code>x_sf</code> (lines 543-544). One call does the rest. The page {{link concepts/mega-moe}} reads it in detail.</p>
+
+<h3><code>process_moe_weight</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="41-90" highlight="47-48,52-57,59-71,73-81,87-88" />
+<ol>
+  <li>Lines 47-48: the source weight is 2-D, <code>[E·k, n]</code>. <code>view(E, -1, n).mT</code> makes a contiguous <code>[E, n, k]</code>. Then the source storage is freed.</li>
+  <li>Line 49-50: BF16 stops here.</li>
+  <li>Lines 52-57: the FP8 scales, one per 32 × 32 block, get the same transpose.</li>
+  <li>Lines 59-71: dummy FP4 path. The assert at line 60 checks that each FP8 byte has two zero low bits ("Only support FP4-QAT checkpoint"). <code>per_token_cast</code> to <code>"e2m1"</code> with 32 values per scale and packed UE8M0 scales.</li>
+  <li>Lines 73-81: FP8 path: DeepGEMM puts the scales into its required layout.</li>
+  <li>Lines 84-88: the scales hang on the parameter as <code>.sf</code>; FP4 also gets <code>.mxfp4 = True</code>.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<p><code>T</code> = tokens on this rank, <code>H</code> = hidden size, <code>I</code> = <code>moe_intermediate_size</code>, <code>E_loc</code> = local slots, <code>k</code> = top-k, <code>R</code> = received rows.</p>
+<table>
+  <thead><tr><th>Object</th><th>Type and shape</th><th>Made by</th></tr></thead>
+  <tbody>
+    <tr><td><code>hidden_states</code></td><td>(fp8 <code>[T, H]</code>, packed scales) with FP8 activations; else bf16 <code>[T, H]</code></td><td>FFN norm</td></tr>
+    <tr><td><code>hidden_states_bf16</code></td><td>bf16 <code>[T, H]</code></td><td>FFN norm</td></tr>
+    <tr><td><code>gate_up_proj_weight</code></td><td>FP4: int8 <code>[E_loc, 2I, H/2]</code> + <code>.sf</code>; BF16/FP8: <code>[E_loc, 2I, H]</code></td><td>loader / <code>process_moe_weight</code></td></tr>
+    <tr><td><code>down_proj_weight</code></td><td>FP4: int8 <code>[E_loc, H, I/2]</code> + <code>.sf</code></td><td>loader</td></tr>
+    <tr><td><code>topk_idx</code>, <code>topk_weights</code></td><td><code>[T, k]</code>: physical slots, weights</td><td><code>gate_forward</code></td></tr>
+    <tr><td><code>moe_in_hidden</code></td><td>(fp8 <code>[R, H]</code>, scales)</td><td>DeepEP dispatch</td></tr>
+    <tr><td><code>gate_up_proj_out</code></td><td>bf16 <code>[R, 2I]</code></td><td>grouped GEMM 1</td></tr>
+    <tr><td><code>down_in_hidden</code></td><td>fp8 <code>[R, I]</code> + scales</td><td>SwiGLU + cast</td></tr>
+    <tr><td><code>moe_out_hidden</code></td><td>bf16 <code>[R, H]</code></td><td>grouped GEMM 2</td></tr>
+    <tr><td>return value</td><td>bf16 <code>[T, H]</code></td><td>combine, or <code>out</code> of the mega call</td></tr>
+  </tbody>
+</table>
+<p>The FP4 layout is from the loader docstring ({{cite deepinfer/hugging_face/weights.py:283}}). The GEMM recipes use blocks of 32 for activations and for FP4 weights ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:118-128}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Streams, events and CUDA graphs">
+<ul>
+  <li>DeepEP calls use <code>async_with_compute_stream=True</code>. <code>current_stream_wait()</code> makes the compute stream wait for the communication ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:479}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:585}}).</li>
+  <li><code>allocate_on_comm_stream</code> is true only with a previous event. Dispatch passes <code>None</code>, so it is false there. Combine passes the captured event, so it is true there ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:480}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:508}}).</li>
+  <li>Both calls set <code>defer_epilogue=True</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:488}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:509}}).</li>
+  <li>Decode steps run in CUDA graphs. The routed-expert timer works only on layer 1 in decode, with <code>cuda_graph_timer</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:588-592}}).</li>
+  <li><code>dispatch</code> uses <code>do_cpu_sync</code> only in prefill and not in YOCO compact mode ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:482-485}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Interaction with EPLB">
+<ul>
+  <li><code>gate_forward</code> passes <code>logical_to_physical_map</code> and <code>logical_count</code> of the layer to the gate kernel ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:392-393}}).</li>
+  <li>Dispatch and the mega call add the received rows into <code>expert_count</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:474}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:555}}).</li>
+  <li><code>_init_eplb</code> gives the balancer the weights to move: <code>gate_up_proj_weight</code>, <code>down_proj_weight</code>, and their <code>.sf</code> for one-byte types. Transposed views go back to the stored order before the move ({{cite deepinfer/model_executor/models/deepseek.py:324-329}}).</li>
+  <li><code>forward</code> reads <code>eplb.current()</code> in every call ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:326-327}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:591}}). The model always makes the EPLB manager when it has MoE layers, also with EP size 1 ({{cite deepinfer/model_executor/models/deepseek.py:310-317}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="A worked example: one decode step on one rank">
+<p>Settings of <code>examples/offline_inference.py</code>: <code>--ep 8</code>, <code>max_num_seqs=4</code>, <code>nextn = 5</code>. Toy model values: 64 logical experts, k = 4, 32 extra slots (the example lower limit).</p>
+<ol>
+  <li>Slots: <code>64 + 32 = 96</code>, divisible by 8, so 12 slots per rank (<code>resolve_num_extra_experts</code> adds no padding).</li>
+  <li>The decode step has at most <code>4 × 6 = 24</code> tokens on this rank. <code>topk_idx</code> is <code>[24, 4]</code>.</li>
+  <li>If the EP group fits in the NVLink domain (GPU) or on Ascend: one mega call. In a NORMAL engine with CP size 1, the buffer has <code>num_max_tokens_per_rank</code> = the prefill limit 32768.</li>
+  <li>Else: dispatch sends <code>24 × 4 = 96</code> rows. If the experts are balanced, the rank receives about 96 rows in 12 groups. Grouped GEMM 1 makes bf16 <code>[96, 2I]</code>, grouped GEMM 2 makes bf16 <code>[96, H]</code>, and combine returns bf16 <code>[24, H]</code>.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Container is not <code>FusedExperts</code>, gate is not <code>TopKGate</code>, shared expert is not <code>ReplicatedSharedExpert</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:156}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:221}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:243}}</td></tr>
+    <tr><td>Other <code>topk_method</code>, <code>scoring_func</code>, or <code>norm_topk_prob</code> false</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:164-170}}</td></tr>
+    <tr><td><code>mma_type</code> not one of three</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:182}}</td></tr>
+    <tr><td>Physical slots do not divide by the EP size</td><td><code>AssertionError</code> with the counts</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:203-205}}</td></tr>
+    <tr><td>Activation is not SwiGLU</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:215-216}}</td></tr>
+    <tr><td>Dummy FP4 weights with non-zero low bits</td><td><code>AssertionError: Only support FP4-QAT checkpoint</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:60}}</td></tr>
+    <tr><td><code>DEEPINFER_FORCE_IMBALANCE_RATIO</code> in (0, 1)</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:369}}</td></tr>
+    <tr><td>Mega FP8 input is not the buffer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:543-544}}</td></tr>
+    <tr><td>Any exception in the DeepEP path</td><td>logged with rank and <code>topk_idx.shape</code>, then raised again</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:612-614}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables read in this file">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_FORCE_IMBALANCE_RATIO</code></td><td>0.0 ({{cite deepinfer/environ.py:119}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:367-370}}</td><td>Random routing biased to EP rank 0. The memory profile sets 1.8, then 0.0 ({{cite deepinfer/worker/model_runner.py:509-512}}).</td></tr>
+    <tr><td><code>DEEPINFER_USERBUFFER_COMM_SMS</code></td><td>0 = computed when the EP buffer is made ({{cite deepinfer/environ.py:109}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:471}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:504}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:602}}</td><td>SMs for dispatch and combine; the shared expert gets the rest.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code></td><td><code>off</code> ({{cite deepinfer/environ.py:188}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:485}}</td><td><code>compact</code> turns off <code>do_cpu_sync</code> in prefill dispatch.</td></tr>
+  </tbody>
+</table>
+<p>Config fields, not environment variables, decide the rest: <code>fp8_mlp</code>, <code>mxfp4</code>, <code>activation_type</code>, <code>vision</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:177-178}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:215}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:234}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/moe-routing}}: the gate, top-k, the shared expert and MXFP4 weights.</li>
+  <li>{{link concepts/expert-parallelism}}: dispatch, grouped GEMM, combine.</li>
+  <li>{{link concepts/mega-moe}}: the one-call path and its symmetric buffer.</li>
+  <li>{{link concepts/eplb}} and {{link code/eplb}}: the tables that the gate reads and the counter that the kernels write.</li>
+  <li>{{link code/userbuffer}}: where the EP buffer and the symmetric buffers come from.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method decides between the mega path and the DeepEP path at run time?
+    <x-a><p>None at run time. <code>__init__</code> sets <code>use_mega_moe</code> once ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:184-188}}). <code>forward</code> only reads it ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:571}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>forward</code> get two hidden-state inputs?
+    <x-a><p>The experts take FP8 rows with scales, but the gate needs BF16. The FFN norm returns both ({{cite deepinfer/model_executor/models/v4_modules/hc.py:155-161}}), and <code>forward</code> gives the BF16 copy to <code>gate_forward</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:574}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With FP4 expert weights, does <code>__init__</code> call <code>process_moe_weight</code>?
+    <x-a><p>No. FP4 weights are already in the packed runtime layout, so <code>__init__</code> only calls <code>reconstruct_param</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:207-210}}). <code>process_moe_weight(..., use_fp4=True)</code> runs only for dummy weights ({{cite deepinfer/model_executor/models/deepseek.py:494}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A COMPLETION engine and a NORMAL engine use the same settings. Which one gets the smaller EP or symmetric buffer, and why?
+    <x-a><p>The COMPLETION engine. Its <code>max_num_tokens</code> is <code>max_num_decoding_tokens</code>, while all other engine types use <code>max_num_prefilling_tokens</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:175}}). Both buffers are sized with <code>max_num_tokens</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:305-324}}).</p></x-a>
+  </x-q>
+</x-quiz>

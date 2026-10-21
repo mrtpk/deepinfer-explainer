@@ -25,8 +25,8 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B5b Attention II | running | — | — |
 | B6a Layer + mHC | running | — | — |
 | B6b Engram + VL | running | — | — |
-| B7 MoE + EP | done | running | — |
-| B8 Scale | wave 3 | — | — |
+| B7 MoE + EP | done | done (40 defects fixed) | yes |
+| B8 Scale | running | — | — |
 | B9 Decoding | done | done (25 defects fixed) | yes |
 | B10a SO + precision | wave 3 | — | — |
 | B10b Kernels + loading | wave 3 | — | — |
@@ -51,7 +51,7 @@ Committed so far: Phase 1, D, B1, B2, B5a.
 
 - IDEA for B10a/final: interactive number-format converter (value → BF16 / E4M3 / E2M1 bits) for learn/number-formats and concepts/low-precision-formats.
 
-- FINAL-PASS TODO: reference/env-vars.html: (a) DEEPINFER_FORCE_IMBALANCE_RATIO from the env never takes effect (model_runner.py ~509-512); (b) line ~494 says the shared expert runs "while combine runs" — wrong order (see facts.md B7).
+- FINAL-PASS TODO: reference/env-vars.html: (a) DEEPINFER_FORCE_IMBALANCE_RATIO from the env never takes effect (model_runner.py ~509-512); (b) line ~494 says the shared expert runs "while combine runs" — the code shows only the launch order; overlap is decided inside DeepEP (see facts.md).
 
 - FINAL-PASS TODO: learn/kv-cache.html (already fact-checked) may say ica_state is float32 state for ratio-2 layers and that the main KV entry is 528 B; per B5a, ica_state is None in practice and the loader default is FP4 (288 B). Check and fix in pass F.
 - 2026-10-21: build.py --preview writes site/ even with errors (writers asked: one broken page blocked all previews).

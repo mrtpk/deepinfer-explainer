@@ -1,0 +1,199 @@
+---
+title: MoE routing: the gate, top-k and the shared expert
+nav_title: MoE routing
+level: Intermediate
+prerequisites: learn/moe, learn/parallelism, learn/number-formats
+related: concepts/expert-parallelism, concepts/mega-moe, concepts/eplb, concepts/low-precision-formats, code/v4-mlp, reference/env-vars
+summary: In each MoE layer, a gate scores every expert for every token. DeepInfer sends each token to its top-k routed experts and to one shared expert, and maps each choice to a physical expert slot.
+---
+<x-sentence>In each MoE layer, a small gate gives every token one score for each expert. The token goes to its k best experts and to the shared expert.</x-sentence>
+
+<h2>The idea</h2>
+<p>A DeepSeek V4.1 {{term moe | MoE}} layer has many feed-forward networks, the experts. There are two kinds:</p>
+<ul>
+  <li>{{term routed-expert | Routed experts}}. Each token uses only a few of them.</li>
+  <li>The {{term shared-expert}}. Every token uses it.</li>
+</ul>
+<p>The {{term router | gate}} decides which routed experts a token uses. The gate is one small linear layer. It turns the {{term hidden-state}} of a token into one score for each routed expert. Then {{term top-k-routing}} keeps the k experts with the highest scores. The layer output of the token is the weighted sum of its k expert outputs, plus the output of the shared expert.</p>
+<p>Some experts get many more tokens than others. A busy expert makes its device slow, and the other devices must wait for it. The gate therefore adds a {{term correction-bias}} to the scores before it chooses. A negative bias makes a busy expert a little less attractive. The bias changes only the choice, not the weights of the chosen experts.</p>
+<p>DeepInfer adds one more step. An expert can have more than one copy on the devices. The gate chooses a {{term logical-expert}}, and then a lookup table gives one physical copy (a "slot"). The page {{link concepts/eplb}} explains why copies exist.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a hospital help desk. For each patient, the desk picks the two best specialists. Every patient also sees the general nurse, who is the shared expert. The desk also knows that one specialist is often busy, so it sends a borderline patient to the next specialist. The comparison stops here: the help desk sees live queues, but the gate does not. In DeepInfer the bias is a fixed value from the checkpoint. Run-time balance comes from EPLB.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7_moe_routing" alt="Panel 1: six stages of the gate: gate GEMM to fp32 logits, sqrtsoftplus score, choose top-k with score plus bias, weights normalized and scaled, map from logical expert to physical slot, output topk_idx and topk_weights. Panel 2: a worked example with 8 experts and top-2: without bias experts 2 and 4 win; with a negative bias on expert 2, experts 4 and 0 win, with weights 0.541 and 0.459, times an example factor 1.5." caption="Figure: the gate in six stages (panel 1) and one token as a worked example (panel 2). Look at expert 2: it has the highest score, but the bias drops it." />
+<p>Read panel 1 from stage 1 to stage 6. Amber marks the only place where the bias acts. Panel 2 shows one token with toy numbers. The weights in the result box use the score <code>s</code>, not <code>s + bias</code>.</p>
+<x-simplified>
+<p>The gate math runs inside kernel libraries that are not in this repository: DeepGEMM on NVIDIA and <code>tile_kernels</code> on both platforms. DeepInfer only passes the settings. Stages 2 to 4 show the usual meaning of the setting names <code>sqrtsoftplus</code>, <code>noaux_tc</code> and <code>norm_topk_prob</code>. The repository does not show the formulas. Also, the rule that picks one copy of an expert is inside the kernel.</p>
+</x-simplified>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the parameter containers in moe.py</h3>
+<p>The file <code>v4_modules/moe.py</code> holds only parameters, with the names and shapes of the Hugging Face checkpoint. Its docstring defines the expert counts that the whole MoE code uses:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/moe.py" lines="1-8" caption="Logical experts come from the config. Extra experts are copies. The physical count must divide by the EP size." />
+<p><code>TopKGate</code> holds the gate weight and two biases. It accepts only one scoring function and one top-k method:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/moe.py" lines="40-67" highlight="58-60,62,64,67" />
+<ul>
+  <li>Lines 58-60: other values for <code>scoring_func</code>, <code>topk_method</code> or <code>norm_topk_prob</code> stop start-up with an <code>AssertionError</code>.</li>
+  <li>Lines 62 and 64: one fp32 bias for text tokens and one for image tokens. The loader fills them from the checkpoint names <code>ffn.gate.bias</code> and <code>ffn.gate.bias_vl</code> ({{cite deepinfer/hugging_face/names.py:61-62}}). No code changes them at run time.</li>
+  <li>Line 67: the gate weight stays in BF16. It does not use FP8.</li>
+</ul>
+
+<h3>Step 2: DeepseekMoE checks the config and builds the gate</h3>
+<p><code>DeepseekMoE</code> in <code>v4_modules/mlp.py</code> is the runtime class. It checks the same settings again and reads the routing values:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="164-170" />
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="221-238" highlight="222-227,230-231,234-236">
+<x-tr line="233">Routing bias for selecting image tokens.</x-tr>
+</x-code>
+<p>The gate is a <code>ReplicatedLinear</code> with an fp32 output (line 225). "Replicated" means that every device has the full gate. The image bias exists only for a vision model. Line 236 uses the text bias when <code>e_score_correction_bias_vl</code> is <code>None</code>. <code>TopKGate</code> always makes that parameter ({{cite deepinfer/model_executor/models/v4_modules/moe.py:63-64}}), so in practice the image bias comes from the checkpoint name <code>ffn.gate.bias_vl</code>.</p>
+
+<h3>Step 3: gate_forward</h3>
+<p><code>gate_forward</code> runs once per MoE layer and step. It collects the settings and calls one of two kernels:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="379-401" highlight="388-389,392-393,397-400" />
+<ol>
+  <li>Lines 381-396: the settings. <code>bias</code> and <code>image_bias</code> are the correction biases. <code>to_physical_map</code> and <code>logical_count</code> come from EPLB (line 379). <code>mask</code> marks the valid tokens of the batch.</li>
+  <li>Line 398: on NVIDIA (<code>use_mega_gate = PLATFORM.is_gpu</code>, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:228}}), one DeepGEMM call does the gate GEMM and the top-k.</li>
+  <li>Line 400: on Ascend, <code>self.gate(hidden_states)</code> makes the fp32 logits first. Then <code>moe_topk_gate</code> from <code>tile_kernels</code> does the top-k.</li>
+</ol>
+<p>Both calls return <code>topk_idx</code> and <code>topk_weights</code>. The ids in <code>topk_idx</code> are <em>physical slots</em>, not logical experts. The comment at {{cite deepinfer/model_executor/models/v4_modules/mlp.py:196-198}} says so: "The gate selects logical routed experts. EPLB maps each logical expert to one or more physical slots".</p>
+
+<h3>Step 4: where the choices go</h3>
+<p>The layer gives the two tensors to the expert step. There are two paths ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:571-574}}):</p>
+<ul>
+  <li>The DeepEP path: dispatch, grouped GEMMs, combine. See {{link concepts/expert-parallelism}}.</li>
+  <li>The mega-MoE path: one DeepGEMM call. Here the gate writes its output straight into the symmetric buffer ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:537-541}}). See {{link concepts/mega-moe}}.</li>
+</ul>
+
+<h3>Step 5: the shared expert</h3>
+<p>The checkpoint can have more than one shared expert. <code>ReplicatedSharedExpert</code> joins them into one wide MLP:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/moe.py" lines="24-37" highlight="31-32" />
+<p>Every device has the full shared expert, so its tokens do not travel. On the DeepEP path, DeepInfer runs it on the local tokens and gives the result to <code>combine</code> as <code>bias</code>. Combine adds it to the sum of the routed outputs ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:601-609}}). On the mega path, the shared expert is part of the one kernel call ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:256}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:554}}).</p>
+
+<h3>Step 6: routed expert weights are MXFP4</h3>
+<p>The loader accepts only one checkpoint format: FP8 for most weights and FP4 for the routed experts, with blocks of 32 and UE8M0 scales:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="251-264" highlight="256,258-259,264" />
+<p>The docs give the same format: "MoE routed-expert weights: per-32, ue8m0, MXFP4" ({{cite doc/inference_deployment_qa.md:221}}). {{term mxfp4 | MXFP4}} stores two 4-bit values in one byte, and one {{term scale-factor}} byte for each 32 values. The shared expert and the gate do not use FP4.</p>
+
+<p>The interactive visual on the page {{link concepts/eplb}} shows what top-k routing does to the load of each device. Try it after this page.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The routing settings: where each value comes from">
+<p>All routing values come from the checkpoint file <code>config.json</code>. <code>_build_moe</code> copies them into <code>cfg.moe</code>:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="164-174" />
+<table>
+  <thead><tr><th>Field</th><th>Meaning</th><th>Where DeepInfer uses it</th></tr></thead>
+  <tbody>
+    <tr><td><code>n_routed_experts</code></td><td>Logical routed experts per layer.</td><td>gate output width ({{cite deepinfer/model_executor/models/v4_modules/moe.py:67}})</td></tr>
+    <tr><td><code>num_experts_per_tok</code></td><td>k: experts per token.</td><td><code>num_topk</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:167}})</td></tr>
+    <tr><td><code>n_shared_experts</code></td><td>Shared experts, joined into one MLP.</td><td>{{cite deepinfer/model_executor/models/v4_modules/moe.py:79-82}}</td></tr>
+    <tr><td><code>routed_scaling_factor</code></td><td>Multiplies the routing weights.</td><td>passed to the gate kernel ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:385}})</td></tr>
+    <tr><td><code>scoring_func</code></td><td>Must be <code>"sqrtsoftplus"</code>.</td><td>assert ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:170}})</td></tr>
+    <tr><td><code>topk_method</code></td><td>Must be <code>"noaux_tc"</code>.</td><td>assert ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:164}})</td></tr>
+    <tr><td><code>norm_topk_prob</code></td><td>Must be true: the k weights are normalized.</td><td>assert ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:165}})</td></tr>
+    <tr><td><code>moe_intermediate_size</code></td><td>Inner width of one expert.</td><td>{{cite deepinfer/model_executor/models/v4_modules/moe.py:89}}</td></tr>
+  </tbody>
+</table>
+<p><strong>The real numbers are not in the repository.</strong> The expert count, k and the scaling factor are in the <code>config.json</code> of the checkpoint, which the repository does not contain. This site uses toy numbers only.</p>
+<p><strong>No group-limited routing.</strong> Some DeepSeek models first pick expert groups and then experts inside the groups. <code>_build_moe</code> reads no group fields, and <code>gate_forward</code> passes no group setting. So DeepInfer V4.1 routing has no group limit.</p>
+</x-deepdive>
+
+<x-deepdive title="gate_forward, line by line">
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="359-401" highlight="367-371,374-377,383-384,390-393" />
+<ol>
+  <li><strong>Lines 367-371.</strong> A profiling setting. If <code>DEEPINFER_FORCE_IMBALANCE_RATIO</code> is above 0 and the EP size is above 1, the gate is skipped. Random choices send more tokens to the first EP rank (see the deep dive on profiling settings).</li>
+  <li><strong>Line 373.</strong> <code>images_seq_mask</code> marks image tokens. Only a vision batch has it.</li>
+  <li><strong>Lines 374-377.</strong> <code>gate_force_random</code> is a bool per token. A prefill with context parallelism uses its reordered copy <code>gate_force_random_cp</code>.</li>
+  <li><strong>Lines 383-384.</strong> <code>use_shared_as_routed=False</code> and <code>num_shared_experts=0</code>: the gate does not treat the shared expert as a routed choice. The shared expert runs on its own path.</li>
+  <li><strong>Line 386.</strong> <code>ep_rank</code> goes to the kernel. The repository does not show what the kernel does with it.</li>
+  <li><strong>Lines 392-393.</strong> The EPLB tables of this layer: <code>logical_to_physical_map</code> (int32 <code>[n_logical, extra + 1]</code>, <code>-1</code> = no copy) and <code>logical_count</code> (int32 <code>[n_logical]</code>) ({{cite deepinfer/model_executor/eplb/__init__.py:51-52}}).</li>
+  <li><strong>Line 395.</strong> <code>out</code>: with mega-MoE, the gate writes into slices of the symmetric buffer and makes no new tensors.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="A worked example with numbers">
+<p>This example uses 8 logical experts, k = 2, and 4 extra slots on 4 EP ranks. All numbers are toy values. The formulas are the usual meaning of the setting names (see the note on the picture).</p>
+<ol>
+  <li><strong>Gate GEMM.</strong> The token has the logits <code>[1.2, -0.5, 2.0, 0.3, 1.9, -1.0, 0.8, 0.1]</code> in fp32.</li>
+  <li><strong>Score.</strong> <code>softplus(z) = ln(1 + e^z)</code>, then the square root. For expert 2: <code>ln(1 + e^2.0) = 2.127</code>, and <code>sqrt(2.127) = 1.458</code>. All scores are positive.</li>
+  <li><strong>Choose.</strong> The biases are <code>-0.35</code> for expert 2, <code>+0.05</code> for expert 4, and 0 for the others. The values of <code>s + bias</code> are <code>1.210</code> (expert 0), <code>1.108</code> (expert 2) and <code>1.478</code> (expert 4). The top 2 are experts 4 and 0. Without the bias, the top 2 are experts 2 and 4.</li>
+  <li><strong>Weights.</strong> Normalize the scores <em>without</em> the bias: <code>1.428 / (1.428 + 1.210) = 0.541</code> and <code>0.459</code>. Then multiply by <code>routed_scaling_factor</code>. With an example factor of 1.5, the weights are <code>0.812</code> and <code>0.688</code>.</li>
+  <li><strong>Physical slots.</strong> 8 logical plus 4 extra gives 12 slots, so 3 slots per rank. The first layout is <code>[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]</code> ({{cite deepinfer/model_executor/eplb/__init__.py:31-39}}). Expert 4 has one copy, in slot 4 (rank 1). Expert 0 has two copies: slot 0 (rank 0) and slot 8 (rank 2). The kernel picks one of the two.</li>
+</ol>
+<p>The result for this token is <code>topk_idx = [4, 0 or 8]</code> and <code>topk_weights = [0.812, 0.688]</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Shapes and data types">
+<p><code>T</code> is the number of tokens in the step on this rank. <code>H</code> is the hidden size. <code>E</code> is the number of logical experts. <code>k</code> is <code>num_experts_per_tok</code>.</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Type and shape</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>gate input <code>hidden_states_bf16</code></td><td>bf16 <code>[T, H]</code></td><td>the FFN norm; also on the FP8 path, the gate gets the BF16 copy ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:574}})</td></tr>
+    <tr><td><code>Wgate</code></td><td>bf16 <code>[E, H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/moe.py:67}}</td></tr>
+    <tr><td>logits (NPU path)</td><td>fp32 <code>[T, E]</code></td><td><code>use_fp32_output=True</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:225}})</td></tr>
+    <tr><td><code>e_score_correction_bias</code>, <code>_vl</code></td><td>fp32 <code>[E]</code> each</td><td>{{cite deepinfer/model_executor/models/v4_modules/moe.py:62-64}}</td></tr>
+    <tr><td><code>valid_token_mask</code>, <code>gate_force_random</code></td><td>bool <code>[T]</code></td><td>input metadata. <code>False</code> in the mask marks padding tokens ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:44-46}})</td></tr>
+    <tr><td><code>topk_idx</code>, <code>topk_weights</code></td><td><code>[T, k]</code>: physical slot ids and weights</td><td>gate kernel. The forced-imbalance path makes int64 ids and fp32 weights with <code>torch.topk</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:335-345}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Routed expert weights in MXFP4: layout and size">
+<p>The runtime parameter of the routed experts is an int8 tensor <code>(n_local, h_out, h_in // 2)</code>: two e2m1 values per byte. Its scale tensor <code>.sf</code> holds packed UE8M0 bytes in column-major order ({{cite deepinfer/hugging_face/weights.py:281-289}}). The loader reads the experts of this rank one at a time, joins <code>w1</code> and <code>w3</code> into <code>linear1</code>, and checks every shape ({{cite deepinfer/hugging_face/weights.py:300-326}}).</p>
+<p>The grouped GEMM gets the block sizes as recipes: activations in blocks of 32, FP4 weights in blocks of 32 ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:118-128}}). The FP8 block size is always 32 ({{cite deepinfer/model_executor/layers/linear.py:13-14}}).</p>
+<p><strong>A size example</strong> with toy sizes <code>H = 4096</code> and <code>moe_intermediate_size = 2048</code>. The <code>linear1</code> weight of one expert has <code>2 × 2048 × 4096 = 16,777,216</code> values.</p>
+<ul>
+  <li>MXFP4: 8 MiB of data plus <code>16,777,216 / 32</code> = 512 KiB of scales.</li>
+  <li>FP8 with 32 × 32 weight blocks: 16 MiB plus <code>16,777,216 / 1024</code> = 16 KiB of scales (one byte per scale). The checkpoint uses these blocks for FP8 weights ({{cite deepinfer/hugging_face/config.py:258}}).</li>
+  <li>BF16: 32 MiB.</li>
+</ul>
+<p><strong>The dummy-weight path.</strong> With <code>load_format="dummy"</code>, <code>process_moe_weight</code> converts synthetic FP8 values into the FP4 layout. It asserts that the two low bits of each FP8 byte are zero: "Only support FP4-QAT checkpoint" ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:59-60}}). A comment says that real loading fills the packed layout directly ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:85-86}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Profiling settings: forced imbalance and forced random">
+<p><strong>DEEPINFER_FORCE_IMBALANCE_RATIO</strong> (float, default 0.0, {{cite deepinfer/environ.py:119}}). With a value <code>ratio ≥ 1</code> and EP size above 1, the gate is replaced by random scores. The local experts of each rank get scores in <code>U(0, f)</code>, the others in <code>U(0, 1)</code>. Then <code>torch.topk</code> picks k ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:329-345}}). The factor <code>f</code> comes from a mean-field formula:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="347-357" />
+<p>Example: EP 8, 64 slots (8 per rank), k = 8, ratio 1.8:</p>
+<ol>
+  <li><code>x = 1.8 / (1.8 + 7) = 0.2045</code>: the share of all selections that rank 0 must get.</li>
+  <li><code>t = 1 − (1 − 0.2045) × 8 / 56 = 0.886</code>: the estimated top-k threshold.</li>
+  <li><code>denom = 1 − 0.2045 × 8 / 8 = 0.7955</code>, so <code>f = 0.886 / 0.7955 = 1.114</code>.</li>
+</ol>
+<p>Line 336 gives the higher range to the first 8 columns. So EP rank 0 gets about 1.8 times the selections of each other rank.</p>
+<x-warning title="Your value of DEEPINFER_FORCE_IMBALANCE_RATIO does not stay">
+<p>The memory profile at start-up sets the value to 1.8, runs the profile, and then sets it to 0.0 ({{cite deepinfer/worker/model_runner.py:509-512}}). These lines write to <code>envs</code> directly. So after start-up the value is 0.0, also when you set the variable in the environment.</p>
+</x-warning>
+<p><strong>DEEPINFER_FORCE_LOAD_BALANCE</strong> (bool, default off, {{cite deepinfer/environ.py:120}}). The C++ input preparation copies it into <code>gate_force_random</code> for every token ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:82-86}}). The gate kernel gets it as <code>force_random</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:391}}). The field docstring says: "True: replace the token's gate logits with random values to balance MoE load" ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:48-50}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Do not read topk_idx as logical expert ids">
+<p>The gate returns physical slot ids. With extra experts, slot 8 can hold logical expert 0. To get the logical id, use <code>physical_to_logical_map</code> of the layer ({{cite deepinfer/model_executor/eplb/__init__.py:50}}).</p>
+</x-warning>
+<ul>
+  <li><strong>Unsupported checkpoint.</strong> A checkpoint with another scoring function or top-k method stops start-up with an <code>AssertionError</code> ({{cite deepinfer/model_executor/models/v4_modules/moe.py:58-60}}). A checkpoint without FP4 experts stops with <code>ValueError: Unsupported HF expert_dtype</code> ({{cite deepinfer/hugging_face/config.py:261-262}}).</li>
+  <li><strong>Forced imbalance below 1.</strong> A value between 0 and 1 fails the assertion at line 369 ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:369}}).</li>
+  <li><strong>One hot expert.</strong> The correction bias is fixed. If the traffic makes one expert very busy, its device is slow, and all EP ranks wait for it at combine. Use EPLB with extra experts ({{link concepts/eplb}}).</li>
+  <li><strong>Image tokens.</strong> A vision batch uses <code>bias_vl</code> only for tokens in <code>images_seq_mask</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:389-390}}). A text-only batch passes <code>image_bias=None</code>.</li>
+</ul>
+<p><strong>Why it matters.</strong> The gate decides where every token goes in every MoE layer. Its output decides the communication volume of dispatch and combine, and the load of each device. EPLB, expert parallelism and mega-MoE all start from <code>topk_idx</code> and <code>topk_weights</code>.</p>
+
+<x-quiz>
+  <x-q level="easy">Which two kinds of experts does a token use in a DeepInfer MoE layer?
+    <x-a><p>Its k routed experts, which the gate chooses, and the shared expert, which every token uses. The shared expert is one wide MLP with a full copy on every device ({{cite deepinfer/model_executor/models/v4_modules/moe.py:24-37}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Does the correction bias change the weight of a chosen expert?
+    <x-a><p>No, in the usual meaning of <code>noaux_tc</code>. The bias changes only which experts win the top-k, and the weights come from the scores without the bias. The kernel that does this is not in the repository. In the worked example, the weights are <code>1.428 / 2.638</code> and <code>1.210 / 2.638</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">On which platform does DeepInfer call <code>deep_gemm.bf16_mega_gate</code>, and what does the other platform call?
+    <x-a><p>On NVIDIA, because <code>use_mega_gate = PLATFORM.is_gpu</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:228}}). On Ascend, the gate <code>ReplicatedLinear</code> makes fp32 logits, and <code>tile_kernels.moe.moe_topk_gate</code> picks the experts ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:397-400}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A layer has 8 logical experts and 4 extra slots on 4 EP ranks, with the first layout. The gate chooses logical expert 1. Which slots can appear in <code>topk_idx</code>, and on which ranks are they?
+    <x-a><p>The first layout is <code>[0..7, 0, 1, 2, 3]</code> ({{cite deepinfer/model_executor/eplb/__init__.py:36-39}}). Logical expert 1 is in slot 1 and slot 9. With 3 slots per rank, slot 1 is on rank 0 and slot 9 is on rank 3. <code>logical_count[1] = 2</code>, and the gate kernel picks one of the two.</p></x-a>
+  </x-q>
+  <x-q level="hard">You export <code>DEEPINFER_FORCE_IMBALANCE_RATIO=2.0</code> before start-up. Is routing random during serving?
+    <x-a><p>No. The memory profile writes 1.8 and then 0.0 into <code>envs.DEEPINFER_FORCE_IMBALANCE_RATIO</code> ({{cite deepinfer/worker/model_runner.py:509-512}}). After start-up the value is 0.0, so <code>gate_forward</code> uses the real gate ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:367}}).</p></x-a>
+  </x-q>
+</x-quiz>

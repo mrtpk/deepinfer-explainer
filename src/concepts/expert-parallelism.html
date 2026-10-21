@@ -1,0 +1,167 @@
+---
+title: Expert parallelism: dispatch, grouped GEMM, combine
+nav_title: Expert parallelism (dispatch/combine)
+level: Advanced
+prerequisites: learn/moe, learn/parallelism, concepts/moe-routing
+related: concepts/mega-moe, concepts/eplb, concepts/hardware-platforms, concepts/dp-step-votes, code/v4-mlp, code/userbuffer, code/parallel-state
+summary: DeepInfer splits the expert slots of every MoE layer evenly over the EP ranks. DeepEP dispatch sends each token to the ranks of its experts, DeepGEMM runs grouped GEMMs there, and DeepEP combine brings the results back.
+---
+<x-sentence>Each EP rank holds an equal part of the expert slots. DeepEP sends every token to the ranks of its k experts and then brings the results back.</x-sentence>
+
+<h2>The idea</h2>
+<p>An MoE layer has many {{term routed-expert | routed experts}}. With {{term expert-parallelism}} (EP), each {{term rank}} of the EP group holds only some of them. The other parts of the model are on every rank. Attention uses {{term data-parallelism}}: each rank has its own requests. The docs say "attention uses data parallelism (#DP = #EP)" ({{cite doc/inference_deployment_qa.md:33}}).</p>
+<p>So the tokens of a rank need experts that are on other ranks. One MoE layer has three parts:</p>
+<ol>
+  <li><strong>Dispatch.</strong> Each rank sends one copy of each token to every rank that holds one of its k experts. This is an all-to-all {{term collective}}.</li>
+  <li><strong>Expert compute.</strong> Each rank now has rows from many ranks, sorted by local expert. One {{term grouped-gemm}} computes all local experts at once.</li>
+  <li><strong>Combine.</strong> The results go back to the rank of the token. There, the k results of each token are added with their routing weights. The output of the {{term shared-expert}} is also added.</li>
+</ol>
+<p>DeepInfer uses {{term deepep | DeepEP}} for dispatch and combine, and DeepGEMM for the grouped GEMMs. Both are {{term vendor-library | vendor libraries}}. This page explains only how DeepInfer calls them.</p>
+<p>Why do this? The docs give the reason: EP "increases batch size and GPU matrix-multiplication efficiency, and therefore throughput" ({{cite doc/inference_deployment_qa.md:29}}). Each expert gets the tokens of all ranks, so its GEMM has more rows.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a food court with several kitchens. Each kitchen cooks only some dishes. A waiter takes the order of a table and sends each dish to the kitchen that cooks it (dispatch). Each kitchen cooks all its orders for the same dish together (grouped GEMM). Then the waiter collects the plates for his table (combine). The comparison stops here: in DeepInfer, every "waiter" is also a "kitchen". Each rank does attention for its own requests and also holds experts.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7_ep_dispatch" alt="Panel 1: three EP ranks with own tokens a to e; dispatch sends one copy per chosen expert, so rank 0 holds rows for E0 (a, c, e) and E1 (b); combine returns the weighted sum to the own rank. Panel 2: seven steps on one rank: gate_forward, dispatch, grouped GEMM gate_up, SwiGLU with routing weight, grouped GEMM down, shared expert, combine with the shared output as bias." caption="Figure: where tokens go (panel 1) and what runs on one rank (panel 2). Follow token a: it leaves rank 0 for E0 (rank 0) and E3 (rank 1), and comes back to rank 0." />
+<p>Panel 1 uses a toy group of 3 ranks with 2 expert slots each. The middle row is the state after dispatch: each rank holds rows, grouped by its local experts. Panel 2 lists the seven calls of one MoE layer on one rank, with shapes and source lines.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the EP group</h3>
+<p>EP groups are blocks of <code>ep_size</code> neighbouring ranks. If the EP size equals the world size, the EP group is the world group:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="101-106" />
+<p>The example script sets the EP size with <code>--ep</code> (default 8). By default it starts one data-parallel rank per EP rank: <code>dp_size = ep_size // cp_size</code> ({{cite examples/offline_inference.py:13-28}}).</p>
+
+<h3>Step 2: each rank holds an equal number of slots</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="196-205" />
+<p>Slots are numbered globally. Rank <code>r</code> holds slots <code>r × n_local</code> to <code>(r + 1) × n_local − 1</code>. At start-up, the loader reads the checkpoint weights of exactly those slots ({{cite deepinfer/hugging_face/weights.py:264-267}}). Extra slots hold copies of other experts. The page {{link concepts/eplb}} explains them.</p>
+
+<h3>Step 3: one EP buffer per process</h3>
+<p>Before the first step, every MoE layer asks for its communication buffer. On the DeepEP path, this is a DeepEP <code>EPBuffer</code>:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="316-324" />
+<p>All layers share one buffer. The first call makes it, and later calls only check that it is large enough ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:81-85}}). The page {{link code/userbuffer}} explains the buffer manager.</p>
+
+<h3>Step 4: dispatch</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="469-489" highlight="471,474-477,485-486" />
+<ul>
+  <li>Line 471: dispatch and combine use <code>DEEPINFER_USERBUFFER_COMM_SMS</code> {{term sm | SMs}}.</li>
+  <li>Line 474: DeepEP adds the received token counts into the EPLB counter of this layer.</li>
+  <li>Line 476: the buffer limit differs for prefill and decode steps.</li>
+  <li>Line 477: DeepGEMM gives the row alignment of each expert group.</li>
+  <li>Line 486: <code>do_expand=True</code>. The receiver gets one row per (token, expert) pair, not one row per token.</li>
+</ul>
+<p>The layer waits for the result and gets four values: the received rows, their expert ids and weights, and a <code>handle</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:585}}). <code>handle.psum_num_recv_tokens_per_expert</code> tells the grouped GEMM where each local expert group ends.</p>
+
+<h3>Step 5: the grouped GEMMs</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="417-457" highlight="422-430,436-442,449-457" />
+<ol>
+  <li>The first grouped GEMM computes the gate and up halves of all local experts at once. The output is BF16.</li>
+  <li><code>swiglu_forward_and_per_token_cast</code> does the {{term swiglu | SwiGLU}} activation. It also gets the routing weights (line 440) and casts the result to FP8.</li>
+  <li>The second grouped GEMM (down) gives one BF16 row of the hidden size for each received row.</li>
+</ol>
+<p>With FP8 activations, the GEMM is <code>m_grouped_fp8_fp4_gemm_nt_contiguous</code>, with blocks of 32 on both sides ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:118-128}}). Lines 431-434 free the received rows after the first GEMM, to save memory.</p>
+
+<h3>Step 6: shared expert and combine</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="600-610" highlight="601-603,606" />
+<p>The code captures an event after the routed experts (line 601). Then it starts the shared expert inside <code>limit_num_sms</code> on GPU, which gives the shared expert fewer SMs. Then it calls combine, with the event as <code>previous_event</code> and the shared output as <code>bias</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:501-509}}). The event comes from before the shared expert, so it covers only the routed experts. When the combine transfer runs on the device, and when DeepEP adds the bias, is decided inside DeepEP. The result is BF16 <code>[T, hidden]</code> for the own tokens of this rank.</p>
+
+<h3>Step 7: prefill and decode</h3>
+<p>The same code runs for prefill and decode. Two arguments of dispatch change ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:476}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:485}}):</p>
+<table>
+  <thead><tr><th></th><th>Prefill step</th><th>Decode step</th></tr></thead>
+  <tbody>
+    <tr><td><code>num_max_tokens_per_rank</code></td><td><code>max_num_prefilling_tokens</code> = <code>max_num_batched_tokens // cp_size</code></td><td><code>max_num_decoding_tokens</code> = <code>max_num_seqs × (1 + nextn)</code></td></tr>
+    <tr><td><code>do_cpu_sync</code></td><td>true, except in YOCO <code>compact</code> mode</td><td>false</td></tr>
+    <tr><td>EP size in the docs</td><td>"EP2–8 / DP2–8; use the smallest EP/DP that HBM allows" ({{cite doc/inference_deployment_qa.md:47}})</td><td>"EP64–128 / DP64–128 (Wide-EP); use the largest EP/DP that the available GPUs allow" ({{cite doc/inference_deployment_qa.md:49}})</td></tr>
+  </tbody>
+</table>
+<p>The two token limits come from <code>finalize_model_config</code> ({{cite deepinfer/model_executor/model_loader.py:119-120}}). The docs give the reason for Wide-EP in decode: it "substantially reduces per-step memory traffic in the MoE expert part" ({{cite doc/inference_deployment_qa.md:57}}).</p>
+<x-note title="DeepEP or mega-MoE?">
+<p>The steps on this page are the DeepEP path. Inside one {{term nvlink-domain}}, DeepInfer uses mega-MoE instead: one DeepGEMM call does all seven steps. With the released checkpoint format, GPU layers use mega-MoE when the EP group fits in the NVLink domain. Ascend layers always use it. See {{link concepts/mega-moe}}.</p>
+</x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="DeepseekMoE.forward on the DeepEP path, line by line">
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="565-616" highlight="571-572,574,578-585,593-598,601-610,612-614" />
+<ol>
+  <li><strong>Lines 571-572.</strong> A mega-MoE layer leaves here. The rest is the DeepEP path.</li>
+  <li><strong>Line 574.</strong> The gate uses the BF16 copy of the hidden states, also when the expert input is FP8.</li>
+  <li><strong>Lines 578-585.</strong> Dispatch with <code>dispatch_pre_evt=None</code>. <code>current_stream_wait()</code> makes the compute stream wait for the communication.</li>
+  <li><strong>Lines 588-598.</strong> The routed experts. On layer 1 in decode steps, a CUDA-graph timer measures them and scales the time by the number of MoE layers. <code>expected_m=None</code> goes to DeepGEMM.</li>
+  <li><strong>Lines 601-610.</strong> Event, shared expert with fewer SMs, combine, wait.</li>
+  <li><strong>Lines 612-614.</strong> On any exception, the layer logs the global rank and the shape of <code>topk_idx</code>, then raises again.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Shapes and data types through one layer, with numbers">
+<p><code>T</code> = own tokens of this rank, <code>k</code> = experts per token, <code>R</code> = received rows, <code>H</code> = hidden size, <code>I</code> = <code>moe_intermediate_size</code>, <code>E_loc</code> = local slots. The checkpoint format gives FP8 activations and MXFP4 expert weights.</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Type and shape</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td>layer input</td><td>(fp8 <code>[T, H]</code>, scales) and bf16 <code>[T, H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:565-570}}</td></tr>
+    <tr><td><code>topk_idx</code>, <code>topk_weights</code></td><td><code>[T, k]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:574}}</td></tr>
+    <tr><td><code>moe_in_hidden</code></td><td>(fp8 <code>[R, H]</code>, scales): one row per (token, local expert)</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:585}}</td></tr>
+    <tr><td><code>gate_up_proj_weight</code></td><td>int8 <code>[E_loc, 2I, H/2]</code> (two FP4 values per byte) + <code>.sf</code></td><td>{{cite deepinfer/hugging_face/weights.py:283}}</td></tr>
+    <tr><td><code>gate_up_proj_out</code></td><td>bf16 <code>[R, 2I]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:417-421}}</td></tr>
+    <tr><td><code>down_in_hidden</code></td><td>fp8 <code>[R, I]</code> + scales (weights applied)</td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:436-442}}</td></tr>
+    <tr><td><code>moe_out_hidden</code></td><td>bf16 <code>[R, H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:444-448}}</td></tr>
+    <tr><td><code>shared_out</code></td><td>bf16 <code>[T, H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:603}}</td></tr>
+    <tr><td>layer output</td><td>bf16 <code>[T, H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mlp.py:610}}</td></tr>
+  </tbody>
+</table>
+<p><strong>A worked example</strong> with the settings of <code>examples/offline_inference.py</code>: <code>max_num_seqs=4</code>, <code>max_num_batched_tokens=32768</code>, <code>--ep 8</code> ({{cite examples/offline_inference.py:13}}, {{cite examples/offline_inference.py:52-54}}), and the default <code>nextn = 5</code>.</p>
+<ol>
+  <li>A decode step has at most <code>4 × (1 + 5) = 24</code> tokens per rank. So <code>num_max_tokens_per_rank = 24</code> in decode.</li>
+  <li>A prefill step has at most <code>32768 // 1 = 32768</code> tokens per rank.</li>
+  <li>With a toy <code>k = 8</code> and 8 ranks, dispatch on each rank makes <code>24 × 8 = 192</code> rows in a full decode step. Rows for local experts stay on the rank. On average each rank also receives 192 rows, but a rank with hot experts receives more.</li>
+</ol>
+<p>The real <code>k</code>, <code>H</code> and <code>I</code> are in the checkpoint <code>config.json</code>, not in the repository.</p>
+</x-deepdive>
+
+<x-deepdive title="The EP buffer and the SM budget">
+<x-code file="deepinfer/model_executor/parallel_utils/userbuffer.py" lines="72-90" highlight="74,77-79,86-90" />
+<ul>
+  <li><strong>Size.</strong> The buffer is sized for <code>max_num_tokens</code> per rank. For a NORMAL engine, this is the prefill limit, because the engine does both prefill and decode. Only a COMPLETION engine uses the decode limit ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:175}}).</li>
+  <li><strong>FP8 dispatch.</strong> <code>use_fp8_dispatch</code> is true with FP8 activations. Then dispatch sends FP8 rows and their scales.</li>
+  <li><strong>Batch invariance.</strong> With <code>DEEPINFER_BATCH_INVARIANT</code> on and EPLB rearrangement on, DeepInfer passes <code>allow_multiple_reduction=False</code> (line 79).</li>
+  <li><strong>SM count.</strong> With <code>DEEPINFER_USERBUFFER_COMM_SMS=0</code> (the default), lines 86-90 compute a value and write it back into <code>envs</code>.</li>
+</ul>
+<p>An example for a GPU with 148 SMs: <code>compute_num_sms = min(32, 148 // 4) = 32</code>. The communication SMs are <code>min(theoretical, 148 − 32) = min(theoretical, 116)</code>. DeepEP gives the theoretical value from the expert count and k.</p>
+<p>The shared expert runs inside <code>limit_num_sms</code>, which sets DeepGEMM and tile_kernels to <code>current DeepGEMM SM count − comm SMs</code> and restores the old value after ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:39-51}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Every EP rank must run every MoE layer">
+<p>Dispatch and combine are collectives over the EP group. Every EP rank must call them in every MoE layer of every step, also with no tokens. A rank with no work runs a placeholder step for this reason ({{cite deepinfer/worker/worker.py:125-127}}). The page {{link concepts/dp-step-votes}} explains how the data-parallel ranks agree on the step type.</p>
+<p>A rank with zero received rows is valid. The code notes it: "num_expanded_tokens can be 0" ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:413-415}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Layers with other expert counts (DFlash)">
+<p>The DFlash draft layers of speculative decoding also have MoE layers. They use the same <code>DeepseekMoE</code> class ({{cite deepinfer/model_executor/models/mtp/dflash.py:389-392}}), but the expert count and k come from other config fields: <code>dspark_n_routed_experts</code> and <code>dspark_num_experts_per_tok</code> ({{cite deepinfer/hugging_face/config.py:187-190}}). The loader rounds their extra experts separately ({{cite deepinfer/model_executor/model_loader.py:102-106}}). They share the one <code>EPBuffer</code> with the main layers ({{cite deepinfer/model_executor/models/deepseek.py:422-428}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Slots do not divide by the EP size.</strong> <code>DeepseekMoE</code> asserts it ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:203-205}}). The loader prevents it: it rounds the extra experts up so that the total divides by <code>ep_size</code> ({{cite deepinfer/model_executor/eplb/__init__.py:21-28}}).</li>
+  <li><strong>A hot expert.</strong> The rank of a busy expert receives more rows and finishes last. All ranks wait for it at combine. See {{link concepts/eplb}}.</li>
+  <li><strong>A rank that skips a step.</strong> Dispatch is a collective. If one EP rank does not run the layer, the others wait. This is why placeholder steps exist.</li>
+  <li><strong>Memory.</strong> In a NORMAL engine, the EP buffer is sized for the prefill token limit. A large <code>max_num_batched_tokens</code> makes a large buffer on every rank.</li>
+  <li><strong>CPU sync in prefill.</strong> <code>do_cpu_sync</code> is true for prefill. The TODO comment says that it makes YOCO compaction a CPU bottleneck, so compact mode turns it off ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:482-485}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Expert parallelism lets many devices share the expert weights and gives each expert large GEMMs. The cost is two all-to-all collectives per MoE layer, and the slowest rank sets the speed of all ranks.</p>
+
+<x-quiz>
+  <x-q level="easy">What are the three parts of an MoE layer with expert parallelism?
+    <x-a><p>Dispatch: DeepEP sends tokens to the ranks of their experts. Expert compute: grouped GEMMs on each rank. Combine: DeepEP returns the results and adds them ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:576-610}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">How many expert slots does each rank hold?
+    <x-a><p><code>num_physical_experts // ep_size</code>, where physical = routed + extra ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:199-201}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Where does the shared expert output join the routed outputs on the DeepEP path?
+    <x-a><p>In combine. DeepInfer passes it as <code>bias=shared_hidden_states</code> to <code>EPBuffer.combine</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:505}}). The shared expert runs on the own tokens of the rank and does not travel.</p></x-a>
+  </x-q>
+  <x-q level="hard">A NORMAL engine runs with <code>max_num_seqs=4</code>, <code>max_num_batched_tokens=32768</code>, CP size 1 and <code>nextn = 5</code>. Which <code>num_max_tokens_per_rank</code> does dispatch get in a decode step, and which size is the EP buffer made for?
+    <x-a><p>Dispatch gets <code>max_num_decoding_tokens = 4 × (1 + 5) = 24</code> ({{cite deepinfer/model_executor/model_loader.py:119}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:476}}). The buffer is made for <code>max_num_tokens</code>, which is the prefill limit 32768 for a NORMAL engine ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:175}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:317-320}}).</p></x-a>
+  </x-q>
+</x-quiz>
