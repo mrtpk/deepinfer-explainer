@@ -1,0 +1,243 @@
+---
+title: v4_modules/attn.py: the MLA attention runtime
+nav_title: v4_modules/attn.py
+level: Advanced
+prerequisites: concepts/mla-attention, concepts/sparse-attention-indexer
+related: concepts/mla-attention, concepts/sparse-attention-indexer, concepts/sliding-window-attention, concepts/kv-compression, concepts/cross-layer-kv-sharing, concepts/yoco-swa-replay, code/v4-mla-attn, code/v4-index-attn, code/v4-compress, code/decoder-layer
+summary: attn.py turns the MLA weight container into runtime weights and runs one attention layer per call: projections, sliding-window and compressed KV stores, the indexer, the FlashMLA kernel and the output projection. It also holds the DFlash draft attention.
+---
+<h2>Purpose</h2>
+<p><code>attn.py</code> runs one attention layer: it makes Q and the KV vectors, writes them to the caches, gets the key list, calls FlashMLA, and projects the result back to the hidden size.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/v4_modules/attn.py</code>, 1,008 lines. Role 2 "runtime adapter" ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:10-15}}).</td></tr>
+    <tr><th>Main classes</th><td><code>V4AttentionBase</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:65}}), <code>V4Attention</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:228}}), <code>DFlashAttention</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:883}}).</td></tr>
+    <tr><th>Runs in</th><td>Every worker process, once per layer per step. All work is device kernels; decode runs inside a CUDA graph.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekDecoderLayer</code> and <code>DFlashDecoderLayer</code> in <code>decoder_layer.py</code>.</td></tr>
+    <tr><th>Calls</th><td>FlashMLA wrappers in <code>layers/attention_backend.py</code>, <code>deep_gemm.fp8_einsum</code>, TileLang interface kernels, <code>Compressor</code> (<code>compress.py</code>), <code>MQA</code> (<code>index_attn.py</code>), <code>userbuffer</code> for context parallelism.</td></tr>
+    <tr><th>Not in this file</th><td>The HF-shaped weights (<code>mla_attn.py</code>), the compression math (<code>compress.py</code>), the top-k selection (<code>index_attn.py</code>), the kernel insides (vendor libraries).</td></tr>
+  </tbody>
+</table>
+<p>The module docstring sums it up: <code>V4AttentionBase</code> holds the shared projection, norm and RoPE plumbing; <code>V4Attention</code> adds compressed KV, sparse index, sliding window, YOCO and cross-layer paths; <code>DFlashAttention</code> serves the draft model ({{cite deepinfer/model_executor/models/v4_modules/attn.py:1-7}}).</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b5a_mla_flow" alt="Panel 1: the three rows of one attention layer: query, sliding-window KV and compressed KV, all from the same hidden state. Panel 2: the prefill and decode FlashMLA calls with their argument shapes, and the three parts of the prefill KV buffer. Panel 3: inverse RoPE, grouped Wv einsum and out_proj." caption="Figure: <code>V4Attention.forward</code> for a sparse C2 layer. The boxes cite the lines of this file. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>DeepseekDecoderLayer.__init__</code> makes one <code>V4Attention</code> per main layer ({{cite deepinfer/model_executor/models/decoder_layer.py:85}}). Its forward calls it with the FP8 and BF16 hidden states and the cross-layer runtime ({{cite deepinfer/model_executor/models/decoder_layer.py:154-161}}).</li>
+  <li><code>DFlashDecoderLayer</code> makes a <code>DFlashAttention</code> and calls <code>update_main_cache</code> and <code>forward_drafts</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:190-195}}, {{cite deepinfer/model_executor/models/decoder_layer.py:216-236}}).</li>
+  <li><code>DeepseekForCausalLM.allocate_userbuffer</code> asks each layer for <code>get_max_ag_bytes_per_token()</code> ({{cite deepinfer/model_executor/models/deepseek.py:429-430}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>Attention kernels:</strong> <code>prefill_attn_varlen_sparse</code> and <code>decode_mla_mqa_sparse</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:20-23}}), which call FlashMLA. The fused FlashMLA module <code>fused_norm_rope_attn_rope_cast</code> also permutes weights at start-up ({{cite deepinfer/model_executor/models/v4_modules/attn.py:14}}).</li>
+  <li><strong>GEMMs:</strong> <code>ReplicatedLinear</code> for the projections; <code>deep_gemm.fp8_einsum</code> for the grouped Wv ({{cite deepinfer/model_executor/models/v4_modules/attn.py:215-221}}).</li>
+  <li><strong>TileLang interface kernels:</strong> <code>fused_norm_rope_hadamard_cast_store_kvcache</code>, <code>gather</code>, <code>kv_index_cat</code>, <code>load_paged_kv_cache</code>, <code>store_kv_cache</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:29-39}}). None of the calls here passes Hadamard arguments.</li>
+  <li><strong>Sub-modules:</strong> <code>Compressor</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:346}}) and <code>MQA</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:355-362}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_make_cp_gather_getter</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:54}}</td><td>Starts a CP all-gather now; returns a function that waits for it.</td></tr>
+    <tr><td><code>V4AttentionBase.__init__</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:66}}</td><td>Sizes, flags (<code>is_sparse</code>, <code>has_packed_kv</code>, <code>use_swa</code>, fused path), RoPE table.</td></tr>
+    <tr><td><code>_permute_q_b_proj_for_fused</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:111}}</td><td>Reorders the q_b rows for the fused FlashMLA kernel.</td></tr>
+    <tr><td><code>_init_wv_o_proj</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:122}}</td><td>Converts Wv to <code>[G, ro, H/G·D]</code> with DeepGEMM scale layout; makes <code>out_proj</code>.</td></tr>
+    <tr><td><code>_q_b_norm_rope</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:158}}</td><td>Optional per-head norm and RoPE on the query.</td></tr>
+    <tr><td><code>_wv_and_o_proj</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:191}}</td><td>Inverse RoPE, FP8 cast, grouped Wv einsum, <code>out_proj</code>.</td></tr>
+    <tr><td><code>V4Attention.__init__</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:229}}</td><td>YOCO and sharing flags, projections, norms, sinks, compressor, indexer, Wv.</td></tr>
+    <tr><td><code>_init_q_projections</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:278}}</td><td>Merges Wq.A with Wkv.A, and Wq.B with the indexer's q_B.</td></tr>
+    <tr><td><code>_init_compressor_and_indexer</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:308}}</td><td>Makes <code>Compressor</code>, <code>MQA</code> and the merged projections of the BF16 hidden.</td></tr>
+    <tr><td><code>get_max_ag_bytes_per_token</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:375}}</td><td>Bytes per token for the CP all-gather buffer.</td></tr>
+    <tr><td><code>_project_q_and_swa</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:386}}</td><td>Returns <code>q_a</code> and <code>kv_swa</code>.</td></tr>
+    <tr><td><code>_prepare_swa_kv</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:402}}</td><td>Norm + RoPE + FP8 cast of the SWA vector; decode stores it at once.</td></tr>
+    <tr><td><code>_project_q_b</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:453}}</td><td>Query up-projection; splits off the indexer query.</td></tr>
+    <tr><td><code>_resolve_shared_hidden</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:465}}</td><td>YOCO: picks the hidden state that feeds the compressed KV.</td></tr>
+    <tr><td><code>_project_current_hidden_inputs</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:481}}</td><td>One GEMM for the compressor input and the indexer weights.</td></tr>
+    <tr><td><code>_store_main_kv</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:509}}</td><td>Calls the Compressor to store into <code>ca_cache</code>.</td></tr>
+    <tr><td><code>_compute_kv_ca_index</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:525}}</td><td>Stores the compressed KV and returns the compressed-key list (indexer, shared, or dense).</td></tr>
+    <tr><td><code>_prefill_attention</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:589}}</td><td>Joins the index lists; calls <code>prefill_attn_varlen_sparse</code>.</td></tr>
+    <tr><td><code>_decode_attention</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:628}}</td><td>Calls <code>decode_mla_mqa_sparse</code> with the two caches.</td></tr>
+    <tr><td><code>_store_yoco_full_kv</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:672}}</td><td>YOCO compact prefill: writes main and index KV for the full context.</td></tr>
+    <tr><td><code>_prepare_prefill_kv</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:723}}</td><td>Allocates the prefill KV buffer, or reuses the one of the KV source.</td></tr>
+    <tr><td><code>V4Attention.forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:752}}</td><td>The whole layer.</td></tr>
+    <tr><td><code>DFlashAttention</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:883}}</td><td>Draft attention: <code>update_main_cache</code> (line 928), <code>forward_drafts</code> (line 963).</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>V4AttentionBase.__init__</code>: the flags</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="84-96" highlight="85-86,87-92,93-96" />
+<ol>
+  <li>Line 85: a layer is sparse when its config has <code>index_topk</code> above 0.</li>
+  <li>Line 86: <code>has_packed_kv</code>: the layer has compressed KV (ratio 1 or 2).</li>
+  <li>Lines 87-92: the fused FlashMLA path. The comment says it is "disabled in dense packed-KV decoding".</li>
+  <li>Lines 93-96: a layer needs the sliding window, or compressed KV, or both. A sparse layer needs the window.</li>
+</ol>
+
+<h3><code>_init_compressor_and_indexer</code>: who owns what</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="345-373" highlight="345-352,354-364,366-371" />
+<ol>
+  <li>Only a KV-source layer has a <code>Compressor</code> (line 346). In a YOCO consumer, its weights go into a separate projection of the shared hidden state (lines 349-350).</li>
+  <li>Only a layer with its own indexer has an <code>MQA</code> (line 355). Its <code>weights_proj</code> joins the projection of the current hidden state (line 364).</li>
+  <li>Lines 368-371: the joined projection gives fp32 output for C2 and bf16 for C1. The <code>Compressor</code> asserts these dtypes ({{cite deepinfer/model_executor/models/v4_modules/compress.py:89-95}}).</li>
+</ol>
+
+<h3><code>forward</code>, part 1: inputs and projections</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="760-810" highlight="764-765,768,774,780,785,787-790,792-797,799,802-809" />
+<ol>
+  <li>Lines 764-765: <code>compute_attn_info</code> expands compact index fields of the metadata into the index lists that the kernels need. It does nothing when they exist already.</li>
+  <li>Line 768: one GEMM for the compressor input and the indexer weights.</li>
+  <li>Lines 769-780: YOCO paths: in compact prefill, the full-context KV is written first (line 774); else a YOCO KV source projects the shared hidden state (line 780).</li>
+  <li>Line 785: with CP, the all-gather of the compressor input starts now and overlaps with the Q projection.</li>
+  <li>Lines 787-799: Q, the SWA vector, its FP8 store or cast, and the query up-projection.</li>
+  <li>Lines 802-809: store the compressed KV and get the compressed-key list (next method).</li>
+</ol>
+
+<h3><code>_compute_kv_ca_index</code>: three sources of the key list</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="553-587" highlight="558-567,568-570,580,583-584,585-586" />
+<ol>
+  <li>Lines 553-567: the layer has its own indexer: call <code>MQA</code>, which returns <code>[T, index_topk]</code>.</li>
+  <li>Lines 568-578: a sparse layer that shares the indexer of an earlier layer reuses <code>cross_layer_runtime.topk_indices</code>.</li>
+  <li>Line 580: a dense compressed layer reads all its compressed keys: <code>input_metadata.kv_ca_index[ratio]</code>.</li>
+  <li>Lines 583-584: without a local indexer, the compressed KV is stored late, to overlap with the CP all-gather. With an indexer it was stored earlier (line 546), because the indexer needs <code>pre_rope_kv</code>.</li>
+</ol>
+
+<h3><code>forward</code>, part 2: the prefill buffer</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="812-857" highlight="813-818,825-830,834-842,847-855" />
+<ol>
+  <li>Lines 814-818: the buffer sizes. <code>total_k_swa</code> = number of sequences × window ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:272-273}}).</li>
+  <li>Lines 825-830: copy the current SWA vectors into the middle part (with CP: gather them into it).</li>
+  <li>Lines 834-842: load the compressed KV from <code>ca_cache</code> as BF16 into the last part. A share-KV consumer skips the load and reuses the buffer of its source.</li>
+  <li>Lines 847-855: load the SWA history into the first part, then store the new SWA vectors. The comment explains the order: the store slots can overlap the loaded range.</li>
+</ol>
+
+<h3><code>forward</code>, part 3: kernel and output</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="859-880" />
+<p><code>_prefill_attention</code> joins the SWA index and the compressed-key list with <code>kv_index_cat</code> and calls <code>prefill_attn_varlen_sparse</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:603-625}}). <code>_decode_attention</code> passes <code>swa_cache</code> and <code>ca_cache</code> with their index lists to <code>decode_mla_mqa_sparse</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:640-669}}). The page {{link concepts/mla-attention}} reads these calls in detail.</p>
+
+<h3><code>DFlashAttention.forward_drafts</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="969-1008" highlight="970,975-991,994-1007" />
+<p>The draft attention has no compressed KV and no indexer. It writes the draft keys into its own <code>swa_cache</code> slots. The comment says they "live for one decode step and are overwritten by the next step" (line 975). Then it calls the decode kernel with <code>dflash_kv_index</code> and the scheduler metadata key <code>"DFlash"</code>. See {{link code/dflash}}.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<p>Symbols as on {{link concepts/mla-attention}}: <code>T</code> tokens, <code>H</code> heads, <code>D</code> = 512, <code>R</code> RoPE size, <code>rq</code> q LoRA rank, <code>G</code> groups, <code>ro</code> o LoRA rank.</p>
+<table>
+  <thead><tr><th>Object</th><th>Type and shape</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td><code>hidden_states</code> (input)</td><td><code>Movable</code> of bf16 or (FP8, scales) <code>[T, hidden]</code></td><td>754</td></tr>
+    <tr><td><code>hidden_states_bf16</code></td><td><code>Movable</code> of bf16 <code>[T, hidden]</code></td><td>757</td></tr>
+    <tr><td><code>projected_kv</code></td><td>C2 fp32 <code>[T, 2D]</code>; C1 bf16 <code>[T, D]</code></td><td>503</td></tr>
+    <tr><td><code>index_weights</code></td><td>bf16 <code>[T, nh]</code></td><td>504-506</td></tr>
+    <tr><td><code>q_a</code>, <code>kv_swa</code></td><td><code>[T, rq]</code>, <code>[T, D]</code></td><td>399</td></tr>
+    <tr><td><code>kv_swa</code> (prefill, after transform)</td><td>bf16 <code>[T, 1, D]</code> (FP8 round trip)</td><td>449</td></tr>
+    <tr><td><code>q_b</code></td><td>bf16 <code>[T, H, D]</code></td><td>462-463</td></tr>
+    <tr><td><code>kv_ca_index</code></td><td>int32 <code>[T, topk]</code> (sparse) or <code>[T, pad128(max_model_len / ratio)]</code> (dense)</td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:362}}</td></tr>
+    <tr><td><code>kv</code> (prefill)</td><td>bf16 <code>[total_kv, 1, D]</code></td><td>736</td></tr>
+    <tr><td><code>kv_index</code> (prefill)</td><td>int32 <code>[T, window + topk]</code></td><td>607</td></tr>
+    <tr><td><code>context</code></td><td>bf16 <code>[T, H, D]</code> or (FP8, scales)</td><td>617, 660</td></tr>
+    <tr><td>return</td><td>bf16 <code>[T, hidden]</code></td><td>880</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the size of the prefill buffer">
+<p>A prefill step with two sequences in a C2 layer. The window is 128 (the value in the deployment notes, {{cite doc/inference_deployment_qa.md:191}}; the code reads it from the config).</p>
+<ul>
+  <li>Sequence A: a new prompt of 1,000 tokens.</li>
+  <li>Sequence B: a later chunk of 300 tokens, after 2,048 cached tokens.</li>
+</ul>
+<ol>
+  <li><code>total_k_swa_cached</code> = 2 × 128 = 256 rows. A has no history, so its rows are zeros (<code>src_block_id = −1</code> zero-fills, {{cite deepinfer/model_executor/input_metadata/input_metadata.py:268-271}}).</li>
+  <li><code>total_k_swa_cur</code> = 1,000 + 300 = 1,300 rows.</li>
+  <li><code>total_k_compressed["2"]</code> ≈ 1,000 / 2 + 2,348 / 2 = 500 + 1,174 = 1,674 rows. The new entries are stored before the load, so the load includes them. The real value can be a little larger: it includes padding ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:278-279}}).</li>
+  <li><code>total_kv</code> ≈ 256 + 1,300 + 1,674 = 3,230 rows. In BF16: 3,230 × 512 × 2 B ≈ 3.3 MB.</li>
+</ol>
+<p>A query of B reads its row of <code>kv_index</code>: 128 window positions, then up to <code>topk</code> positions in the compressed part. <code>kv_index_cat</code> adds <code>total_k_swa_cached + total_k_swa_cur</code> = 1,556 to each compressed index ({{cite deepinfer/model_executor/layers/tilelang_ops/kv_index_cat.py:24}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Values in the cross-layer runtime that this file reads or writes">
+<table>
+  <thead><tr><th>Field</th><th>Written by</th><th>Read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>shared_hidden</code></td><td>the first YOCO consumer layer (in <code>decoder_layer.py</code>)</td><td><code>forward</code> line 763, <code>_resolve_shared_hidden</code></td></tr>
+    <tr><td><code>pre_rope_kv</code></td><td>KV source with a local indexer, line 548</td><td>index-K source that is not a KV source, line 550</td></tr>
+    <tr><td><code>topk_indices</code></td><td>index source, line 586</td><td>index consumers, line 569</td></tr>
+    <tr><td><code>loaded_prefill_kv</code></td><td>KV source, lines 840-842</td><td>share-KV consumers, <code>_prepare_prefill_kv</code> lines 747-750</td></tr>
+    <tr><td><code>consumer_full_metadata</code>, <code>consumer_full_hidden</code></td><td><code>deepseek.py</code> and <code>decoder_layer.py</code> at the YOCO boundary</td><td><code>_store_yoco_full_kv</code>, line 769</td></tr>
+  </tbody>
+</table>
+<p>The runtime class is documented in {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:276-308}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Context parallelism in this file">
+<ul>
+  <li>CP is used only in prefill: <code>use_cp = is_prompt and CP size &gt; 1</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:766}}).</li>
+  <li>Each rank projects its own tokens. The compressor input and the SWA vectors are all-gathered through <code>userbuffer.cp</code>, so each rank has the full sequence for the cache store ({{cite deepinfer/model_executor/models/v4_modules/attn.py:785}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:450}}).</li>
+  <li><code>gather(..., mirror_cp_reverse_index)</code> puts the gathered rows back in sequence order ({{cite deepinfer/model_executor/models/v4_modules/attn.py:828}}).</li>
+  <li>Decode asserts that CP is off (line 422).</li>
+  <li><code>get_max_ag_bytes_per_token</code> sizes the shared buffer: 512 × 4 B for the SWA vector, plus the projected KV width (2 B per value for C1, 4 B for C2), plus the indexer's estimate ({{cite deepinfer/model_executor/models/v4_modules/attn.py:375-384}}).</li>
+</ul>
+<p>See {{link concepts/context-parallelism}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: asserts in this file">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>kv_lora_norm_out_scale</code> or <code>v_scaling_factor</code> is not 1</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:80-81}}</td></tr>
+    <tr><td>Layer without SWA and without compressed KV; sparse layer without SWA</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:94-96}}</td></tr>
+    <tr><td>Layer window differs from the model window</td><td><code>AssertionError</code> with the layer id</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:243}}</td></tr>
+    <tr><td>Shared KV/index source without a kproj indexer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:323-324}}</td></tr>
+    <tr><td>Index consumer runs before its source wrote <code>topk_indices</code></td><td><code>AssertionError</code> "index-source topk indices not stored"</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:569-570}}</td></tr>
+    <tr><td>Index-K source without <code>pre_rope_kv</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:550-551}}</td></tr>
+    <tr><td>YOCO compaction: top-k rows do not match the compact layout</td><td><code>AssertionError</code> with both counts</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:571-578}}</td></tr>
+    <tr><td>Share-KV consumer: buffer shape or offset differs from the source</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:747-749}}</td></tr>
+    <tr><td>CP in decode</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:422}}</td></tr>
+  </tbody>
+</table>
+<p>No method in this file logs and continues. Every check is an assert: a check in a constructor stops the start-up, and a check in the forward stops the step.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and engine settings">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_BATCH_INVARIANT</code></td><td>off ({{cite deepinfer/environ.py:197}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:89}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:666}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:1002}}</td><td>Goes to the decode kernel; also keeps a PROMPT engine off the fused path in dense layers.</td></tr>
+    <tr><td><code>cfg.engine_type</code></td><td>NORMAL ({{cite deepinfer/engine/arg_utils.py:41}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:89}}</td><td>A PROMPT engine can use the fused path in dense packed-KV layers.</td></tr>
+    <tr><td><code>cfg.yoco_swa_share_hidden</code></td><td><code>False</code> from the HF loader ({{cite deepinfer/hugging_face/config.py:47}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:249}}</td><td><code>True</code> would project consumer SWA KV from the shared hidden and turn off the Q/SWA merge.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/mla-attention}}: the idea and the kernels, step by step.</li>
+  <li>{{link concepts/sparse-attention-indexer}}: where <code>kv_ca_index</code> comes from.</li>
+  <li>{{link concepts/sliding-window-attention}} and {{link concepts/kv-compression}}: the two KV kinds.</li>
+  <li>{{link concepts/cross-layer-kv-sharing}} and {{link concepts/yoco-swa-replay}}: the shared and YOCO paths.</li>
+  <li>{{link concepts/speculative-decoding}}: the draft attention.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which two FlashMLA wrappers does <code>V4Attention</code> call, and when?
+    <x-a><p><code>prefill_attn_varlen_sparse</code> in prefill and <code>decode_mla_mqa_sparse</code> in decode ({{cite deepinfer/model_executor/models/v4_modules/attn.py:859-877}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A sparse layer shares the indexer of an earlier layer. Which code path gives it its key list?
+    <x-a><p><code>has_local_index</code> is false and <code>is_sparse</code> is true, so <code>_compute_kv_ca_index</code> takes <code>cross_layer_runtime.topk_indices</code>, written by the index source ({{cite deepinfer/model_executor/models/v4_modules/attn.py:568-570}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:585-586}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In prefill, why does the code store the new SWA vectors only after it loads the SWA history?
+    <x-a><p>The store slots of the ring can overlap the range that the load reads. A store first would overwrite history that the prefill still needs ({{cite deepinfer/model_executor/models/v4_modules/attn.py:854-855}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Two sequences in a C2 prefill: 1,000 new tokens, and 300 new tokens after 2,048 cached ones. Window 128. About how many rows does the buffer <code>kv</code> have, and what offset does <code>kv_index_cat</code> add to a compressed index?
+    <x-a><p>256 SWA history rows + 1,300 current rows + about 1,674 compressed rows ≈ 3,230. The offset is 256 + 1,300 = 1,556 ({{cite deepinfer/model_executor/models/v4_modules/attn.py:814-818}}, {{cite deepinfer/model_executor/layers/tilelang_ops/kv_index_cat.py:24}}). This is the deep dive "Worked example: the size of the prefill buffer".</p></x-a>
+  </x-q>
+</x-quiz>

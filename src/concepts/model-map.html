@@ -1,0 +1,234 @@
+---
+title: Model map: DeepSeek-V4.1-Flash in DeepInfer
+nav_title: Model map
+level: Intermediate
+prerequisites: learn/transformer, learn/attention, learn/moe
+related: concepts/mla-attention, concepts/sparse-attention-indexer, concepts/sliding-window-attention, concepts/kv-compression, concepts/cross-layer-kv-sharing, concepts/yoco-swa-replay, concepts/mhc-residual, concepts/moe-routing, concepts/mega-moe, concepts/engram, concepts/vision-encoder, code/deepseek, code/decoder-layer, tours/decoder-layer
+summary: The hub page of the model. DeepInfer runs DeepSeek-V4.1-Flash as an embedding, N decoder layers (mHC, attention, mHC, MoE) and a final norm. This page shows the layer kinds, the optional parts and the file that holds each part.
+---
+<x-sentence>DeepInfer runs one model, DeepSeek-V4.1-Flash: an embedding, N decoder layers of attention and MoE with mHC mixing, and a final norm.</x-sentence>
+
+<h2>The idea</h2>
+<p>DeepSeek-V4.1-Flash is a {{term llm}} with the usual transformer plan (see {{link learn/transformer}}). The {{term embedding}} turns each token id into a {{term hidden-state}}. Then N {{term decoder-layer | decoder layers}} change the hidden states one after the other. A final norm ends the forward. The {{term lm-head}} turns the last hidden state into {{term logits}}. In DeepInfer the sampler applies the lm head, not the forward.</p>
+<p>Each decoder layer has two sub-layers:</p>
+<ol>
+  <li><strong>Attention.</strong> The token looks at earlier tokens. V4.1 uses {{link concepts/mla-attention | MLA attention}}: one 512-value vector per token is both key and value. A layer can read keys from two sources. The first source is a {{link concepts/sliding-window-attention | sliding window}} of recent tokens. The second source is {{link concepts/kv-compression | compressed keys}}: one per token or per 2 tokens. In sparse layers, an {{link concepts/sparse-attention-indexer | indexer}} selects only some of the compressed keys.</li>
+  <li><strong>MoE.</strong> A {{term moe}} block sends each token to a few experts. See {{link concepts/moe-routing}} and {{link concepts/mega-moe}}.</li>
+</ol>
+<p>Between the sub-layers, V4.1 does not use a plain residual sum. It keeps <code>hc_mult</code> parallel copies of the residual stream and mixes them before and after each sub-layer. This is {{link concepts/mhc-residual | mHC}}.</p>
+<p>Some features change the plan:</p>
+<ul>
+  <li><strong>Layer kinds.</strong> The config gives each layer a {{term compress-ratio}}: 0 (sliding window only), 1 (C1) or 2 (C2).</li>
+  <li><strong>{{link concepts/yoco-swa-replay | YOCO}}.</strong> The layers from the first C1 layer to the end are "consumer" layers. Their compressed KV comes from one shared hidden state. When YOCO prefill truncation is on (default off), a long prefill computes only the last tokens in these layers.</li>
+  <li><strong>{{link concepts/cross-layer-kv-sharing | Cross-layer sharing}}.</strong> A layer can reuse the compressed KV, the index keys or the top-k list of an earlier layer.</li>
+  <li><strong>Optional parts.</strong> A DFlash draft head for {{link concepts/speculative-decoding | speculative decoding}}, {{link concepts/engram | Engram}} n-gram memory in some layers, and the {{link concepts/vision-encoder | vision encoder}} for images.</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of an assembly line with N stations. Each product (a token) passes every station in the same order. Each station has two machines: one compares the product with earlier products (attention), one sends it to a few specialists (MoE). The comparison stops here: in a real line, products do not look at each other. Also, here the product travels with several copies of itself (mHC), and a station can borrow a machine setting from an earlier station (sharing).</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5a_model_map_a" alt="Panel 1: one forward from top to bottom: input ids (and images in a VL prefill), the embedding, decoder layers 0 to N-1 with a [T, hc, hidden] trunk between them, the final mHC mix and output norm that give hidden states [T, hidden], and the separate sampler call that applies the lm head. Side notes: Engram hashes once before the loop, DFlash target layers write features that update_main_cache uses after the loop, and context parallelism gathers before and after. Panel 2: the module list: embedding, producer layers 0 to n_prefill_layer-1, YOCO consumer layers n_prefill_layer to N-1, the lm head, and the DFlash layers; three boxes describe the layer kinds: ratio 0 SWA only, ratio 1 C1, ratio 2 C2 with fp32 state." caption="Figure: the whole model. Follow the left column of panel 1 from top to bottom. The right column shows parts that only some configs have. Click to zoom." />
+<p>Panel 1 is one call of <code>DeepseekModel.forward</code>, the same for prefill and decode. Panel 2 shows the order in which <code>V41Builder</code> builds the modules, and the three layer kinds. The sizes (N, hidden, hc) come from the checkpoint's config.json and are not in the repo.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: from config.json to the layer list</h3>
+<p>The model loader reads the Hugging Face <code>config.json</code>. <code>load_hf_model_config</code> checks the architecture and the number formats, then builds the inference config <code>gpt</code> ({{cite deepinfer/hugging_face/config.py:237-311}}). The per-layer list comes from the config key <code>compress_ratios</code>:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="146-161" highlight="152-154,161" />
+<ol>
+  <li>Line 152: ratio 0 gives a sliding-window spec; ratio 1 or 2 gives a compressed spec with an indexer config.</li>
+  <li>Line 153: the lm head takes one entry, with no attention.</li>
+  <li>Line 154: one spec for each DFlash layer.</li>
+  <li>Line 161: <code>n_prefill_layer</code> is the index of the first ratio-1 layer. It is the first YOCO consumer layer (deep dive "YOCO producer and consumer layers").</li>
+</ol>
+<p><code>V41Builder</code> then makes the parameter containers in this order: the embedding, the N blocks, the main head, and the DFlash heads ({{cite deepinfer/model_executor/models/v4_modules/builder.py:105-125}}).</p>
+
+<h3>Step 2: three model classes</h3>
+<p>The only registered architecture is <code>DeepseekV41ForCausalLM</code>. It maps to <code>DeepseekVLForCausalLM</code> ({{cite deepinfer/model_executor/models/__init__.py:15-17}}). The classes nest like this:</p>
+<ul>
+  <li><code>DeepseekVLForCausalLM</code> (<code>deepseek_vl.py</code>) adds the vision path. In every prefill (also text-only) it computes the input embeddings itself, adds image features when the batch has images, and passes them on ({{cite deepinfer/model_executor/models/deepseek_vl.py:226-234}}).</li>
+  <li><code>DeepseekForCausalLM</code> (<code>deepseek.py</code>) holds the inner model, the lm head, the sampler, the DFlash module and the expert load balancer ({{cite deepinfer/model_executor/models/deepseek.py:251-321}}).</li>
+  <li><code>DeepseekModel</code> (<code>deepseek.py</code>) holds the embedding, the N layers and the final norm ({{cite deepinfer/model_executor/models/deepseek.py:59-116}}), and runs the forward ({{cite deepinfer/model_executor/models/deepseek.py:154-248}}).</li>
+</ul>
+
+<h3>Step 3: the forward loop</h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="161-166" />
+<p>Without input hidden states, the forward starts with the embedding. One <code>CrossLayerRuntime</code> object goes through all layers. A source layer writes shared values into it, and later layers read them ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:276-308}}). Then the loop runs the layers:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="190-218" highlight="191-207,210-218">
+<x-tr line="193">YOCO truncation: the metadata layout switches from full to compact; the hidden states switch inside the first YOCO consumer layer.</x-tr>
+<x-tr line="194">Rule: what must be computed to the end (compact) becomes input_metadata; the full metadata goes to the full-source path through the cross-layer runtime.</x-tr>
+<x-tr line="195">NOTE: when the metadata switches to compact, the hidden states passed in are still the original ones.</x-tr>
+<x-tr line="200-202">All DFlash target layers are on the consumer side: dflash_input switches to the compact row count together with the hidden states (cp_mirror_len under CP, else total_q), so that the rows of dflash_input_store match the consumer layer's hidden states.</x-tr>
+</x-code>
+<p>Lines 191-207 run only in a prefill with YOCO truncation, at the first consumer layer. Lines 210-218 call one layer with its own slice of the KV cache, <code>kv_caches[i]</code>. Each layer returns the new hidden states and the residual data for mHC.</p>
+
+<h3>Step 4: one decoder layer</h3>
+<x-diagram name="b5a_model_map_b" alt="Panel 1: five boxes: (1) mHC post of the previous sub-layer plus pre mix and attention norm, (2) V4Attention with SWA KV, compressed KV and indexer, (3) mHC post and pre plus FFN norm, (4) DeepseekMoE, (5) return of hidden and lazy residual; an Engram hook feeds into step 1 for some layers. Panel 2: the four file roles of v4_modules: parameter containers, runtime adapters, tensor operators, topology and assembly, with the file names of each." caption="Figure: one decoder layer (panel 1) and the file roles of v4_modules (panel 2). Look at the arrow from step 4 to step 5: the post mix of the MoE runs in the next layer." />
+<p><code>DeepseekDecoderLayer.forward</code> is short. Without the timers and the YOCO boundary, it is four calls:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="143-175" highlight="143,155-161,162,169-173" />
+<ol>
+  <li>Line 143: <code>attn_norm_forward</code> finishes the mHC post mix of the previous sub-layer, mixes the copies into one attention input, and normalizes it. It returns FP8 values and a BF16 copy.</li>
+  <li>Lines 155-161: <code>V4Attention</code> ({{link concepts/mla-attention}}).</li>
+  <li>Line 162: <code>ffn_norm_forward</code> does the same mHC work around the MoE input.</li>
+  <li>Lines 169-173: <code>DeepseekMoE</code> ({{link concepts/moe-routing}}).</li>
+</ol>
+<p>The page {{link code/decoder-layer}} reads the file line by line, and the tour {{link tours/decoder-layer}} follows one token through it.</p>
+
+<h3>Step 5: the end of the forward</h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="225-239" highlight="227,230,238-239" />
+<p>The last layer leaves the residual stream as <code>hc_mult</code> copies. Line 227 does the last mHC post mix. With <code>hc_shifted</code> (the HF default is <code>True</code>, {{cite deepinfer/hugging_face/config.py:295}}), line 230 mixes the copies into one. Without it, the <code>HCHead</code> does this (line 238). Line 239 is the final {{term rmsnorm}}. The forward returns these hidden states. The sampler applies <code>lm_head.weight</code> later, only to the rows that it samples ({{cite deepinfer/model_executor/models/deepseek.py:391-400}}).</p>
+
+<h3>Step 6: where each piece lives</h3>
+<p>The file <code>v4_modules/__init__.py</code> sorts the model files into four roles: parameter containers, runtime adapters, tensor operators, and topology ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:6-20}}). This table maps each part of the model to its concept page and its files:</p>
+<table>
+  <thead><tr><th>Part</th><th>Concept page</th><th>Container (weights)</th><th>Runtime (forward)</th></tr></thead>
+  <tbody>
+    <tr><td>Whole model, forward loop</td><td>this page</td><td><code>containers.py</code>, <code>builder.py</code></td><td>{{link code/deepseek | deepseek.py}}</td></tr>
+    <tr><td>One layer</td><td>this page</td><td><code>hc_blocks.py</code></td><td>{{link code/decoder-layer | decoder_layer.py}}</td></tr>
+    <tr><td>MLA attention</td><td>{{link concepts/mla-attention}}</td><td>{{link code/v4-mla-attn | mla_attn.py}}</td><td>{{link code/v4-attn | attn.py}}</td></tr>
+    <tr><td>Sparse indexer</td><td>{{link concepts/sparse-attention-indexer}}</td><td><code>mla_attn.py</code> (<code>MQAIndexer</code>)</td><td>{{link code/v4-index-attn | index_attn.py}}</td></tr>
+    <tr><td>Sliding window</td><td>{{link concepts/sliding-window-attention}}</td><td><code>mla_attn.py</code> (<code>Wkv</code>)</td><td><code>attn.py</code></td></tr>
+    <tr><td>KV compression</td><td>{{link concepts/kv-compression}}</td><td><code>mla_attn.py</code> (<code>PackedWkv</code>)</td><td>{{link code/v4-compress | compress.py}}</td></tr>
+    <tr><td>Cross-layer sharing</td><td>{{link concepts/cross-layer-kv-sharing}}</td><td>-</td><td>{{link code/v4-cross-layer | cross_layer.py}}</td></tr>
+    <tr><td>YOCO</td><td>{{link concepts/yoco-swa-replay}}</td><td>-</td><td><code>yoco.py</code>, <code>deepseek.py</code></td></tr>
+    <tr><td>mHC</td><td>{{link concepts/mhc-residual}}</td><td><code>hc_blocks.py</code></td><td>{{link code/v4-hc | hc.py}}, <code>mhc_ops.py</code></td></tr>
+    <tr><td>MoE</td><td>{{link concepts/moe-routing}}, {{link concepts/mega-moe}}</td><td><code>moe.py</code></td><td>{{link code/v4-mlp | mlp.py}}</td></tr>
+    <tr><td>Engram</td><td>{{link concepts/engram}}</td><td><code>engram_parameters.py</code></td><td>{{link code/v4-engram | engram.py}}</td></tr>
+    <tr><td>DFlash draft head</td><td>{{link concepts/speculative-decoding}}, {{link concepts/dspark}}</td><td><code>heads.py</code></td><td>{{link code/dflash | mtp/dflash.py}}</td></tr>
+    <tr><td>Vision (VL)</td><td>{{link concepts/vision-encoder}}</td><td><code>vision_encoder/</code></td><td>{{link code/deepseek-vl | deepseek_vl.py}}, {{link code/vit | vit.py}}</td></tr>
+  </tbody>
+</table>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="What the repo fixes, and what comes from config.json">
+<p>The repo has no <code>config.json</code>. The default checkpoint is <code>deepseek-ai/DeepSeek-V4.1-Flash-1017</code> on Hugging Face ({{cite README.md:67-68}}). So the shape of the model is not in the repo. This table lists what the code reads, and what the code fixes.</p>
+<table>
+  <thead><tr><th>Value</th><th>HF key (text_config)</th><th>In the repo?</th><th>Read at</th></tr></thead>
+  <tbody>
+    <tr><td>Number of layers N</td><td><code>num_hidden_layers</code></td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:266}}</td></tr>
+    <tr><td>Hidden size, query heads</td><td><code>hidden_size</code>, <code>num_attention_heads</code></td><td>No. FlashMLA takes 64 or 128 heads without padding ({{cite deepinfer/model_executor/layers/attention_backend.py:5}})</td><td>{{cite deepinfer/hugging_face/config.py:274-275}}</td></tr>
+    <tr><td>KV heads</td><td><code>num_key_value_heads</code></td><td>Yes: must be 1</td><td>{{cite deepinfer/hugging_face/config.py:55}}</td></tr>
+    <tr><td>Latent size <code>head_dim</code></td><td><code>head_dim</code></td><td>Yes in effect: the cache format needs 512</td><td>{{cite deepinfer/worker/cache_engine.py:53-54}}</td></tr>
+    <tr><td>RoPE size</td><td><code>qk_rope_head_dim</code></td><td>64 when indexer layers exist (assert)</td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:121}}</td></tr>
+    <tr><td>Low-rank sizes</td><td><code>q_lora_rank</code>, <code>o_lora_rank</code>, <code>o_groups</code></td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:286-293}}</td></tr>
+    <tr><td>Window</td><td><code>sliding_window</code></td><td>No. The notes say 128 ({{cite doc/inference_deployment_qa.md:191}})</td><td>{{cite deepinfer/hugging_face/config.py:284}}</td></tr>
+    <tr><td>Layer kinds</td><td><code>compress_ratios</code></td><td>No. Only 0, 1, 2 are allowed</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:51-53}}</td></tr>
+    <tr><td>Indexer</td><td><code>index_topk</code>, <code>index_n_heads</code>, <code>index_head_dim</code></td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:120-125}}</td></tr>
+    <tr><td>mHC copies</td><td><code>hc_mult</code></td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:294}}</td></tr>
+    <tr><td>Experts</td><td><code>n_routed_experts</code>, <code>num_experts_per_tok</code>, <code>n_shared_experts</code></td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:164-174}}</td></tr>
+    <tr><td>Vocabulary</td><td><code>vocab_size</code></td><td>No. 129280 is only inferred: the first multimodal token id is 129280 ({{cite deepinfer/hugging_face/tokenizer.py:26}})</td><td>{{cite deepinfer/hugging_face/config.py:276}}</td></tr>
+    <tr><td>Draft layers</td><td><code>num_nextn_predict_layers</code></td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:267}}</td></tr>
+    <tr><td>Sharing maps</td><td><code>kv_source_layer_ids</code>, <code>index_source_layer_ids</code>, …</td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:68-85}}</td></tr>
+    <tr><td>Engram layers</td><td><code>engram_layer_ids</code></td><td>No</td><td>{{cite deepinfer/hugging_face/config.py:197-199}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Numbers in the docs.</strong> The deployment notes say "For V4.1, the stored layers are the first 20" (SWA layers that go to the store) ({{cite doc/inference_deployment_qa.md:163}}). They also describe "20 decoder layers" in the YOCO replay ({{cite doc/inference_deployment_qa.md:187}}). These numbers come from the docs, not from the code.</p>
+<p><strong>Defaults that the HF loader adds.</strong> Some fields have no HF key. <code>_GPT_DEFAULTS</code> gives them ({{cite deepinfer/hugging_face/config.py:20-48}}). Important ones: <code>hc_enabled=True</code>, <code>use_qnorm=False</code>, <code>yoco_swa_share_hidden=False</code>, <code>use_ape=False</code>. Other defaults come from <code>text.get</code>: <code>hc_shifted</code> is <code>True</code> and <code>use_fp4_sparse_kv</code> is <code>True</code> unless the config says otherwise ({{cite deepinfer/hugging_face/config.py:295}}, {{cite deepinfer/hugging_face/config.py:303}}).</p>
+</x-deepdive>
+
+<x-deepdive title="DeepseekModel.forward, line by line">
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="154-188" highlight="161-162,166,168-170,173-174,180-188" />
+<ol>
+  <li><strong>Lines 161-162.</strong> The text path embeds the ids. The VL class passes its own hidden states in every prefill, also a text-only one ({{cite deepinfer/model_executor/models/deepseek_vl.py:232-233}}). So with the VL class, these lines run only in decode.</li>
+  <li><strong>Line 166.</strong> One <code>CrossLayerRuntime</code> per forward. Translated comment: "Runtime values held across layers (shared_hidden / pre_rope_kv / topk): pass the same reference layer by layer; each layer writes in place."</li>
+  <li><strong>Lines 168-170.</strong> Prefill with context parallelism: reorder the tokens into the mirror-CP layout (see {{link concepts/context-parallelism}}).</li>
+  <li><strong>Lines 173-174.</strong> DFlash on: allocate <code>dflash_input [T, hidden × number of target layers]</code>. The assert says the target layer list and the MTP head type must match.</li>
+  <li><strong>Lines 180-188.</strong> Engram on: hash the n-grams of the batch once; <code>fetch</code> returns one hook per Engram layer.</li>
+</ol>
+<p>Then the loop (lines 190-218, Step 3 above), and the end:</p>
+<ol start="6">
+  <li><strong>Lines 220-223.</strong> DFlash writes its main cache from <code>dflash_input</code>. Translated comment: "the target-layer features are consumed only here; in decode this is captured in the main model's CUDA graph."</li>
+  <li><strong>Lines 225-239.</strong> Final mHC mix and <code>output_norm</code> (Step 5 above).</li>
+  <li><strong>Lines 241-244.</strong> Prefill with CP: all-gather the hidden states and put them back in the original token order.</li>
+  <li><strong>Line 246.</strong> Return <code>CausalLMForwardOutput(hidden_states=...)</code>.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Shapes through the model">
+<table>
+  <thead><tr><th>Where</th><th>Tensor</th><th>dtype and shape</th></tr></thead>
+  <tbody>
+    <tr><td>Input</td><td><code>input_metadata.input_ids</code></td><td>int32 <code>[T]</code></td></tr>
+    <tr><td>After the embedding</td><td><code>hidden_states</code></td><td>bf16 <code>[T, hidden]</code> ({{cite deepinfer/model_executor/models/deepseek.py:144-148}}, {{cite deepinfer/model_executor/models/deepseek.py:161-162}})</td></tr>
+    <tr><td>Between layers</td><td>layer output, plus <code>residual</code> (<code>HCLazyPostData</code>)</td><td><code>[T, hidden]</code>; <code>residual.residual</code> is <code>[1, T, hc_mult, hidden]</code> ({{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:21-25}})</td></tr>
+    <tr><td>Attention input</td><td>normed hidden</td><td>(FP8, scales) and bf16 <code>[T, hidden]</code></td></tr>
+    <tr><td>After the last post mix</td><td><code>hidden_states</code></td><td><code>[T, hc_mult, hidden]</code> ({{cite deepinfer/model_executor/models/deepseek.py:226-228}})</td></tr>
+    <tr><td>After the final mix and norm</td><td><code>hidden_states</code></td><td>bf16 <code>[T, hidden]</code> ({{cite deepinfer/model_executor/models/v4_modules/mhc_ops.py:40-45}})</td></tr>
+    <tr><td>Sampler</td><td>logits</td><td>fp32, only the sampled rows</td></tr>
+  </tbody>
+</table>
+<p>Here <code>T</code> is the number of tokens in the step. In decode, with the default 5 drafts, each sequence gives 6 tokens, so 32 sequences give <code>T = 192</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Layer kinds and their caches">
+<table>
+  <thead><tr><th>Kind</th><th>From the HF loader</th><th>Attention reads</th><th>KV cache per layer</th></tr></thead>
+  <tbody>
+    <tr><td>Ratio 0: SWA only</td><td><code>_win_spec</code>: <code>sparse_stage=0</code>, no packed heads ({{cite deepinfer/hugging_face/config.py:99-108}})</td><td>the window</td><td><code>swa_cache</code> ring only</td></tr>
+    <tr><td>Ratio 1: C1</td><td><code>_compress_spec</code>: <code>n_packed_heads</code>, <code>kv_compress_ratio=1</code>, indexer config ({{cite deepinfer/hugging_face/config.py:111-133}})</td><td>window + top-k of the per-token entries</td><td><code>swa_cache</code> + <code>ca_cache</code> (128 entries per block) + <code>ica_cache</code></td></tr>
+    <tr><td>Ratio 2: C2</td><td>same, <code>kv_compress_ratio=2</code></td><td>window + top-k of the per-2-token entries</td><td><code>swa_cache</code> + <code>ca_cache</code> (64 entries per block) + <code>ica_cache</code> + fp32 <code>ca_state</code></td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>Every layer has the sliding window: <code>use_swa</code> has no HF key, and the code default is <code>True</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:93}}).</li>
+  <li>The HF loader gives all compressed layers the same <code>index_topk</code>. If it is above 0, all compressed layers are sparse. The code also supports dense compressed layers (<code>index_topk</code> = 0): they read all compressed keys ({{cite deepinfer/model_executor/model_metadata_utils.py:29-34}}).</li>
+  <li><code>ca_state</code> exists only for ratios above 1 ({{cite deepinfer/worker/cache_engine.py:119-120}}). <code>ica_state</code> exists only for indexers without <code>use_kproj</code> ({{cite deepinfer/worker/cache_engine.py:123-127}}). The HF loader always sets <code>use_kproj=True</code> ({{cite deepinfer/hugging_face/config.py:122}}), so <code>ica_state</code> stays <code>None</code>.</li>
+</ul>
+<p>The byte sizes are on {{link learn/kv-cache}} (deep dive "Memory per token").</p>
+</x-deepdive>
+
+<x-deepdive title="YOCO producer and consumer layers">
+<p>YOCO splits the main layers into two halves:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/yoco.py" lines="14-21" />
+<p>The HF loader sets <code>n_prefill_layer</code> to the index of the first layer with ratio 1 ({{cite deepinfer/hugging_face/config.py:158-161}}). By line 21, that layer is the <em>first consumer</em>. <code>V4Attention</code> agrees: <code>is_first_yoco_consumer_layer</code> is true when <code>layer_idx == n_prefill_layer</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:247}}).</p>
+<x-warning title="The docstring and the code do not agree">
+<p>The docstring of <code>_n_prefill_layer</code> says: "it and everything before it form the prefill side, the layers after it are yoco consumer layers" ({{cite deepinfer/hugging_face/config.py:159}}). The code treats that layer as a consumer. This site describes the code.</p>
+</x-warning>
+<p><strong>What changes in a consumer layer.</strong> In a KV-source consumer layer, the compressed KV is projected from the shared hidden state, not from the layer's own hidden state ({{cite deepinfer/model_executor/models/v4_modules/attn.py:345-352}}). The shared hidden state is the attention-norm output of the first consumer layer ({{cite deepinfer/model_executor/models/decoder_layer.py:146-152}}). The deployment notes describe the same design: "the decoder layers' block KV cache is projected from the last encoder layer's hidden state" ({{cite doc/inference_deployment_qa.md:187}}).</p>
+<p>With <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code> set to <code>mask</code> or <code>compact</code> (default <code>off</code>, {{cite deepinfer/environ.py:188}}), a prefill keeps only the last <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code> query tokens in the consumer layers. The README uses 140 ({{cite README.md:25}}). The page {{link concepts/yoco-swa-replay}} explains this.</p>
+</x-deepdive>
+
+<x-deepdive title="Cross-layer sharing maps, with a worked example">
+<p>The config lists the source layers. <code>_source_map</code> maps every layer from the first source onward to the nearest source at or before it:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="62-65" />
+<p><strong>Worked example.</strong> <code>kv_source_layer_ids = [2, 5]</code> and N = 8 give <code>{2: 2, 3: 2, 4: 2, 5: 5, 6: 5, 7: 5}</code>. Layers 0 and 1 are not in the map, so they use their own KV. Layers 3 and 4 reuse the compressed KV of layer 2; the cache engine gives them the same <code>ca_cache</code> view ({{cite deepinfer/worker/cache_engine.py:448-449}}).</p>
+<p><code>SharedLayerTopology</code> checks the maps at start-up: segments must be contiguous, index-topk segments must lie inside index-K segments, and those inside KV segments ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:36-47}}). Share-KV must not cross the YOCO boundary ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:114-116}}). The page {{link concepts/cross-layer-kv-sharing}} explains the maps.</p>
+</x-deepdive>
+
+<x-deepdive title="The optional parts: DFlash, Engram, VL">
+<p><strong>DFlash draft head.</strong> <code>DeepseekForCausalLM</code> builds <code>DFlash</code> when <code>DEEPINFER_USE_NEXTN_DECODE</code> is not 0 (default 5) ({{cite deepinfer/model_executor/models/deepseek.py:276}}, {{cite deepinfer/model_executor/models/deepseek.py:300-306}}). The DFlash layers come after the lm head in the module list ({{cite deepinfer/model_executor/models/mtp/dflash.py:92-95}}). In the main forward, the layers in <code>dspark_target_layer_ids</code> write a feature row into <code>dflash_input</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:144-145}}). After the loop, <code>update_main_cache</code> turns these features into the DFlash KV. The sampler then runs the drafts. See {{link concepts/speculative-decoding}}.</p>
+<p><strong>Engram.</strong> The layers in <code>engram_layer_ids</code> get an <code>Engram</code> module ({{cite deepinfer/model_executor/models/decoder_layer.py:80-83}}). It works as a hook inside the attention norm step: after the mHC post mix, it changes the residual stream ({{cite deepinfer/model_executor/models/decoder_layer.py:111-118}}). Engram tables can live in CPU memory: <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> moves them to the device, and it is always on with <code>DEEPINFER_ACCELERATOR=ascend</code> ({{cite deepinfer/environ.py:147}}, {{cite deepinfer/model_executor/models/deepseek.py:473-477}}). See {{link concepts/engram}}.</p>
+<p><strong>Vision.</strong> In a prefill with images, <code>get_input_embeddings</code> embeds the ids and lets the vision-language tuner put image features into the image-token rows ({{cite deepinfer/model_executor/models/deepseek_vl.py:194-224}}). Decode never runs the vision encoder. See {{link concepts/vision-encoder}}.</p>
+<p><strong>EPLB.</strong> The constructor puts the MoE layers of the main model and of DFlash into groups with the same weight layout. It makes one expert load balancer per group ({{cite deepinfer/model_executor/models/deepseek.py:310-317}}, {{cite deepinfer/model_executor/models/deepseek.py:331-364}}). See {{link concepts/eplb}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Wrong checkpoint.</strong> The loader accepts one architecture name, <code>model_type == "deepseek_v41"</code>, BF16 parameters, FP8 weights with 32 × 32 blocks and FP4 experts. Anything else raises <code>ValueError</code> ({{cite deepinfer/hugging_face/config.py:241-262}}).</li>
+  <li><strong>No vision config.</strong> Only multimodal HF models are supported; the loader asserts <code>vl_aligner</code> ({{cite deepinfer/model_config_loader.py:21-22}}).</li>
+  <li><strong>Unsupported ratio.</strong> A compress ratio other than 0, 1 or 2 raises <code>ValueError</code> ({{cite deepinfer/model_executor/model_metadata_utils.py:52-53}}).</li>
+  <li><strong>No C1 layer.</strong> <code>_n_prefill_layer</code> uses <code>next(...)</code> with no default, so a config without a ratio-1 layer raises <code>StopIteration</code> ({{cite deepinfer/hugging_face/config.py:160-161}}).</li>
+  <li><strong>Bad sharing maps.</strong> <code>SharedLayerTopology</code> asserts at start-up. A consumer layer without <code>layer_info_shared_cfg</code> fails on purpose: without the check, it would silently read a cache that nobody writes ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:106-112}}).</li>
+  <li><strong>YOCO truncation on a model without consumers.</strong> With the mode not <code>off</code>, <code>ModelMetadata</code> asserts that YOCO is on and that the keep-token count is above 0 ({{cite deepinfer/model_executor/model_metadata_utils.py:90-92}}).</li>
+  <li><strong>DFlash and the drafts disagree.</strong> The forward asserts that a DFlash module exists exactly when target layers are set ({{cite deepinfer/model_executor/models/deepseek.py:173}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The model map tells you which page to read for a question. A question about memory leads to the layer kinds and the caches. A question about speed in long prompts leads to the indexer and YOCO. A question about a wrong output leads to the config checks above.</p>
+
+<x-quiz>
+  <x-q level="easy">Which two sub-layers does each decoder layer run, and in which order?
+    <x-a><p>Attention (<code>V4Attention</code>), then MoE (<code>DeepseekMoE</code>). mHC mixing and a norm come before each one ({{cite deepinfer/model_executor/models/decoder_layer.py:143-173}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Does <code>DeepseekForCausalLM.forward</code> return logits?
+    <x-a><p>No. It returns hidden states in <code>CausalLMForwardOutput</code> ({{cite deepinfer/model_executor/models/deepseek.py:246-248}}). The sampler applies <code>lm_head.weight</code> in <code>sample()</code> ({{cite deepinfer/model_executor/models/deepseek.py:392-400}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The config has <code>compress_ratios = [0, 0, 2, 2, 1, 2, 1, 2]</code> for 8 main layers (no draft layers). What is <code>n_prefill_layer</code>, and which layers are YOCO consumers?
+    <x-a><p>The first ratio-1 layer is layer 4, so <code>n_prefill_layer = 4</code> ({{cite deepinfer/hugging_face/config.py:158-161}}). Consumers are layers 4 to 7: <code>n_prefill_layer ≤ i &lt; N</code> ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:19-21}}). Layer 4 itself is the first consumer, although the docstring says otherwise.</p></x-a>
+  </x-q>
+  <x-q level="medium">Which file allocates the attention weights, and which file runs the attention? Why are they separate?
+    <x-a><p><code>mla_attn.py</code> allocates them (a parameter container); <code>attn.py</code> runs the forward (a runtime adapter). Containers keep the Hugging Face names, shapes and dtypes for loading; runtime files convert them to the layout that the kernels need ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:6-15}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>kv_source_layer_ids = [1, 4]</code> and N = 6, which layers have their own compressed KV cache? Which layers write to the cache of layer 1?
+    <x-a><p><code>_source_map</code> gives <code>{1: 1, 2: 1, 3: 1, 4: 4, 5: 4}</code> ({{cite deepinfer/hugging_face/config.py:62-65}}). Layer 0 is not in the map, so it is its own source. Own caches: layers 1 and 4, and also layer 0 if layer 0 is a compressed layer (a ratio-0 layer has no compressed cache). Layers 2 and 3 get the <code>ca_cache</code> view of layer 1 ({{cite deepinfer/worker/cache_engine.py:448-449}}), but only the source layer 1 writes it: a consumer has no <code>PackedWkv</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:252-269}}). This is in the deep dive "Cross-layer sharing maps".</p></x-a>
+  </x-q>
+</x-quiz>

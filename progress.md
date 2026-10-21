@@ -21,10 +21,10 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B3b API + cache | running | — | — |
 | B4a Inputs + graphs | running | — | — |
 | B4b Worker + ZOS | running | — | — |
-| B5a Attention I | done | running | — |
+| B5a Attention I | done | done (43 defects fixed) | yes |
 | B5b Attention II | running | — | — |
 | B6a Layer + mHC | running | — | — |
-| B6b Engram + VL | wave 2 | — | — |
+| B6b Engram + VL | running | — | — |
 | B7 MoE + EP | done | running | — |
 | B8 Scale | wave 3 | — | — |
 | B9 Decoding | done | running | — |

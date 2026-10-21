@@ -1,0 +1,194 @@
+---
+title: v4_modules/mla_attn.py: the attention weight containers
+nav_title: v4_modules/mla_attn.py
+level: Advanced
+prerequisites: concepts/mla-attention
+related: concepts/mla-attention, concepts/sparse-attention-indexer, concepts/kv-compression, concepts/weight-loading, code/v4-attn, code/v4-index-attn, code/v4-compress
+summary: mla_attn.py allocates the weights of one attention layer with their Hugging Face names and shapes: the low-rank Q and KV projections, the compressor, the indexer, the grouped output projection and the attention sinks. It has no forward.
+---
+<h2>Purpose</h2>
+<p><code>mla_attn.py</code> allocates all weights of one attention layer, with the names, shapes and dtypes that the Hugging Face checkpoint uses. It runs nothing: <code>attn.py</code>, <code>compress.py</code> and <code>index_attn.py</code> own the forward.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/v4_modules/mla_attn.py</code>, 299 lines. Role 1 "parameter container" ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:6-9}}).</td></tr>
+    <tr><th>Main class</th><td><code>LoraRopeCompressFlashMHAAutoRecomp</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:156}}). Also <code>ColumnParallelLora</code> (line 26), <code>SoftmaxAPEGatedColumnParallelLora</code> (line 63), <code>MQAIndexer</code> (line 100) and the function <code>runtime_attn_sink</code> (line 295).</td></tr>
+    <tr><th>Runs in</th><td>Start-up only. The builder makes the containers on the <code>meta</code> device; <code>load_model</code> then gives them memory and fills them.</td></tr>
+    <tr><th>Called by</th><td><code>MoeDecoderBlockHC</code> (one container per layer), and the runtime classes that read the containers.</td></tr>
+    <tr><th>Calls</th><td>Only other containers: <code>ReplicatedLinear</code>, <code>DropoutAddRMSNorm</code>, <code>build_rotary_emb</code>.</td></tr>
+    <tr><th>Not in this file</th><td>Any forward, any kernel, any runtime layout. The weight conversion (merging, FP8 scale layout) is in <code>attn.py</code>.</td></tr>
+  </tbody>
+</table>
+<p>The module docstring lists the four classes and says that <code>cross_layer.py</code> decides which layers hold <code>PackedWkv</code> and <code>index_attn</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:1-12}}).</p>
+
+<h2>Where it sits</h2>
+<h3>Who calls it</h3>
+<ul>
+  <li><code>MoeDecoderBlockHC.__init__</code> makes one <code>LoraRopeCompressFlashMHAAutoRecomp</code> per block, with the per-layer config and the two "source" flags ({{cite deepinfer/model_executor/models/v4_modules/hc_blocks.py:100-104}}).</li>
+  <li><code>V41Builder._build_block</code> computes the flags from the shared topology. It merges the layer's attention config over the global config first ({{cite deepinfer/model_executor/models/v4_modules/builder.py:45-74}}).</li>
+  <li>The runtime reads the containers: <code>V4Attention</code> and <code>DFlashAttention</code> assert the type ({{cite deepinfer/model_executor/models/v4_modules/attn.py:236}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:894}}); <code>Compressor</code> reads <code>SoftmaxAPEGatedColumnParallelLora</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:71}}); <code>MQA</code> reads <code>MQAIndexer</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:71}}).</li>
+  <li>The HF loader maps checkpoint names onto these attribute names ({{cite deepinfer/hugging_face/names.py:43-57}}).</li>
+</ul>
+<h3>What it calls</h3>
+<ul>
+  <li><code>ReplicatedLinear</code>: a plain <code>nn.Linear</code> with a <code>use_fp8_gemm</code> flag ({{cite deepinfer/model_executor/models/v4_modules/linear.py:8-20}}). So each weight has shape <code>[out_features, in_features]</code>.</li>
+  <li><code>DropoutAddRMSNorm</code>: an RMSNorm container with no forward ({{cite deepinfer/model_executor/models/v4_modules/norm.py:13-34}}).</li>
+  <li><code>build_rotary_emb</code>: a RoPE container with no parameters, "base" or "yarn" ({{cite deepinfer/model_executor/models/v4_modules/rope.py:42-53}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it holds</th></tr></thead>
+  <tbody>
+    <tr><td><code>ColumnParallelLora</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:26}}</td><td><code>A</code> (to rank + RoPE heads × RoPE size), optional <code>norm</code>, optional <code>B</code>. Used for <code>Wq</code> and <code>Wkv</code>.</td></tr>
+    <tr><td><code>SoftmaxAPEGatedColumnParallelLora</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:63}}</td><td>The compressor: <code>A</code> (values), <code>Gate</code> (scores, only for ratio ≠ 1), <code>norm</code>. BF16 GEMMs.</td></tr>
+    <tr><td><code>MQAIndexer</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:100}}</td><td>The indexer: <code>q_B</code>, <code>weights_proj</code>, <code>k_proj</code>, <code>k_norm</code>, RoPE; settings and asserts.</td></tr>
+    <tr><td><code>LoraRopeCompressFlashMHAAutoRecomp</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:156}}</td><td>All weights of one layer, and the layer settings.</td></tr>
+    <tr><td><code>runtime_attn_sink</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:295}}</td><td>Gives the fp32 sink tensor to the runtime without a copy.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>ColumnParallelLora</code>: the low-rank projection</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="26-60" highlight="44-49,50-59" />
+<ol>
+  <li>Lines 44-49: <code>A</code> maps <code>in_features</code> to <code>rank + num_lora_rope_head × rope_head_dim</code>. For <code>Wkv</code> this is <code>kv_lora_rank + 1 × qk_rope_head_dim</code> = 512.</li>
+  <li>Lines 50-59: <code>B</code> exists only when <code>out_features &gt; 0</code>. <code>Wkv</code> passes 0, so it has no <code>B</code>.</li>
+</ol>
+
+<h3><code>MQAIndexer</code>: the indexer weights and its rules</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="103-153" highlight="111,115,119-123,125-130,131-136,137-142" />
+<ol>
+  <li>Line 111: <code>topk_tokens = cfg.index_topk</code>.</li>
+  <li>Lines 119-123: asserts. RoPE on, no q norm, RoPE size 64, <code>sparse_stage == 2</code>, flat <code>k_proj</code> only.</li>
+  <li>Lines 125-130: <code>q_B</code> reads the query latent (<code>q_lora_rank</code>) and makes <code>n_head × head_dim</code> values. FP8 GEMM.</li>
+  <li>Lines 131-136: <code>weights_proj</code> reads the hidden state and makes one weight per index head. BF16.</li>
+  <li>Lines 137-142: <code>k_proj</code> reads the 512-value compressed vector and makes <code>head_dim</code> values. BF16.</li>
+  <li>Line 148: the indexer RoPE uses <code>compress_rope_theta</code>.</li>
+</ol>
+
+<h3><code>LoraRopeCompressFlashMHAAutoRecomp.__init__</code>, part 1: Q, KV and output</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="170-197" highlight="170-171,175-176,189-190,192-196" />
+<ol>
+  <li>Lines 170-171: compression overlap and APE raise <code>ValueError</code>.</li>
+  <li>Lines 175-176: one KV head, always.</li>
+  <li>Lines 189-190: YOCO is on when <code>n_prefill_layer &lt; num_hidden_layers</code>.</li>
+  <li>Lines 192-196: a q LoRA rank, interleaved RoPE, no q norm weight, no attention bias, FP8 attention.</li>
+</ol>
+<p>Then the weights (lines 198-246): <code>Wq</code> (low-rank, FP8, with an RMSNorm over <code>q_lora_rank</code>), an optional weightless <code>q_norm</code>, the grouped output <code>Wv</code>, and <code>Wkv</code>.</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="221-229" highlight="227-229" />
+<p><code>Wv</code> is one matrix <code>[o_groups × o_lora_rank, (kv_lora_rank + R) × heads_per_group]</code>. Line 229 stores its group layout as <code>einsum_info</code>. The runtime uses it as <code>[G, ro, heads_per_group × 512]</code> in <code>fp8_einsum</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:124}}).</p>
+
+<h3><code>__init__</code>, part 2: compressor, indexer, sinks</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="248-292" highlight="250,252-269,271-273,277,283,287-292" />
+<ol>
+  <li>Line 250: <code>sparse_stage</code> is 0 (SWA-only layer) or 2 (compressed layer).</li>
+  <li>Lines 252-269: only a layer with packed heads has a compressor slot. Only a KV-source layer fills it; other layers keep <code>None</code> and use the source's cache.</li>
+  <li>Lines 271-273: only an index-source layer with <code>sparse_stage == 2</code> and an <code>attn_index</code> config gets an <code>MQAIndexer</code>.</li>
+  <li>Line 277: compressed layers use <code>compress_rope_theta</code>; SWA-only layers use <code>rope_theta</code>.</li>
+  <li>Line 283: <code>v_scaling_factor = 1</code>; the runtime asserts it.</li>
+  <li>Lines 287-292: one fp32 sink value per head.</li>
+</ol>
+
+<h3><code>runtime_attn_sink</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="295-299" />
+<p>The runtime shares the same storage as the container. It does not copy or rescale the values, and it asserts fp32.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Every parameter: HF name, container name, shape">
+<p>Symbols: <code>hidden</code>, <code>H</code> heads, <code>D</code> = <code>head_dim</code> = 512, <code>rq</code> = <code>q_lora_rank</code>, <code>G</code> = <code>o_groups</code>, <code>ro</code> = <code>o_lora_rank</code>, <code>nh</code>, <code>dh</code> = indexer heads and head size. Shapes are <code>[out, in]</code> as in <code>nn.Linear</code>.</p>
+<table>
+  <thead><tr><th>HF suffix ({{cite deepinfer/hugging_face/names.py:43-57}})</th><th>Container attribute</th><th>Shape</th><th>GEMM</th></tr></thead>
+  <tbody>
+    <tr><td><code>attn.wq_a.weight</code></td><td><code>Wq.A.weight</code></td><td><code>[rq, hidden]</code></td><td>FP8</td></tr>
+    <tr><td><code>attn.q_norm.weight</code></td><td><code>Wq.norm.weight</code></td><td><code>[rq]</code></td><td>-</td></tr>
+    <tr><td><code>attn.wq_b.weight</code></td><td><code>Wq.B.weight</code></td><td><code>[H·D, rq]</code></td><td>FP8</td></tr>
+    <tr><td><code>attn.wkv.weight</code></td><td><code>Wkv.A.weight</code></td><td><code>[D, hidden]</code></td><td>FP8</td></tr>
+    <tr><td><code>attn.kv_norm.weight</code></td><td><code>Wkv.norm.weight</code></td><td><code>[D]</code></td><td>-</td></tr>
+    <tr><td><code>attn.wo_a.weight</code></td><td><code>Wv.weight</code></td><td><code>[G·ro, D·H/G]</code></td><td>FP8 (einsum)</td></tr>
+    <tr><td><code>attn.wo_b.weight</code></td><td><code>out_proj.weight</code></td><td><code>[hidden, G·ro]</code></td><td>FP8</td></tr>
+    <tr><td><code>attn.compressor.wkv.weight</code></td><td><code>PackedWkv.A.weight</code></td><td><code>[D, hidden]</code></td><td>BF16</td></tr>
+    <tr><td><code>attn.compressor.wgate.weight</code></td><td><code>PackedWkv.Gate.weight</code> (ratio ≠ 1)</td><td><code>[D, hidden]</code></td><td>BF16</td></tr>
+    <tr><td><code>attn.compressor.norm.weight</code></td><td><code>PackedWkv.norm.weight</code></td><td><code>[D]</code></td><td>-</td></tr>
+    <tr><td><code>attn.indexer.wq_b.weight</code></td><td><code>index_attn.q_B.weight</code></td><td><code>[nh·dh, rq]</code></td><td>FP8</td></tr>
+    <tr><td><code>attn.indexer.weights_proj.weight</code></td><td><code>index_attn.weights_proj.weight</code></td><td><code>[nh, hidden]</code></td><td>BF16</td></tr>
+    <tr><td><code>attn.indexer.wk.weight</code></td><td><code>index_attn.k_proj.weight</code></td><td><code>[dh, D]</code></td><td>BF16</td></tr>
+    <tr><td><code>attn.indexer.k_norm.weight</code></td><td><code>index_attn.k_norm.weight</code></td><td><code>[dh]</code></td><td>-</td></tr>
+    <tr><td><code>attn.attn_sink</code></td><td><code>attn_sink_params</code></td><td>fp32 <code>[H]</code></td><td>-</td></tr>
+  </tbody>
+</table>
+<p>The HF loader sets <code>use_knorm=True</code> for the indexer ({{cite deepinfer/hugging_face/config.py:123}}), so <code>k_norm</code> exists ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:114}}, {{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:143-147}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: which layers hold which modules">
+<p>Take a made-up layer list with ratios <code>[0, 2, 2, 1]</code>, <code>kv_source_layer_ids = [1, 3]</code> and <code>index_source_layer_ids = [1, 3]</code>. The HF loader gives the maps <code>{1: 1, 2: 1, 3: 3}</code> ({{cite deepinfer/hugging_face/config.py:62-65}}).</p>
+<table>
+  <thead><tr><th>Layer</th><th>Ratio</th><th><code>PackedWkv</code></th><th><code>index_attn</code></th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>0</td><td>no slot</td><td>no slot</td><td><code>n_packed_heads</code> = 0 (SWA-only spec)</td></tr>
+    <tr><td>1</td><td>2</td><td>yes</td><td>yes</td><td>KV source and index source</td></tr>
+    <tr><td>2</td><td>2</td><td><code>None</code></td><td><code>None</code></td><td>consumer of layer 1 for both</td></tr>
+    <tr><td>3</td><td>1</td><td>yes (no <code>Gate</code>)</td><td>yes</td><td>source; ratio 1 needs no gate</td></tr>
+  </tbody>
+</table>
+<p>Layer 3 is also the first ratio-1 layer, so it is the first YOCO consumer (see {{link concepts/model-map}}). The builder shares <code>k_proj</code> and <code>k_norm</code> modules between index-K source and consumer layers ({{cite deepinfer/model_executor/models/v4_modules/builder.py:76-91}}).</p>
+<x-simplified><p>The layer list is an example. The real <code>compress_ratios</code> and source lists are in config.json.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Settings that the container passes to the runtime">
+<table>
+  <thead><tr><th>Attribute</th><th>Value</th><th>Read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>sink_mode</code></td><td>always <code>"swa"</code> (line 183)</td><td><code>V4Attention</code> asserts it ({{cite deepinfer/model_executor/models/v4_modules/attn.py:270}})</td></tr>
+    <tr><td><code>kv_compress_ratio</code>, <code>sparse_stage</code></td><td>from the layer config</td><td><code>kv_compress_ratio</code>: <code>V4Attention</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:239}}). <code>sparse_stage</code>: only the container itself, to decide on the indexer (lines 250, 271)</td></tr>
+    <tr><td><code>window_size</code></td><td><code>(sliding_window, 0)</code></td><td><code>V4Attention</code> takes element 0 ({{cite deepinfer/model_executor/models/v4_modules/attn.py:242}})</td></tr>
+    <tr><td><code>n_packed_heads</code></td><td>0, or <code>num_attention_heads</code> for compressed layers ({{cite deepinfer/hugging_face/config.py:116}})</td><td><code>has_packed_kv</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:86}})</td></tr>
+    <tr><td><code>einsum_out_clamp_value</code></td><td>config, HF default <code>None</code></td><td><code>_init_wv_o_proj</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:150}})</td></tr>
+    <tr><td><code>Wv.weight.einsum_info</code></td><td><code>(G, ro, wv_in_features)</code></td><td>loading metadata; the container conventions keep it ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:33-37}})</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>compress_overlap</code> or <code>use_ape</code> in the config</td><td><code>ValueError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:170-171}}</td></tr>
+    <tr><td>More than one KV head</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:176}}</td></tr>
+    <tr><td>No q LoRA, RoPE not interleaved, q norm weight, attention bias, or <code>fp8_attn</code> off</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:192-196}}</td></tr>
+    <tr><td><code>o_groups</code> is 0 or does not divide the head count</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:222-223}}</td></tr>
+    <tr><td><code>sparse_stage</code> not 0 or 2</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:250}}</td></tr>
+    <tr><td>Indexer without <code>use_kproj</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:272}}</td></tr>
+    <tr><td>Indexer RoPE size not 64, <code>mlp_kproj</code>, q norm, no RoPE</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:119-123}}</td></tr>
+    <tr><td>Sink tensor not fp32</td><td><code>AssertionError</code> at runtime set-up</td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:298}}</td></tr>
+  </tbody>
+</table>
+<p>The file reads no environment variables.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/mla-attention}}: what these weights do in the forward.</li>
+  <li>{{link concepts/sparse-attention-indexer}}: the <code>MQAIndexer</code> weights in use.</li>
+  <li>{{link concepts/kv-compression}}: the compressor weights in use.</li>
+  <li>{{link concepts/cross-layer-kv-sharing}}: why some layers have <code>None</code> modules.</li>
+  <li>{{link concepts/weight-loading}}: how the HF tensors reach these containers.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Does <code>mla_attn.py</code> define a <code>forward</code> method?
+    <x-a><p>No. It is a parameter container: it only allocates weights ({{cite deepinfer/model_executor/models/v4_modules/__init__.py:6-9}}). <code>attn.py</code> owns the forward.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>Wkv</code> have no <code>B</code> matrix?
+    <x-a><p>It is built with <code>out_features = 0</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:232-235}}), and <code>B</code> exists only for <code>out_features &gt; 0</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:50-59}}). The 512-value output of <code>A</code> is the stored key and value; no up-projection is needed.</p></x-a>
+  </x-q>
+  <x-q level="medium">A C1 layer is a KV source. Which compressor weights does it have?
+    <x-a><p><code>PackedWkv.A</code> and <code>PackedWkv.norm</code>, but no <code>Gate</code>: the gate exists only when <code>kv_compress_ratio != 1</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:86-95}}). The docstring says why: the single-token softmax of C1 is always 1.</p></x-a>
+  </x-q>
+  <x-q level="hard">With 64 heads and <code>o_groups = 8</code>, what is the input size of one group in <code>Wv</code>?
+    <x-a><p><code>(kv_lora_rank + R) × (H / G)</code> = 512 × 8 = 4,096 values ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:227}}). The runtime views the weight as <code>[8, ro, 4096]</code>. (64 and 8 are example values.)</p></x-a>
+  </x-q>
+</x-quiz>

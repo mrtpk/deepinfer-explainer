@@ -1,0 +1,221 @@
+---
+title: MLA attention: one latent vector per token
+nav_title: MLA attention
+level: Advanced
+prerequisites: learn/attention, learn/kv-cache, concepts/model-map
+related: concepts/sparse-attention-indexer, concepts/sliding-window-attention, concepts/kv-compression, concepts/cross-layer-kv-sharing, concepts/low-precision-formats, code/v4-attn, code/v4-mla-attn, code/v4-compress
+summary: In DeepInfer's MLA, all query heads of a layer read one 512-value vector per token. This vector is the key and also the value, so the KV cache keeps one small entry per token.
+---
+<x-sentence>All query heads of an MLA layer read one 512-value vector per token. This vector is the key and also the value.</x-sentence>
+
+<h2>The idea</h2>
+<p>In standard {{term attention}}, each {{term attention-head | attention head}} makes its own key and its own value for every token. The {{term kv-cache}} must keep all of them: 2 × heads × head_dim numbers per token and layer. The page {{link learn/kv-cache}} shows how fast this grows.</p>
+<p>{{term mla}} (Multi-head Latent Attention) keeps less. The model first squeezes the hidden state of a token into one small {{term latent-kv | latent vector}}. The cache keeps only this vector. All query heads then read the same vector.</p>
+<p>DeepSeek-V4.1 in DeepInfer takes this idea to its simplest form:</p>
+<ul>
+  <li>The latent vector has 512 values. The cache code asserts this number ({{cite deepinfer/worker/cache_engine.py:53-54}}).</li>
+  <li>The 512 values are the key <em>and</em> the value for every head. So the layer is {{term mqa}}: many query heads, one key/value head ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:175-176}}).</li>
+  <li>Each query head also has 512 values, so a query and a key have the same size.</li>
+  <li>The last values of the vector carry the token position, with {{term rope}}. The first values carry no position.</li>
+  <li>The queries and the output use {{term low-rank-projection | low-rank projections}}: a matrix to a small size, then a matrix back to a large size.</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of a reading room with one summary card for each book. Many readers (the heads) come with their own questions (the queries). They all read the same card. The room keeps one card per book, not one card per reader. The comparison stops here. In DeepInfer, part of the card also records where the book stands on the shelf (RoPE). Also, the readers combine their notes in groups before they report.</p>
+<p>In DeepInfer, an attention layer can read the keys below. All of them are vectors of the same 512 values:</p>
+<ol>
+  <li>the {{term sliding-window-attention | sliding window}}: the most recent tokens, one vector each;</li>
+  <li>the compressed keys: one vector per token (C1) or per 2 tokens (C2), see {{link concepts/kv-compression}};</li>
+  <li>in sparse layers, only a selected subset of the compressed keys, see {{link concepts/sparse-attention-indexer}}.</li>
+</ol>
+
+<h2>The picture</h2>
+<x-diagram name="b5a_mla_flow" alt="Panel 1: the hidden state goes through one merged projection; the result splits into the query latent q_a and the sliding-window KV vector kv_swa of 512 values. The query path normalizes q_a and projects it to H heads of 512 values with RoPE on the last R values. The SWA path normalizes, applies RoPE, casts to FP8 and stores 528 bytes per token in swa_cache. The compressed path projects the BF16 hidden state, compresses 2 tokens into 1 entry in a C2 layer and stores it in ca_cache. Panel 2: prefill calls prefill_attn_varlen_sparse with one BF16 buffer of SWA history, current SWA KV and compressed KV; decode calls decode_mla_mqa_sparse with the two caches and two index lists. Panel 3: the output gets an inverse RoPE, then a grouped projection Wv to o_lora_rank per group, then out_proj back to the hidden size." caption="Figure: one MLA layer in DeepInfer. Look at the three rows of panel 1: Q, the sliding-window KV and the compressed KV all come from the same hidden state. Click to zoom." />
+<p>Read panel 1 row by row. Every key and value in the picture is a 512-value vector with one head. Panel 2 shows that prefill and decode use different {{term flashmla}} kernels, but both get lists of key positions. Panel 3 shows the way back to the hidden size: the output of all heads goes through a grouped projection.</p>
+
+<h2>In the code</h2>
+<p>Two files hold MLA. The parameter container <code>mla_attn.py</code> allocates the weights. The runtime file <code>attn.py</code> owns the forward. The file roles are listed in {{cite deepinfer/model_executor/models/v4_modules/__init__.py:6-20}}.</p>
+
+<h3>Step 1: the weights of one layer</h3>
+<p>The container class is <code>LoraRopeCompressFlashMHAAutoRecomp</code>. The query projection <code>Wq</code> is low-rank: <code>A</code> maps the hidden state to <code>q_lora_rank</code> values, an {{term rmsnorm}} normalizes them, and <code>B</code> maps them to all heads.</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="198-211" highlight="199-201,210" caption="<code>Wq</code>: hidden_size → q_lora_rank → head_dim × num_attention_heads. Both GEMMs use FP8." />
+<p>The KV projection <code>Wkv</code> has only an <code>A</code> part (<code>out_features</code> is 0). Its output has <code>kv_lora_rank + qk_rope_head_dim</code> values for one head. That is the 512-value vector.</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="221-246" highlight="227-229,232-237" caption="<code>Wv</code> is the grouped output projection. <code>Wkv</code> makes the latent vector: no B matrix, one RoPE head." />
+<p>The HF loader sets <code>kv_lora_rank = head_dim − qk_rope_head_dim</code>. The comment says: "HF's shared KV vector includes RoPE; the internal rank excludes it" ({{cite deepinfer/hugging_face/config.py:287-289}}). So <code>head_dim</code> in the config is the full 512.</p>
+
+<h3>Step 2: the runtime merges projections</h3>
+<p><code>V4Attention</code> joins weights that read the same input into one matrix. Then one GEMM makes all the outputs. <code>Wq.A</code> and <code>Wkv.A</code> both read the hidden state, so they become one projection:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="278-304" highlight="281-288,294-304" caption="<code>q_a_kv_swa_proj</code> = [Wq.A ‖ Wkv.A]. <code>q_b_proj</code> = [Wq.B ‖ the indexer's q_B] when the layer has its own indexer." />
+<p>In a {{link concepts/yoco-swa-replay | YOCO}} consumer layer with <code>yoco_swa_share_hidden</code>, the two inputs differ, so the merge is off (line 280). The HF loader sets <code>yoco_swa_share_hidden</code> to <code>False</code> by default ({{cite deepinfer/hugging_face/config.py:47}}).</p>
+
+<h3>Step 3: the query and the sliding-window KV</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="386-400" highlight="394,399" />
+<p>The first <code>q_lora_rank</code> values are the query latent <code>q_a</code>. The next <code>qk_head_dim</code> (512) values are <code>kv_swa</code>, the KV vector of the current token for the sliding window. Then the query goes up to all heads:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="453-463" highlight="458,462-463" />
+<p><code>_q_b_norm_rope</code> applies RoPE to the last <code>qk_rope_head_dim</code> values of each head: the offset is <code>qk_head_dim − qk_rope_head_dim</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:161-171}}). The same function can also normalize each head, but the HF loader sets <code>use_qnorm</code> to <code>False</code> ({{cite deepinfer/hugging_face/config.py:44}}).</p>
+<p>The SWA vector goes through one fused kernel: RMSNorm, RoPE, cast to FP8 with one UE8M0 scale per 32 values. In decode the kernel writes the result straight into <code>swa_cache</code>. In prefill it returns a BF16 copy of the cast values (<code>cast_back=True</code>), so the attention sees the same numbers that the cache keeps ({{cite deepinfer/model_executor/models/v4_modules/attn.py:412-445}}).</p>
+
+<h3>Step 4: the compressed KV</h3>
+<p>A layer with a compress ratio of 1 or 2 also makes compressed keys. A second projection reads the BF16 hidden state. The <code>Compressor</code> turns its output into one 512-value entry per token (C1) or per 2 tokens (C2), and stores the entry in <code>ca_cache</code>:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="509-523" highlight="517-523" caption="The Compressor also returns the entry before RoPE (<code>return_pre_rope_kv</code>) when the layer has its own indexer." />
+<p>The page {{link concepts/kv-compression}} explains the compression. For MLA, only one fact matters: a compressed entry holds the same 512 values as a sliding-window entry. Only the number format can differ. The sliding-window cache is FP8. The compressed cache is FP4 by default (deep dive "FP8 flags and number formats"). So one kernel call can read both caches.</p>
+
+<h3>Step 5: the attention kernels</h3>
+<x-warning title="Head count: 64 or 128">
+<p>FlashMLA accepts only 64 or 128 query heads. DeepInfer pads other counts with zero heads, and a count above 128 raises <code>ValueError</code> ({{cite deepinfer/model_executor/layers/attention_backend.py:5}}, {{cite deepinfer/model_executor/layers/attention_backend.py:8-23}}).</p>
+</x-warning>
+<p>Prefill and decode call different wrappers in <code>layers/attention_backend.py</code>. Prefill builds one BF16 buffer with all keys that the step needs, and one index list per query:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="603-626" highlight="607,617-625" caption="The index of a query = [its sliding-window keys | its compressed keys]. <code>kv_index_cat</code> joins the two lists." />
+<p>Decode does not build a buffer. It passes the two caches and two index lists. The kernel reads the quantized entries (FP8 in <code>swa_cache</code>, FP4 or FP8 in <code>ca_cache</code>) from the caches:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="640-669" highlight="642-646,660-664" />
+<p>Both calls pass <code>attn_sink=self.attn_sink_params</code>: one {{term attention-sink}} value per head ({{cite deepinfer/model_executor/models/v4_modules/attn.py:269-271}}). Both use <code>softmax_scale = qk_head_dim ** -0.5</code> = 512<sup>−0.5</sup> ≈ 0.0442 ({{cite deepinfer/model_executor/models/v4_modules/attn.py:78}}).</p>
+
+<h3>Step 6: back to the hidden size</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="191-225" highlight="193,215-221,225" />
+<ol>
+  <li>Line 193: the output of each head is a weighted sum of 512-value vectors, so its last values still carry RoPE. The code applies RoPE again with <code>conjugate=True</code> at the query position.</li>
+  <li>Lines 194-202: the output is cast to FP8 (if the fused kernel did not do it already) and viewed as <code>[T, o_groups, heads_per_group × 512]</code>.</li>
+  <li>Lines 215-221: <code>deep_gemm.fp8_einsum("bhr,hdr->bhd", ...)</code> projects each group to <code>o_lora_rank</code> values.</li>
+  <li>Line 225: <code>out_proj</code> maps <code>o_groups × o_lora_rank</code> values back to the hidden size.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Shapes at each step, with the names in the code">
+<p>Symbols: <code>T</code> = tokens in the step (<code>total_q</code>), <code>H</code> = <code>num_attention_heads</code>, <code>D</code> = <code>qk_head_dim</code> = 512, <code>R</code> = <code>qk_rope_head_dim</code>, <code>rq</code> = <code>q_lora_rank</code>, <code>G</code> = <code>o_groups</code>, <code>ro</code> = <code>o_lora_rank</code>. The example layer is a sparse C2 layer with SWA and its own indexer.</p>
+<table>
+  <thead><tr><th>Name in the code</th><th>dtype and shape</th><th>Made at</th></tr></thead>
+  <tbody>
+    <tr><td><code>hidden_states</code></td><td>(FP8 e4m3, scales) <code>[T, hidden]</code>; the attention norm makes it because <code>fp8_attn</code> is on</td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:43}}</td></tr>
+    <tr><td><code>hidden_states_bf16</code></td><td>bf16 <code>[T, hidden]</code>, the same values</td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:143}}</td></tr>
+    <tr><td><code>q_a_kv_swa</code></td><td>bf16 <code>[T, rq + D]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:394}}</td></tr>
+    <tr><td><code>q_a</code>, <code>kv_swa</code></td><td><code>[T, rq]</code> and <code>[T, D]</code> (views of the split)</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:399}}</td></tr>
+    <tr><td><code>q_b</code> before the split</td><td>bf16 <code>[T, H·D + nh·dh]</code> (nh, dh: indexer heads and head size)</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:458-461}}</td></tr>
+    <tr><td><code>q_b</code> (main query)</td><td>bf16 <code>[T, H, D]</code>, RoPE on <code>[..., D−R:]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:462-463}}</td></tr>
+    <tr><td><code>projected_kv</code></td><td>C2: fp32 <code>[T, 2·D]</code> = [Gate ‖ A]; C1: bf16 <code>[T, D]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:366-371}}</td></tr>
+    <tr><td><code>pre_rope_kv</code></td><td>bf16 <code>[Tc, D]</code>. Prefill: Tc = compressed entries of the step. C2 decode: one row per query token, zero rows where no entry ends ({{cite deepinfer/model_executor/layers/tilelang_ops/compress.py:93-101}})</td><td>{{cite deepinfer/model_executor/models/v4_modules/compress.py:146}}, {{cite deepinfer/model_executor/models/v4_modules/compress.py:167}}</td></tr>
+    <tr><td><code>kv</code> (prefill only)</td><td>bf16 <code>[total_kv, 1, D]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:736}}</td></tr>
+    <tr><td><code>kv_index</code> (prefill)</td><td>int32 <code>[T, window + topk]</code>, row stride padded to a multiple of 4, −1 = masked</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/kv_index_cat.py:16-26}}</td></tr>
+    <tr><td><code>kv_swa_index</code>, <code>kv_ca_index</code> (decode)</td><td>int32 <code>[T, window]</code>, int32 <code>[T, topk]</code> (sparse layer): cache slots, −1 = invalid</td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:313-315}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:506-514}}</td></tr>
+    <tr><td><code>context</code></td><td>bf16 <code>[T, H, D]</code>, or (FP8, scales) from the fused kernel</td><td>{{cite deepinfer/model_executor/layers/attention_backend.py:46-48}}</td></tr>
+    <tr><td><code>wv</code></td><td><code>[T, G, ro]</code>, FP8 + scales or bf16</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:203-214}}</td></tr>
+    <tr><td>layer output</td><td>bf16 <code>[T, hidden]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:225}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Which sizes are fixed by the code.</strong></p>
+<ul>
+  <li><code>D = kv_lora_rank + R = 512</code>: the cache format asserts it ({{cite deepinfer/worker/cache_engine.py:46-56}}, {{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-118}}).</li>
+  <li><code>R = 64</code> in a model with indexer layers. The indexer asserts <code>rope_dim == 64</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:115}}, {{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:121}}), and the HF loader gives the indexer the same <code>qk_rope_head_dim</code> as the main attention ({{cite deepinfer/hugging_face/config.py:127}}). Then <code>kv_lora_rank = 512 − 64 = 448</code>.</li>
+  <li><code>H</code> is 64 or 128 for FlashMLA without padding ({{cite deepinfer/model_executor/layers/attention_backend.py:5}}).</li>
+  <li><code>H</code> must be a multiple of <code>G</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:222-223}}).</li>
+</ul>
+<p><code>H</code>, <code>rq</code>, <code>G</code>, <code>ro</code> and the window are config values. They are not in the repo.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: bytes per token, and one decode step">
+<p><strong>Cache bytes.</strong> One sliding-window entry is 512 FP8 values plus 16 UE8M0 scales = 528 B. A compressed entry is 528 B in MXFP8 or 288 B in FP4 ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-128}}). The HF loader turns FP4 on unless the config says otherwise (<code>use_fp4_sparse_kv</code>, default <code>True</code>, {{cite deepinfer/hugging_face/config.py:302-303}}).</p>
+<p>Compare a classic multi-head layer with the same query size: 64 heads, separate K and V of 512 values each, in BF16. One token needs 2 × 64 × 512 × 2 B = 131,072 B per layer. DeepInfer's SWA entry needs 528 B: about 248 times less.</p>
+<x-simplified><p>The comparison model is made up. It only shows the effect of "one KV head, one vector for K and V". The real head count of V4.1 is in config.json, not in the repo.</p></x-simplified>
+<p><strong>One decode step.</strong> 32 sequences, each with 1 new token and 5 draft tokens (the default <code>DEEPINFER_USE_NEXTN_DECODE = 5</code>), give <code>T = 192</code>.</p>
+<ol>
+  <li><code>_prepare_swa_kv</code> writes 192 SWA entries: 192 × 528 = 101,376 B for this layer ({{cite deepinfer/model_executor/models/v4_modules/attn.py:421-432}}).</li>
+  <li>A C2 layer writes about one compressed entry per 2 tokens of each sequence into <code>ca_cache</code>.</li>
+  <li><code>decode_mla_mqa_sparse</code> gets <code>q</code> bf16 <code>[192, H, 512]</code>, <code>kv_swa_index</code> int32 <code>[192, window]</code> and <code>kv_ca_index</code> int32 <code>[192, topk]</code>.</li>
+  <li>Each query reads at most <code>window + topk</code> entries, whatever the length of the sequence.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Why the output gets a second RoPE">
+<p>The value of a key is the same 512-value vector as the key. Its last <code>R</code> values were turned by RoPE at the <em>key</em> position j. The output of a head is a weighted sum of such vectors. Line 193 turns the last <code>R</code> output values back by the <em>query</em> position i (<code>conjugate=True</code>):</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="191-193" />
+<p>A rotation by j and a rotation by −i give a rotation by j − i. So the RoPE part of the output depends on the distance between the two tokens, not on the absolute position.</p>
+<x-simplified><p>The reason above is the general property of rotations. The repo does not state the design reason. When the fused kernel runs, this step happens inside FlashMLA: the name <code>fused_norm_rope_attn_rope_cast</code> lists "rope" two times, and line 192 skips the Python step.</p></x-simplified>
+<p>The decode wrapper passes <code>head_dim_v = qk_head_dim</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:662}}). So the value size is 512, the full vector.</p>
+</x-deepdive>
+
+<x-deepdive title="The kernels: wrappers, arguments, head padding, fused path">
+<p><code>layers/attention_backend.py</code> wraps four FlashMLA entry points: <code>flash_mla_sparse_fwd</code>, <code>flash_mla_with_kvcache</code> and <code>fused_norm_rope_attn_rope_cast.prefill</code> / <code>.decode</code> ({{cite deepinfer/model_executor/layers/attention_backend.py:1-3}}). This site does not explain their insides.</p>
+<x-code file="deepinfer/model_executor/layers/attention_backend.py" lines="123-146" highlight="124,128-129,133-134,137-139" caption="Decode without the fused kernel. <code>block_table</code> and <code>cache_seqlens</code> are <code>None</code>: the index lists already hold cache slots." />
+<ol>
+  <li>Line 124: the query gets a sequence axis of 1 and maybe zero heads (padding to 64 or 128).</li>
+  <li>Line 133: <code>causal=False</code>. Translated comment: "sparse attention supports only non-causal." The index lists already contain only the keys that a query may see.</li>
+  <li>Line 134: <code>is_fp8_kvcache=True</code>. Translated comment: "the V4.1 KV cache is paged FP8."</li>
+  <li>Lines 137-140: the <code>extra_*</code> arguments carry the second cache (<code>ca_cache</code>) and its index list.</li>
+  <li>Lines 143-145: the padded heads are cut off again.</li>
+</ol>
+<p><strong>The fused path.</strong> <code>use_fused_norm_rope_attn_rope_cast</code> is true when all three conditions are true ({{cite deepinfer/model_executor/models/v4_modules/attn.py:87-92}}):</p>
+<ol>
+  <li>The platform is GPU.</li>
+  <li>The layer has 64 or 128 query heads.</li>
+  <li>The layer is sparse, or it has no compressed KV, or the engine is a PROMPT engine without batch invariance.</li>
+</ol>
+<p>Then:</p>
+<ul>
+  <li>the q_b weight rows are permuted once at start-up ({{cite deepinfer/model_executor/models/v4_modules/attn.py:111-120}});</li>
+  <li>the query goes into the kernel before norm and RoPE (<code>_q_b_norm_rope</code> returns it unchanged, line 160);</li>
+  <li>the kernel returns <code>(fp8, scales)</code> with 32 values per scale, so <code>_wv_and_o_proj</code> skips its own cast ({{cite deepinfer/model_executor/models/v4_modules/attn.py:174-189}}).</li>
+</ul>
+<p><strong>Scheduler metadata.</strong> Decode passes <code>flash_mla_sched_meta_dict[self.sched_meta_key]</code>. The key is <code>"{ratio}_{has_packed_kv}_{use_swa}_{index_topk}"</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:241}}). Layers with the same key share one <code>FlashMLASchedMeta</code> object, made on first access ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:388-389}}).</p>
+<p><strong>Batch invariance.</strong> <code>DEEPINFER_BATCH_INVARIANT</code> (default off, {{cite deepinfer/environ.py:197}}) goes to the decode kernel as <code>batch_invariant</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:666}}). See {{link concepts/determinism}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Attention sinks">
+<p>The container makes one fp32 value per head, <code>attn_sink_params</code>, when <code>attn_sink_init_value</code> is set ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:285-292}}). The HF loader sets <code>attn_sink_init_value=0</code> for every layer kind ({{cite deepinfer/hugging_face/config.py:103}}, {{cite deepinfer/hugging_face/config.py:114}}), so every layer has sinks. The checkpoint gives the real values.</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="295-299" caption="The runtime takes the fp32 tensor as it is: no copy, no rescale." />
+<p>When the wrapper pads the heads, it pads the sinks with zeros too ({{cite deepinfer/model_executor/layers/attention_backend.py:21-22}}). The runtime also asserts <code>sink_mode == "swa"</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:270}}).</p>
+<x-simplified><p>The glossary meaning of a sink (one extra score per head with no value) is the usual meaning of the term. How FlashMLA uses the value is inside the vendor library and not shown here.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="FP8 flags and number formats in one layer">
+<table>
+  <thead><tr><th>Part</th><th>Format</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Attention input (after the norm)</td><td>FP8 + scales, plus a BF16 copy</td><td><code>fp8_attn</code> must be true ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:196}}); norm with <code>use_fp8</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:43}})</td></tr>
+    <tr><td><code>Wq.A</code>, <code>Wq.B</code>, <code>Wkv.A</code>, <code>Wv</code>, <code>out_proj</code></td><td>FP8 GEMM (<code>use_fp8_gemm=True</code>)</td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:210}}, {{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:228}}, {{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:245}}, {{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:282}}</td></tr>
+    <tr><td>Compressor <code>A</code> and <code>Gate</code></td><td>BF16 GEMM. Comment: they do not take part in FP8 quantization</td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:79-92}}</td></tr>
+    <tr><td>SWA cache</td><td>MXFP8: e4m3, 1 UE8M0 scale per 32 values, 528 B</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:413-419}}</td></tr>
+    <tr><td>Compressed cache</td><td>FP4 (e2m1, 1 e4m3 scale per 16) or MXFP8</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:37-39}}</td></tr>
+    <tr><td>Grouped Wv output</td><td>FP8 on GPU when the granularity is 32 and no clamp is set; else BF16</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:151}}</td></tr>
+  </tbody>
+</table>
+<p><code>get_fp8_casting_granularity()</code> always returns 32 ({{cite deepinfer/model_executor/layers/linear.py:13-14}}). <code>einsum_out_clamp_value</code> clamps the Wv output when the config sets it ({{cite deepinfer/model_executor/models/v4_modules/attn.py:222-223}}); the HF default is <code>None</code> ({{cite deepinfer/hugging_face/config.py:22}}). The page {{link concepts/low-precision-formats}} explains the formats.</p>
+</x-deepdive>
+
+<x-deepdive title="RoPE details: which table, which values">
+<ul>
+  <li>One rotary table per layer. Layers with compressed KV use <code>compress_rope_theta</code>; SWA-only layers use <code>rope_theta</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:275-280}}). So in a compressed layer the SWA keys use <code>compress_rope_theta</code> too.</li>
+  <li>Compressed layers use YaRN scaling when the config has <code>rope_scaling</code> ({{cite deepinfer/hugging_face/config.py:130-131}}).</li>
+  <li>The container asserts <code>rope_interleaved</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:193}}).</li>
+  <li>RoPE always acts on the <em>last</em> <code>R</code> values: <code>offset = qk_head_dim − qk_rope_head_dim</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:441}}).</li>
+  <li>Compressed entries use their own positions, <code>positions_c</code> ({{cite deepinfer/model_executor/models/v4_modules/compress.py:144}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<p>Most problems are config checks at start-up. They stop the load with an assert or an exception.</p>
+<ul>
+  <li><strong>More than one KV head.</strong> The HF loader raises <code>ValueError</code> unless <code>num_key_value_heads</code> is 1 ({{cite deepinfer/hugging_face/config.py:55-57}}). The container asserts it again ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:176}}).</li>
+  <li><strong>Wrong vector size.</strong> If <code>kv_lora_rank + qk_rope_head_dim</code> is not 512, the cache engine asserts ({{cite deepinfer/worker/cache_engine.py:53-54}}).</li>
+  <li><strong>Unsupported options.</strong> <code>compress_overlap</code> or <code>use_ape</code> raise <code>ValueError</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:170-171}}). The container also asserts a q LoRA rank, interleaved RoPE, no q-norm weight, no attention bias and FP8 attention (lines 192-196).</li>
+  <li><strong>Too many heads.</strong> More than 128 query heads raise <code>ValueError</code> in the kernel wrapper ({{cite deepinfer/model_executor/layers/attention_backend.py:15-16}}). Head counts below 128 that are not 64 work, but the padded heads cost compute and the fused kernel is off.</li>
+  <li><strong>Sink dtype.</strong> A checkpoint with non-fp32 sinks fails the assert in <code>runtime_attn_sink</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:298}}).</li>
+  <li><strong>Merge alignment.</strong> FP8 weights that are merged must have a row count that is a multiple of 128, except the last one ({{cite deepinfer/model_executor/models/v4_modules/utils.py:53-55}}). For <code>q_a_kv_swa_proj</code>, <code>q_lora_rank</code> must be a multiple of 128.</li>
+</ul>
+<p><strong>Why it matters.</strong> The KV cache decides how many sequences fit on a device. DeepInfer keeps one 512-value vector per token, in FP8 or FP4. That is hundreds of times less KV data than a classic layer of the same query size. The price is a fixed format: many sizes in the config are not free choices.</p>
+
+<x-quiz>
+  <x-q level="easy">How many KV heads does a DeepInfer attention layer have, and how many values does one cached key have?
+    <x-a><p>One KV head ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:176}}). One key is a 512-value vector: <code>kv_lora_rank + qk_rope_head_dim</code> ({{cite deepinfer/worker/cache_engine.py:53-54}}). The same vector is also the value.</p></x-a>
+  </x-q>
+  <x-q level="medium">Which two weight matrices does <code>q_a_kv_swa_proj</code> merge, and why can it merge them?
+    <x-a><p><code>Wq.A</code> and <code>Wkv.A</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:281-288}}). Both read the same input, the normalized hidden state, so one GEMM can make both outputs. The split at line 399 separates them. In a YOCO consumer layer with <code>yoco_swa_share_hidden</code>, the KV input is a different hidden state, so the merge is off.</p></x-a>
+  </x-q>
+  <x-q level="medium">In prefill, what are the three parts of the BF16 buffer <code>kv</code>, in order?
+    <x-a><p>The sliding-window history loaded from <code>swa_cache</code>, the SWA KV of the current tokens, and the compressed KV loaded from <code>ca_cache</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:813-857}}). Its shape is <code>[total_kv, 1, 512]</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">A config has <code>head_dim = 512</code> and <code>qk_rope_head_dim = 32</code>, and every compressed layer has an indexer. Where does the load stop?
+    <x-a><p>The HF loader gives the indexer the same <code>qk_rope_head_dim</code> ({{cite deepinfer/hugging_face/config.py:127}}). <code>MQAIndexer</code> asserts <code>rope_dim == 64</code> ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:121}}), so building the first indexer fails. The cache check would pass, because 480 + 32 = 512. This is in the deep dive "Shapes at each step".</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>_wv_and_o_proj</code> apply RoPE to the attention output, and when does it skip this step?
+    <x-a><p>The values are the keys, so the last <code>R</code> output values carry RoPE from the key positions. Line 193 turns them by the query position with <code>conjugate=True</code>, which leaves a rotation by the distance. It skips the step when the fused FlashMLA kernel runs, because the kernel does the second RoPE itself ({{cite deepinfer/model_executor/models/v4_modules/attn.py:192-193}}).</p></x-a>
+  </x-q>
+</x-quiz>

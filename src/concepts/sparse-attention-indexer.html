@@ -1,0 +1,201 @@
+---
+title: Sparse attention with an indexer
+nav_title: Sparse attention indexer
+level: Advanced
+prerequisites: learn/attention, concepts/mla-attention, concepts/kv-compression
+related: concepts/mla-attention, concepts/kv-compression, concepts/cross-layer-kv-sharing, concepts/sliding-window-attention, concepts/paged-kv-cache, code/v4-index-attn, code/v4-attn, code/v4-compress
+summary: In a sparse layer, a small indexer scores all compressed keys for each query and keeps the best index_topk. The main attention then reads only those keys plus the sliding window.
+---
+<x-sentence>In a sparse layer, a small indexer scores every compressed key for each query and keeps the best ones. The main attention reads only those keys.</x-sentence>
+
+<h2>The idea</h2>
+<p>In full {{term attention}}, each query reads every earlier key. For a prompt of 100,000 tokens, the last query reads 100,000 keys. The work grows with the length of the sequence.</p>
+<p>{{term sparse-attention}} sets a limit. Each query reads only a fixed number of keys, <code>index_topk</code>, plus its sliding window. The problem is to choose good keys without reading all of them with the expensive attention. DeepInfer uses an {{term sparse-indexer | indexer}} for this choice. The indexer is a second, cheaper attention:</p>
+<ul>
+  <li>it has its own head count and head size (<code>index_n_heads</code>, <code>index_head_dim</code>, from config.json);</li>
+  <li>its queries and keys are {{term fp4}} numbers;</li>
+  <li>it gives each key one score: <code>relu(q·k)</code>, weighted per head, with no softmax ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:3}});</li>
+  <li>a {{term top-k-selection}} kernel keeps the <code>index_topk</code> keys with the highest scores.</li>
+</ul>
+<p>The indexer scores the <em>compressed</em> keys: one per token in a C1 layer, one per 2 tokens in a C2 layer (see {{link concepts/kv-compression}}). The selected positions then go to the {{link concepts/mla-attention | MLA}} kernel as an index list.</p>
+<p><strong>An everyday comparison.</strong> In a large library, you do not read every book to answer a question. You look at the catalog cards first. The cards are short, so this is fast. Then you take the 20 books with the best cards to your desk. The indexer is the catalog check. The main attention reads the books on the desk. The comparison stops here: the indexer does a new catalog check for every single query token, and its "cards" are learned numbers, not titles. A good book with a bad card is never read.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5a_indexer" alt="Panel 1: the index query comes from the shared query latent through the merged q_b projection, then RoPE and FP4 cast; the index key comes from the pre-RoPE compressed KV of the Compressor through k_proj, then norm, RoPE and FP4 cast into the paged ica_cache; the per-head weights come from the hidden state through weights_proj. Panel 2: one score per query and key, an example row of 12 keys where the 4 highest scores are selected, and the DeepSelect topk call that returns int32 [T, topk] with -1 for missing keys. Panel 3: in prefill the index points to a row in the gathered buffer, offset by ks and then by the sliding-window length; in decode a logical entry is mapped through block_tables to a physical slot, for example entry 130 to slot 770." caption="Figure: how the indexer chooses keys. Look at panel 3: the same top-k list means different things in prefill and in decode. Click to zoom." />
+<p>Panel 1 shows that the indexer reuses work of the main attention. Its query comes from the same query latent. Its key comes from the same compressed entry. Panel 2 shows the selection with made-up numbers. Panel 3 shows what a selected index points to.</p>
+
+<h2>In the code</h2>
+<p>The parameter container is <code>MQAIndexer</code> in <code>mla_attn.py</code>. The runtime is the class <code>MQA</code> in <code>index_attn.py</code>. <code>V4Attention</code> in <code>attn.py</code> calls it.</p>
+
+<h3>Step 1: which layers have an indexer</h3>
+<p>The HF loader gives every compressed layer the same <code>index_topk</code> and an indexer config with <code>use_kproj=True</code> ({{cite deepinfer/hugging_face/config.py:111-128}}). A layer is sparse when <code>index_topk</code> is above 0 ({{cite deepinfer/model_executor/models/v4_modules/attn.py:85}}). The container makes the indexer only in an "index source" layer:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mla_attn.py" lines="270-273" />
+<p>With {{link concepts/cross-layer-kv-sharing | cross-layer sharing}}, a later layer can reuse the top-k list of an earlier layer. Such a layer has no indexer of its own ({{cite deepinfer/model_executor/models/v4_modules/attn.py:568-570}}). The value of <code>index_topk</code> is in config.json, not in the repo.</p>
+
+<h3>Step 2: the index query and the weights share projections</h3>
+<p>The index query starts from the same query latent <code>q_a</code> as the main query. Its <code>q_B</code> matrix is merged into <code>q_b_proj</code>. The per-head weights come from the hidden state; their matrix <code>weights_proj</code> is merged into <code>current_hidden_proj</code>:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="292-304" highlight="295-299" />
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="354-364" highlight="364" />
+<p>So the indexer usually needs no GEMM of its own for its query and its weights. One exception is a YOCO consumer layer that is a KV source. There the compressed KV has its own projection from the shared hidden state, so <code>current_hidden_proj</code> holds only the index weights ({{cite deepinfer/model_executor/models/v4_modules/attn.py:349-352}}).</p>
+
+<h3>Step 3: the index key comes from the compressed KV</h3>
+<p>The <code>Compressor</code> stores each new compressed entry in <code>ca_cache</code>. It also returns a copy before RoPE, <code>pre_rope_kv</code>. The indexer projects this copy to <code>index_head_dim</code> values, normalizes it, applies RoPE, casts it to FP4 and stores it in <code>ica_cache</code>:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/index_attn.py" lines="133-162" highlight="144,150,156-161" />
+<p>The index key format <code>FP4_INDEX_KV_FORMAT</code> holds 128 FP4 values and one UE8M0 scale per 32 values ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:129-137}}). The cache engine sizes it as <code>index_head_dim / 2 + index_head_dim / 32</code> bytes ({{cite deepinfer/worker/cache_engine.py:76-78}}): 64 + 4 = 68 B for 128 values. The deployment notes say the same: "Indexer KV: per-32, ue8m0, MXFP4" ({{cite doc/inference_deployment_qa.md:219}}).</p>
+
+<h3>Step 4: score and select in prefill</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/index_attn.py" lines="345-376" highlight="347,349,361-372" />
+<ol>
+  <li>Line 347: the queries go in chunks of <code>compute_chunk_size</code> rows, to limit the memory of the score matrix.</li>
+  <li>Line 349: a {{term deepgemm | DeepGEMM}} kernel computes <code>p_sum</code>, one bf16 score for each query of the chunk and each compressed key.</li>
+  <li>Lines 361-372: {{term deepselect}} <code>topk</code> keeps the best <code>topk_tokens</code> keys of each row. <code>end</code> limits the search to the valid keys of the row. <code>output_idx_offset=ks</code> turns a position in the sequence into a row of the gathered key buffer. Missing keys get −1.</li>
+</ol>
+
+<h3>Step 5: score and select in decode</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/index_attn.py" lines="483-514" highlight="494-503,508-513" />
+<p>Decode reads the index keys straight from the paged <code>ica_cache</code>, with the block table. The comment on line 498 is a real trap: the score buffer is not cleared, so the call must pass <code>end</code>. After <code>topk</code>, <code>convert_kv_index</code> turns each logical position into a physical slot of <code>ca_cache</code>.</p>
+
+<h3>Step 6: the indices go to the attention kernel</h3>
+<p><code>_compute_kv_ca_index</code> returns the list as <code>kv_ca_index</code> and stores it in the cross-layer runtime for later layers ({{cite deepinfer/model_executor/models/v4_modules/attn.py:585-587}}). In prefill, <code>kv_index_cat</code> puts the sliding-window list in front ({{cite deepinfer/model_executor/models/v4_modules/attn.py:603-607}}). In decode, the list goes to FlashMLA as the index of the extra cache <code>ca_cache</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:641-647}}). So one query reads at most <code>window + index_topk</code> keys.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Numbers that the code fixes, and numbers from the config">
+<table>
+  <thead><tr><th>Value</th><th>Fixed by the code?</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Index Q and K format</td><td>Yes: FP4 (e2m1) with UE8M0 scales, 32 values per scale</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:85-87}}</td></tr>
+    <tr><td>Weights and scores</td><td>Yes: bf16</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:87}}</td></tr>
+    <tr><td>RoPE size of the index Q/K</td><td>Yes: 64 (assert)</td><td>{{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:121}}</td></tr>
+    <tr><td>Values per index key</td><td>128 in <code>FP4_INDEX_KV_FORMAT</code>; the head size itself comes from <code>index_head_dim</code></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:129-137}}</td></tr>
+    <tr><td>Chunk size in prefill</td><td>At most 8192 rows; less if <code>DEEPINFER_INDEX_ATTN_MEMORY_LIMIT</code> is small</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:117}}</td></tr>
+    <tr><td>Tokens per KV block</td><td>Yes: 128 (so 64 compressed entries per block in C2)</td><td>{{cite deepinfer/model_executor/model_metadata_utils.py:133-135}}</td></tr>
+    <tr><td>Candidate block size</td><td>8 or 16 (assert); count: multiple of 8, at most 4096</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:103-105}}, {{cite deepinfer/model_executor/layers/tilelang_ops/candidate_blocks.py:38}}, {{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:221}}</td></tr>
+    <tr><td><code>index_topk</code></td><td>No: config.json (<code>index_topk</code>)</td><td>{{cite deepinfer/hugging_face/config.py:120}}</td></tr>
+    <tr><td><code>index_n_heads</code>, <code>index_head_dim</code></td><td>No: config.json</td><td>{{cite deepinfer/hugging_face/config.py:124-125}}</td></tr>
+    <tr><td>Candidate source layer, blocks, block size</td><td>No: config.json</td><td>{{cite deepinfer/hugging_face/config.py:70-84}}</td></tr>
+  </tbody>
+</table>
+<p>One more rule: all indexer layers must have the same head count. The comment gives the reason: the decode schedule metadata is shared per compress ratio, and on NPU its content depends on the head count ({{cite deepinfer/model_executor/model_metadata_utils.py:71-73}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Shapes and dtypes, step by step">
+<p><code>T</code> = query tokens, <code>Tc</code> = new compressed entries in the step, <code>nh</code> = <code>index_n_heads</code>, <code>dh</code> = <code>index_head_dim</code>, <code>L</code> = <code>max_kv_len</code> = <code>runtime_max_model_len // ratio</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:95}}).</p>
+<table>
+  <thead><tr><th>Name</th><th>dtype and shape</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>index_weights</code></td><td>bf16 <code>[T, nh]</code> (in a C2 layer the projection output is fp32, then <code>.bfloat16()</code>)</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:504-506}}</td></tr>
+    <tr><td><code>index_q_b</code></td><td>bf16 <code>[T, nh·dh]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:460-461}}</td></tr>
+    <tr><td><code>q_fp4, q_sf</code></td><td>FP4 <code>[T, nh, dh]</code> packed, plus UE8M0 scales</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:164-179}}</td></tr>
+    <tr><td><code>index_k_input</code> (<code>pre_rope_kv</code>)</td><td>bf16 <code>[Tc, 512]</code> (in C2 decode: one row per query token)</td><td>{{cite deepinfer/model_executor/models/v4_modules/attn.py:546}}</td></tr>
+    <tr><td><code>index_k</code></td><td>bf16 <code>[Tc, dh]</code>, then stored FP4 in <code>ica_cache</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:144}}</td></tr>
+    <tr><td><code>ica_cache</code></td><td>uint8 <code>[num_blocks, 128 // ratio, 1, 68]</code> for dh = 128</td><td>{{cite deepinfer/worker/cache_engine.py:207-208}}</td></tr>
+    <tr><td><code>p_sum</code> (prefill chunk)</td><td>bf16 <code>[chunk, L]</code> (L is passed as <code>max_seqlen_k</code>)</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:111}}</td></tr>
+    <tr><td><code>p_sum</code> (decode)</td><td>bf16 <code>[T, L]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:434-445}}</td></tr>
+    <tr><td><code>topk_index</code></td><td>int32 <code>[T, index_topk]</code>, −1 = no key</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:541-544}}</td></tr>
+  </tbody>
+</table>
+<p>The <code>MQA</code> forward docstring says what the output means ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:541-544}}). In prefill, an index is a row of the gathered key sequence, with the <code>ks</code> offset added. In decode, it is a physical slot in the KV cache.</p>
+</x-deepdive>
+
+<x-deepdive title="Prefill, step by step, with a worked example">
+<ol>
+  <li><strong>Quantize Q</strong> (line 546): RoPE on the last 64 values of each index head, then FP4 cast.</li>
+  <li><strong>Store K</strong> (lines 549-555): only if <code>store_kv</code> is true and this layer is an index-K source.</li>
+  <li><strong>Align weights</strong> (lines 557-558): on GPU, <code>_align_mqa_weights</code> copies the weights into a buffer whose row stride is a multiple of 16 bytes, which DeepGEMM needs ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:40-53}}).</li>
+  <li><strong>Load all index keys</strong> of the batch from <code>ica_cache</code> into one buffer, in the same order as the main compressed keys (<code>load_segments_ca</code>) ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:181-191}}).</li>
+  <li><strong>For each chunk of queries</strong>: <code>deep_gemm.fp8_fp4_mqa_logits(q, kv, weights, ks, ke, max_seqlen_k=L)</code> gives <code>p_sum</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:298-306}}). <code>ks[t]</code> and <code>ke[t]</code> are the start and end of the keys of query t in the gathered buffer ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:280-287}}).</li>
+  <li><strong>Select</strong>: <code>topk(..., end=klen, output_idx_offset=ks)</code>, with <code>klen = ke − ks</code> ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:368-369}}).</li>
+</ol>
+<p><strong>Worked example: the chunk size.</strong> <code>max_model_len = 32768</code> gives <code>runtime_max_model_len = 32768 + 5 + 6 + 5 = 32784</code> with 5 drafts and ZOS on, as <code>EngineArgs</code> sets it ({{cite deepinfer/config.py:11-16}}; see {{link code/llm-engine}}). In a C2 layer, <code>L = 32784 // 2 = 16392</code>. One score row is 16392 × 2 B = 32,784 B. With the default limit of 10 GiB ({{cite deepinfer/environ.py:126}}):</p>
+<pre><code class="language-python">compute_chunk_size = min(8192, 10 * 2**30 // 32784 // 8 * 8)
+                   = min(8192, 327520) = 8192
+p_sum per chunk    = 8192 rows * 32784 B = 268,566,528 B  (about 256 MiB)</code></pre>
+<p>A prefill of 20,000 tokens therefore runs 3 chunks: 8192 + 8192 + 3616 rows.</p>
+</x-deepdive>
+
+<x-deepdive title="Decode, step by step, with a worked example">
+<ol>
+  <li><strong>Schedule metadata</strong> (line 470): <code>deep_gemm.get_paged_mqa_logits_metadata</code>, made once per compress ratio and step, by the first indexer layer that needs it ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:389-397}}).</li>
+  <li><strong>Scores</strong>: <code>deep_gemm.fp8_fp4_paged_mqa_logits</code> reads the FP4 keys from <code>ica_cache</code> through <code>block_tables</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:433-445}}).</li>
+  <li><strong>Select</strong>: <code>topk(p_sum, topk_tokens, end=topk_lens, ...)</code> returns logical positions inside the sequence ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:494-503}}).</li>
+  <li><strong>Map to slots</strong>: <code>convert_kv_index</code> rewrites the list in place ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:508-513}}).</li>
+</ol>
+<p>The reference function shows the mapping exactly:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/flash_mla_utils.py" lines="40-51" />
+<p><strong>Worked example.</strong> C2 layer, so a block holds 128 / 2 = 64 compressed entries. A query selected logical entry 130. Its sequence has <code>block_tables</code> row <code>[7, 3, 12, …]</code>.</p>
+<ul>
+  <li>logical block = 130 // 64 = 2, offset = 130 % 64 = 2;</li>
+  <li>physical block = <code>block_tables[2]</code> = 12;</li>
+  <li>slot = 12 × 64 + 2 = 770.</li>
+</ul>
+<p>Lines 50-51 of the reference set every list position at or after <code>context_lens</code> to −1. DeepInfer passes <code>topk_lens</code> there, so a short sequence with fewer valid entries than <code>index_topk</code> gets −1 in the rest of its row.</p>
+</x-deepdive>
+
+<x-deepdive title="Candidate blocks: a coarse first choice that later layers reuse">
+<p>The config can name one <em>candidate source</em> layer (<code>candidate_source_layer_id</code>). Every later main layer then uses its candidates ({{cite deepinfer/hugging_face/config.py:76-84}}).</p>
+<ol>
+  <li>The source layer computes its full <code>p_sum</code>. It cuts each row into blocks of <code>candidate_block_size</code> keys (8 or 16), and gives each block the score of its best key. The last valid block gets +inf, so it is always kept ({{cite deepinfer/model_executor/layers/tilelang_ops/candidate_blocks.py:17-36}}).</li>
+  <li><code>topk</code> keeps <code>candidate_topk_blocks</code> blocks per query in <code>block_candidate_idxs</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:204-226}}).</li>
+  <li>Later layers in the group compute scores only for the tokens of these blocks, with the "sparse" DeepGEMM kernels (<code>fp8_fp4_sparse_mqa_logits</code>, <code>fp8_fp4_paged_sparse_mqa_logits</code>) ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:317-325}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:447-454}}).</li>
+  <li><code>restore_candidate_indices_inplace</code> turns the compact positions back into sequence positions ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:373-374}}).</li>
+</ol>
+<p>The topology checks that the candidates can hold enough tokens: <code>candidate_topk_blocks × block size ≥ index_topk</code> of each consumer ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:237-238}}). Consumers must also have at most 32 index heads and <code>index_head_dim == 128</code> ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:103}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Sharing between layers: index source, index-K source">
+<p>Three maps from the config control sharing ({{cite deepinfer/hugging_face/config.py:71-75}}):</p>
+<ul>
+  <li><strong>Index source</strong> (<code>index_source_layer_ids</code>): a consumer layer has no indexer and reuses <code>cross_layer_runtime.topk_indices</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:568-570}}).</li>
+  <li><strong>Index-K source</strong> (<code>index_k_source_layer_ids</code>, default: the KV sources): a consumer has its own index Q and weights, but reads the <code>ica_cache</code> of its source. In decode it uses the cache view of the source layer ({{cite deepinfer/worker/cache_engine.py:429-431}}). In prefill it reuses the loaded buffer ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:193-196}}).</li>
+  <li>The index-topk segments must lie inside the index-K segments, which must lie inside the KV segments ({{cite deepinfer/model_executor/models/v4_modules/cross_layer.py:191-197}}).</li>
+</ul>
+<p>The page {{link concepts/cross-layer-kv-sharing}} explains the maps.</p>
+</x-deepdive>
+
+<x-deepdive title="The vendor calls, in one list">
+<p>This site shows only how DeepInfer calls the vendor libraries. It does not explain their insides.</p>
+<table>
+  <thead><tr><th>Call</th><th>When</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>deep_gemm.fp8_fp4_mqa_logits(q, kv, weights, ks, ke, max_seqlen_k)</code></td><td>prefill, no candidates</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:299-306}}</td></tr>
+    <tr><td><code>deep_gemm.get_sparse_mqa_logits_metadata</code> + <code>fp8_fp4_sparse_mqa_logits</code></td><td>prefill, candidates</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:273-281}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:317-325}}</td></tr>
+    <tr><td><code>deep_gemm.get_paged_mqa_logits_metadata</code> + <code>fp8_fp4_paged_mqa_logits</code></td><td>decode, no candidates</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:392-396}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:434-445}}</td></tr>
+    <tr><td><code>deep_gemm.get_paged_sparse_mqa_logits_metadata</code> + <code>fp8_fp4_paged_sparse_mqa_logits</code></td><td>decode, candidates</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:410-418}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:447-454}}</td></tr>
+    <tr><td><code>deep_select.interface.topk(...)</code></td><td>every selection</td><td>{{cite deepinfer/model_executor/models/v4_modules/index_attn.py:12}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Ascend differences.</strong> On NPU the decode metadata call takes the head count instead of the block size and SM count ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:394}}). The paged logits call passes <code>use_ascend_kv_layout=False</code>; a TODO says <code>True</code> may be faster but changes the cache layout ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:443-444}}). The <code>topk</code> import goes through the NPU import hook, see {{link concepts/hardware-platforms}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Always pass end to topk">
+<p>The score buffer of a decode step is not cleared. Old values stay after the valid keys of a row. The comment says: "We must pass <code>end</code> to the topk kernel since OOB p_sum is not cleaned" ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:498}}). A change that drops <code>end</code> selects stale keys with no error.</p>
+</x-warning>
+<ul>
+  <li><strong>Memory limit too small.</strong> If <code>DEEPINFER_INDEX_ATTN_MEMORY_LIMIT</code> is below 8 score rows, start-up stops with an assert that names the minimum ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:117-118}}).</li>
+  <li><strong>Wrong indexer variant.</strong> Only <code>use_kproj=True</code> is supported ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:272}}); <code>mlp_kproj</code> raises an assert ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:123}}).</li>
+  <li><strong>Sparse layer without SWA.</strong> A sparse layer must also have the sliding window ({{cite deepinfer/model_executor/models/v4_modules/attn.py:95-96}}).</li>
+  <li><strong>Different head counts.</strong> Two indexer layers with different <code>index_n_heads</code> fail an assert ({{cite deepinfer/model_executor/model_metadata_utils.py:71-73}}).</li>
+  <li><strong>Few keys.</strong> Not an error: a query with fewer valid keys than <code>index_topk</code> gets −1 entries. The metadata docs define −1 as an invalid entry ({{cite deepinfer/model_executor/input_metadata/input_metadata.py:241-242}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> With the indexer, the cost of the main attention per query has a fixed upper limit: the window plus <code>index_topk</code> keys. The indexer itself still scores every compressed key, but with FP4 numbers and no softmax. This makes long contexts affordable.</p>
+
+<x-quiz>
+  <x-q level="easy">How many compressed keys does the main attention read for one query in a sparse layer, at most?
+    <x-a><p><code>index_topk</code> compressed keys, plus the keys of its sliding window. The top-k list has shape <code>[T, index_topk]</code>, and −1 marks missing keys ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:541-544}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The index key is not a separate projection of the hidden state. Where does it come from?
+    <x-a><p>From the compressed entry before RoPE, <code>pre_rope_kv</code>, that the Compressor returns. <code>KProject</code> maps it to <code>index_head_dim</code> values; then norm, RoPE and FP4 cast store it in <code>ica_cache</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:544-557}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:133-162}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In decode, why does <code>_topk_decode</code> call <code>convert_kv_index</code>, and why does prefill not need it?
+    <x-a><p>In decode the attention kernel reads the paged <code>ca_cache</code>, so it needs physical slots. <code>topk</code> returns logical positions, and <code>convert_kv_index</code> maps them through <code>block_tables</code>. In prefill the kernel reads the gathered BF16 buffer, and <code>output_idx_offset=ks</code> already gives rows of that buffer ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:361-372}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">C2 layer, decode. A query selects logical entry 200. The block table row of its sequence is <code>[4, 9, 2, 6]</code>. Which slot does the attention read?
+    <x-a><p>A C2 block holds 128 / 2 = 64 entries. 200 // 64 = 3, 200 % 64 = 8. <code>block_tables[3]</code> = 6, so the slot is 6 × 64 + 8 = 392 ({{cite deepinfer/model_executor/layers/tilelang_ops/flash_mla_utils.py:47-49}}). This is in the deep dive "Decode, step by step".</p></x-a>
+  </x-q>
+  <x-q level="hard">You set <code>max_model_len = 1,048,576</code> and keep the defaults. What is <code>compute_chunk_size</code> for a C2 layer without candidates?
+    <x-a><p><code>runtime_max_model_len</code> = 1,048,576 + 5 + 6 + 5 = 1,048,592 with ZOS on ({{cite deepinfer/config.py:11-16}}). <code>L</code> = 524,296, so one row is 1,048,592 B. 10 GiB // 1,048,592 = 10,239; // 8 × 8 = 10,232. <code>min(8192, 10232)</code> = 8192 ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:111}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:117}}). One chunk of scores then uses about 8 GiB.</p></x-a>
+  </x-q>
+</x-quiz>

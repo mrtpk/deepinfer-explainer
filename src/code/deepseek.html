@@ -1,0 +1,229 @@
+---
+title: models/deepseek.py: the DeepSeek-V4.1 model
+nav_title: deepseek.py
+level: Intermediate
+prerequisites: concepts/model-map
+related: concepts/model-map, code/decoder-layer, code/deepseek-vl, code/dflash, code/v4-attn, code/model-runner, code/model-loader, concepts/yoco-swa-replay, concepts/eplb
+summary: deepseek.py holds DeepseekModel (embedding, N decoder layers, final mix and norm) and DeepseekForCausalLM (lm head, sampler, DFlash, EPLB, weight loading). The forward returns hidden states.
+---
+<h2>Purpose</h2>
+<p><code>deepseek.py</code> builds the whole language model from the loaded weights and runs its forward: embedding, N decoder layers, final mHC mix and norm. The sampler call and the weight loading are here too.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/deepseek.py</code>, 525 lines of Python. No "Derived from vLLM" header.</td></tr>
+    <tr><th>Main classes</th><td><code>DeepseekModel</code> ({{cite deepinfer/model_executor/models/deepseek.py:59}}) and <code>DeepseekForCausalLM</code> ({{cite deepinfer/model_executor/models/deepseek.py:251}}). The registered class <code>DeepseekVLForCausalLM</code> is a subclass in <code>deepseek_vl.py</code>.</td></tr>
+    <tr><th>Runs in</th><td>Every worker process: the driver and each context-parallel follower. The forward launches device kernels on the current CUDA stream; in decode it usually runs inside a CUDA graph.</td></tr>
+    <tr><th>Called by</th><td><code>model_loader.get_model</code> (load), <code>ModelRunner</code> (forward and sample), <code>CudaGraphRunner</code> (capture).</td></tr>
+    <tr><th>Calls</th><td><code>DeepseekDecoderLayer</code>, <code>HCHead</code> / <code>mhc_pre_apply_mix</code>, <code>DFlash</code>, <code>EngramRuntime</code>, <code>Sampler</code>, <code>eplb</code>, <code>userbuffer</code>, the HF loading functions.</td></tr>
+    <tr><th>Not in this file</th><td>The math of attention, MoE and mHC (in <code>v4_modules/</code>), the layer body (<code>decoder_layer.py</code>), the image path (<code>deepseek_vl.py</code>), the KV cache (<code>worker/cache_engine.py</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b5a_model_map_a" alt="Panel 1: one forward from input ids through the embedding, decoder layers, final mix and norm to hidden states, and the separate sampler call; side notes for Engram, DFlash and context parallelism. Panel 2: the module list of the builder and the three layer kinds." caption="Figure: what <code>DeepseekModel.forward</code> runs. The boxes cite the lines of this file. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Loading.</strong> <code>get_model</code> looks up the class in the registry and calls <code>model_class.load_model(...)</code> ({{cite deepinfer/model_executor/model_loader.py:65-79}}). The class is <code>DeepseekVLForCausalLM</code> ({{cite deepinfer/model_executor/models/__init__.py:15-17}}). Its <code>load_model</code> reads the image processor config and then calls this file's <code>load_model</code> ({{cite deepinfer/model_executor/models/deepseek_vl.py:237-245}}).</li>
+  <li><strong>Forward.</strong> <code>ModelRunner</code> calls <code>self.model(kv_caches=..., input_metadata=...)</code>, or replays a CUDA graph ({{cite deepinfer/worker/model_runner.py:326-329}}). The graph runner calls the model in the same way at capture time ({{cite deepinfer/worker/cuda_graph_runner.py:66}}).</li>
+  <li><strong>Sampling.</strong> <code>ModelRunner</code> calls <code>self.model.sample(...)</code> ({{cite deepinfer/worker/model_runner.py:361-365}}).</li>
+  <li><strong>Output buffers.</strong> The CUDA graph runner calls <code>allocate_output(max_batch_size)</code> ({{cite deepinfer/worker/cuda_graph_runner.py:96}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>Layers.</strong> One <code>DeepseekDecoderLayer</code> per main layer ({{cite deepinfer/model_executor/models/deepseek.py:92-103}}).</li>
+  <li><strong>Topology.</strong> <code>build_shared_layer_topology</code> for cross-layer sharing ({{cite deepinfer/model_executor/models/deepseek.py:268-269}}).</li>
+  <li><strong>Draft head.</strong> <code>DFlash</code> from <code>mtp/dflash.py</code> ({{cite deepinfer/model_executor/models/deepseek.py:300-306}}).</li>
+  <li><strong>Engram.</strong> <code>NgramHashMapping</code>, <code>EngramRuntime</code> and the kernel <code>tile_kernels.engram.engram_hash</code> ({{cite deepinfer/model_executor/models/deepseek.py:83-90}}, {{cite deepinfer/model_executor/models/deepseek.py:180-188}}).</li>
+  <li><strong>Sampler.</strong> <code>Sampler(cfg.vocab_size)</code> ({{cite deepinfer/model_executor/models/deepseek.py:296}}).</li>
+  <li><strong>Loading.</strong> <code>finalize_model_config</code>, <code>build_model_on_meta</code>, <code>load_hf_checkpoint</code> and the HF coverage helpers ({{cite deepinfer/model_executor/models/deepseek.py:457-510}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>DeepseekModel.__init__</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:60}}</td><td>Makes the embedding, N layers, the HC head (if not shifted), the output norm and Engram.</td></tr>
+    <tr><td><code>_init_yoco</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:118}}</td><td>Sets the YOCO boundary layer and checks DFlash and Engram placement.</td></tr>
+    <tr><td><code>build_embed_tokens</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:140}}</td><td>Wraps the HF embedding weight in <code>VocabParallelEmbedding</code>.</td></tr>
+    <tr><td><code>allocate_output</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:150}}</td><td>Zero hidden states <code>[num_tokens, hidden]</code> for CUDA graphs.</td></tr>
+    <tr><td><code>DeepseekModel.forward</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:154}}</td><td>The forward of the language model. Returns hidden states.</td></tr>
+    <tr><td><code>DeepseekForCausalLM.__init__</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:252}}</td><td>Makes the inner model, lm head, sampler, DFlash, EPLB and userbuffers.</td></tr>
+    <tr><td><code>_init_eplb</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:324}}</td><td>Groups the MoE layers by weight layout and makes one load balancer per group.</td></tr>
+    <tr><td><code>forward</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:374}}</td><td>Passes the DFlash module to the inner model.</td></tr>
+    <tr><td><code>sample</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:383}}</td><td>Runs the sampler with the lm head weight, then steps EPLB.</td></tr>
+    <tr><td><code>allocate_userbuffer</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:412}}</td><td>Allocates MoE and context-parallel communication buffers.</td></tr>
+    <tr><td><code>load_model</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:446}}</td><td>Class method. Builds the containers, loads the checkpoint, makes the runtime model.</td></tr>
+    <tr><td><code>from_model_cfg</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:524}}</td><td>Class method. <code>cls(gpt, model_cfg.gpt)</code>; the VL class overrides it.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>DeepseekForCausalLM.__init__</code>: from containers to runtime</h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="263-306" highlight="268-269,276-277,280-286,290-294,300-302">
+<x-tr line="266">Shared topology (share-kv / share-index): built once at model level and passed explicitly to every layer.</x-tr>
+<x-tr line="267">The layer map is normalized over all layers (main + NextN, that is, all modules except emb / lm_head).</x-tr>
+<x-tr line="268">Remove emb and lm_head.</x-tr>
+<x-tr line="301">NOTE: the number of MTP layers is decoupled from the number of predictions.</x-tr>
+</x-code>
+<ol>
+  <li>Line 268: the container list has N + 2 + nextn modules. Without the embedding and the lm head, N + nextn layers remain.</li>
+  <li>Line 276: <code>load_nextn</code> is <code>DEEPINFER_USE_NEXTN_DECODE</code> (default 5). It decides if DFlash is built (line 300).</li>
+  <li>Line 277: the main head is module N + 1. Lines 280-286 give the inner model modules 0 … N: the embedding and the N blocks.</li>
+  <li>Lines 290-294: the lm head reuses the HF head weight. It is not called in the forward.</li>
+  <li>Lines 300-303: <code>DFlash</code> gets the embedding and the lm head of the main model.</li>
+</ol>
+<p>The constructor ends with EPLB for all MoE layers (lines 310-317), <code>torch.cuda.empty_cache()</code> and <code>allocate_userbuffer()</code> (lines 320-321).</p>
+
+<h3><code>DeepseekModel.__init__</code></h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="80-116" highlight="80,92-103,106-110,114" />
+<ol>
+  <li>Line 80: the embedding comes from module 0, a <code>MultimodalEmbedding</code> container.</li>
+  <li>Lines 92-103: one <code>DeepseekDecoderLayer</code> per block. <code>layer_idx</code> runs from 0; the target layers of DFlash get a <code>dflash_input_index</code>.</li>
+  <li>Line 107: <code>HCHead</code> exists only when <code>hc_shifted</code> is off.</li>
+  <li>Line 110: <code>output_norm</code> is the norm of the HF <code>GPTHead</code>.</li>
+  <li>Line 114: <code>EngramRuntime</code> gets the Engram modules of the Engram layers.</li>
+</ol>
+
+<h3><code>DeepseekModel.forward</code>, part 1: before the loop</h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="161-188" highlight="162,166,168-170,173-174,180-188">
+<x-tr line="165">Runtime values held across layers (shared_hidden / pre_rope_kv / topk): pass the same reference layer by layer; each layer writes in place.</x-tr>
+<x-tr line="172">DFlash target-layer features, and metadata with the same row layout (it can switch to compact at the YOCO compaction boundary).</x-tr>
+<x-tr line="173">(assert message) dflash_cfg.dspark_target_layer_ids does not match the MTP head type.</x-tr>
+</x-code>
+<p>The VL class passes <code>hidden_states</code> in every prefill, also a text-only one ({{cite deepinfer/model_executor/models/deepseek_vl.py:232-233}}). So with the registered VL class, line 162 runs only in decode. With context parallelism, line 170 reorders the tokens of a prefill into the mirror-CP layout. Lines 180-188 hash the n-grams of the batch once for all Engram layers.</p>
+
+<h3><code>DeepseekModel.forward</code>, part 2: the loop and the end</h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="209-244" highlight="210-218,223,227,230,238-239,243-244" />
+<ol>
+  <li>Lines 209-218: each layer gets its own KV cache view <code>kv_caches[i]</code>, the metadata, the residual of the previous layer and the shared runtime.</li>
+  <li>Line 223: DFlash writes its main cache from the features of the target layers. Translated comment (lines 221-222): "The target-layer features are consumed only here: write the DFlash main cache. In decode it is captured together with the main model's CUDA graph, which saves the CPU launch cost of each kernel. The padding rows of a CUDA graph land in state 0 of the placeholder, the dummy slot that the BlockManager never allocates."</li>
+  <li>Lines 225-238: the last mHC post mix, then one mix of the <code>hc_mult</code> copies (shifted) or <code>HCHead</code> (not shifted).</li>
+  <li>Line 239: the final RMSNorm.</li>
+  <li>Lines 241-244: prefill with CP: all-gather and restore the token order.</li>
+</ol>
+<p>The YOCO block in lines 191-207 is on {{link concepts/model-map}} (Step 3) and {{link concepts/yoco-swa-replay}}.</p>
+
+<h3><code>sample</code></h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="391-410" highlight="392-400,402-409" />
+<p>The sampler gets the DFlash module and the lm head weight as <code>embedding</code>. It computes logits only for the rows that it samples. Then EPLB counts the step. The load-balance ratio is read later, in a post function (lines 406-409).</p>
+
+<h3><code>load_model</code></h3>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="457-470" highlight="457,459-460,466-469" />
+<ol>
+  <li>Line 457: <code>finalize_model_config</code> adds parallel and runtime fields, for example the expert layout ({{cite deepinfer/model_executor/model_loader.py:109-125}}).</li>
+  <li>Lines 459-460: one log line with the main KV format: "FP4" or "MXFP8".</li>
+  <li>Lines 466-469: check the HF files, then build all containers on the <code>meta</code> device (no memory).</li>
+  <li>Lines 474-498: give each parameter real memory: on the device, or on the CPU for Engram tables. Tied parameters share storage, "so MTP never allocates another vocabulary matrix" (lines 483-485). With <code>skip_load</code>, dummy weights are made.</li>
+  <li>Lines 502-510: Engram tables are pre-allocated; then <code>load_hf_checkpoint</code> fills all weights.</li>
+  <li>Lines 513-519: <code>cls.from_model_cfg</code> builds the runtime model and logs the memory before and after.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<table>
+  <thead><tr><th>Object</th><th>Type and shape</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td><code>kv_caches</code></td><td><code>GPUCacheInterface</code>; <code>kv_caches[i]</code> is a <code>KVCache</code></td><td>views into the shared buffers ({{cite deepinfer/worker/cache_engine.py:205-218}})</td></tr>
+    <tr><td><code>input_metadata.input_ids</code></td><td>int32 <code>[T]</code></td><td>T = tokens of the step</td></tr>
+    <tr><td><code>hidden_states</code> (start)</td><td>bf16 <code>[T, hidden]</code></td><td>embedding or VL input</td></tr>
+    <tr><td><code>residual</code></td><td><code>HCLazyPostData</code>: <code>residual [1, T, hc_mult, hidden]</code>, mixes <code>[1, T, hc_mult, 1]</code> and <code>[1, T, hc_mult, hc_mult]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:21-25}}</td></tr>
+    <tr><td><code>dflash_input</code></td><td>bf16 <code>[T, hidden × len(dspark_target_layer_ids)]</code></td><td>only with DFlash ({{cite deepinfer/model_executor/models/deepseek.py:72-74}}, {{cite deepinfer/model_executor/models/deepseek.py:174}})</td></tr>
+    <tr><td><code>hashes</code></td><td>Engram n-gram hashes of <code>ngram_token_ids</code></td><td>only with Engram</td></tr>
+    <tr><td>return</td><td><code>CausalLMForwardOutput(hidden_states=bf16 [T, hidden])</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:246-248}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the module list and the layer indices">
+<p>Take a made-up config with N = 8 main layers and <code>num_nextn_predict_layers</code> = 1. <code>V41Builder</code> makes 11 modules ({{cite deepinfer/model_executor/models/v4_modules/builder.py:105-125}}):</p>
+<table>
+  <thead><tr><th>Index in <code>model.module.module</code></th><th>Module</th><th>Used by</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td><code>MultimodalEmbedding</code></td><td><code>DeepseekModel.embed_tokens</code> (line 80)</td></tr>
+    <tr><td>1 … 8</td><td><code>MoeDecoderBlockHC</code></td><td><code>DeepseekDecoderLayer</code> 0 … 7 (lines 92-103)</td></tr>
+    <tr><td>9 = N + 1</td><td><code>MainPredictHeadHC</code></td><td><code>output_norm</code>, <code>lm_head</code>, maybe <code>HCHead</code> (lines 277, 288-294)</td></tr>
+    <tr><td>10</td><td><code>DFlashNextPredictHeadHC</code></td><td><code>DFlash</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:92-95}})</td></tr>
+  </tbody>
+</table>
+<p>Line 268 gives <code>num_total_layers = 11 − 2 = 9</code>: the 8 main layers and 1 draft layer. The sharing maps cover these 9 layers. <code>num_moe_layers</code> = 8 + the MoE layers of DFlash (line 310). The KV cache list has one entry per runtime layer, so the forward reads <code>kv_caches[0]</code> … <code>kv_caches[7]</code>.</p>
+<x-simplified><p>N = 8 and one draft layer are example values. The real values are in the checkpoint's config.json, not in the repo.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and CUDA graphs">
+<ul>
+  <li>Every worker process builds its own model: the driver and each context-parallel follower. Followers get their inputs by broadcast (see {{link code/llm-engine}}, deep dive "Processes and threads").</li>
+  <li>The forward must not synchronize the CPU with the device: <code>ModelRunner</code> runs it inside <code>forbid_cuda_sync()</code> ({{cite deepinfer/worker/model_runner.py:320-329}}).</li>
+  <li>In decode, the graph runner captures this forward, and later replays it ({{cite deepinfer/worker/cuda_graph_runner.py:55-66}}). The DFlash cache update at line 223 is captured too (comment on line 221).</li>
+  <li><code>load_model</code> runs once at start-up, under the default dtype of the model config and <code>torch.device("cuda")</code> ({{cite deepinfer/model_executor/model_loader.py:69-74}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Interaction with other subsystems">
+<ul>
+  <li><strong>KV cache.</strong> The forward does not know the cache layout. It passes <code>kv_caches[i]</code> to layer i. The cache engine decides which layers share a view ({{link concepts/cross-layer-kv-sharing}}).</li>
+  <li><strong>Input metadata.</strong> The forward reads <code>is_prompt</code>, <code>input_ids</code>, <code>ngram_token_ids</code> and the CP fields. With YOCO compaction it swaps the metadata object at the boundary (lines 191-207).</li>
+  <li><strong>EPLB.</strong> <code>_init_eplb</code> groups the MoE layers by <code>(logical, physical, routed, extra experts, EP group, weight shapes and dtypes)</code> and makes one <code>ExpertLoadBalancer</code> per group (lines 331-364). <code>sample()</code> calls <code>expert_lb.step(is_prompt)</code> each step. See {{link concepts/eplb}}.</li>
+  <li><strong>Userbuffer.</strong> <code>allocate_userbuffer</code> sizes the CP all-gather buffer as the maximum over three needs: <code>hidden × 2</code> bytes per token for the sampler, <code>hc_mult × hidden × 2</code> with YOCO compact mode, and the per-layer need of the attention ({{cite deepinfer/model_executor/models/deepseek.py:415-436}}).</li>
+  <li><strong>Sampler and DFlash.</strong> <code>sample()</code> hands the DFlash module to the sampler, which runs the drafts. See {{link concepts/speculative-decoding}}.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Main head is not <code>MainPredictHeadHC</code>, or its head is not <code>GPTHead</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:106-109}}, {{cite deepinfer/model_executor/models/deepseek.py:278}}</td></tr>
+    <tr><td>Embedding container has the wrong type, or <code>attention_dropout</code> is not 0</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:141-143}}</td></tr>
+    <tr><td>YOCO compact mode with DFlash target layers on both sides of the boundary</td><td><code>AssertionError</code> with the layer ids</td><td>{{cite deepinfer/model_executor/models/deepseek.py:129-134}}</td></tr>
+    <tr><td>YOCO compact mode with Engram in a consumer layer</td><td><code>AssertionError</code>: "not supported yet"</td><td>{{cite deepinfer/model_executor/models/deepseek.py:136-138}}</td></tr>
+    <tr><td>DFlash module and target layers do not match</td><td><code>AssertionError</code> in every forward</td><td>{{cite deepinfer/model_executor/models/deepseek.py:173}}</td></tr>
+    <tr><td>Engram on, but the metadata has no <code>ngram_token_ids</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/deepseek.py:179}}</td></tr>
+    <tr><td>Two tied HF parameters with different shape or dtype</td><td><code>AssertionError</code> "Incompatible HF tie"</td><td>{{cite deepinfer/model_executor/models/deepseek.py:482}}</td></tr>
+    <tr><td>Checkpoint does not cover all parameters</td><td><code>RuntimeError</code> with the missing names</td><td>{{cite deepinfer/model_executor/model_loader.py:147-149}}</td></tr>
+    <tr><td>No MoE (dense model)</td><td>no EPLB; <code>sample()</code> skips it (comment "dense models have no EPLB")</td><td>{{cite deepinfer/model_executor/models/deepseek.py:402-403}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that this file reads">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect in this file</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/models/deepseek.py:276}}</td><td>0 turns DFlash off: no draft module, no DFlash MoE layers in EPLB.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code></td><td><code>off</code> ({{cite deepinfer/environ.py:188}})</td><td>{{cite deepinfer/model_executor/models/deepseek.py:126}}, {{cite deepinfer/model_executor/models/deepseek.py:192}}, {{cite deepinfer/model_executor/models/deepseek.py:417}}</td><td>Sets the YOCO boundary; <code>compact</code> swaps the metadata and enlarges the CP buffer.</td></tr>
+    <tr><td><code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code></td><td>off; always on with <code>DEEPINFER_ACCELERATOR=ascend</code> ({{cite deepinfer/environ.py:147}})</td><td>{{cite deepinfer/model_executor/models/deepseek.py:473}}</td><td>Engram tables on the device instead of the CPU.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/model-map}}: the whole model, layer kinds and file roles.</li>
+  <li>{{link concepts/mla-attention}} and {{link concepts/sparse-attention-indexer}}: what each layer's attention does.</li>
+  <li>{{link concepts/mhc-residual}}: the <code>hc_mult</code> copies of the residual stream and the final mix.</li>
+  <li>{{link concepts/yoco-swa-replay}}: the boundary block in the forward loop.</li>
+  <li>{{link concepts/speculative-decoding}}: DFlash and the drafts.</li>
+  <li>{{link concepts/engram}}, {{link concepts/eplb}}, {{link concepts/context-parallelism}}: the optional parts.</li>
+  <li>{{link concepts/weight-loading}}: the HF loading steps in <code>load_model</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What does <code>DeepseekForCausalLM.forward</code> return, and where are the logits computed?
+    <x-a><p>A <code>CausalLMForwardOutput</code> with bf16 hidden states <code>[T, hidden]</code> ({{cite deepinfer/model_executor/models/deepseek.py:246-248}}). The sampler computes logits in <code>sample()</code>, with <code>lm_head.weight</code> ({{cite deepinfer/model_executor/models/deepseek.py:392-400}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>DEEPINFER_USE_NEXTN_DECODE=0</code>. Name two things that change in this file.
+    <x-a><p><code>load_nextn</code> is 0, so <code>MTP_module</code> is <code>None</code> and <code>num_mtp_moe_layers</code> is 0 ({{cite deepinfer/model_executor/models/deepseek.py:300-306}}). EPLB then covers only the N main MoE layers (line 310). The inner model also gets no DFlash target layers, so <code>dflash_input</code> is not allocated ({{cite deepinfer/model_executor/models/deepseek.py:72}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>DeepseekModel.__init__</code> sometimes not make an <code>HCHead</code>?
+    <x-a><p>With <code>hc_shifted</code>, each sub-layer applies the mix of the sub-layer before it, and the last mix is applied at the end of the model with <code>mhc_pre_apply_mix</code> ({{cite deepinfer/model_executor/models/deepseek.py:229-230}}). So no head is needed ({{cite deepinfer/model_executor/models/deepseek.py:107}}). The HF loader turns <code>hc_shifted</code> on by default ({{cite deepinfer/hugging_face/config.py:295}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A config has 8 main layers and 1 draft layer. How many modules does the container list have, which index is the main head, and what is <code>num_total_layers</code>?
+    <x-a><p>11 modules: embedding, 8 blocks, main head, 1 DFlash head. The main head is index N + 1 = 9 ({{cite deepinfer/model_executor/models/deepseek.py:277}}). <code>num_total_layers</code> = 11 − 2 = 9 ({{cite deepinfer/model_executor/models/deepseek.py:268}}). This is the deep dive "Worked example: the module list".</p></x-a>
+  </x-q>
+</x-quiz>
