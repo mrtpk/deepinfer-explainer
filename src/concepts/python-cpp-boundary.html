@@ -1,0 +1,200 @@
+---
+title: The Python and C++ boundary
+nav_title: Python and C++
+level: Intermediate
+prerequisites: concepts/engine-step-loop, concepts/scheduler
+related: code/engine-pyi, reference/cpp-engine-api, code/scheduler-hpp, code/block-manager-hpp, code/llm-engine, concepts/zero-overhead-scheduling, concepts/hardware-platforms, code/platform
+summary: DeepInfer runs the scheduler and the step bookkeeping in C++. One pybind11 module, deepinfer._C, connects that code to Python. This page explains the build, the three submodules, the GIL and lock rules, and the memory that crosses the boundary.
+---
+<x-sentence>DeepInfer runs the scheduler and the step bookkeeping in C++. Python reaches that code through one compiled {{term pybind11}} module, <code>deepinfer._C</code>.</x-sentence>
+
+<h2>The idea</h2>
+<p>Most of DeepInfer is Python. The entry point, the engine, the workers and the model forward pass are Python code that calls PyTorch and device {{term kernel | kernels}}. One part is C++: the code that decides what each engine {{term engine-step | step}} does, and the code that prepares the inputs for that step. This C++ code is in the folder <code>csrc/</code>.</p>
+<p>The C++ code is compiled into one {{term extension-module}}: a <code>.so</code> file that Python imports like a normal module. Its name is <code>deepinfer._C</code> ({{cite setup.py:59-60}}). It has three submodules:</p>
+<ul>
+  <li><code>_C.engine</code>: the {{term scheduler}}, the {{term block-manager | block managers}}, sequences, output objects, and the functions that prepare model and sampler inputs. This is the largest part: 34 names.</li>
+  <li><code>_C.cuda_utils</code>: three functions for raw device memory and for memory that another process opens.</li>
+  <li><code>_C.graph_timer</code>: three classes that time regions inside a captured {{term cuda-graph}}.</li>
+</ul>
+<p><strong>Why C++?</strong> The code and the docs do not give a direct reason. The deployment doc gives the context: in a decode step, <code>schedule</code> and <code>post-process</code> are "pure CPU logic", and the device sits idle while they run ({{cite doc/inference_deployment_qa.md:270}}). {{term zos | Zero-overhead scheduling}} hides this CPU time behind device work ({{cite doc/inference_deployment_qa.md:274}}). So the CPU time of each step matters. This site does not claim more than that.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a shop with a front desk and a stock room. Customers talk only to the front desk (Python). The stock room (C++) keeps the stock lists and counts fast. Items go between the two through one window (the pybind11 module). The comparison stops here: sometimes the stock room lends its own shelf to the front desk instead of a copy of the items. The front desk must finish with that shelf before the next step, because the stock room then uses it again. On this page, such a shelf is a {{term borrowed-view}}.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b10b_cpp_boundary" alt="Panel 1: setup.py compiles 11 common C++ files plus two platform files into deepinfer._C; scripts/build.sh builds into build/tag and links each .so into deepinfer/_so/tag; import deepinfer adds that folder to the package path. Panel 2: three submodules, cuda_utils with 3 functions, engine with 34 names, graph_timer with 3 classes, and the Python files that use them. Panel 3: one call to schedule: Python calls the binding, pybind11 converts the argument, C++ releases the GIL and locks the block managers, and the result returns with arrays that borrow C++ memory." caption="Figure: how <code>csrc/</code> becomes <code>deepinfer._C</code> (panel 1), what is inside it (panel 2), and what happens during one call (panel 3). Click to zoom." />
+<p>Read the panels from top to bottom. Panel 1 happens once, at build time. Panel 2 is the result. Panel 3 happens in every engine step. The amber card in panel 3 marks results that are not copies: they point into C++ memory.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: compile csrc/ into one extension module</h3>
+<p><code>setup.py</code> lists the C++ files that both platforms compile:</p>
+<x-code file="setup.py" lines="22-34" caption="Eleven common files: the top-level binding, nine engine files and the graph-timer binding." />
+<p>Each platform adds two files. On NVIDIA, the build uses <code>CUDAExtension</code> with <code>csrc/cuda_utils.cpp</code> and <code>graph_timer_cuda.cpp</code>. On Ascend, it uses <code>NpuExtension</code> from torch_npu with <code>csrc/asc_utils.cpp</code> and <code>graph_timer_asc.cpp</code> ({{cite setup.py:38-72}}). The page {{link concepts/hardware-platforms}} compares the two branches.</p>
+
+<h3>Step 2: one build folder per platform</h3>
+<p>Do not run <code>setup.py</code> directly. The script <code>scripts/build.sh</code> runs it and puts the result in a folder for one platform:</p>
+<x-code file="scripts/build.sh" lines="11-28" highlight="12-14,18,25,28" caption="The {{term platform-tag}} is <code>&lt;DEEPINFER_ACCELERATOR&gt;-&lt;uname -m&gt;</code>, for example <code>nvidia-x86_64</code>." />
+<p>At import time, <code>deepinfer/__init__.py</code> computes the same tag and adds <code>deepinfer/_so/&lt;tag&gt;/</code> to the package search path ({{cite deepinfer/__init__.py:30-32}}). Then <code>import deepinfer._C</code> finds the <code>.so</code> of this platform. The <code>Makefile</code> has one target per platform: <code>make build-nvidia</code> and <code>make build-ascend</code> ({{cite Makefile:3-11}}).</p>
+
+<h3>Step 3: three submodules</h3>
+<p>One C++ function makes the module and its three submodules:</p>
+<x-code file="csrc/pybind.cpp" lines="7-17" highlight="9,12,15">
+  <x-tr line="14">Probe timing inside a CUDA graph.</x-tr>
+</x-code>
+<p>Each submodule has a {{term type-stub}} in <code>deepinfer/_C/</code>: <code>cuda_utils.pyi</code>, <code>engine.pyi</code> and <code>graph_timer.pyi</code> ({{cite deepinfer/_C/__init__.pyi:1-5}}). Python never imports these <code>.pyi</code> files. Editors and type checkers read them. The page {{link code/engine-pyi}} lists all 34 names of <code>_C.engine</code>.</p>
+
+<h3>Step 4: one call crosses the boundary</h3>
+<p>In each step, the engine asks the C++ scheduler for a plan:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="884-887" />
+<p>The binding connects the Python name <code>schedule</code> to the C++ method. pybind11 converts the argument and the return value:</p>
+<x-code file="csrc/engine/pybind_scheduler.cpp" lines="97-99">
+  <x-tr line="98-99">Schedule one step. Returns (seq_metadata_list, scheduler_outputs). The SequenceMetadata objects in seq_metadata_list come from the pool. Give them back with pool.release after use.</x-tr>
+</x-code>
+<p>The first two lines of the C++ body are the rules of the boundary:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="275-284" highlight="276-277,282-284">
+  <x-tr line="279-281">The SchedulerOutputs of the previous step borrow the storage of these three vectors (see the clone_states/clone_blocks/zero_states properties in pybind). Python must use them up before the next schedule. Here we clear them and use them again.</x-tr>
+</x-code>
+<ol>
+  <li>Line 276 releases the {{term gil}}. The comment says why: "otherwise other python threads would be blocked".</li>
+  <li>Line 277 locks the two block managers: KV blocks and state slots. Each one is a {{term mutex}}.</li>
+  <li>Lines 282-284 clear the vectors that the previous result lent to Python.</li>
+</ol>
+
+<h3>Step 5: memory that crosses the boundary</h3>
+<p>Data can cross the boundary in three ways. Each way has a different owner.</p>
+<p><strong>C++ lends memory to Python.</strong> Some results are borrowed views. The property <code>clone_blocks</code> makes a NumPy array on the scheduler's own vector, with an empty capsule as owner:</p>
+<x-code file="csrc/engine/pybind_scheduler.cpp" lines="41-50" highlight="47">
+  <x-tr line="49-50">[n, 2] int32 (src, dst) block clone pairs; dst = 0 means only give back src, with no copy. Zero-copy borrow of the Scheduler's internal storage. The next schedule() clears it and uses it again: use it up before that, never keep it across steps.</x-tr>
+</x-code>
+<p><strong>Python gives data to C++.</strong> The <code>Sequence</code> constructor copies the prompt token ids into C++ storage. The binding accepts only a C-contiguous int32 NumPy array, with no conversion ({{cite csrc/engine/pybind_sequence.cpp:93-105}}). Its docstring says, translated: <em>"The caller guarantees that the token ids are valid; this constructor only copies the data."</em></p>
+<p><strong>C++ allocates device memory for Python.</strong> <code>cuda_utils.alloc_tensor</code> calls the CUDA driver directly and wraps the pointer in a tensor with a deleter:</p>
+<x-code file="csrc/cuda_utils.cpp" lines="77-89" highlight="79,82" caption="The tensor owns the memory. When the last reference goes away, the deleter calls <code>cuMemFree</code> ({{cite csrc/cuda_utils.cpp:66-75}})." />
+<p>The KV cache uses this function for its large buffers: the KV blocks and the state slots ({{cite deepinfer/worker/cache_engine.py:911-916}}, {{cite deepinfer/worker/cache_engine.py:937}}, {{cite deepinfer/worker/cache_engine.py:956}}). So these buffers do not come from the PyTorch caching allocator. On Ascend, <code>asc_utils.cpp</code> does the same with <code>aclrtMalloc</code> ({{cite csrc/asc_utils.cpp:88-97}}).</p>
+
+<h3>Step 6: rebuild the stubs after a C++ change</h3>
+<p><code>make stubgen</code> runs <code>scripts/gen_stub.sh</code>. The script imports the built module with <code>pybind11_stubgen</code> and writes the <code>.pyi</code> files ({{cite Makefile:27-28}}, {{cite scripts/gen_stub.sh:11-13}}). The build does not do this for you. The page {{link code/engine-pyi}} gives the steps.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The GIL and the block-manager locks">
+<p>Two kinds of lock meet at the boundary: the Python {{term gil}} and the C++ mutex of each <code>BlockManager</code>. The base class <code>Lockable</code> has one strict rule:</p>
+<x-code file="csrc/utils/lockable.hpp" lines="13-36" highlight="16,17,25-27,35">
+  <x-tr line="16">Holding the GIL when you call this function is forbidden, to avoid a deadlock!</x-tr>
+  <x-tr line="17">Fast path.</x-tr>
+</x-code>
+<ol>
+  <li>Line 16: if the calling thread holds the GIL, <code>TORCH_CHECK</code> fails. Python sees a <code>RuntimeError</code>.</li>
+  <li>Line 17: the fast path tries the lock without a wait.</li>
+  <li>Lines 20-27: else it waits for at most 20 seconds (<code>CLOCK_MONOTONIC</code>). After that, <code>TORCH_CHECK</code> fails with "failed to lock mutex".</li>
+  <li>Line 35: the mutex is an error-check mutex. A second lock from the same thread gives an error, not a hang.</li>
+</ol>
+<p><strong>Why no GIL while you lock.</strong> The code comment gives only "to avoid a deadlock". The general case is this: thread A holds the GIL and waits for the mutex. Thread B holds the mutex and waits for the GIL. Neither can continue. When every caller first releases the GIL, this cannot happen.</p>
+<p><strong>Lock order.</strong> <code>BlockManagerMutexAcquire</code> locks the state manager first, then the block manager. It unlocks in the opposite order ({{cite csrc/engine/block_manager.hpp:189-204}}). A fixed order prevents a second kind of deadlock between two threads that both want both locks.</p>
+<p><strong>How the code releases the GIL.</strong> There are three patterns:</p>
+<ul>
+  <li>Inside the C++ function: <code>py::gil_scoped_release</code> as the first line, as in <code>_schedule</code> ({{cite csrc/engine/scheduler.hpp:276}}) and <code>prepare_sampler_inputs</code> ({{cite csrc/engine/prepare_sample.cpp:42}}).</li>
+  <li>In the binding: <code>py::call_guard&lt;py::gil_scoped_release&gt;()</code>, for example for <code>BlockManager.lock</code> and <code>free_seq</code> ({{cite csrc/engine/pybind_scheduler.cpp:67-71}}, {{cite csrc/engine/pybind_scheduler.cpp:100-102}}).</li>
+  <li>Release, work, then get the GIL again to build a Python result. <code>build_request_outputs</code> reads its NumPy input pointers first, releases the GIL ({{cite csrc/engine/outputs.hpp:102-104}}), and gets it back before it makes the result array ({{cite csrc/engine/outputs.hpp:306-307}}).</li>
+</ul>
+<p>One call must keep the GIL: <code>update_metadata_for_sampling_zos</code> assigns a Python object ({{cite csrc/engine/pybind_scheduler.cpp:51-53}}). The page {{link code/engine-pyi}} lists every call that releases the GIL.</p>
+<p><strong>Which other Python threads run.</strong> The released GIL helps these threads in the engine process:</p>
+<ul>
+  <li>the structured-output compile pool ({{cite deepinfer/structure_output/so_matcher_builder.py:45}});</li>
+  <li>the statistics log thread ({{cite deepinfer/engine/stats_logger.py:186}});</li>
+  <li>the image-processing pool of the VL model ({{cite deepinfer/model_executor/models/deepseek_vl.py:84}});</li>
+  <li>the optional profiling HTTP server ({{cite deepinfer/engine/profile_server.py:157}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Memory across the boundary: owners and lifetimes">
+<table>
+  <thead><tr><th>What</th><th>Direction</th><th>Owner</th><th>Valid until</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>clone_states</code>, <code>clone_blocks</code> (int32 <code>[n, 2]</code>), <code>zero_states</code> (int32 <code>[n]</code>)</td><td>C++ → Python, borrowed</td><td>scheduler vectors</td><td>next <code>schedule()</code></td><td>{{cite csrc/engine/pybind_scheduler.cpp:31-62}}</td></tr>
+    <tr><td>result of <code>process_outputs</code> (float64 <code>[n]</code>, int32 <code>[n]</code>)</td><td>C++ → Python, borrowed</td><td>static buffers</td><td>next <code>process_outputs</code></td><td>{{cite csrc/engine/pybind_scheduler.cpp:109-112}}</td></tr>
+    <tr><td><code>SequenceMetadata</code> objects</td><td>C++ → Python</td><td><code>SequenceMetadataPool</code></td><td><code>pool.release</code></td><td>{{cite csrc/engine/pybind_scheduler.cpp:97-99}}</td></tr>
+    <tr><td>prompt token ids</td><td>Python → C++, copied</td><td>the C++ <code>Sequence</code></td><td>life of the sequence</td><td>{{cite csrc/engine/pybind_sequence.cpp:93-105}}</td></tr>
+    <tr><td>vector fields, for example <code>chunk_checkpoints</code></td><td>C++ → Python, copied</td><td>a new Python list on each read</td><td>always (it is a copy)</td><td>{{cite deepinfer/model_executor/sampling_inputs.py:7-9}}</td></tr>
+    <tr><td>device buffer from <code>alloc_tensor</code> (uint8 <code>[size]</code>)</td><td>C++ → Python, owned</td><td>the tensor; its deleter frees</td><td>last reference</td><td>{{cite csrc/cuda_utils.cpp:77-89}}</td></tr>
+    <tr><td>{{term ipc-handle}} bytes</td><td>process → process</td><td>the exporting process</td><td>while the export lives</td><td>{{cite csrc/cuda_utils.cpp:34-64}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example: one borrowed array.</strong> A forked sequence moves into the running queue. It has 130 tokens and the block size is 64 (an example value), so it uses 3 KV blocks. The scheduler gives it one new block for its last, part-full block and pushes the pair (old last block, new block) ({{cite csrc/engine/scheduler.hpp:606-611}}). Each extra block after the last used block adds a pair (block, 0), which gives the block back with no copy (lines 612-615). Here there is no extra block, so <code>clone_blocks</code> holds 2 ints. The property returns a NumPy array of shape <code>(1, 2)</code>. Its strides are <code>(8, 4)</code> bytes, that is <code>2 × sizeof(int)</code> and <code>sizeof(int)</code>. Its data pointer is <code>clone_blocks.data()</code> ({{cite csrc/engine/pybind_scheduler.cpp:46-47}}). The empty capsule <code>py::capsule([]() {})</code> tells NumPy that it does not own the memory. When the next <code>schedule()</code> calls <code>clone_blocks.clear()</code>, the array points at stale or reused memory. With no fork, the property returns a new empty array of shape <code>(0, 2)</code> (line 45). The engine does not keep the three arrays. It uses them at once, in the same step. It gives them to the worker, which clones and zeroes the blocks and states on the device ({{cite deepinfer/engine/llm_engine.py:889-903}}).</p>
+<p><strong>The device buffer.</strong> <code>alloc_tensor</code> rounds the size up to a multiple of 4096 bytes for <code>cuMemAlloc</code>, but the tensor shape keeps the requested size ({{cite csrc/cuda_utils.cpp:24-27}}, {{cite csrc/cuda_utils.cpp:79-82}}). If the allocation fails, the function logs an error and returns <code>None</code>. The cache engine asserts the type and stops with a message ({{cite deepinfer/worker/cache_engine.py:914-915}}).</p>
+<p><strong>IPC handles.</strong> <code>export_ipc_tensor(ptr, nbytes)</code> returns a byte string that holds a <code>cudaIpcMemHandle_t</code> and the size. <code>import_ipc_tensor</code> opens it in another process ({{cite csrc/cuda_utils.cpp:43-47}}). The deleter of the tensor closes the handle when the tensor dies ({{cite csrc/cuda_utils.cpp:15-22}}). In the package, only <code>utils.CudaIPCWrapper</code> uses these calls ({{cite deepinfer/utils.py:52-69}}), and only a test uses that class ({{cite tests/distributed/test_expert_shuffle.py:89}}). On Ascend, the export needs a 2 MB-aligned address:</p>
+<x-code file="csrc/asc_utils.cpp" lines="56-64" highlight="60,64">
+  <x-tr line="57-59">ACL needs the exported address to be 2 MB aligned. Else aclrtIpcMemGetExportKey returns ACL_ERROR_RT_DRV_INTERNAL_ERROR (507899); it checks only the address, not the size. In production the KV cache is one large allocation and is aligned. This explicit check makes the cause easy to find.</x-tr>
+  <x-tr line="63">By default the export has a PID allow-list check, and a cross-process import fails at once (507899).</x-tr>
+</x-code>
+</x-deepdive>
+
+<x-deepdive title="What C++ reads from Python, and when">
+<p><strong>Config objects.</strong> The <code>Scheduler</code> constructor takes <code>scheduler_config</code> as a plain <code>py::object</code>. It reads nine attributes by name, once, and keeps C++ copies ({{cite csrc/engine/scheduler.hpp:94-108}}). A later change to the Python object has no effect on the scheduler. A missing attribute raises an error at construction.</p>
+<p><strong>Process groups.</strong> The scheduler gets the data-parallel group as a <code>c10d::ProcessGroup</code> and runs its all-reduce votes from C++ ({{cite csrc/engine/scheduler.hpp:169-182}}). A Gloo group keeps the vote tensor on the CPU; any other backend puts it on the device ({{cite csrc/engine/scheduler.hpp:109}}).</p>
+<p><strong>Environment variables.</strong> C++ reads two variables itself with <code>getenv</code>:</p>
+<table>
+  <thead><tr><th>Variable</th><th>Default in C++</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5</td><td>{{cite csrc/engine/utils.hpp:36-40}}</td><td>Number of draft tokens. The comment asks to keep the default equal to <code>environ.py</code>.</td></tr>
+    <tr><td><code>DEEPINFER_CPP_LOG_LEVEL</code></td><td><code>info</code></td><td>{{cite csrc/utils/log.hpp:19-31}}</td><td>C++ log level: <code>off</code>, <code>error</code>, <code>warn</code> or <code>info</code>. Read once (a <code>static</code>). An unknown value gives <code>info</code>.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Build and import, step by step">
+<ol>
+  <li><code>DEEPINFER_ACCELERATOR=nvidia ./build.sh</code> first checks that the variable is <code>nvidia</code> or <code>ascend</code>. Then it installs <code>requirements-&lt;accelerator&gt;.txt</code> and, on NVIDIA, NCCL 2.32.3. Last, it builds the vendor libraries and runs <code>scripts/build.sh build</code> ({{cite build.sh:5-25}}).</li>
+  <li><code>scripts/build.sh</code> computes <code>PY_BUILDTAG</code> (for example <code>linux-x86_64-cpython-312</code>; an example, not from the repo) and the platform tag. The tag uses <code>nvidia</code> when the variable is not set ({{cite scripts/build.sh:11-14}}).</li>
+  <li>It sets <code>MAX_JOBS</code> to 16 unless you set it ({{cite scripts/build.sh:6-9}}), and runs <code>python setup.py build --build-base build/&lt;tag&gt;</code>.</li>
+  <li><code>setup.py</code> picks the extension type from <code>accelerator_kind()</code>, that is, from the device files of the build machine ({{cite setup.py:10-12}}). It needs the C++11 ABI of PyTorch ({{cite setup.py:18-19}}). The CUDA branch needs a conda env or a virtualenv ({{cite setup.py:55-57}}).</li>
+  <li>The script links every <code>.so</code> into <code>deepinfer/_so/&lt;tag&gt;/</code> with a relative symlink. If no file was linked, it exits with an error. Then it byte-compiles the package ({{cite scripts/build.sh:23-29}}).</li>
+  <li>At run time, <code>import deepinfer</code> computes the tag from <code>DEEPINFER_ACCELERATOR</code> (default <code>"nvidia"</code>, {{cite deepinfer/environ.py:101}}) and appends the folder to <code>__path__</code> if it exists ({{cite deepinfer/__init__.py:9-32}}).</li>
+  <li>Import <code>torch</code> before <code>deepinfer._C</code>. The extension links against the PyTorch libraries, and the package files do this in order ({{cite deepinfer/model_executor/sampling_inputs.py:16}}).</li>
+</ol>
+<x-warning title="Two different signals choose the platform">
+<p><code>setup.py</code> uses the device files of the machine. The folder tag uses the environment variable. On an Ascend host, a build with the variable not set compiles the NPU extension into <code>_so/nvidia-aarch64/</code>. An import with the variable not set also looks there, so it works. But an import with <code>DEEPINFER_ACCELERATOR=ascend</code> looks in <code>_so/ascend-aarch64/</code> and does not find it. (We derived this from the code; we did not run it.) Use <code>make build-ascend</code>, which sets the variable ({{cite Makefile:8-11}}).</p>
+</x-warning>
+<p><strong>Clean.</strong> <code>scripts/build.sh clean</code> removes <code>build/&lt;tag&gt;</code>, <code>deepinfer/_so/&lt;tag&gt;</code>, old <code>deepinfer/*.so</code> files and all <code>__pycache__</code> folders ({{cite scripts/build.sh:32-38}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The two small submodules">
+<p><strong><code>_C.cuda_utils</code></strong> has three functions ({{cite deepinfer/_C/cuda_utils.pyi:1-18}}). The header declares two more that only C++ uses: <code>cuda_copy_async</code> and <code>get_current_stream</code> ({{cite csrc/cuda_utils.hpp:18-25}}). The helper <code>make_from_blob</code> wraps a device pointer in a tensor. On Ascend it must use the torch_npu version:</p>
+<x-code file="csrc/cuda_utils.hpp" lines="35-45" highlight="40-44">
+  <x-tr line="35-37">The only way to wrap a raw device pointer as a tensor. On NPU, torch::from_blob breaks the dtype metadata (the dtype inference of at::from_blob fails on PrivateUse1), so it must use at_npu::native::from_blob; GPU uses torch::from_blob. Only for device memory views; CPU tensors still use torch::from_blob directly.</x-tr>
+</x-code>
+<p><strong><code>_C.graph_timer</code></strong> has <code>EventHandle</code>, <code>EventRecordNodeHandle</code> and <code>GraphHandle</code> ({{cite csrc/graph_timer/pybind.cpp:5-29}}). <code>EventHandle.synchronize</code> releases the GIL while it waits (line 10). <code>deepinfer/timer.py</code> and <code>worker/cuda_graph_runner.py</code> use it ({{cite deepinfer/timer.py:118}}, {{cite deepinfer/worker/cuda_graph_runner.py:11}}). See {{term graph-timer}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Do not keep borrowed arrays">
+<p>Copy <code>clone_states</code>, <code>clone_blocks</code>, <code>zero_states</code> and the result of <code>process_outputs</code> before the next call (for example with <code>np.array(x)</code>). A saved view shows the data of a later step, or freed memory. Nothing raises an error.</p>
+</x-warning>
+<ul>
+  <li><strong>Import order.</strong> If <code>deepinfer._C</code> loads before <code>torch</code>, the import fails. A script comment says, translated: <em>"Load libtorch first, or deepinfer._C reports libc10.so not found"</em> ({{cite examples/yoco/yoco_equiv.py:200}}).</li>
+  <li><strong>Wrong <code>.so</code> folder.</strong> If the tag at run time differs from the tag at build time, the import finds no module or an old one. See the deep dive "Build and import".</li>
+  <li><strong>Lock with the GIL held.</strong> New C++ code that locks a block manager without releasing the GIL fails the check in <code>Lockable::lock_</code> ({{cite csrc/utils/lockable.hpp:16}}).</li>
+  <li><strong>Lock time-out.</strong> If another thread holds a block manager for more than 20 seconds, the call fails with "failed to lock mutex" ({{cite csrc/utils/lockable.hpp:25-27}}).</li>
+  <li><strong>Wrong argument type.</strong> <code>Sequence(...)</code> with a Python list for <code>prompt_token_ids</code> raises <code>TypeError</code>, because of <code>noconvert()</code> ({{cite csrc/engine/pybind_sequence.cpp:103}}).</li>
+  <li><strong>Old stub.</strong> After a binding change, the <code>.pyi</code> files are wrong until you run <code>make stubgen</code>.</li>
+  <li><strong>Default drift.</strong> C++ has its own default for <code>DEEPINFER_USE_NEXTN_DECODE</code> (5). A change in <code>environ.py</code> alone makes the two sides disagree ({{cite csrc/engine/utils.hpp:38-39}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The scheduler, the block managers and the input preparation run in C++. So many engine bugs show up at this boundary. Examples are data that a later step changed, a lock that waits, and a module from the wrong build. When you know who owns each buffer and which call releases the GIL, you can find these bugs fast.</p>
+
+<x-quiz>
+  <x-q level="easy">How many submodules does <code>deepinfer._C</code> have, and what are their names?
+    <x-a><p>Three: <code>cuda_utils</code>, <code>engine</code> and <code>graph_timer</code>. <code>csrc/pybind.cpp</code> makes them with <code>def_submodule</code> ({{cite csrc/pybind.cpp:9-16}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Does the repository say why the scheduler is in C++?
+    <x-a><p>No. The deployment doc only says that schedule and post-process are pure CPU work and that the device is idle during them without asynchronous scheduling ({{cite doc/inference_deployment_qa.md:270}}). The code gives no reason.</p></x-a>
+  </x-q>
+  <x-q level="medium">On an NVIDIA x86 machine, you run <code>make build-nvidia</code>. Where does the <code>.so</code> go, and how does <code>import deepinfer._C</code> find it?
+    <x-a><p>The build writes to <code>build/nvidia-x86_64</code> and links each <code>.so</code> into <code>deepinfer/_so/nvidia-x86_64/</code> ({{cite scripts/build.sh:12-14}}, {{cite scripts/build.sh:23-26}}). <code>deepinfer/__init__.py</code> computes the same tag and appends that folder to the package <code>__path__</code> ({{cite deepinfer/__init__.py:30-32}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A new Python thread calls <code>scheduler.try_allocate_seq(seq)</code> while the main thread is inside <code>schedule()</code>. What happens?
+    <x-a><p>The binding releases the GIL and then waits for the block-manager locks ({{cite csrc/engine/pybind_scheduler.cpp:87-90}}). The main thread holds them during <code>_schedule()</code>, so the new thread waits. If it waits more than 20 seconds, the lock fails with "failed to lock mutex" ({{cite csrc/utils/lockable.hpp:25-27}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>Lockable::lock_</code> refuse to run when the thread holds the GIL, and why does <code>BlockManagerMutexAcquire</code> always lock the state manager first?
+    <x-a><p>Both rules prevent deadlocks. A thread can hold the GIL and wait for a mutex. If the mutex holder needs the GIL to finish, both threads stop. So the check at {{cite csrc/utils/lockable.hpp:16}} makes every caller release the GIL first. A fixed lock order (state manager, then block manager; {{cite csrc/engine/block_manager.hpp:190-196}}) prevents two threads from each holding one lock and waiting for the other. This is the deep dive "The GIL and the block-manager locks".</p></x-a>
+  </x-q>
+</x-quiz>

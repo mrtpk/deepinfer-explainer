@@ -1,0 +1,208 @@
+---
+title: model_executor/model_loader.py: get_model and the HF load entry points
+nav_title: model_loader.py
+level: Intermediate
+prerequisites: concepts/weight-loading
+related: concepts/weight-loading, code/hf-weights, code/deepseek, code/model-runner, code/eplb, tours/startup
+summary: model_loader.py finds the model class, adds the parallel fields to the model config (token limits and extra experts), builds the parameter containers on the meta device, and runs the one-way coverage check before the HF weights load under a 30-minute watchdog.
+---
+<h2>Purpose</h2>
+<p><code>model_loader.py</code> is the entry point for model loading. It finds the model class, completes the config, and guards the checkpoint load with checks and a watchdog.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/model_loader.py</code>, 153 lines of Python. The header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/model_executor/model_loader.py:2}})</td></tr>
+    <tr><th>Main functions</th><td><code>get_model</code> ({{cite deepinfer/model_executor/model_loader.py:65}}), <code>finalize_model_config</code> ({{cite deepinfer/model_executor/model_loader.py:109}}), <code>load_hf_checkpoint</code> ({{cite deepinfer/model_executor/model_loader.py:136}}). No class.</td></tr>
+    <tr><th>Runs in</th><td>Every worker process (the driver and each context-parallel follower), in the main thread, once at start-up. The watchdog adds one daemon thread during the load.</td></tr>
+    <tr><th>Called by</th><td><code>ModelRunner.load_model</code> (<code>get_model</code>), <code>DeepseekForCausalLM.load_model</code> (the other three), and <code>examples/_ve_helper.py</code> (<code>load_hf_checkpoint</code>).</td></tr>
+    <tr><th>Calls</th><td><code>ModelRegistry</code>, <code>eplb.resolve_num_extra_experts</code>, the process groups <code>PG</code>, <code>V41Builder</code>, and the <code>deepinfer.hugging_face</code> API.</td></tr>
+    <tr><th>Not in this file</th><td>The load order (in <code>deepseek.py</code>), the name map and the safetensors reader (in <code>hugging_face/</code>). See {{link code/hf-weights}}.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b10b_weight_load" alt="Panel 1: config.json becomes model_cfg; finalize_model_config in model_loader.py adds token limits and extra experts. Panel 2: the six load steps; step 2 is build_model_on_meta and step 5 is load_hf_checkpoint, both in model_loader.py. Panel 3: which experts each EP rank reads." caption="Figure: the whole load. This file owns <code>finalize_model_config</code> (panel 1, box 2), <code>build_model_on_meta</code> (panel 2, step 2) and <code>load_hf_checkpoint</code> (panel 2, step 5). Click to zoom." />
+<p>The file has two roles. <code>get_model</code> is the top of the call chain. The other public functions are building blocks that <code>DeepseekForCausalLM.load_model</code> calls in a fixed order ({{cite deepinfer/model_executor/models/deepseek.py:457-510}}).</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>ModelRunner.load_model</code></strong> calls <code>get_model(self.model_config, skip_load)</code> ({{cite deepinfer/worker/model_runner.py:96-97}}). The engine starts this on all ranks with <code>_run_workers("load_model", skip_load=load_format == "dummy")</code> ({{cite deepinfer/engine/llm_engine.py:241}}).</li>
+  <li><strong><code>DeepseekForCausalLM.load_model</code></strong> imports <code>build_model_on_meta</code>, <code>finalize_model_config</code> and <code>load_hf_checkpoint</code> ({{cite deepinfer/model_executor/models/deepseek.py:22-26}}).</li>
+  <li><strong><code>LLMEngine.__init__</code></strong> and <strong><code>MultimodalProcessor</code></strong> call the private <code>_get_model_architecture</code> to look at the model class ({{cite deepinfer/engine/llm_engine.py:209}}, {{cite deepinfer/ve/multimodal_processor.py:68}}).</li>
+  <li><strong><code>examples/_ve_helper.py</code></strong> calls <code>load_hf_checkpoint</code> on a tree with only vision parameters ({{cite examples/_ve_helper.py:58-60}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>ModelRegistry.load_model_cls</code>, which imports the module of the one registered architecture ({{cite deepinfer/model_executor/models/__init__.py:15-28}}).</li>
+  <li><code>resolve_num_extra_experts</code> from <code>eplb</code> ({{cite deepinfer/model_executor/model_loader.py:19}}).</li>
+  <li><code>PG.expert_parallel_group()</code> and <code>PG.context_parallel_group()</code> for the group sizes ({{cite deepinfer/model_executor/model_loader.py:116-120}}).</li>
+  <li><code>V41Builder</code> and the HF functions <code>model_params</code>, <code>validate_hf_shapes</code>, <code>load_covered_params</code>. It imports them inside the functions ({{cite deepinfer/model_executor/model_loader.py:130}}, {{cite deepinfer/model_executor/model_loader.py:143}}).</li>
+</ul>
+
+<h2>Key functions, one by one</h2>
+<p>The file is short, so this section joins the function table and the walk-through.</p>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_set_default_torch_dtype</code></td><td>{{cite deepinfer/model_executor/model_loader.py:26-34}}</td><td>Context manager: sets the PyTorch default dtype, then restores it.</td></tr>
+    <tr><td><code>_get_model_architecture</code></td><td>{{cite deepinfer/model_executor/model_loader.py:37-44}}</td><td>Architecture name → model class, or <code>ValueError</code>.</td></tr>
+    <tr><td><code>checkpoint_load_watchdog</code></td><td>{{cite deepinfer/model_executor/model_loader.py:47-62}}</td><td>Aborts the process if the block does not end within 30 minutes.</td></tr>
+    <tr><td><code>get_model</code></td><td>{{cite deepinfer/model_executor/model_loader.py:65-80}}</td><td>Loads the model and checks that it is on the device.</td></tr>
+    <tr><td><code>_configure_moe_redundancy</code></td><td>{{cite deepinfer/model_executor/model_loader.py:83-106}}</td><td>Writes the number of extra experts for the main and the DFlash MoE.</td></tr>
+    <tr><td><code>finalize_model_config</code></td><td>{{cite deepinfer/model_executor/model_loader.py:109-125}}</td><td>Adds token limits and extra experts to <code>model_cfg.gpt</code>.</td></tr>
+    <tr><td><code>build_model_on_meta</code></td><td>{{cite deepinfer/model_executor/model_loader.py:128-133}}</td><td>Builds all parameter containers on the meta device.</td></tr>
+    <tr><td><code>load_hf_checkpoint</code></td><td>{{cite deepinfer/model_executor/model_loader.py:136-153}}</td><td>Coverage check, shape check, then the load.</td></tr>
+  </tbody>
+</table>
+
+<h3><code>get_model</code></h3>
+<x-code file="deepinfer/model_executor/model_loader.py" lines="65-80" highlight="69-70,76-79" />
+<ol>
+  <li>Line 69: find the class. With the only registered architecture, it is <code>DeepseekVLForCausalLM</code>.</li>
+  <li>Line 70: two context managers. The default dtype becomes <code>model_config.dtype</code>, which is always <code>torch.bfloat16</code> ({{cite deepinfer/config.py:75}}). New tensors go to <code>"cuda"</code> unless code names another device.</li>
+  <li>Lines 71-75: the class method <code>load_model</code> does the real work.</li>
+  <li>Lines 76-79: every parameter and every <code>sf</code> scale tensor of the result must be on the device. An <code>AssertionError</code> names the first one that is not.</li>
+  <li>Line 80: eval mode, no gradients.</li>
+</ol>
+
+<h3><code>finalize_model_config</code> and <code>_configure_moe_redundancy</code></h3>
+<x-code file="deepinfer/model_executor/model_loader.py" lines="109-125" highlight="117,119-120,122-123">
+  <x-tr line="110-114">Set up the runtime environment that model construction needs, and write the parallel and runtime fields for inference into the loaded model_cfg. model_cfg was loaded by ModelConfig through load_model_config (HF config.json). Some runtime fields (runtime_max_model_len / max_num_seqs / max_num_batched_tokens / engine_type) were already written into model_cfg.gpt by ModelConfig; this function uses the inference process groups to complete the expert layout and the derived token limits.</x-tr>
+</x-code>
+<ol>
+  <li>Line 117: the EP size is 1 if no EP group exists.</li>
+  <li>Line 119: <code>max_num_decoding_tokens = max_num_seqs × (1 + DEEPINFER_USE_NEXTN_DECODE)</code>. A decode step sends one new token and the drafts for each sequence.</li>
+  <li>Line 120: <code>max_num_prefilling_tokens = max_num_batched_tokens // cp_size</code>. Context parallelism splits a prefill over the CP ranks.</li>
+  <li>Lines 122-123: the extra-expert lower limit comes from the environment. <code>_configure_moe_redundancy</code> rounds it up.</li>
+</ol>
+<x-code file="deepinfer/model_executor/model_loader.py" lines="83-106" highlight="94,102,105-106">
+  <x-tr line="97-98">{layout} DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS={min} was rounded up to {extra}, so that num_routed_experts={n} + num_extra_experts divides by ep_size={ep_size}.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 89-91: a model with no <code>moe</code> block keeps no extra experts. In this release, <code>ModelMetadata</code> requires the MoE block anyway ({{cite deepinfer/model_executor/model_metadata_utils.py:96-97}}).</li>
+  <li>Line 94: <code>resolve_num_extra_experts</code> returns the smallest value at or above the limit that makes <code>routed + extra</code> divide by the EP size ({{cite deepinfer/model_executor/eplb/__init__.py:21-28}}).</li>
+  <li>Lines 95-99: a warning if the value went up.</li>
+  <li>Line 102: the result goes to <code>moe.n_redundant_experts</code>. <code>FusedExperts</code> reads it to size its slots ({{cite deepinfer/model_executor/models/v4_modules/moe.py:77-95}}).</li>
+  <li>Lines 103-106: DFlash can have its own MoE settings. The function merges them over the main settings with the {{term attrdict}} <code>+</code> operator, so the count of DFlash experts decides the padding. The result goes into the DFlash override.</li>
+</ol>
+
+<h3><code>build_model_on_meta</code></h3>
+<x-code file="deepinfer/model_executor/model_loader.py" lines="128-133">
+  <x-tr line="129">Build the language parameter containers of the HF model on the meta device.</x-tr>
+</x-code>
+<p>Inside <code>torch.device("meta")</code>, a new tensor gets a shape and a dtype but no memory. One exception: the vision encoder builds its RoPE tables on the device, because its constructor is not meta-safe ({{cite deepinfer/model_executor/models/v4_modules/containers.py:50-54}}).</p>
+
+<x-warning title="The check below is one-way">
+<p>Line 147 subtracts the coverage from the model parameters. It never subtracts the parameters from the checkpoint. A checkpoint tensor that the model does not use is not reported.</p>
+</x-warning>
+
+<h3><code>load_hf_checkpoint</code></h3>
+<x-code file="deepinfer/model_executor/model_loader.py" lines="136-153" highlight="145,147-149,150,151-152">
+  <x-tr line="149">HF checkpoint {hf_dir} does not cover {len(missing)} model parameters: {missing}</x-tr>
+  <x-tr line="153">HF load done: all {len(params)} model parameters come from {hf_dir}</x-tr>
+</x-code>
+<ol>
+  <li>Line 145: <code>model_params</code> lists every parameter and every persistent buffer by its path ({{cite deepinfer/hugging_face/parameters.py:14-27}}).</li>
+  <li>Lines 147-149: any parameter with no source stops the load with <code>RuntimeError</code>. The message lists all of them, sorted.</li>
+  <li>Line 150: shapes and dtypes are compared with the safetensors headers only.</li>
+  <li>Lines 151-152: the load itself runs under the watchdog.</li>
+  <li>Line 153: the log line counts the model parameters, not the checkpoint tensors.</li>
+</ol>
+
+<h3><code>checkpoint_load_watchdog</code></h3>
+<x-code file="deepinfer/model_executor/model_loader.py" lines="47-62" highlight="53-55,57,62">
+  <x-tr line="49">Time-out protection for checkpoint loading. If the load does not finish within the given time, abort the process.</x-tr>
+</x-code>
+<p>The watchdog thread waits on an <code>Event</code>. The <code>finally</code> block sets the event, so the thread also ends after an exception. If the wait times out, the thread logs an error and calls <code>os.abort()</code>. That kills the whole process with <code>SIGABRT</code>: no Python exception, no clean-up.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: what this file reads and writes">
+<table>
+  <thead><tr><th>Object</th><th>Type</th><th>Read or written</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>model_config.architecture</code></td><td><code>str</code></td><td>read</td><td>38</td></tr>
+    <tr><td><code>model_config.model</code>, <code>.model_cfg</code>, <code>.dtype</code></td><td><code>str</code>, {{term attrdict}}, <code>torch.dtype</code></td><td>read</td><td>70-73</td></tr>
+    <tr><td><code>model_cfg.gpt.max_num_decoding_tokens</code></td><td><code>int</code></td><td>written</td><td>119</td></tr>
+    <tr><td><code>model_cfg.gpt.max_num_prefilling_tokens</code></td><td><code>int</code></td><td>written</td><td>120</td></tr>
+    <tr><td><code>model_cfg.gpt.moe.n_redundant_experts</code></td><td><code>int</code></td><td>written</td><td>102</td></tr>
+    <tr><td><code>model_cfg.gpt.dflash_cfg.moe.n_redundant_experts</code></td><td><code>int</code></td><td>written if the override exists</td><td>106</td></tr>
+    <tr><td><code>params</code></td><td><code>dict[str, Tensor]</code>, path → parameter</td><td>local</td><td>145</td></tr>
+    <tr><td><code>coverage.model_names()</code></td><td><code>frozenset[str]</code> of all four maps</td><td>read</td><td>147</td></tr>
+  </tbody>
+</table>
+<p>The token limits size buffers in the model: the MoE layer and Engram choose their maximum token count from them ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:173-175}}, {{cite deepinfer/model_executor/models/v4_modules/engram.py:94}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the numbers that finalize_model_config writes">
+<p>Assume <code>max_num_seqs = 256</code>, <code>max_num_batched_tokens = 32768</code>, CP size 2 and EP size 16. Also assume the default <code>DEEPINFER_USE_NEXTN_DECODE = 5</code> ({{cite deepinfer/environ.py:129}}), 256 routed experts and a DFlash override with 64 routed experts. The expert counts and the batch values are examples, not values from the repo.</p>
+<ol>
+  <li><code>max_num_decoding_tokens = 256 × (1 + 5) = 1536</code>.</li>
+  <li><code>max_num_prefilling_tokens = 32768 // 2 = 16384</code>.</li>
+  <li>With <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS=32</code>: main <code>-(256 + 32) % 16 = 0</code>, so 32 extra, 288 slots, 18 per rank. DFlash <code>-(64 + 32) % 16 = 0</code>, so 32 extra, 96 slots, 6 per rank. No warning.</li>
+  <li>With the variable not set (0): main 0 extra and 16 per rank; DFlash 0 extra and 4 per rank.</li>
+  <li>With EP size 24 and the limit 32: main <code>-(288) % 24 = 0</code>, so 32; DFlash <code>-(96) % 24 = 0</code>, so 32. With EP size 20: main 44 (warning), DFlash <code>-(96) % 20 = 4</code>, so 36 (warning).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<ul>
+  <li>Each data-parallel rank is its own process with its own engine, and each one calls <code>get_model</code>.</li>
+  <li>Each context-parallel follower gets <code>load_model</code> from the driver by a CPU broadcast and runs it too ({{cite deepinfer/worker/base.py:296-302}}).</li>
+  <li><code>finalize_model_config</code> reads the EP and CP group sizes (lines 116-120), so it must run after the worker makes the process groups in <code>init_dist</code> ({{cite deepinfer/worker/base.py:196}}). Its docstring says that it uses the inference process groups (lines 110-114). This explains why it runs in the worker and not in <code>ModelConfig</code>.</li>
+  <li>The watchdog is a daemon thread. It does not stop the process from exiting. It ends when the load ends or fails ({{cite deepinfer/model_executor/model_loader.py:57-62}}).</li>
+  <li>The watchdog covers only <code>load_covered_params</code>. The earlier steps, for example opening every shard in <code>prepare_hf_coverage</code>, have no time-out.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Problem</th><th>Result</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td>architecture not registered</td><td><code>ValueError</code> with the supported list</td><td>{{cite deepinfer/model_executor/model_loader.py:40-43}}</td></tr>
+    <tr><td>parameter or scale not on the device after the load</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/model_loader.py:76-79}}</td></tr>
+    <tr><td>extra-expert limit rounded up</td><td>warning only</td><td>{{cite deepinfer/model_executor/model_loader.py:95-99}}</td></tr>
+    <tr><td>model parameter not covered</td><td><code>RuntimeError</code> with all names</td><td>{{cite deepinfer/model_executor/model_loader.py:147-149}}</td></tr>
+    <tr><td>checkpoint tensor not used</td><td>nothing</td><td>{{cite deepinfer/model_executor/model_loader.py:147}}</td></tr>
+    <tr><td>shape or dtype differs</td><td><code>ValueError</code> from <code>validate_hf_shapes</code></td><td>{{cite deepinfer/hugging_face/loading.py:104-121}}</td></tr>
+    <tr><td>load takes more than 30 minutes</td><td>error log, then <code>os.abort()</code></td><td>{{cite deepinfer/model_executor/model_loader.py:53-55}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables read in this file">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5 ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/model_loader.py:119}}</td><td>Draft tokens per sequence; sets <code>max_num_decoding_tokens</code>.</td></tr>
+    <tr><td><code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code></td><td>0 ({{cite deepinfer/environ.py:114}})</td><td>{{cite deepinfer/model_executor/model_loader.py:122}}</td><td>Lower limit of extra expert slots; rounded up. The example scripts set 32 ({{cite examples/_config.py:77-79}}).</td></tr>
+  </tbody>
+</table>
+<p>The time-out of the watchdog is a default argument (<code>30 * 60</code> seconds), not an environment variable. No caller passes another value ({{cite deepinfer/model_executor/model_loader.py:48}}, {{cite deepinfer/model_executor/model_loader.py:151}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/weight-loading}}: the whole load, with the name map and the scales.</li>
+  <li>{{link code/hf-weights}}: the coverage plan and the three load channels.</li>
+  <li>{{link code/deepseek}}: <code>DeepseekForCausalLM.load_model</code>, the caller of the building blocks.</li>
+  <li>{{link concepts/eplb}}: why extra expert slots exist.</li>
+  <li>{{link tours/startup}}: where the load happens in the start-up.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which function in this file raises when a model parameter has no checkpoint tensor?
+    <x-a><p><code>load_hf_checkpoint</code>, with <code>RuntimeError</code> ({{cite deepinfer/model_executor/model_loader.py:147-149}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What happens if loading the weights takes 31 minutes?
+    <x-a><p>The watchdog thread logs an error and calls <code>os.abort()</code>, so the process stops at once ({{cite deepinfer/model_executor/model_loader.py:53-55}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>finalize_model_config</code> run inside the worker, and not when <code>ModelConfig</code> parses <code>config.json</code>?
+    <x-a><p>It needs the sizes of the EP and CP process groups ({{cite deepinfer/model_executor/model_loader.py:116-120}}). These groups exist only after the worker starts the distributed environment.</p></x-a>
+  </x-q>
+  <x-q level="hard">EP size 20, 256 main experts, 64 DFlash experts, <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS=32</code> (example values). How many expert slots does each rank hold for the main layers and for the DFlash layers, and how many warnings appear?
+    <x-a><p>Main: <code>-(256 + 32) % 20 = 12</code>, so 44 extra, 300 slots, 15 per rank. DFlash: <code>-(64 + 32) % 20 = 4</code>, so 36 extra, 100 slots, 5 per rank. Both values are above 32, so two warnings appear, one for "backbone" and one for "DFlash" ({{cite deepinfer/model_executor/model_loader.py:93-106}}). This is the deep dive "Worked example".</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,158 @@
+---
+title: deepinfer/npu_ops/: an import hook for two Ascend replacements
+nav_title: npu_ops/
+level: Advanced
+prerequisites: concepts/hardware-platforms, code/platform
+related: concepts/hardware-platforms, code/platform, code/sampler, code/v4-index-attn, code/vit, concepts/sparse-attention-indexer
+summary: On Ascend, npu_ops replaces builtins.__import__ with a hook. From then on, from-imports of deep_select.interface.topk and flash_attn.cute.interface._flash_attn_fwd get NPU versions, loaded lazily. The package is marked as temporary.
+---
+<h2>Purpose</h2>
+<p><code>npu_ops</code> gives Ascend processes their own version of two {{term vendor-library}} functions, without a change to the files that import them.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/npu_ops/__init__.py</code> (12 lines, the patch map), <code>patch_imports.py</code> (142 lines, the hook), <code>deep_select.py</code> (26 lines), <code>vit_attn.py</code> (31 lines).</td></tr>
+    <tr><th>Main functions</th><td><code>patch_imports</code> ({{cite deepinfer/npu_ops/patch_imports.py:96}}), <code>_hooked_import</code> ({{cite deepinfer/npu_ops/patch_imports.py:55}}), class <code>Lazy</code> ({{cite deepinfer/npu_ops/patch_imports.py:33}}).</td></tr>
+    <tr><th>Runs in</th><td>Only processes with a <code>PlatformNPU</code>. The package runs once, when the platform is made. After that, the hook runs on every import statement in the process, but it acts only on <code>from … import …</code> statements.</td></tr>
+    <tr><th>Called by</th><td><code>PlatformNPU.__init__</code>, with <code>import deepinfer.npu_ops</code> and the note <code>TODO(NPU): Intended to be removed.</code> ({{cite deepinfer/platform.py:140-141}}). Nothing else imports it.</td></tr>
+    <tr><th>Calls</th><td><code>builtins.__import__</code>, <code>importlib.import_module</code>, <code>torch.topk</code>, the vendor <code>deep_select.interface.topk</code>, and <code>torch_npu.npu_fusion_attention</code>.</td></tr>
+    <tr><th>Not in this folder</th><td>The <code>torch.cuda</code> → <code>torch.npu</code> mapping (that is <code>torch_npu.contrib.transfer_to_npu</code>, {{cite deepinfer/platform.py:120-121}}), and the TileLang kernels for Ascend (<code>tilelang_ops/asc/</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/hardware-platforms}} introduces the hook in its deep dive "The npu_ops import hook in detail". This page gives the full map, the call sites and the risks.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b10b_npu_hook" alt="Panel 1: the first read of deepinfer.PLATFORM, for example in timer.py, makes PlatformNPU; its constructor imports deepinfer.npu_ops; patch_imports builds the map and replaces builtins.__import__ with _hooked_import. Panel 2: three outcomes for a from-import: not patched gives the original import; a caller inside the source module gets the original vendor object; any other caller gets a new module object whose patched name is a Lazy wrapper. Panel 3: topk falls back to torch.topk unless return_value is False; _flash_attn_fwd calls npu_fusion_attention in TND layout; a module imported before the hook keeps the vendor object." caption="Figure: when the hook is installed (panel 1), what a from-import returns (panel 2), and what the replacements do (panel 3). Click to zoom." />
+
+<h3>Who calls it, and who is affected</h3>
+<ul>
+  <li><strong>Installer.</strong> Only <code>PlatformNPU.__init__</code> ({{cite deepinfer/platform.py:140-141}}). On NVIDIA nothing imports the package.</li>
+  <li><strong>Importers of <code>deep_select.interface.topk</code>:</strong> the sampler ({{cite deepinfer/model_executor/layers/sampler.py:12}}), the sampler helpers ({{cite deepinfer/model_executor/layers/sampler_utils.py:4}}), and the sparse-attention indexer ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:12}}).</li>
+  <li><strong>Importer of <code>flash_attn.cute.interface._flash_attn_fwd</code>:</strong> the vision encoder ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:13}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li>The original <code>builtins.__import__</code>, saved before the swap ({{cite deepinfer/npu_ops/patch_imports.py:12}}, {{cite deepinfer/npu_ops/patch_imports.py:141-142}}).</li>
+  <li><code>importlib.import_module</code>, when a <code>Lazy</code> wrapper is used the first time ({{cite deepinfer/npu_ops/patch_imports.py:39-43}}).</li>
+</ul>
+
+<h2>Key functions, one by one</h2>
+<p>The folder is small, so this section joins the function table and the walk-through.</p>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>patch map</td><td>{{cite deepinfer/npu_ops/__init__.py:3-12}}</td><td>Two entries: source module → {target module: name}.</td></tr>
+    <tr><td><code>patch_imports</code></td><td>{{cite deepinfer/npu_ops/patch_imports.py:96-142}}</td><td>Checks the spec, fills <code>_patch_map</code>, swaps <code>builtins.__import__</code>. Once only.</td></tr>
+    <tr><td><code>_add</code>, <code>_iter_pairs</code></td><td>{{cite deepinfer/npu_ops/patch_imports.py:15-30}}</td><td>Add one target; refuse a duplicate target.</td></tr>
+    <tr><td><code>Lazy</code></td><td>{{cite deepinfer/npu_ops/patch_imports.py:33-52}}</td><td>Stands in for the replacement; imports it at the first call or attribute read.</td></tr>
+    <tr><td><code>_hooked_import</code></td><td>{{cite deepinfer/npu_ops/patch_imports.py:55-93}}</td><td>The hook. Decides what a from-import returns.</td></tr>
+    <tr><td><code>deep_select.topk</code></td><td>{{cite deepinfer/npu_ops/deep_select.py:20-26}}</td><td><code>torch.topk</code> unless <code>return_value=False</code>.</td></tr>
+    <tr><td><code>vit_attn._flash_attn_fwd</code></td><td>{{cite deepinfer/npu_ops/vit_attn.py:8-31}}</td><td>Variable-length attention for the ViT with torch_npu.</td></tr>
+  </tbody>
+</table>
+
+<h3>The patch map</h3>
+<x-code file="deepinfer/npu_ops/__init__.py" lines="1-12" />
+<p>The keys are the <em>source</em> modules (where the replacement lives). The values say which name in which <em>target</em> module to replace. So <code>from deep_select.interface import topk</code> gets <code>deepinfer.npu_ops.deep_select.topk</code>.</p>
+
+<h3><code>patch_imports</code></h3>
+<x-code file="deepinfer/npu_ops/patch_imports.py" lines="112-142" highlight="114-116,118,123-130,133-135,137-138,140-142" />
+<ol>
+  <li>Lines 114-116: a second call raises <code>RuntimeError</code>. Python caches modules, so <code>import deepinfer.npu_ops</code> runs this only once anyway.</li>
+  <li>Line 118: a side effect. It adds a process-wide filter that hides the "pkg_resources is deprecated" <code>DeprecationWarning</code>.</li>
+  <li>Lines 123-130: a <code>None</code> key maps each target to a function with the suffix <code>_ref</code> in the same module. The map in this release does not use this form.</li>
+  <li>Lines 133-135: the normal form. <code>_add</code> raises <code>ValueError</code> for a target that occurs twice ({{cite deepinfer/npu_ops/patch_imports.py:18-19}}).</li>
+  <li>Lines 137-138: the list of patches goes out as an <code>ImportWarning</code>. Python hides <code>ImportWarning</code> by default, so you see it only with <code>-W default</code> or a similar option.</li>
+  <li>Lines 140-142: store the map, save the current <code>__import__</code>, and install the hook. The hook stays for the life of the process.</li>
+</ol>
+
+<h3><code>_hooked_import</code></h3>
+<x-code file="deepinfer/npu_ops/patch_imports.py" lines="55-93" highlight="63-64,68-69,71,82-91,92">
+  <x-tr line="62">Handle only <code>from name import a, b</code> (not <code>*</code>). fromlist can be None.</x-tr>
+  <x-tr line="78">Get the original target module. Imports inside it are still patched.</x-tr>
+  <x-tr line="88">When src itself imports back the matching target, give it the original object.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 63-64: a relative import or a plain <code>import X</code> goes to the original import.</li>
+  <li>Lines 66-69: if the target module is not in the map, or no patched name is in the list, the original import runs too.</li>
+  <li>Line 71: the caller is the module that runs the statement, from its <code>__name__</code>.</li>
+  <li>Lines 82-91: for each patched name, a caller inside the source module gets the original object (so <code>npu_ops/deep_select.py</code> can call the vendor <code>topk</code>). Any other caller gets a <code>Lazy</code> wrapper.</li>
+  <li>Line 92: other names of the target module come from the real module, through the module-level <code>__getattr__</code> of the new module object.</li>
+</ol>
+
+<h3>The two replacements</h3>
+<x-code file="deepinfer/npu_ops/deep_select.py" lines="7-26" highlight="14-16,22-24,26" />
+<p>Only calls with <code>return_value=False</code> reach the vendor kernel. The indexer passes it on all three of its calls ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:216-226}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:361-372}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:494-503}}). The sampler calls do not pass it, so they use <code>torch.topk</code> ({{cite deepinfer/model_executor/layers/sampler.py:643}}, {{cite deepinfer/model_executor/layers/sampler_utils.py:68}}, {{cite deepinfer/model_executor/layers/sampler_utils.py:167}}). These calls pass a third positional argument (<code>True</code> or <code>False</code>), which <code>_torch_topk</code> takes as <code>sorted</code>.</p>
+<x-code file="deepinfer/npu_ops/vit_attn.py" lines="8-31" highlight="20-29">
+  <x-tr line="16">Varlen attention for the ViT: not causal, full attention inside each segment.</x-tr>
+  <x-tr line="18">cu_seqlens_q: a host list (InputMetadataVL.vit_attn_cu_seqlens, the cumulative end of each segment).</x-tr>
+</x-code>
+<p>The ViT calls <code>_flash_attn_fwd</code> with <code>causal=False</code>, the same lengths for queries and keys, and <code>softmax_scale=None</code> ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:107-121}}). The replacement ignores those keyword arguments (<code>**kwargs</code>). It uses <code>cu_seqlens_q</code> for both lengths, no mask (<code>sparse_mode=0</code>) and the scale <code>1/sqrt(head_dim)</code>. It returns <code>(out, None)</code>; the ViT keeps only the first value.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: three imports after the hook">
+<p>The hook is installed. Three statements run in this order:</p>
+<ol>
+  <li><strong><code>index_attn.py</code>, line 12:</strong> <code>from deep_select.interface import topk</code>. The name is <code>deep_select.interface</code>, the fromlist is <code>("topk",)</code>, level 0. The map has the target. The caller <code>deepinfer.model_executor.models.v4_modules.index_attn</code> is not the source. Result: a new module object whose <code>topk</code> is <code>&lt;Lazy import patch deep_select.interface.topk -&gt; deepinfer.npu_ops.deep_select.topk&gt;</code>. Nothing is imported yet.</li>
+  <li><strong>The first call</strong> <code>topk(p_sum, …, return_value=False)</code>. <code>Lazy._load</code> imports <code>deepinfer.npu_ops.deep_select</code>. That module runs <code>from deep_select.interface import topk as _topk</code>. Now the caller <em>is</em> the source module, so it gets the original vendor <code>topk</code>. Then <code>return_value=False</code> sends the call to it.</li>
+  <li><strong><code>sampler.py</code>, line 12:</strong> the same statement gives a new <code>Lazy</code> wrapper (the hook does not cache module objects). Its first call loads the same, already imported, NPU module. The call <code>topk(logprobs, k, True, indices_type=torch.int32)</code> has no <code>return_value</code>. So it runs <code>torch.topk(logprobs, k, dim=-1, sorted=True)</code> and converts the indices to int32.</li>
+</ol>
+<p><strong>Types.</strong> <code>_torch_topk</code> returns <code>(values, indices)</code> with the dtype of the input for the values and <code>indices_type</code> for the indices, shape <code>[..., k]</code> ({{cite deepinfer/npu_ops/deep_select.py:7-17}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Import order: what the hook cannot change">
+<p>The hook changes only import statements that run after it is installed. A module that already ran <code>from deep_select.interface import topk</code> keeps the vendor function in its globals. The hook does not put its own module objects into <code>sys.modules</code> either. The docstring says, translated: <em>"Only from-imports are intercepted; sys.modules is not faked. src loads only when the patched object is first used"</em> ({{cite deepinfer/npu_ops/patch_imports.py:109-110}}).</p>
+<p>In the normal start, the engine import makes the platform early. <code>llm_engine.py</code> imports <code>profile_server.py</code>, which imports <code>utils.py</code>, which imports <code>timer.py</code>, which reads <code>PLATFORM</code> ({{cite deepinfer/engine/llm_engine.py:35}}, {{cite deepinfer/engine/profile_server.py:33}}, {{cite deepinfer/utils.py:22}}, {{cite deepinfer/timer.py:13}}). The model modules load later, through the model registry ({{cite deepinfer/model_executor/models/__init__.py:27}}). We found this order by reading the import statements, not by a run.</p>
+<x-warning title="Nothing enforces the order">
+<p>On Ascend, a test or a script can import <code>sampler.py</code>, <code>sampler_utils.py</code>, <code>index_attn.py</code> or <code>vit.py</code> before it reads <code>deepinfer.PLATFORM</code>. Then these modules keep the vendor functions. To be safe, read <code>deepinfer.PLATFORM</code> first, after you set the visible devices.</p>
+</x-warning>
+<p><code>import deep_select.interface as m</code> and <code>m.topk</code> are also not patched: the hook handles only the <code>from</code> form (line 63).</p>
+</x-deepdive>
+
+<x-deepdive title="Cost and scope of the hook">
+<ul>
+  <li>Every import statement in the process goes through <code>_hooked_import</code>, also in PyTorch and other libraries. A plain <code>import X</code> costs one check. A from-import of a module that is not in the map costs a few checks, a small tuple and one dict lookup (lines 63-69).</li>
+  <li>Each patched import makes a new <code>ModuleType</code> object. Two importers therefore get two different <code>Lazy</code> objects. Both load the same source module, because <code>importlib</code> caches it.</li>
+  <li><code>Lazy</code> forwards calls and attribute reads ({{cite deepinfer/npu_ops/patch_imports.py:45-49}}). Code that checks the type or the identity of the function sees a <code>Lazy</code> object, not a function.</li>
+  <li>The package has no function that removes the hook. <code>patch_imports</code> keeps the old import in the module global <code>_orig_import</code> (line 141), but no code puts it back. Only a new process starts clean.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Problem</th><th>Result</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>patch_imports</code> called twice</td><td><code>RuntimeError</code></td><td>{{cite deepinfer/npu_ops/patch_imports.py:114-115}}</td></tr>
+    <tr><td>same target twice in the map</td><td><code>ValueError</code></td><td>{{cite deepinfer/npu_ops/patch_imports.py:18-19}}</td></tr>
+    <tr><td>wrong spec types</td><td><code>TypeError</code></td><td>{{cite deepinfer/npu_ops/patch_imports.py:125-126}}, {{cite deepinfer/npu_ops/patch_imports.py:131-132}}</td></tr>
+    <tr><td>replacement module cannot be imported (for example no torch_npu)</td><td><code>ImportError</code> at the first call or attribute read, not at import time</td><td>{{cite deepinfer/npu_ops/patch_imports.py:39-43}}</td></tr>
+    <tr><td>target module does not exist</td><td>no error at the import statement; <code>ImportError</code> later, when <code>real_module()</code> runs (an unpatched name is read, or the source module imports the name)</td><td>{{cite deepinfer/npu_ops/patch_imports.py:75-80}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/hardware-platforms}}: all platform switch points, including this one.</li>
+  <li>{{link code/platform}}: <code>PlatformNPU</code>, which installs the hook.</li>
+  <li>{{link concepts/sparse-attention-indexer}}: the top-k that still uses the vendor kernel on Ascend.</li>
+  <li>{{link code/vit}}: the vision encoder that calls <code>_flash_attn_fwd</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which two vendor names does <code>npu_ops</code> replace?
+    <x-a><p><code>deep_select.interface.topk</code> and <code>flash_attn.cute.interface._flash_attn_fwd</code> ({{cite deepinfer/npu_ops/__init__.py:3-12}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Is the hook active in an NVIDIA process?
+    <x-a><p>No. Only <code>PlatformNPU.__init__</code> imports <code>deepinfer.npu_ops</code> ({{cite deepinfer/platform.py:140-141}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">On Ascend, which <code>topk</code> runs for the sampler's top logprobs, and which for the indexer?
+    <x-a><p>The sampler call has no <code>return_value</code> argument, so the replacement runs <code>torch.topk</code> ({{cite deepinfer/model_executor/layers/sampler.py:643}}, {{cite deepinfer/npu_ops/deep_select.py:22-24}}). The indexer passes <code>return_value=False</code>, so it gets the vendor kernel ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:225}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>npu_ops/deep_select.py</code> not call itself in an endless loop, although it imports <code>topk</code> from the patched module?
+    <x-a><p>The hook checks the caller. The importing module can be the source module <code>deepinfer.npu_ops.deep_select</code> or a submodule of it. Then the hook gives the original vendor object, not a <code>Lazy</code> wrapper ({{cite deepinfer/npu_ops/patch_imports.py:86-89}}). So <code>_topk</code> is the real vendor function. The deep dive "Worked example" follows this step by step.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,172 @@
+---
+title: deepinfer/platform.py: the Platform classes and get_platform()
+nav_title: platform.py
+level: Intermediate
+prerequisites: concepts/hardware-platforms
+related: concepts/hardware-platforms, code/npu-ops, code/deep-cluster, concepts/hardware-discovery, code/parallel-state, code/shared-memory, concepts/python-cpp-boundary
+summary: platform.py defines the Platform base class, PlatformGPU and PlatformNPU, and get_platform(), which makes one of them per process from the device files. The package exposes it as deepinfer.PLATFORM, made on first use.
+---
+<h2>Purpose</h2>
+<p><code>platform.py</code> holds every hardware choice in one object, and <code>get_platform()</code> makes the object for NVIDIA or Ascend once per process.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/platform.py</code>, 227 lines of Python. It imports PyTorch only inside methods, never at the top ({{cite deepinfer/platform.py:1-11}}).</td></tr>
+    <tr><th>Main classes</th><td><code>Platform</code> ({{cite deepinfer/platform.py:19}}), <code>PlatformGPU</code> ({{cite deepinfer/platform.py:55}}), <code>PlatformNPU</code> ({{cite deepinfer/platform.py:86}}). Also <code>PlatformEnum</code> and the function <code>get_platform</code>.</td></tr>
+    <tr><th>Runs in</th><td>Every process that reads <code>deepinfer.PLATFORM</code>: the engine process, context-parallel followers, image workers. One object per process.</td></tr>
+    <tr><th>Called by</th><td>Only <code>deepinfer/__init__.py</code> calls <code>get_platform()</code>. All other code reads <code>from deepinfer import PLATFORM</code>: 27 files at this commit.</td></tr>
+    <tr><th>Calls</th><td><code>deep_cluster.hardware.accelerator_kind</code>, PyTorch, and on Ascend <code>torch_npu</code>, <code>deepinfer.npu_ops</code> and <code>libascendcl.so</code> through <code>ctypes</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The device detection ({{link code/deep-cluster}}), the kernel dispatch (<code>tilelang_ops/ops.py</code>), the import patches ({{link code/npu-ops}}), and the C++ build switch (<code>setup.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/hardware-platforms}} explains the idea, the constructor of <code>PlatformNPU</code> line by line, and host-memory pinning. This page maps the file and its users.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="platform_select" alt="Panel 1: accelerator_kind checks Ascend device files first, then NVIDIA device files, else cpu; get_platform turns ascend into PlatformNPU and everything else into PlatformGPU. Panel 2: a table of the values each class sets, and the extra start-up steps that only PlatformNPU does." caption="Figure: how <code>get_platform()</code> picks a class (panel 1) and what each class sets (panel 2). This diagram belongs to the page on hardware platforms. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>deepinfer/__init__.py</code></strong> makes the object on the first read of <code>deepinfer.PLATFORM</code>, with a module-level <code>__getattr__</code>, and stores it as a module global ({{cite deepinfer/__init__.py:53-64}}).</li>
+  <li><strong>Readers of <code>PLATFORM</code>.</strong> 27 files import it. The deep dive "Who reads which name" counts the uses. Examples: the kernel dispatcher ({{cite deepinfer/model_executor/layers/tilelang_ops/ops.py:15}}), the process groups ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:82-83}}), and the pinned buffer ({{cite deepinfer/shared_memory.py:119}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>accelerator_kind()</code>, which reads device files and does not import PyTorch ({{cite deepinfer/platform.py:224-226}}).</li>
+  <li>On NVIDIA: <code>torch.cuda.cudart()</code> for <code>cudaHostRegister</code>, and <code>dist.ProcessGroupNCCL.Options</code> ({{cite deepinfer/platform.py:65-83}}).</li>
+  <li>On Ascend: <code>torch_npu</code>, <code>torch_npu.contrib.transfer_to_npu</code>, <code>import deepinfer.npu_ops</code>, and two ACL functions from <code>libascendcl.so</code> ({{cite deepinfer/platform.py:120-143}}, {{cite deepinfer/platform.py:169-184}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>PlatformEnum</code></td><td>{{cite deepinfer/platform.py:14-16}}</td><td><code>GPU</code> or <code>NPU</code>.</td></tr>
+    <tr><td><code>Platform</code></td><td>{{cite deepinfer/platform.py:19-52}}</td><td>Base: four names, <code>is_gpu</code> / <code>is_npu</code>, no-op pinning, abstract options.</td></tr>
+    <tr><td><code>PlatformGPU</code></td><td>{{cite deepinfer/platform.py:55-83}}</td><td><code>"cuda"</code>, <code>"nccl"</code>, <code>int32</code> scales, <code>cudaHostRegister</code>, NCCL CTA limits.</td></tr>
+    <tr><td><code>PlatformNPU.__init__</code></td><td>{{cite deepinfer/platform.py:91-143}}</td><td>Visible devices, HCCL and torch_npu settings, PyTorch patches, <code>int16</code> scales, the import hook, the ACL functions.</td></tr>
+    <tr><td><code>PlatformNPU.get_distributed_options</code></td><td>{{cite deepinfer/platform.py:145-149}}</td><td>Default <code>ProcessGroupHCCL.Options()</code>.</td></tr>
+    <tr><td><code>_resolve_acl_host_register_api</code></td><td>{{cite deepinfer/platform.py:163-184}}</td><td>Loads <code>aclrtHostRegisterV2</code> and <code>aclrtHostUnregister</code>, or <code>RuntimeError</code>.</td></tr>
+    <tr><td><code>_bind_current_device</code></td><td>{{cite deepinfer/platform.py:186-193}}</td><td>Sets the ACL device context of the calling thread.</td></tr>
+    <tr><td><code>PlatformNPU.pin_host_memory</code>, <code>unpin_host_memory</code></td><td>{{cite deepinfer/platform.py:195-219}}</td><td>Pin and unpin host memory; warn on failure.</td></tr>
+    <tr><td><code>get_platform</code></td><td>{{cite deepinfer/platform.py:222-227}}</td><td>Makes <code>PlatformNPU</code> on Ascend, else <code>PlatformGPU</code>. Cached.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The base class</h3>
+<x-code file="deepinfer/platform.py" lines="19-52" highlight="20,22,24,26,29-35,37,44,51-52" />
+<ol>
+  <li>Lines 20-27: four names that each platform must set. Three are class attributes; <code>fp8_sf_type</code> is set in the constructor, because it needs PyTorch.</li>
+  <li>Lines 29-35: <code>is_gpu</code> and <code>is_npu</code> compare the enum. Together, these two properties have the most reads (47 of 76; see the deep dive "Who reads which name").</li>
+  <li>Lines 37-49: pinning is a no-op in the base class. The docstring says a platform without host-register support "falls back to pageable copies".</li>
+  <li>Lines 51-52: <code>get_distributed_options</code> must be overridden.</li>
+</ol>
+
+<h3><code>PlatformGPU</code></h3>
+<x-code file="deepinfer/platform.py" lines="55-83" highlight="57-58,63,68,80-82" />
+<ol>
+  <li>Lines 57-58: kernel folder <code>cuda</code>, backend <code>nccl</code>.</li>
+  <li>Line 63: one <code>int32</code> holds four UE8M0 scales.</li>
+  <li>Lines 65-73: pin with <code>cudaHostRegister(ptr, nbytes, 0)</code>. The return code is not checked.</li>
+  <li>Lines 75-83: every NCCL group gets <code>min_ctas = max_ctas = DEEPINFER_NCCL_NUM_SMS</code> (default 32, {{cite deepinfer/environ.py:108}}).</li>
+</ol>
+<p>The constructor does not check for a GPU. On a machine with no accelerator, <code>get_platform()</code> still makes a <code>PlatformGPU</code>, and the first CUDA call fails later.</p>
+
+<x-warning title="Make the platform after the visible devices are set">
+<p>On Ascend, the constructor imports torch_npu and patches PyTorch. The package comment says it "must happen only after ASCEND_RT_VISIBLE_DEVICES has been configured" ({{cite deepinfer/__init__.py:58-59}}). Set the visible devices before you import the engine.</p>
+</x-warning>
+
+<h3><code>PlatformNPU.__init__</code> (the end)</h3>
+<x-code file="deepinfer/platform.py" lines="130-143" highlight="136,138,141,143" />
+<ol>
+  <li>Lines 130-131: two torch_npu settings.</li>
+  <li>Line 136: NPU streams get a <code>cuda_stream</code> property, so CUDA-style code that reads <code>stream.cuda_stream</code> works.</li>
+  <li>Line 138: one <code>int16</code> holds two UE8M0 scales.</li>
+  <li>Line 141: the import installs the import hook of {{link code/npu-ops}}.</li>
+  <li>Line 143: load the ACL pin functions. A missing library or function stops start-up with <code>RuntimeError</code>.</li>
+</ol>
+<p>Lines 92-128 set the visible devices and nine environment variables. The page {{link concepts/hardware-platforms#npu-init}} reads them one by one.</p>
+
+<h3><code>get_platform</code></h3>
+<x-code file="deepinfer/platform.py" lines="222-227" />
+<p><code>@functools.cache</code> makes the function return the same object on each call. The package also stores the object in its globals, so <code>deepinfer.PLATFORM</code> calls <code>__getattr__</code> only once ({{cite deepinfer/__init__.py:62-64}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Who reads which name">
+<p>We counted the reads of each name in <code>deepinfer/</code> at commit 9bd9cf2 with <code>grep "PLATFORM\.&lt;name&gt;"</code>:</p>
+<table>
+  <thead><tr><th>Name</th><th>Reads</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><code>is_npu</code></td><td>28</td><td>kernel and cache-format branches, for example {{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:160}} and {{cite deepinfer/model_executor/layers/tilelang_ops/fused_transform.py:244}}</td></tr>
+    <tr><td><code>fp8_sf_type</code></td><td>23</td><td>packed scale tensors ({{cite deepinfer/model_executor/models/v4_modules/containers.py:78}}, {{cite deepinfer/model_executor/layers/linear.py:69}})</td></tr>
+    <tr><td><code>is_gpu</code></td><td>19</td><td>for example the NVLink domain check ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:130-134}})</td></tr>
+    <tr><td><code>tilelang_ops_backend</code></td><td>2</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/ops.py:15}}, {{cite deepinfer/model_executor/layers/tilelang_ops/ops.py:32}}</td></tr>
+    <tr><td><code>distributed_backend</code>, <code>get_distributed_options</code></td><td>1 each</td><td>{{cite deepinfer/model_executor/parallel_utils/parallel_state.py:82-83}}</td></tr>
+    <tr><td><code>pin_host_memory</code>, <code>unpin_host_memory</code></td><td>1 each</td><td>{{cite deepinfer/shared_memory.py:119}}, {{cite deepinfer/shared_memory.py:349}}</td></tr>
+    <tr><td><code>enum</code>, <code>PlatformEnum</code></td><td>0 outside this file</td><td>only through <code>is_gpu</code> / <code>is_npu</code></td></tr>
+  </tbody>
+</table>
+<p>The TileLang kernel folder name is the only string that selects code by name. The page {{link concepts/tilelang-kernels}} will cover the kernels; in short, <code>ops.py</code> imports the subpackage <code>cuda</code> or <code>asc</code> from this name.</p>
+</x-deepdive>
+
+<x-deepdive title="When the platform is made, and why order matters">
+<p>The platform is made at the first read of <code>deepinfer.PLATFORM</code>. Many modules read it at import time, with <code>from deepinfer import PLATFORM</code> at the top. One chain at engine import time: <code>entrypoints/llm.py</code> imports <code>engine/llm_engine.py</code>, which imports <code>engine/profile_server.py</code> ({{cite deepinfer/engine/llm_engine.py:35}}). That imports <code>utils.py</code> ({{cite deepinfer/engine/profile_server.py:33}}), which imports <code>timer.py</code> ({{cite deepinfer/utils.py:22}}), which reads <code>PLATFORM</code> ({{cite deepinfer/timer.py:13}}). We found this order by a static read of the import statements; we did not run it.</p>
+<p>So in practice, <code>import deepinfer.entrypoints.llm</code> makes the platform. <code>import deepinfer</code> alone does not: the package file has no PyTorch import and makes no platform ({{cite deepinfer/__init__.py:1}}). The example scripts follow this rule. Their config module says, translated: <em>"This module must not import deepinfer at the top level. The env setup must finish before deepinfer is imported, so create_llm imports deepinfer lazily inside the function"</em> ({{cite examples/_config.py:5-6}}). They set the visible devices first, then import <code>LLM</code> ({{cite examples/_config.py:107-110}}).</p>
+<p><strong>The import hook depends on the same order.</strong> On Ascend, the constructor installs the <code>npu_ops</code> hook. A module that ran <code>from deep_select.interface import topk</code> before that keeps the vendor function. In the chain above, <code>timer.py</code> makes the platform before the model modules load. Nothing in the code checks this order. See {{link code/npu-ops}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Edge cases and error paths">
+<table>
+  <thead><tr><th>Case</th><th>Result</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td>no accelerator (<code>"cpu"</code>)</td><td><code>PlatformGPU</code>; the first CUDA call fails later</td><td>{{cite deepinfer/platform.py:226}}</td></tr>
+    <tr><td>Ascend, <code>CUDA_VISIBLE_DEVICES</code> set and different from <code>ASCEND_RT_VISIBLE_DEVICES</code> (also when only <code>CUDA_VISIBLE_DEVICES</code> is set)</td><td><code>RuntimeError</code></td><td>{{cite deepinfer/platform.py:101-102}}</td></tr>
+    <tr><td>Ascend, only <code>ASCEND_RT_VISIBLE_DEVICES</code> set</td><td>copied to <code>CUDA_VISIBLE_DEVICES</code>, <code>UserWarning</code></td><td>{{cite deepinfer/platform.py:94-100}}</td></tr>
+    <tr><td><code>libascendcl.so</code> not found, or the two functions missing</td><td><code>RuntimeError</code> ("unsupported driver version")</td><td>{{cite deepinfer/platform.py:169-178}}</td></tr>
+    <tr><td>Ascend pin fails (other than 507910)</td><td>warning; copies use the slow pageable path</td><td>{{cite deepinfer/platform.py:202-207}}</td></tr>
+    <tr><td>Ascend unpin fails (other than 507911)</td><td>warning: "pinned host memory may be leaked"</td><td>{{cite deepinfer/platform.py:215-219}}</td></tr>
+    <tr><td>NVIDIA pin or unpin fails</td><td>no check of the return code</td><td>{{cite deepinfer/platform.py:68}}, {{cite deepinfer/platform.py:73}}</td></tr>
+    <tr><td><code>get_distributed_options</code> on a new subclass that does not override it</td><td><code>NotImplementedError</code></td><td>{{cite deepinfer/platform.py:51-52}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Read or written</th><th>Line</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_NCCL_NUM_SMS</code></td><td>read (NVIDIA)</td><td>{{cite deepinfer/platform.py:81-82}}</td><td>default 32</td></tr>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code>, <code>ASCEND_RT_VISIBLE_DEVICES</code></td><td>read; first may be written (Ascend)</td><td>{{cite deepinfer/platform.py:92-102}}</td><td>must match</td></tr>
+    <tr><td><code>PYTORCH_NPU_ALLOC_CONF</code>, <code>TASK_QUEUE_ENABLE</code>, <code>HCCL_BUFFSIZE</code></td><td>overwritten (Ascend)</td><td>{{cite deepinfer/platform.py:105-111}}</td><td>your value is lost</td></tr>
+    <tr><td><code>HCCL_CONNECT_TIMEOUT</code>, <code>HCCL_EXEC_TIMEOUT</code>, two port ranges, <code>TORCH_NPU_DEVICE_CAPABILITY</code>, <code>TILELANG_DEFAULT_TARGET</code></td><td>default only (Ascend)</td><td>{{cite deepinfer/platform.py:112-118}}, {{cite deepinfer/platform.py:128}}</td><td>your value wins</td></tr>
+  </tbody>
+</table>
+<p><code>DEEPINFER_ACCELERATOR</code> is not read here. It selects the <code>_so/</code> folder of the C++ module ({{cite deepinfer/__init__.py:15}}) and the Engram storage default ({{cite deepinfer/environ.py:147}}). <code>get_platform()</code> uses only the device files.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/hardware-platforms}}: the idea, the switch points and the constructor line by line.</li>
+  <li>{{link concepts/hardware-discovery}} and {{link code/deep-cluster}}: how <code>accelerator_kind()</code> reads the device files.</li>
+  <li>{{link code/npu-ops}}: the import hook that <code>PlatformNPU</code> installs.</li>
+  <li>{{link concepts/python-cpp-boundary}}: the other platform switch, at build time.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What is <code>PLATFORM.fp8_sf_type</code> on NVIDIA and on Ascend?
+    <x-a><p><code>torch.int32</code> on NVIDIA and <code>torch.int16</code> on Ascend ({{cite deepinfer/platform.py:63}}, {{cite deepinfer/platform.py:138}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Does <code>import deepinfer</code> make the platform?
+    <x-a><p>No. The package makes it on the first read of <code>deepinfer.PLATFORM</code>, through <code>__getattr__</code> ({{cite deepinfer/__init__.py:53-64}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A machine has no GPU and no NPU. Which class does <code>get_platform()</code> return, and where does the first error come from?
+    <x-a><p><code>accelerator_kind()</code> returns <code>"cpu"</code>, so <code>get_platform()</code> returns <code>PlatformGPU</code> ({{cite deepinfer/platform.py:226}}). Its constructor only sets the scale type, so no error comes from it. The first error comes later, from the first CUDA call.</p></x-a>
+  </x-q>
+  <x-q level="hard">On Ascend, a script runs <code>from deepinfer.model_executor.layers.sampler import Sampler</code> as its first DeepInfer import. Which <code>topk</code> does the sampler module get, and why?
+    <x-a><p>The vendor <code>topk</code>. <code>sampler.py</code> imports <code>deep_select.interface.topk</code> on line 12, before any line that reads <code>PLATFORM</code>. The first read comes later, through the import on line 16 ({{cite deepinfer/model_executor/layers/sampler.py:12-16}}). The hook is installed only in <code>PlatformNPU.__init__</code> ({{cite deepinfer/platform.py:140-141}}), so it does not exist yet. In the normal engine start, <code>timer.py</code> makes the platform first ({{cite deepinfer/timer.py:13}}). This is the deep dive "When the platform is made".</p></x-a>
+  </x-q>
+</x-quiz>

@@ -29,7 +29,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B8 Scale | done | done (27 defects fixed) | yes |
 | B9 Decoding | done | done (25 defects fixed) | yes |
 | B10a SO + precision | done | done (37 defects fixed) | yes |
-| B10b Kernels + loading | running (6 pages; 2 TileLang pages DEFERRED by user) | — | — |
+| B10b Kernels + loading | done (6 pages; 2 TileLang pages DEFERRED by user) | done (~35 defects fixed) | yes |
 | B11 Start-up + reference | done | done (40 defects fixed) | yes |
 | D Diagrams to 1100 | done | n/a | yes |
 | F Final pass | later | — | — |
@@ -43,6 +43,8 @@ Resume order after the reset:
 Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
+
+- FINAL-PASS TODO: concepts/hardware-platforms names only sampler.py for the Ascend torch.topk fallback; sampler_utils.py also gets it.
 
 - FINAL-PASS TODO: other pages may say split groups / DP votes use the 14400 s Gloo time-out — only the default group does (facts.md B8). Pages that mention it: code/worker-base, learn/parallelism, tours/startup, reference/env-vars.
 

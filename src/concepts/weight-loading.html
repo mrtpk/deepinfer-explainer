@@ -1,0 +1,275 @@
+---
+title: Weight loading: from a Hugging Face checkpoint to the device
+nav_title: Weight loading
+level: Intermediate
+prerequisites: learn/number-formats, learn/moe, concepts/expert-parallelism
+related: code/model-loader, code/hf-weights, code/deepseek, concepts/low-precision-formats, concepts/eplb, concepts/engram, tours/startup
+summary: At start-up, each rank parses config.json, builds the model with no memory, maps every checkpoint tensor name to a model parameter, checks that each parameter has a source, and copies only the bytes that this rank needs.
+---
+<x-sentence>At start-up, each rank checks the Hugging Face checkpoint, maps tensor names to model parameters, and copies only the weights that this rank needs.</x-sentence>
+
+<h2>The idea</h2>
+<p>A model is mostly {{term model-weights | weights}}: large tables of numbers. DeepInfer reads them from a {{term hf-checkpoint}}. That is a folder with three kinds of file:</p>
+<ul>
+  <li><code>config.json</code>: the sizes and settings of the model, for example the number of layers.</li>
+  <li><code>model.safetensors.index.json</code>: a map from each tensor name to the file that holds it ({{cite deepinfer/hugging_face/weights.py:40}}).</li>
+  <li>The {{term checkpoint-shard | shards}}: many {{term safetensors}} files with the tensor bytes.</li>
+</ul>
+<p>DeepInfer does four jobs with this folder. Every {{term rank}} does them itself:</p>
+<ol>
+  <li><strong>Read the config.</strong> Parse <code>config.json</code>, refuse formats that the runtime cannot run, and make the model config.</li>
+  <li><strong>Draw the plan.</strong> Build the whole model on the {{term meta-device}}. This gives the name, shape and dtype of every parameter, but uses no memory.</li>
+  <li><strong>Match names.</strong> Map each checkpoint tensor name to a parameter name. This map is the {{term weight-coverage | coverage}}. If a parameter has no source, stop.</li>
+  <li><strong>Copy bytes.</strong> Give each parameter real memory and copy the bytes into it. Convert the {{term scale-factor | scales}} of {{term fp8}} weights. Each {{term expert-parallelism | EP}} rank reads only its own experts.</li>
+</ol>
+<p><strong>An everyday comparison.</strong> Think of a move to a new house. First you draw a plan with a label on each room (the meta model). Then you take each box from the truck and read its label (the tensor name). The label tells you the room (the parameter). An empty room stops the move: the house cannot work without it. A box with no room stays on the truck, and nobody complains. The comparison stops here. In DeepInfer, each rank is its own house with its own small set of expert rooms. So each rank opens only some of the expert boxes.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b10b_weight_load" alt="Panel 1: load_hf_model_config checks config.json and builds an AttrDict; ModelConfig and finalize_model_config add runtime and parallel fields; ModelMetadata makes per-layer lists. Panel 2: six steps of DeepseekForCausalLM.load_model: check files and plan coverage, build on meta, tie MTP embedding and head, give real memory, load with checks, build the runtime model. Panel 3: an example with 8 logical experts and EP size 3: one extra slot, physical_to_logical [0..7, 0], rank 0 reads experts 0-2, rank 1 reads 3-5, rank 2 reads 6, 7 and 0 again." caption="Figure: the config path (panel 1), the load order (panel 2), and which experts each EP rank reads (panel 3). The expert count 8 is an example, not a value from the repo. Click to zoom." />
+<p>Panel 1 happens before the model exists. Panel 2 is one call, <code>DeepseekForCausalLM.load_model</code>. The violet step reads only the index and the shard headers; the green step reads the weights. Panel 3 shows why two EP ranks can read the same expert: a {{term redundant-expert}} slot holds a copy of an existing expert.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: config.json becomes model_cfg</h3>
+<p><code>load_hf_model_config</code> reads <code>config.json</code>. It accepts only one model family and one number format:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="248-264" highlight="248,251,254-262" caption="Line 251 also checks SwiGLU, no attention bias, zero attention dropout, one KV head and BF16 ({{cite deepinfer/hugging_face/config.py:51-59}}). Any other value raises <code>ValueError</code> before a weight is read." />
+<p>The result is an {{term attrdict}}: a dict that also allows <code>cfg.gpt.hidden_size</code>. Other code adds fields to it. <code>ModelConfig</code> copies four runtime values into <code>model_cfg.gpt</code> ({{cite deepinfer/config.py:82-94}}). Inside the worker, <code>finalize_model_config</code> adds the token limits and the number of extra experts ({{cite deepinfer/model_executor/model_loader.py:116-125}}). Many parts then make a {{term model-metadata}} object from <code>model_cfg.gpt</code>, for example the KV cache manager in <code>cache_engine.py</code> ({{cite deepinfer/worker/cache_engine.py:320}}).</p>
+
+<h3>Step 2: check the files and plan the coverage</h3>
+<p><code>prepare_hf_coverage</code> runs before the model is built. It reads only the index and the shard headers:</p>
+<x-code file="deepinfer/hugging_face/loading.py" lines="34-61" highlight="36-38,40-41,42-43,48-57,58-59,61" />
+<ol>
+  <li>Lines 34-38: read the index. If a shard file does not exist, raise <code>FileNotFoundError</code>.</li>
+  <li>Lines 40-41: refuse separate HC norm tensors. The runtime needs them folded into the HC matrices.</li>
+  <li>Lines 42-43: refuse an index where a name occurs with and without the prefix <code>model.</code>.</li>
+  <li>Lines 45-59: open each shard and make sure that it holds every tensor that the index names.</li>
+  <li>Line 61: <code>build_coverage</code> maps the names and groups them into three channels: ordinary parameters, routed experts and Engram tables.</li>
+</ol>
+
+<h3>Step 3: map a checkpoint name to a parameter name</h3>
+<p>The checkpoint and the model use different names. The {{term hf-name-map}} converts them:</p>
+<x-code file="deepinfer/hugging_face/names.py" lines="164-177" highlight="167,173-174,177" />
+<table>
+  <thead><tr><th>Checkpoint name</th><th>Model parameter</th></tr></thead>
+  <tbody>
+    <tr><td><code>embed.weight</code></td><td><code>module.module.0.emb.tok_emb.weight</code></td></tr>
+    <tr><td><code>layers.3.attn.wq_a.weight</code></td><td><code>module.module.4.self_attn.Wq.A.weight</code></td></tr>
+    <tr><td><code>layers.3.ffn.shared_experts.w1.weight</code> and <code>...w3.weight</code></td><td>both to <code>module.module.4.experts.shared_experts.0.linear1.weight</code></td></tr>
+    <tr><td><code>mtp.0.attn.wq_a.weight</code></td><td><code>module.module.&lt;n_layer + 2&gt;.block.self_attn.Wq.A.weight</code></td></tr>
+    <tr><td><code>mtp.0.embed.weight</code></td><td>none: the {{term mtp}} layer shares the backbone copy</td></tr>
+  </tbody>
+</table>
+<p>Layer <code>L</code> of the checkpoint is module <code>L + 1</code>, because module 0 is the embedding ({{cite deepinfer/hugging_face/names.py:1-9}}). The suffix table is in {{cite deepinfer/hugging_face/names.py:36-71}}.</p>
+
+<h3>Step 4: build on meta, tie, then give memory</h3>
+<p>The builder makes every parameter on the meta device ({{cite deepinfer/model_executor/model_loader.py:128-133}}). Then <code>cover_tied_parameters</code> marks the embedding and output head of each MTP layer as {{term tied-parameter | tied}} to the backbone ({{cite deepinfer/hugging_face/loading.py:69-83}}). When the loader gives memory, a tied parameter gets the storage of its source:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="479-487" highlight="485,487">
+</x-code>
+<p>Engram tables stay in CPU memory unless <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> is on ({{cite deepinfer/model_executor/models/deepseek.py:473}}). On Ascend the variable is always on ({{cite deepinfer/environ.py:147}}). All other parameters go to the device.</p>
+
+<x-warning title="The coverage check is one-way">
+<p>The loader stops only when a <em>model parameter</em> has no source. It does not stop when a <em>checkpoint tensor</em> has no parameter. Such a tensor is not read. So a successful load does not prove that the checkpoint and the model match tensor for tensor.</p>
+</x-warning>
+
+<h3>Step 5: check coverage and shapes, then load</h3>
+<x-code file="deepinfer/model_executor/model_loader.py" lines="145-153" highlight="147-149,150,151-152">
+  <x-tr line="149">HF checkpoint {hf_dir} does not cover {len(missing)} model parameters: {missing}</x-tr>
+  <x-tr line="153">HF load done: all {len(params)} model parameters come from {hf_dir}</x-tr>
+</x-code>
+<ol>
+  <li>Line 147: <code>missing</code> is the set of model parameters minus the names in the coverage. Only this direction is checked.</li>
+  <li>Line 150: <code>validate_hf_shapes</code> compares shapes and dtypes of the ordinary parameters and the tied aliases. It does not check experts, Engram tables or <code>.scale</code> tensors. It reads only the safetensors headers ({{cite deepinfer/hugging_face/loading.py:86-121}}).</li>
+  <li>Lines 151-152: <code>load_covered_params</code> copies the bytes, under a 30-minute watchdog.</li>
+</ol>
+<p>An example script uses the one-way rule on purpose. It builds a model with only the vision parameters and loads them from the full checkpoint. Its docstring says, translated: <em>"a parameter tree with only ViT/aligner and the three image_* parameters reads only those 266 tensors"</em> ({{cite examples/_ve_helper.py:32-33}}).</p>
+
+<h3>Step 6: read the bytes and convert the scales</h3>
+<p>DeepInfer has its own safetensors reader. It reads one byte range per tensor with plain file reads, not with a memory map ({{cite deepinfer/hugging_face/weights.py:182-188}}). The ordinary and expert channels use this reader; the Engram channel reads slices with <code>safe_open</code> ({{cite deepinfer/hugging_face/weights.py:358-362}}). For an FP8 weight, it also reads the <code>.scale</code> tensor next to it. The checkpoint stores scales as {{term ue8m0}} bytes. The loader decodes them to FP32 with no loss:</p>
+<x-code file="deepinfer/hugging_face/weights.py" lines="163-167" highlight="166-167" caption="A UE8M0 byte <code>b</code> means <code>2 ** (b − 127)</code>. For example, byte 120 gives 2<sup>−7</sup> = 0.0078125." />
+<p>The ordinary channel stores the FP32 scales as <code>param.sf</code> ({{cite deepinfer/hugging_face/weights.py:418-421}}). Routed experts are different: the loader copies their scale bytes without a decode, into the packed layout of the platform ({{cite deepinfer/hugging_face/weights.py:318-323}}).</p>
+
+<h3>Step 7: each EP rank reads only its experts</h3>
+<p>Each EP rank holds a slice of the physical expert slots. The loader takes the slice of the initial slot map:</p>
+<x-code file="deepinfer/hugging_face/weights.py" lines="262-267" highlight="265-267" />
+<x-code file="deepinfer/model_executor/eplb/__init__.py" lines="21-39" highlight="27-28,36-39">
+  <x-tr line="26">Take the number of redundant experts that is at least the lower limit and makes num_physical_experts divisible by ep_size.</x-tr>
+  <x-tr line="35">Initial layout: [original routed experts, copied routed experts].</x-tr>
+</x-code>
+<p>With 8 experts (an example value), EP size 3 and no lower limit, the padding is <code>-(8 + 0) % 3 = 1</code>. So there are 9 slots and 3 per rank. Rank 2 holds slots 6-8. Slot 8 is the first extra slot (extra index 0), so it holds a copy of expert <code>0 % 8 = 0</code>. Rank 2 reads expert 0 from the checkpoint too. The page {{link concepts/eplb}} explains how these copies move later.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="config.json: every check and every derived field">
+<p><strong>Checks</strong> (all before any weight is read; <code>ValueError</code>, except the two <code>assert</code> rows, which raise <code>AssertionError</code>):</p>
+<table>
+  <thead><tr><th>Key</th><th>Must be</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>architectures</code></td><td>a list with exactly one registered name (only <code>DeepseekV41ForCausalLM</code>)</td><td>{{cite deepinfer/hugging_face/config.py:241-247}}, {{cite deepinfer/model_executor/models/__init__.py:15-17}}</td></tr>
+    <tr><td><code>model_type</code></td><td><code>deepseek_v41</code></td><td>{{cite deepinfer/hugging_face/config.py:248-249}}</td></tr>
+    <tr><td><code>hidden_act</code>, <code>attention_bias</code>, <code>attention_dropout</code>, <code>num_key_value_heads</code></td><td><code>silu</code>, <code>false</code>, <code>0.0</code>, <code>1</code></td><td>{{cite deepinfer/hugging_face/config.py:55-57}}</td></tr>
+    <tr><td><code>dtype</code></td><td><code>bfloat16</code></td><td>{{cite deepinfer/hugging_face/config.py:58-59}}</td></tr>
+    <tr><td><code>quantization_config</code></td><td><code>fp8</code> weights, <code>fp4</code> experts, <code>dynamic</code> activations, blocks <code>[32, 32]</code>, scale format <code>ue8m0</code></td><td>{{cite deepinfer/hugging_face/config.py:254-262}}</td></tr>
+    <tr><td><code>compress_ratios</code></td><td>length <code>n_layer + nextn</code> (an <code>assert</code>)</td><td>{{cite deepinfer/hugging_face/config.py:151}}</td></tr>
+    <tr><td><code>vl_aligner</code> in the result</td><td>present (an <code>assert</code>; it always passes, because <code>load_hf_model_config</code> always sets <code>vl_aligner</code>)</td><td>{{cite deepinfer/model_config_loader.py:22}}, {{cite deepinfer/hugging_face/config.py:316-319}}</td></tr>
+  </tbody>
+</table>
+<p>A missing key raises <code>KeyError</code>, because the parser reads most keys with <code>text["..."]</code>.</p>
+<p><strong>Derived fields.</strong></p>
+<ul>
+  <li><code>kv_lora_rank = head_dim − qk_rope_head_dim</code>. The comment: "HF's shared KV vector includes RoPE; the internal rank excludes it" ({{cite deepinfer/hugging_face/config.py:288-289}}).</li>
+  <li><code>n_prefill_layer</code> is the index of the first layer with compress ratio 1 ({{cite deepinfer/hugging_face/config.py:158-161}}).</li>
+  <li><code>attn_module_list</code> has <code>n_layer</code> backbone entries, one <code>None</code> for the head, and <code>nextn</code> DFlash entries. Ratio 0 gives a sliding-window spec; other ratios give a compressed spec ({{cite deepinfer/hugging_face/config.py:146-155}}).</li>
+  <li><code>fp8_attn</code>, <code>fp8_mlp</code>, <code>mxfp8</code> and <code>mxfp4</code> follow from the checked format, so they are always true ({{cite deepinfer/hugging_face/config.py:263-264}}, {{cite deepinfer/hugging_face/config.py:301-306}}).</li>
+  <li>Keys with no HF source get fixed defaults from <code>_GPT_DEFAULTS</code> ({{cite deepinfer/hugging_face/config.py:20-48}}). Some keys have a default when <code>config.json</code> does not set them, for example <code>hc_shifted=True</code>, <code>use_fp4_sparse_kv=True</code> and <code>num_nextn_predict_layers=0</code> ({{cite deepinfer/hugging_face/config.py:295}}, {{cite deepinfer/hugging_face/config.py:303}}, {{cite deepinfer/hugging_face/config.py:267}}).</li>
+  <li>The Engram block exists only if <code>engram_layer_ids</code> is not empty. It uses <code>tokenizer.json</code> from the same folder ({{cite deepinfer/hugging_face/config.py:195-214}}).</li>
+</ul>
+<p><strong>Worker processes parse the file again.</strong> <code>ModelConfig</code> does not send <code>model_cfg</code> to another process:</p>
+<x-code file="deepinfer/config.py" lines="96-113" highlight="100,104,110,112-113">
+  <x-tr line="97-98">model_cfg cannot be pickled. So pass only the necessary runtime scalars; the worker process loads model_cfg again in __setstate__ and fills them back in.</x-tr>
+</x-code>
+</x-deepdive>
+
+<x-deepdive title="Name mapping in full">
+<p>Module numbers inside the model ({{cite deepinfer/hugging_face/names.py:1-9}}):</p>
+<table>
+  <thead><tr><th>Module</th><th>Meaning</th><th>Checkpoint prefix</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>embedding stage</td><td>global: <code>embed.weight</code>, <code>image_*</code></td></tr>
+    <tr><td>1 … n_layer</td><td>backbone layer <code>L = module − 1</code></td><td><code>layers.{L}.</code></td></tr>
+    <tr><td>n_layer + 1</td><td>main head and final norm</td><td>global: <code>head.weight</code>, <code>norm.weight</code>, <code>hc_head_*</code></td></tr>
+    <tr><td>n_layer + 2 + i</td><td>MTP (DFlash) layer i</td><td><code>mtp.{i}.</code>; the model adds a <code>block.</code> level</td></tr>
+  </tbody>
+</table>
+<p><strong>Rules of <code>hf_to_model</code></strong> ({{cite deepinfer/hugging_face/names.py:147-179}}):</p>
+<ol>
+  <li>Remove a leading <code>model.</code>.</li>
+  <li>Try the vision names. <code>vision_pipeline.aligner.visual_encoder.</code> becomes <code>vision.</code>, with renames such as <code>.attn.wqkv.</code> to <code>.attn.qkv.</code> ({{cite deepinfer/hugging_face/names.py:99-129}}).</li>
+  <li>Try the global embedding names, then the global head names.</li>
+  <li>For <code>layers.{L}.suffix</code>: module <code>L + 1</code> and the suffix from the table. An unknown suffix passes through unchanged. The comment says that "the actual parameter container decides whether to load them".</li>
+  <li>For <code>mtp.{i}.suffix</code>: <code>embed.weight</code> and <code>head.weight</code> give <code>None</code> (tied). MTP-only parts such as <code>markov_head</code> and <code>confidence_head</code> have their own table ({{cite deepinfer/hugging_face/names.py:87-97}}). All others go under <code>block.</code>.</li>
+  <li>Any other name gives <code>None</code> and is not loaded.</li>
+</ol>
+<p><strong>Two checkpoint tensors, one parameter.</strong> The shared expert's <code>w1</code> and <code>w3</code> map to the same <code>linear1</code>. The loader concatenates them along dim 0, in name order (<code>w1</code> before <code>w3</code>) ({{cite deepinfer/hugging_face/weights.py:93-107}}). If only one of the two exists, the parameter has no coverage.</p>
+<p><strong>Scale names.</strong> The scale of <code>X.weight</code> is <code>X.scale</code> ({{cite deepinfer/hugging_face/names.py:182-184}}). Scale names are never mapped as parameters (line 95 of <code>weights.py</code>).</p>
+</x-deepdive>
+
+<x-deepdive title="Shapes, dtypes and scales: a worked example">
+<p>The numbers below use example sizes, not values from the repo: hidden size 4096, expert intermediate size 2048.</p>
+<p><strong>An ordinary FP8 linear weight</strong> with shape <code>[1024, 4096]</code> (E4M3, 4 MiB):</p>
+<ol>
+  <li>On meta, <code>prepare_meta_fp8</code> declares an FP32 scale of shape <code>[ceil(1024/32), ceil(4096/32)] = [32, 128]</code> ({{cite deepinfer/model_executor/models/v4_modules/containers.py:128-135}}).</li>
+  <li>The checkpoint has <code>X.scale</code>: 32 × 128 = 4096 UE8M0 bytes.</li>
+  <li>The loader copies the weight, decodes the scale to FP32 (16 KiB) and sets <code>param.sf</code> ({{cite deepinfer/hugging_face/weights.py:414-421}}). It does not compare the scale shape with the meta shape; it replaces <code>sf</code> ({{cite deepinfer/model_executor/models/v4_modules/containers.py:100-101}}, {{cite deepinfer/hugging_face/weights.py:420}}).</li>
+  <li><code>set_ue8m0_sf</code> packs the FP32 scales again into <code>param.ue8m0_sf</code> ({{cite deepinfer/hugging_face/parameters.py:59-70}}).</li>
+  <li>The runtime layer converts <code>sf</code> into the GEMM layout when its dtype is not <code>PLATFORM.fp8_sf_type</code> ({{cite deepinfer/model_executor/layers/linear.py:67-76}}).</li>
+</ol>
+<x-note title="Open question: ue8m0_sf">
+<p>Only <code>set_ue8m0_sf</code> touches <code>param.ue8m0_sf</code>. It writes the attribute ({{cite deepinfer/hugging_face/parameters.py:70}}). It also reads it in two places, but only for its own work. Line 52 asserts that a CPU scale has no old <code>ue8m0_sf</code>. Line 67 reuses an existing <code>ue8m0_sf</code> as the output buffer. No other code in the repo reads it. The runtime layer copies only <code>sf</code> into its new parameter ({{cite deepinfer/model_executor/utils.py:22-26}}) and converts <code>sf</code> itself. So step 4 seems to do work that the runtime does not use.</p>
+</x-note>
+<p><strong>One routed expert</strong>, <code>linear1</code> (gate and up projection together):</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Shape</th><th>Bytes</th></tr></thead>
+  <tbody>
+    <tr><td>checkpoint <code>w1</code>, <code>w3</code> (packed FP4, 2 values per byte)</td><td><code>[2048, 2048]</code> each</td><td>4 MiB each</td></tr>
+    <tr><td>runtime slot <code>param.data[local]</code> (int8)</td><td><code>[4096, 2048]</code> = <code>cat([w1; w3])</code></td><td>8 MiB</td></tr>
+    <tr><td>checkpoint scales <code>w1.scale</code>, <code>w3.scale</code> (UE8M0, one per 32 values)</td><td><code>[2048, 128]</code> each</td><td>256 KiB each</td></tr>
+    <tr><td>runtime <code>param.sf[local]</code>, NVIDIA</td><td>int32 <code>[4096, 32]</code> (4 scales per int32)</td><td>512 KiB</td></tr>
+    <tr><td>runtime <code>param.sf[local]</code>, Ascend</td><td>int16 <code>[4096, 64]</code> (2 scales per int16)</td><td>512 KiB</td></tr>
+  </tbody>
+</table>
+<p>The runtime shapes come from <code>materialize_hf_parameter</code>. The weight is int8 <code>(n_experts, h_out, h_in // 2)</code>. The scales are <code>(n_experts, h_in // (32 × itemsize), h_out)</code>, transposed, so column-major inside each expert ({{cite deepinfer/model_executor/models/v4_modules/containers.py:76-87}}). The loader views the row-major scale bytes as int32 or int16 and copies them in. The asserts check every shape ({{cite deepinfer/hugging_face/weights.py:314-323}}). <code>linear2</code> works the same way with <code>w2</code> alone: <code>[4096, 1024]</code> bytes and int32 scales <code>[4096, 16]</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Extra experts: the numbers">
+<p><code>finalize_model_config</code> reads <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code> (default 0, {{cite deepinfer/environ.py:114}}) as a lower limit. <code>_configure_moe_redundancy</code> rounds it up for the main model and, if the DFlash config has its own MoE block, for DFlash too ({{cite deepinfer/model_executor/model_loader.py:83-106}}). The result goes into <code>moe.n_redundant_experts</code>. The example scripts set the lower limit to 32 ({{cite examples/_config.py:77-79}}).</p>
+<table>
+  <thead><tr><th>Logical experts (example)</th><th>EP size</th><th>Lower limit</th><th>Extra</th><th>Physical slots</th><th>Per rank</th></tr></thead>
+  <tbody>
+    <tr><td>8</td><td>3</td><td>0</td><td>1</td><td>9</td><td>3</td></tr>
+    <tr><td>256</td><td>16</td><td>32</td><td>32</td><td>288</td><td>18</td></tr>
+    <tr><td>256</td><td>20</td><td>32</td><td>44 (warning)</td><td>300</td><td>15</td></tr>
+    <tr><td>256</td><td>8</td><td>0</td><td>0</td><td>256</td><td>32</td></tr>
+  </tbody>
+</table>
+<p>When the result is larger than the lower limit, the loader logs a warning. Translated: <em>"backbone <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code> = 32 was rounded up to 44, so that num_routed_experts = 256 + num_extra_experts divides by ep_size = 20"</em> ({{cite deepinfer/model_executor/model_loader.py:95-99}}).</p>
+<p><strong>Which checkpoint experts a rank reads.</strong> For each MoE layer, sorted by <code>layer_id</code>, <code>_local_expert_ids</code> takes <code>physical_to_logical[n_local × ep_rank : n_local × (ep_rank + 1)]</code> ({{cite deepinfer/hugging_face/weights.py:248-272}}). Every MoE layer with the same expert count starts with the same initial map. In the 256 / 20 example, rank 19 holds slots 285-299. Slots 285-299 are copies of experts <code>(285 − 256)</code> to <code>(299 − 256)</code>, that is experts 29 to 43. So rank 19 reads no expert that is new to it: it reads 15 experts that other ranks also read.</p>
+<p><strong>MTP layers.</strong> The expert channel expects <code>dflash_cfg.moe.n_routed_experts</code> experts for an <code>mtp.*</code> prefix, and the main count for <code>layers.*</code> ({{cite deepinfer/hugging_face/weights.py:140-145}}). A layer with a different count is skipped, so its parameter has no coverage and the load stops.</p>
+</x-deepdive>
+
+<x-deepdive title="Engram tables and tied parameters">
+<p><strong>Engram rows.</strong> An Engram table is split by rows over the Engram group. Each rank holds <code>num_per_part</code> rows, from <code>row_start = rank × num_per_part</code>. The total is padded up to a multiple of <code>lcm(256, group size)</code> ({{cite deepinfer/model_executor/models/v4_modules/engram_parameters.py:19-40}}). The loader reads the rank's rows in chunks of about 256 MiB (<code>1 &lt;&lt; 28</code> bytes) ({{cite deepinfer/hugging_face/weights.py:345-378}}):</p>
+<ol>
+  <li><code>rows_per_chunk = max(1, 2**28 // width)</code>. With a width of 1024 bytes, that is 262,144 rows per chunk.</li>
+  <li>For each chunk, copy the FP8 rows and decode the UE8M0 scale rows to FP32 on the scale's device.</li>
+  <li>The padded rows past the end of the checkpoint table get weight 0 and scale 1 (lines 379-382).</li>
+</ol>
+<p>The table stays in CPU memory unless <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> is on. On Ascend that variable is always on ({{cite deepinfer/environ.py:147}}). The scale tensor is always on the device, because <code>gather_sf</code> uses device collectives ({{cite deepinfer/model_executor/models/v4_modules/containers.py:96-98}}).</p>
+<p><strong>Tied parameters.</strong> <code>cover_tied_parameters</code> adds an alias for each MTP module (number above <code>n_layer + 1</code>) that has <code>emb.tok_emb.weight</code> or <code>shared_head.head.weight</code>. The source is the embedding of module 0 or the head of module <code>n_layer + 1</code> ({{cite deepinfer/hugging_face/loading.py:72-82}}). <code>validate_hf_shapes</code> checks that each alias has the shape and dtype of its source ({{cite deepinfer/hugging_face/loading.py:119-121}}). The comment in the loader: "MTP never allocates another vocabulary matrix" ({{cite deepinfer/model_executor/models/deepseek.py:483-485}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Many ranks, one checkpoint">
+<p>Each rank loads by itself. There is no broadcast of weights between ranks.</p>
+<ul>
+  <li><strong>DP ranks</strong> are separate processes, each with its own engine ({{cite examples/_launch.py:35-44}}).</li>
+  <li><strong>CP followers</strong> get the method name <code>load_model</code> from the driver by a CPU broadcast, and then run it themselves ({{cite deepinfer/worker/base.py:296-302}}).</li>
+  <li>Each worker parses <code>config.json</code> again (deep dive on config.json).</li>
+  <li>Every rank reads all ordinary parameters, because the dense layers are replicated. It reads only its own experts and its own Engram rows.</li>
+  <li>Each rank opens the shard files itself and keeps one file handle per shard while a reader is open ({{cite deepinfer/hugging_face/weights.py:210-220}}).</li>
+  <li>Each rank has its own watchdog. If <code>load_covered_params</code> takes more than 30 minutes, the process calls <code>os.abort()</code> ({{cite deepinfer/model_executor/model_loader.py:47-62}}).</li>
+</ul>
+<p><strong>The log.</strong> <code>log_load_phase</code> writes one line per phase, with device memory: <code>plan_build</code>, <code>materialize</code>, <code>engram_preallocate</code>, <code>checkpoint</code>, <code>runtime_adapt</code> and <code>total</code> ({{cite deepinfer/model_executor/models/deepseek.py:470-517}}). Inside <code>checkpoint</code> there are three more: <code>ordinary</code>, <code>experts</code>, <code>engram</code> ({{cite deepinfer/hugging_face/weights.py:429-434}}).</p>
+<p><strong>Dummy weights.</strong> With <code>load_format="dummy"</code>, the engine passes <code>skip_load=True</code> ({{cite deepinfer/engine/llm_engine.py:241}}). The loader then reads no file and makes dummy values ({{cite deepinfer/model_executor/models/deepseek.py:488-494}}). The page {{link concepts/low-precision-formats}} describes them.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Problem</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>unsupported format in <code>config.json</code></td><td><code>ValueError</code></td><td>{{cite deepinfer/hugging_face/config.py:241-262}}</td></tr>
+    <tr><td>shard file missing</td><td><code>FileNotFoundError</code></td><td>{{cite deepinfer/hugging_face/loading.py:36-38}}</td></tr>
+    <tr><td>shard cannot be read, or index names a missing tensor</td><td><code>ValueError</code></td><td>{{cite deepinfer/hugging_face/loading.py:56-59}}</td></tr>
+    <tr><td>model parameter with no source</td><td><code>RuntimeError</code> with the list</td><td>{{cite deepinfer/model_executor/model_loader.py:147-149}}</td></tr>
+    <tr><td>checkpoint tensor with no parameter</td><td>nothing: not read</td><td>{{cite deepinfer/hugging_face/weights.py:97}}, {{cite deepinfer/hugging_face/weights.py:403}}</td></tr>
+    <tr><td>expert indices not contiguous</td><td>warning; the layer then has no coverage</td><td>{{cite deepinfer/hugging_face/weights.py:135-137}}</td></tr>
+    <tr><td>Engram table with no model parameter</td><td>warning</td><td>{{cite deepinfer/hugging_face/weights.py:349-351}}</td></tr>
+    <tr><td>shape or dtype of an ordinary parameter differs</td><td><code>ValueError</code>, before any weight is read (experts and Engram tables: <code>AssertionError</code> during the copy)</td><td>{{cite deepinfer/hugging_face/loading.py:104-118}}</td></tr>
+    <tr><td>HC or sink weights not FP32</td><td><code>ValueError</code></td><td>{{cite deepinfer/hugging_face/loading.py:112-116}}</td></tr>
+    <tr><td>FP8 weight with no <code>.scale</code></td><td><code>KeyError</code> during the copy (late)</td><td>{{cite deepinfer/hugging_face/weights.py:418-419}}, {{cite deepinfer/hugging_face/names.py:32}}</td></tr>
+    <tr><td>bad safetensors header or byte range, short read</td><td><code>ValueError</code> or <code>EOFError</code></td><td>{{cite deepinfer/hugging_face/weights.py:216-236}}</td></tr>
+    <tr><td>load longer than 30 minutes</td><td><code>os.abort()</code></td><td>{{cite deepinfer/model_executor/model_loader.py:53-55}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A load with no error can still miss weights">
+<p>The coverage check is one-way. If a new checkpoint has a tensor that the model does not define, the tensor is not read and no error occurs ({{cite deepinfer/model_executor/model_loader.py:147}}). Compare the log line "HF weight coverage: N tensors" with the number of tensors you expect ({{cite deepinfer/hugging_face/loading.py:62-65}}).</p>
+</x-warning>
+<ul>
+  <li><strong>Wrong format.</strong> A checkpoint with BF16 experts, E4M3 scales or 128 × 128 blocks stops at the config check. DeepInfer has no conversion path.</li>
+  <li><strong>Unfolded HC norms.</strong> A checkpoint with separate <code>hc_*_norm.weight</code> tensors stops with "HF requires folded HC weights" ({{cite deepinfer/hugging_face/loading.py:40-41}}).</li>
+  <li><strong>A missing <code>.scale</code> of an ordinary FP8 weight</strong> is found only during the copy, after the earlier checks pass and some weights are already loaded. (For experts and Engram tables, a missing <code>.scale</code> removes the coverage, so the coverage check stops the load.)</li>
+  <li><strong>Unexpected extra experts.</strong> The lower limit is rounded up, so the memory for experts can be larger than you set. Look for the rounding warning.</li>
+  <li><strong>Slow storage.</strong> Every rank reads all dense weights. On a shared file system, many ranks read the same bytes at the same time. If one rank takes more than 30 minutes, it aborts.</li>
+  <li><strong>Engram in host memory.</strong> On NVIDIA without <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code>, the Engram tables use CPU memory. Size the host memory for them.</li>
+</ul>
+<p><strong>Why it matters.</strong> Weight loading decides what the model computes. Most mistakes stop the start-up with a clear error. The one-way coverage check is the exception, so check the log when you use a new checkpoint.</p>
+
+<x-quiz>
+  <x-q level="easy">Which file tells the loader which shard holds a tensor?
+    <x-a><p><code>model.safetensors.index.json</code>. Its <code>weight_map</code> maps each tensor name to a shard file ({{cite deepinfer/hugging_face/weights.py:40}}, {{cite deepinfer/hugging_face/loading.py:34-35}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">A checkpoint has one tensor that the model does not use. Does the load fail?
+    <x-a><p>No. The loader checks only that every model parameter has a source ({{cite deepinfer/model_executor/model_loader.py:147-149}}). An unused tensor is not read.</p></x-a>
+  </x-q>
+  <x-q level="medium">What model parameter does <code>layers.0.attn_norm.weight</code> fill?
+    <x-a><p><code>module.module.1.norm1.weight</code>. Layer 0 is module 1, because module 0 is the embedding, and the suffix <code>attn_norm.weight</code> maps to <code>norm1.weight</code> ({{cite deepinfer/hugging_face/names.py:58}}, {{cite deepinfer/hugging_face/names.py:164-167}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A checkpoint scale byte has the value 130. What FP32 scale does the loader make?
+    <x-a><p><code>2 ** (130 − 127) = 8.0</code>. <code>_ue8m0_to_fp32</code> subtracts 127 and calls <code>torch.ldexp(1, e)</code> ({{cite deepinfer/hugging_face/weights.py:163-167}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">256 logical experts (example), EP size 20, <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS=32</code>. How many expert slots does each rank hold, and which checkpoint experts does rank 19 read?
+    <x-a><p>The padding is <code>-(256 + 32) % 20 = 12</code>, so there are 44 extra experts, 300 slots and 15 per rank ({{cite deepinfer/model_executor/eplb/__init__.py:27-28}}). Rank 19 holds slots 285-299. The initial map gives slot <code>p ≥ 256</code> the expert <code>(p − 256) % 256</code>, so rank 19 reads experts 29 to 43 ({{cite deepinfer/model_executor/eplb/__init__.py:36-39}}, {{cite deepinfer/hugging_face/weights.py:265-267}}). This is the deep dive "Extra experts: the numbers".</p></x-a>
+  </x-q>
+</x-quiz>
