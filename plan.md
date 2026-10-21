@@ -229,3 +229,10 @@ At most ~7 subagents at the same time.
 
 Waves: 1 = B1, B2, B3a, B5a, B7, B9, D · 2 = B3b, B4a, B4b, B5b, B6a, B6b · 3 = B8, B10a, B10b, B11 · then F.
 Fact checks start as soon as each batch finishes.
+
+## 14. Deferred pages (user decision 2026-10-21)
+
+- `concepts/tilelang-kernels` and `code/tilelang-ops` are deferred. The user will revisit them.
+  A safety classifier stopped the first attempt on `concepts/tilelang-kernels`; we do not retry without the user.
+  Ready material: `diagrams/b10b_tilelang_path.py`, kernel facts in `notes/facts.md` (43/42 `*_tl` factories,
+  28 test files with 94 tests, interface validation, outlier_detection.py unused).

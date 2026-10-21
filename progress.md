@@ -29,7 +29,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B8 Scale | running | — | — |
 | B9 Decoding | done | done (25 defects fixed) | yes |
 | B10a SO + precision | running | — | — |
-| B10b Kernels + loading | STOPPED (safety classifier on first page; glossary + 3 diagrams only) — waiting for user | — | — |
+| B10b Kernels + loading | running (6 pages; 2 TileLang pages DEFERRED by user) | — | — |
 | B11 Start-up + reference | running | — | — |
 | D Diagrams to 1100 | done | n/a | yes |
 | F Final pass | later | — | — |
@@ -43,6 +43,8 @@ Resume order after the reset:
 Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
+
+- USER DECISION 2026-10-21: B10b option 1. Write the 6 other B10b pages now. The two TileLang pages (concepts/tilelang-kernels, code/tilelang-ops) are DEFERRED: the user will revisit them later. They stay "soon" in the nav. Reason: a safety classifier stopped the first B10b writer on concepts/tilelang-kernels (probably a false positive); we do not retry it without the user. Saved for that work: diagrams/b10b_tilelang_path.py and the B10b facts in notes/facts.md.
 
 - FINAL-PASS TODO: check every page that describes the DFlash hook position (Tour 1 stop 8/11, model-map, decoder-layer, dflash pages): it runs after the attention mHC pre + norm, before attention, and stores the mean of the trunk streams.
 
