@@ -17,17 +17,37 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from svglib import AMBER, BLUE, EMERALD, INK, MUTE, NEUTRAL, VIOLET, WHITE, Diagram  # noqa: E402
+from svglib import AMBER, BLUE, EMERALD, INK, MUTE, NEUTRAL, VIOLET, WHITE, Diagram, text_width  # noqa: E402
 
-d = Diagram()
-d.header(
-    "Inside DeepInfer's KV cache: one block and one state slot",
-    "Byte layout of the two device buffers that CacheEngine allocates  ·  DeepSeek-V4.1 layer kinds  ·  commit 9bd9cf2",
-    params="gpu_blocks: uint8 [num_gpu_blocks, bytes_per_block]      gpu_states: uint8 [num_state_slots, state_bytes]      block_size = 128 tokens",
-)
+d = Diagram(width=1100)
+W = d.W
+CX0, CX1 = 46, W - 46          # panel content x range
 
 
-def bar(y, segs, x0=46, x1=1454, h=46):
+def wrap(s, size, maxw, mono=False, indent="  "):
+    """Greedy word wrap; continuation lines are indented with two spaces."""
+    out, cur = [], ""
+    for w in s.split(" "):
+        cand = (cur + " " + w) if cur else w
+        if cur and text_width((indent if out else "") + cand, size, mono) > maxw:
+            out.append(cur)
+            cur = w
+        else:
+            cur = cand
+    out.append(cur)
+    return [out[0]] + [indent + t for t in out[1:]]
+
+
+# header (drawn by hand: the parameter strip needs two lines at this width)
+d.text(30, 42, "Inside DeepInfer's KV cache: one block and one state slot", 26, INK, "bold")
+d.text(30, 68, "Byte layout of the two device buffers that CacheEngine allocates  ·  DeepSeek-V4.1 layer kinds  ·  commit 9bd9cf2",
+       13.5, MUTE)
+d.text(30, 90, "gpu_blocks: uint8 [num_gpu_blocks, bytes_per_block]      gpu_states: uint8 [num_state_slots, state_bytes]",
+       12.5, MUTE, mono=True)
+d.text(30, 108, "block_size = 128 tokens", 12.5, MUTE, mono=True)
+
+
+def bar(y, segs, x0=CX0, x1=CX1, h=46):
     """Horizontal byte bar. segs: (label, sublabel, role, weight)."""
     total = sum(s[3] for s in segs)
     x = x0
@@ -40,33 +60,38 @@ def bar(y, segs, x0=46, x1=1454, h=46):
         x += ww
 
 
+CARD_PITCH = 19
+
+
 def card(x, y, w, h, title, lines, col, tag=None):
     d.rect(x, y, w, h, fill=col[1], stroke=col[0], sw=1.5)
-    d.text(x + 14, y + 25, title, 16, MUTE if col is NEUTRAL else col[0], "bold")
-    if tag:
-        d.pill_auto(x + w - 10 - (len(tag) * 11 * 0.602 + 20), y + 10, tag, MUTE if col is NEUTRAL else col[0])
+    d.text(x + 12, y + 24, title, 15, MUTE if col is NEUTRAL else col[0], "bold")
     for i, s in enumerate(lines):
-        d.text(x + 14, y + 54 + i * 22, s, 14.5, INK, mono=True)
+        d.text(x + 12, y + 50 + i * CARD_PITCH, s, 12.5, INK, mono=True)
+    if tag:
+        tw = text_width(tag, 11, mono=True) + 20
+        d.pill(x + w - 10 - tw, y + h - 29, tw, tag, MUTE if col is NEUTRAL else col[0])
 
 
 # ============================================================================
 # Panel 1: one KV block
 # ============================================================================
-y0 = 124
-P1_H = 382
+y0 = 128
+P1_H = 390
 d.panel(y0, P1_H, 1, "What does one KV block hold? 128 tokens, for every layer that has a paged cache",
         "Block #b is one row of gpu_blocks. Each layer owns a fixed byte range in every row, so one block id serves all layers.")
 d.text(46, y0 + 86, "gpu_blocks[b]  =  one row of bytes (layer ranges in layer order, each padded to 32 B)", 13, INK, "bold", mono=True)
 bar(y0 + 98, [
-    ("layer i (C1)", "ca", BLUE, 3.0),
+    ("layer i (C1)", "ca", BLUE, 2.4),
     ("layer j (C2, sparse)", "ica | ca", VIOLET, 2.2),
-    ("layer k (C2)", "ca", BLUE, 1.6),
-    ("SWA-only layer", "0 B here", NEUTRAL, 1.1),
-    ("…", "", NEUTRAL, 0.6),
+    ("layer k (C2)", "ca", BLUE, 1.4),
+    ("SWA-only layer", "0 B here", NEUTRAL, 1.6),
+    ("…", "", NEUTRAL, 0.5),
     ("pad", "", NEUTRAL, 0.6),
 ])
-cy, ch, cw = y0 + 172, 186, 452
-xs = [46, 46 + cw + 18, 46 + 2 * (cw + 18)]
+cgap = 14
+cy, ch, cw = y0 + 172, 196, (CX1 - CX0 - 2 * cgap) / 3
+xs = [CX0, CX0 + cw + cgap, CX0 + 2 * (cw + cgap)]
 card(xs[0], cy, cw, ch, "Main cache, ratio 1 (C1)", [
     "ca_cache[layer]:",
     "  uint8 [num_blocks, 128, 1, 528]",
@@ -96,7 +121,7 @@ card(xs[2], cy, cw, ch, "Row size and alignment", [
 # Panel 2: one state slot
 # ============================================================================
 y1 = y0 + P1_H + 20
-P2_H = 382
+P2_H = 390
 d.panel(y1, P2_H, 2, "What does one state slot hold? A fixed area per running sequence, not paged",
         "Slot s is one row of gpu_states. The sequence keeps it from start to end. Ring buffers overwrite old tokens.")
 d.text(46, y1 + 86, "gpu_states[state_id]  =  [ stored region | dropped region ]   (StateBlock, cache_engine.py:221-241)", 13, INK, "bold", mono=True)
@@ -137,13 +162,19 @@ d.legend(30, y, [
     (BLUE, "main compressed KV (ca_cache)"),
     (VIOLET, "indexer keys (ica_cache)"),
     (EMERALD, "sliding-window KV (swa_cache)"),
+])
+y += 26
+d.legend(30, y, [
     (AMBER, "fp32 compression state"),
     (NEUTRAL, "no data / padding / reserved"),
-])
+], title=" " * 11)
 y += 40
-y = d.footnotes(y=y, x=30, lines=[
+FN = []
+for s in [
     "Byte widths in the two bars are not to scale. Which layer is C1, C2, sparse or SWA-only comes from the model config (attn_module_list), which is not in the repo.",
     "Defaults: DEEPINFER_USE_NEXTN_DECODE=5 → backtracking = max(value, 5 + 1) = 6 (environ.py:129-132); DEEPINFER_NUM_STATE_SLOTS_RATIO=1.2 (environ.py:162).",
     "Window 128 and the 20 stored layers are from doc/inference_deployment_qa.md:163,169,191. With DEEPINFER_PREFILL_STORE_EXTRA_STATE the rings are 128 tokens longer (plus the YOCO keep tokens if truncation is on).",
-])
+]:
+    FN += wrap(s, 12, W - 70)
+y = d.footnotes(30, y, FN)
 d.save(height=y + 14)

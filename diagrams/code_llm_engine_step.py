@@ -20,9 +20,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from svglib import BLUE, EMERALD, INK, MUTE, VIOLET, WHITE, Diagram  # noqa: E402
+from svglib import BLUE, EMERALD, INK, MUTE, VIOLET, WHITE, Diagram, text_width  # noqa: E402
 
-d = Diagram()
+d = Diagram(width=1100)
 d.header(
     "One call of LLMEngine.step(), in order",
     "A decode step with zero-overhead scheduling (ZOS) on, the default for a NORMAL engine  ·  N = this step, N−1 = the step before",
@@ -31,9 +31,9 @@ d.header(
 
 y0 = 116
 lanes = [
-    (46, 452, BLUE, "LLMEngine", "deepinfer/engine/llm_engine.py"),
-    (524, 452, VIOLET, "C++ engine", "deepinfer._C.engine (csrc/engine/)"),
-    (1002, 452, EMERALD, "driver Worker → ModelRunner", "deepinfer/worker/worker.py"),
+    (46, 326, BLUE, "LLMEngine", "deepinfer/engine/llm_engine.py"),
+    (387, 326, VIOLET, "C++ engine", "deepinfer._C.engine (csrc/engine/)"),
+    (728, 326, EMERALD, "driver Worker → ModelRunner", "deepinfer/worker/worker.py"),
 ]
 
 rows = [
@@ -53,7 +53,8 @@ rows = [
 
 lane_top = y0 + 8
 head_h = 52
-row_h, row_gap = 58, 16
+row_h, row_gap = 70, 14
+DS, SS = 12.5, 12          # detail mono size, source mono size
 body_top = lane_top + head_h + 18
 total_h = head_h + 18 + len(rows) * (row_h + row_gap) + 6
 for (x, w, col, name, sub) in lanes:
@@ -72,9 +73,31 @@ for i, (lane, title, detail, src, optional) in enumerate(rows):
            dash="5 4" if optional else None)
     d.rect(cx, y, 6, row_h, fill=col[0], stroke=None, rx=3)
     d.badge(cx + 24, y + 19, i + 1, col, r=11, size=12)
-    d.text(cx + 42, y + 24, title, 14.5, INK, "bold")
-    d.text(cx + cw - 10, y + 23, src, 12, MUTE, anchor="end", mono=True)
-    d.text(cx + 42, y + 46, detail, 13, INK, mono=True)
+    d.text(cx + 42, y + 24, title, 14, INK, "bold")
+    # detail wraps to at most 2 lines; the source sits at the bottom right
+    avail = cw - 52
+    src_w = text_width(src, SS, mono=True) + 12
+    if text_width(detail, DS, mono=True) <= avail:
+        lines = [detail]
+    else:  # balanced split into 2 lines at a word boundary
+        words = detail.split(" ")
+        # never start the second line with a separator
+        splits = [(" ".join(words[:k]), " ".join(words[k:])) for k in range(1, len(words)) if words[k] != "·"]
+        def tw(t):
+            return text_width(t, DS, mono=True)
+        # prefer a split that leaves room for the source at the bottom right
+        fit = [sp for sp in splits if tw(sp[0]) <= avail and tw(sp[1]) <= avail - src_w]
+        if not fit:
+            fit = [sp for sp in splits if max(tw(sp[0]), tw(sp[1])) <= avail]
+        assert fit, detail
+        lines = list(min(fit, key=lambda sp: max(tw(sp[0]), tw(sp[1]))))
+    for j, ln in enumerate(lines):
+        d.text(cx + 42, y + 45 + j * 17, ln, DS, INK, mono=True)
+    if len(lines) == 1 or text_width(lines[-1], DS, mono=True) <= avail - src_w:
+        d.text(cx + cw - 10, y + 62, src, SS, MUTE, anchor="end", mono=True)
+    else:  # the second detail line is long: the source goes on the title line
+        assert text_width(title, 14, bold=True) <= avail - src_w, title
+        d.text(cx + cw - 10, y + 24, src, SS, MUTE, anchor="end", mono=True)
     if prev is not None:
         px, py = prev
         nx = cx + cw / 2

@@ -23,7 +23,25 @@ A = (SERIES[0], "#eff6ff")   # sequence A: blue
 B = (SERIES[1], "#fdf2f8")   # sequence B: pink
 BS = 4                        # toy block size
 
-d = Diagram()
+d = Diagram(width=1100)
+W = d.W
+CX0, CX1 = 46, W - 46          # panel content x range
+
+
+def wrap(s, size, maxw, mono=False, indent="  "):
+    """Greedy word wrap; continuation lines are indented with two spaces."""
+    out, cur = [], ""
+    for w in s.split(" "):
+        cand = (cur + " " + w) if cur else w
+        if cur and text_width((indent if out else "") + cand, size, mono) > maxw:
+            out.append(cur)
+            cur = w
+        else:
+            cur = cand
+    out.append(cur)
+    return [out[0]] + [indent + t for t in out[1:]]
+
+
 d.header(
     "A paged KV cache: block table → physical blocks",
     "How a sequence finds the keys and values of its tokens  ·  toy numbers: 4 tokens per block, 12 blocks  ·  DeepInfer uses 128 tokens per block",
@@ -47,23 +65,29 @@ def cells(x, y, n_used, start_idx, col, size=30, gap=4, n=BS, empty_style="dash"
 # Panel 1: logical view, block table, physical pool
 # ============================================================================
 y0 = 124
-P1_H = 470
+P1_H = 556
 d.panel(y0, P1_H, 1, "Where are the keys and values of a sequence? The block table says",
         "The sequence sees its tokens in order. Its block table maps each logical block to any physical block in the pool.")
 
+
+def col_title(x, a, b):
+    d.text(x, y0 + 84, a, 14, INK, "bold")
+    d.text(x, y0 + 102, b, 13, MUTE)
+
+
 # --- column 1: logical view
 c1x = 46
-d.text(c1x, y0 + 86, "Logical view (what the sequence sees)", 14, INK, "bold")
+col_title(c1x, "Logical view", "(what the sequence sees)")
 ROW = 56
 seqs = [
-    ("A", A, 10, [5, 2, 9], y0 + 132),
-    ("B", B, 6, [7, 3], y0 + 132 + 3 * ROW + 46),
+    ("A", A, 10, [5, 2, 9], y0 + 152),
+    ("B", B, 6, [7, 3], y0 + 152 + 3 * ROW + 60),
 ]
-blk_x = c1x + 92
+blk_x = c1x + 76
 blk_w = 4 * 30 + 3 * 4 + 16
 row_centers = {}
 for name, col, ntok, table, ys in seqs:
-    d.text(c1x, ys - 12, f"Sequence {name}  ·  {ntok} tokens", 14, col[0], "bold")
+    d.text(c1x, ys - 14, f"Sequence {name}  ·  {ntok} tokens", 14, col[0], "bold")
     for lb in range(len(table)):
         ry = ys + lb * ROW
         used = max(0, min(BS, ntok - lb * BS))
@@ -73,31 +97,32 @@ for name, col, ntok, table, ys in seqs:
         row_centers[(name, lb)] = ry + 23
 
 # --- column 2: block tables
-c2x, c2w = 590, 250
-d.text(c2x, y0 + 86, "Block table (one per sequence)", 14, INK, "bold")
+c2x, c2w = 318, 232
+col_title(c2x, "Block table", "(one per sequence)")
 for name, col, ntok, table, ys in seqs:
-    top = ys - 30
+    top = ys - 32
     bottom = ys + (len(table) - 1) * ROW + 46 + 4
     d.rect(c2x, top, c2w, bottom - top, fill=col[1], stroke=col[0], sw=1.5)
-    d.text(c2x + 14, top + 20, f"{name}.block_table = [{', '.join(str(t) for t in table)}]", 13.5, col[0], "bold", mono=True)
+    d.text(c2x + 12, top + 20, f"{name}.block_table = [{', '.join(str(t) for t in table)}]", 13.5, col[0], "bold", mono=True)
     for lb, phys in enumerate(table):
         cy = row_centers[(name, lb)]
         d.text(c2x + 14, cy + 4.5, f"[{lb}]  →  block #{phys}", 13, INK, mono=True)
         d.arrow(blk_x + blk_w, cy, c2x - 2, cy, col[0])
 
-# --- column 3: physical pool
-c3x, c3w = 912, 548
-d.text(c3x, y0 + 86, "Physical pool (device memory)", 14, INK, "bold")
-pool_top = y0 + 100
-pool_h = 3 * 92 + 22
-d.rect(c3x - 14, pool_top - 8, c3w + 14, pool_h, fill="#fbfcfe", stroke=GRAY_MID, rx=12, sw=1.2, dash="4 4")
+# --- column 3: physical pool (3 columns x 4 rows)
+bw, bh, gx, gy = 124, 76, 12, 16
+c3w = 3 * bw + 2 * gx
+c3x = CX1 - 14 - c3w
+col_title(c3x, "Physical pool", "(device memory)")
+pool_top = y0 + 124
+pool_h = 4 * 92 + 22
+d.rect(c3x - 14, pool_top - 8, c3w + 28, pool_h, fill="#fbfcfe", stroke=GRAY_MID, rx=12, sw=1.2, dash="4 4")
 owner = {}
 for name, col, ntok, table, ys in seqs:
     for lb, phys in enumerate(table):
         owner[phys] = (name, col, lb, max(0, min(BS, ntok - lb * BS)))
-bw, bh, gx, gy = 124, 76, 12, 16
 for k in range(12):
-    r, c = divmod(k, 4)
+    r, c = divmod(k, 3)
     x = c3x + c * (bw + gx)
     y = pool_top + 6 + r * (bh + gy)
     if k == 0:
@@ -126,10 +151,11 @@ for k in range(12):
             d.rect(x + 10 + i * 27, y + 34, 23, 30, fill=CELL_EMPTY, stroke=LINE, rx=3, sw=0.8)
 # arrows from the tables into the pool container
 for name, col, ntok, table, ys in seqs:
-    cy = ys + 10
+    cy = ys - 8
     d.arrow(c2x + c2w, cy, c3x - 16, cy, col[0], sw=2)
     d.arrow_label((c2x + c2w + c3x - 14) / 2, cy, "look up", col[0])
-d.text(c3x, pool_top + pool_h + 14, "Free blocks: #1 #4 #6 #8 #10 #11. The next allocation takes the first one (#1).", 12.5, MUTE)
+d.text(c3x - 14, pool_top + pool_h + 14, "Free blocks: #1 #4 #6 #8 #10 #11.", 12.5, MUTE)
+d.text(c3x - 14, pool_top + pool_h + 32, "The next allocation takes the first one (#1).", 12.5, MUTE)
 
 # ============================================================================
 # Panel 2: one decode step
@@ -144,13 +170,14 @@ def card(x, y, w, h, num, title, lines, col):
     d.rect(x, y, w, h, fill=col[1], stroke=col[0], sw=1.4)
     d.rect(x, y, 6, h, fill=col[0], stroke=None, rx=3)
     d.badge(x + 24, y + 20, num, col[0], r=11, size=12)
-    d.text(x + 42, y + 25, title, 14.5, INK, "bold")
+    d.text(x + 42, y + 25, title, 14, INK, "bold")
     for i, s in enumerate(lines):
         d.text(x + 22, y + 54 + i * 21, s, 13, INK, mono=True)
 
 
-cw, ch, cy = 440, 124, y1 + 70
-xs = [46, 46 + cw + 30, 46 + 2 * (cw + 30)]
+cgap = 30
+cw, ch, cy = (CX1 - CX0 - 2 * cgap) / 3, 124, y1 + 70
+xs = [CX0, CX0 + cw + cgap, CX0 + 2 * (cw + cgap)]
 card(xs[0], cy, cw, ch, 1, "Token at position 10 (A)", [
     "logical block = 10 // 4 = 2",
     "offset        = 10 %  4 = 2",
@@ -176,16 +203,17 @@ d.text(46, cy + ch + 28,
 # Panel 3: why paging
 # ============================================================================
 y2 = y1 + P2_H + 20
-P3_H = 236
+P3_H = 264
 d.panel(y2, P3_H, 3, "Why blocks? Only the last block of a sequence can be partly empty",
         "Without paging, each sequence reserves its maximum length up front. With paging, the empty space is less than one block per sequence.")
 
-sx = 300
-cs, cg = 26, 3
+sx = 46
+cs, cg = 21, 3
+CHIP_W = 150
 
 
 def strip(y, groups, label, waste):
-    d.text(46, y + 19, label, 13.5, INK, "bold")
+    d.text(46, y - 12, label, 13.5, INK, "bold")
     x = sx
     for kind, col, n in groups:
         for i in range(n):
@@ -197,18 +225,18 @@ def strip(y, groups, label, waste):
                 d.rect(x, y, cs, cs, fill=CELL_EMPTY, stroke=LINE, rx=2, sw=0.8)
             x += cs + cg
         x += 6
-    d.chip(1306, y - 2, 150, waste, ("#b45309", "#fffbeb") if "16" in waste else (INK, WHITE))
+    d.chip(CX1 - CHIP_W, y - 4.5, CHIP_W, waste, ("#b45309", "#fffbeb") if "16" in waste else (INK, WHITE))
 
 
-ya = y2 + 84
+ya = y2 + 100
 strip(ya, [("used", A, 10), ("waste", A, 6), ("used", B, 6), ("waste", B, 10)],
       "Reserve 16 tokens each", "wasted: 16 slots")
-d.text(sx, ya + 48, "A reserves 16 slots and uses 10.  B reserves 16 slots and uses 6.  A third sequence must wait.", 12.5, MUTE)
-yb = ya + 92
+d.text(sx, ya + 42, "A reserves 16 slots and uses 10.  B reserves 16 slots and uses 6.  A third sequence must wait.", 12.5, MUTE)
+yb = ya + 96
 strip(yb, [("used", A, 4), ("used", A, 4), ("used", A, 2), ("waste", A, 2), ("used", B, 4), ("used", B, 2), ("waste", B, 2),
            ("free", None, 4), ("free", None, 4), ("free", None, 4)],
       "Paged: blocks of 4", "wasted: 4 slots")
-d.text(sx, yb + 48, "A has 3 blocks, B has 2 blocks. 12 slots (3 blocks) stay free for other sequences.", 12.5, MUTE)
+d.text(sx, yb + 42, "A has 3 blocks, B has 2 blocks. 12 slots (3 blocks) stay free for other sequences.", 12.5, MUTE)
 
 # ============================================================================
 # Legend and footnotes
@@ -221,9 +249,12 @@ d.legend(30, y, [
     (NEUTRAL, "block 0, never used"),
 ])
 y += 40
-y = d.footnotes(30, y, [
-    "Simplified: one slot here stands for the keys and values of one token in every layer. In DeepInfer one physical block holds 128 tokens for all layers that use paging",
-    "  (model_metadata_utils.py:133-135, cache_engine.py:937-938). The free blocks in panel 1 are scattered because other sequences finished earlier.",
+FN = []
+for s in [
+    "Simplified: one slot here stands for the keys and values of one token in every layer. In DeepInfer one physical block holds 128 tokens for all layers that use paging"
+    " (model_metadata_utils.py:133-135, cache_engine.py:937-938). The free blocks in panel 1 are scattered because other sequences finished earlier.",
     "Not shown: the sliding-window cache and the compression state. DeepInfer keeps them per sequence in a state slot, not in paged blocks (cache_engine.py:205-218).",
-])
+]:
+    FN += wrap(s, 12, W - 70)
+y = d.footnotes(30, y, FN)
 d.save(height=y + 14)

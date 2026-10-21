@@ -24,7 +24,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from svglib import AMBER, BLUE, INK, MUTE, NEUTRAL, VIOLET, WHITE, Diagram  # noqa: E402
 
-d = Diagram()
+d = Diagram(width=1100)
+W = d.W
+CX = W / 2
 d.header(
     "How the folders of DeepInfer depend on each other",
     "Arrows point from the code that imports to the code that it imports  ·  commit 9bd9cf2",
@@ -51,8 +53,8 @@ d.panel(y0, P1_H, 1, "Which folder uses which?",
         "deepinfer/ is the centre. It never imports examples/, eval/ or tests/. Kernels come from outside the repo.")
 
 # column geometry: 3 boxes side by side
-cw = 440
-gx = [46, 530, 1014]
+cw = 300
+gx = [46, 400, 754]
 row1 = y0 + 78
 bh = 86
 
@@ -70,11 +72,11 @@ d.text((gx[1] + cw + gx[2]) / 2, ay - 8, "uses", 12, INK, "bold", "middle")
 # deepinfer centre box
 row2 = row1 + bh + 58
 mid_h = 104
-d.rect(46, row2, 1408, mid_h, fill=BLUE[1], stroke=BLUE, sw=2)
-d.text(750, row2 + 28, "deepinfer/   (the Python package)", 17, BLUE[0], "bold", "middle", mono=True)
-d.text(750, row2 + 52, "223 files  ·  47,174 lines", MS, INK, anchor="middle", mono=True)
-d.text(750, row2 + 74, "entrypoints/ → engine/ → worker/ → model_executor/   + hugging_face/, ve/, structure_output/, npu_ops/ ...", MS, INK, anchor="middle", mono=True)
-d.text(750, row2 + 94, "the only import of the C++ code is the extension module deepinfer._C", 12.5, MUTE, anchor="middle")
+d.rect(46, row2, W - 92, mid_h, fill=BLUE[1], stroke=BLUE, sw=2)
+d.text(CX, row2 + 28, "deepinfer/   (the Python package)", 17, BLUE[0], "bold", "middle", mono=True)
+d.text(CX, row2 + 52, "223 files  ·  47,174 lines", MS, INK, anchor="middle", mono=True)
+d.text(CX, row2 + 74, "entrypoints/ → engine/ → worker/ → model_executor/   + hugging_face/, ve/, structure_output/, npu_ops/ ...", MS, INK, anchor="middle", mono=True)
+d.text(CX, row2 + 94, "the only import of the C++ code is the extension module deepinfer._C", 12.5, MUTE, anchor="middle")
 
 for x in gx:
     d.arrow(x + cw / 2, row1 + bh, x + cw / 2, row2 - 2, INK)
@@ -112,7 +114,7 @@ for i, (t, ls) in enumerate(steps):
     fbox(gx[i], r, cw, bh2, t, ls, AMBER, mono_first=True)
 for i in range(2):
     d.arrow(gx[i] + cw, r + bh2 / 2, gx[i + 1] - 2, r + bh2 / 2, AMBER)
-d.text(750, r + bh2 + 30, "setup.py asks deep_cluster for the accelerator kind, then builds a CUDAExtension or an NpuExtension.",
+d.text(CX, r + bh2 + 30, "setup.py asks deep_cluster for the accelerator kind, then builds a CUDAExtension or an NpuExtension.",
        12.5, MUTE, anchor="middle")
 
 y = y1 + P2_H + 26

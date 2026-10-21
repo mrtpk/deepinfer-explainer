@@ -17,22 +17,35 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from svglib import AMBER, BLUE, EMERALD, INK, MUTE, NEUTRAL, PINK, VIOLET, Diagram  # noqa: E402
+from svglib import AMBER, BLUE, EMERALD, INK, MUTE, NEUTRAL, PINK, VIOLET, Diagram, text_width  # noqa: E402
 
-d = Diagram()
+d = Diagram(width=1100)
+W = d.W
+R = W - 46  # right edge of the panel content
 d.header(
     "The step loop: one prefill step, then many decode steps",
     "Request \"1\" alone, counted from its first prefill step, ZOS on, nextn 5  ·  all counts are illustrative  ·  commit 9bd9cf2",
     params="prompt 41 tokens   max_tokens 128   decode step: 1 token + 5 drafts = seqlen_q 6",
 )
 
+
+def wrap(s, size, maxw, mono=False, indent="  "):
+    """Break s at spaces so that each line is at most maxw wide."""
+    out, cur = [], ""
+    for w in s.split(" "):
+        cand = w if not cur else cur + " " + w
+        if cur and text_width(cand, size, mono) > maxw:
+            out.append(cur)
+            cur = indent + w
+        else:
+            cur = cand
+    out.append(cur)
+    return out
+
+
 # ============================================================================
-# Panel 1: steps that touch the request
+# Panel 1: steps that touch the request (one row per step, time runs down)
 # ============================================================================
-y0 = 112
-P1_H = 316
-d.panel(y0, P1_H, 1, "Which engine steps touch request \"1\"?",
-        "step() runs again and again. A decode step returns the tokens of the step before it (ZOS).")
 steps = [
     ("step 1", "prefill", "q 41  k 41", "#1", "1 token", BLUE),
     ("step 2", "decode D1", "q 6  k 47", "-", "nothing yet", EMERALD),
@@ -43,90 +56,114 @@ steps = [
     ("step m+2", "free blocks", "D(m+1) dropped", "-", "nothing", NEUTRAL),
     ("flush", "flush_inflight", "", "", "", AMBER),
 ]
-bx0, bw, gap = 46, 160, 18
-by = y0 + 90
-d.text(46, by - 12, "forward + sample on the device", 12.5, MUTE, "bold")
+BOX_H, ROW_GAP, DOTS_H = 40, 14, 24
+y0 = 112
+by = y0 + 96
+rows_h = sum((DOTS_H if s[0] == "..." else BOX_H) + ROW_GAP for s in steps) - ROW_GAP
+P1_H = by - y0 + rows_h + 22
+d.panel(y0, P1_H, 1, "Which engine steps touch request \"1\"?",
+        "step() runs again and again. A decode step returns the tokens of the step before it (ZOS).")
+sx, sw = 46, 430          # step column
+rx, rw = 566, R - 566     # "what step() returns" column
+d.text(sx, by - 12, "forward + sample on the device", 12.5, MUTE, "bold")
+d.text(rx, by - 12, "what step() returns to LLM._run_engine()  (one RequestOutput per token)", 12.5, MUTE, "bold")
+yy = by
+prev_bottom = None
 for i, (name, kind, qk, ret, toks, col) in enumerate(steps):
-    x = bx0 + i * (bw + gap)
     if name == "...":
-        d.text(x + bw / 2, by + 44, "...", 22, MUTE, "bold", "middle")
+        d.text(sx + sw / 2, yy + 18, "...", 22, MUTE, "bold", "middle")
+        if prev_bottom is not None:
+            d.arrow(sx + sw / 2, prev_bottom, sx + sw / 2, yy - 2, MUTE, sw=1.4)
+        prev_bottom = yy + DOTS_H
+        yy += DOTS_H + ROW_GAP
         continue
-    d.rect(x, by, bw, 76, fill=col[1], stroke=col, sw=1.4)
-    d.text(x + 12, by + 22, name, 14, INK, "bold")
-    d.text(x + 12, by + 43, kind, 13, col, "bold")
-    d.text(x + 12, by + 63, qk, 13, INK, mono=True)
-    if i + 1 < len(steps):
-        d.arrow(x + bw, by + 38, x + bw + gap - 2, by + 38, MUTE, sw=1.4)
-ry = by + 76 + 46
-d.text(46, ry + 48 + 22, "what step() returns to LLM._run_engine()  (one RequestOutput per token)", 12.5, MUTE, "bold")
-for i, (name, kind, qk, ret, toks, col) in enumerate(steps):
-    x = bx0 + i * (bw + gap)
-    if name in ("...", "flush"):
-        continue
-    d.rect(x, ry, bw, 48, fill="#ffffff", stroke=col, sw=1.2, dash="4 3")
-    d.text(x + 12, ry + 20, ("result of " + ret) if ret not in ("-", "#1") else ("result of step 1" if ret == "#1" else "no output"), 12, MUTE)
-    d.text(x + 12, ry + 39, toks, 13, INK, "bold", mono=True)
-    d.arrow(x + bw / 2, by + 76, x + bw / 2, ry - 2, col, sw=1.4, dash="5 4")
-fx = bx0 + 7 * (bw + gap)
-d.rect(fx, ry, bw, 48, fill="#ffffff", stroke=AMBER, sw=1.2, dash="4 3")
-d.text(fx + 12, ry + 20, "last in-flight step", 12, MUTE)
-d.text(fx + 12, ry + 39, "then break", 13, INK, "bold", mono=True)
-d.arrow(fx + bw / 2, by + 76, fx + bw / 2, ry - 2, AMBER, sw=1.4, dash="5 4")
+    if prev_bottom is not None:
+        d.arrow(sx + sw / 2, prev_bottom, sx + sw / 2, yy - 2, MUTE, sw=1.4)
+    d.rect(sx, yy, sw, BOX_H, fill=col[1], stroke=col, sw=1.4)
+    d.text(sx + 14, yy + 25, name, 14, INK, "bold")
+    d.text(sx + 120, yy + 25, kind, 13, col, "bold")
+    if qk:
+        d.text(sx + 270, yy + 25, qk, 13, INK, mono=True)
+    # what step() returns
+    if name == "flush":
+        rcol, label, value = AMBER, "last in-flight step", "then break"
+    else:
+        rcol = col
+        label = ("result of " + ret) if ret not in ("-", "#1") else ("result of step 1" if ret == "#1" else "no output")
+        value = toks
+    d.rect(rx, yy, rw, BOX_H, fill="#ffffff", stroke=rcol, sw=1.2, dash="4 3")
+    d.text(rx + 14, yy + 25, label, 12, MUTE)
+    d.text(rx + 190, yy + 25, value, 13, INK, "bold", mono=True)
+    d.arrow(sx + sw, yy + BOX_H / 2, rx - 2, yy + BOX_H / 2, rcol, sw=1.4, dash="5 4")
+    prev_bottom = yy + BOX_H
+    yy += BOX_H + ROW_GAP
 
 # ============================================================================
 # Panel 2: ZOS overlap
 # ============================================================================
 y1 = y0 + P1_H + 20
-P2_H = 282
+cpu_y, dev_y = y1 + 92, y1 + 196
+P2_H = dev_y + 52 + 24 - y1
 d.panel(y1, P2_H, 2, "Why one step behind? The CPU post-processes step N-1 while the device runs forward N",
         "Worker.execute_model_step(): launch forward N, post-process N-1, launch sample N, keep N for the next step.")
 lx = 46
-cpu_y, dev_y = y1 + 92, y1 + 178
 d.text(lx, cpu_y + 26, "CPU", 15, INK, "bold")
 d.text(lx, cpu_y + 44, "driver thread", 12, MUTE)
 d.text(lx, dev_y + 26, "device", 15, INK, "bold")
 d.text(lx, dev_y + 44, "one stream", 12, MUTE)
-x0 = 170
-# CPU row: step N
+x0 = 150
+# CPU row (labels may take two lines)
 cpu_boxes = [
-    (x0, 190, "schedule N + prepare N", BLUE),
-    (x0 + 196, 110, "launch fwd N", BLUE),
-    (x0 + 312, 300, "post-process N-1 (outputs)", VIOLET),
-    (x0 + 618, 120, "launch sample N", BLUE),
-    (x0 + 744, 190, "schedule N+1 + prepare", BLUE),
-    (x0 + 940, 120, "launch fwd N+1", BLUE),
-    (x0 + 1066, 210, "post-process N", VIOLET),
+    (x0, 130, ["schedule N", "+ prepare N"], BLUE),
+    (x0 + 136, 78, ["launch", "fwd N"], BLUE),
+    (x0 + 220, 206, ["post-process N-1 (outputs)"], VIOLET),
+    (x0 + 432, 86, ["launch", "sample N"], BLUE),
+    (x0 + 524, 130, ["schedule N+1", "+ prepare"], BLUE),
+    (x0 + 660, 86, ["launch", "fwd N+1"], BLUE),
+    (x0 + 752, 146, ["post-process N"], VIOLET),
 ]
-for x, w, label, col in cpu_boxes:
-    d.rect(x, cpu_y, w, 52, fill=col[1], stroke=col, sw=1.3)
-    d.text(x + 10, cpu_y + 31, label, 12.5, INK, "bold")
+
+
+def label_box(x, y, w, lines, col):
+    d.rect(x, y, w, 52, fill=col[1], stroke=col, sw=1.3)
+    if len(lines) == 1:
+        d.text(x + 10, y + 31, lines[0], 12.5, INK, "bold")
+    else:
+        d.text(x + 10, y + 22, lines[0], 12.5, INK, "bold")
+        d.text(x + 10, y + 40, lines[1], 12.5, INK, "bold")
+
+
+for x, w, lines, col in cpu_boxes:
+    label_box(x, cpu_y, w, lines, col)
 dev_boxes = [
-    (x0 + 200, 536, "forward N  (CUDA graph replay)", EMERALD),
-    (x0 + 744, 150, "sample N", EMERALD),
-    (x0 + 1066, 210, "forward N+1", EMERALD),
+    (x0 + 140, 376, ["forward N  (CUDA graph replay)"], EMERALD),
+    (x0 + 524, 106, ["sample N"], EMERALD),
+    (x0 + 752, 146, ["forward N+1"], EMERALD),
 ]
-for x, w, label, col in dev_boxes:
-    d.rect(x, dev_y, w, 52, fill=col[1], stroke=col, sw=1.3)
-    d.text(x + 10, dev_y + 31, label, 12.5, INK, "bold")
+for x, w, lines, col in dev_boxes:
+    label_box(x, dev_y, w, lines, col)
 # launch arrows
-d.arrow(x0 + 196 + 55, cpu_y + 52, x0 + 196 + 55, dev_y - 2, EMERALD, sw=1.5)
+lf = x0 + 136 + 39
+d.arrow(lf, cpu_y + 52, lf, dev_y - 2, EMERALD, sw=1.5)
 mid = (cpu_y + 52 + dev_y) / 2
-for sx_, tx_ in ((x0 + 618 + 60, x0 + 744 + 75), (x0 + 940 + 60, x0 + 1066 + 105)):
+for sx_, tx_ in ((x0 + 432 + 43, x0 + 524 + 53), (x0 + 660 + 43, x0 + 752 + 73)):
     d.path_arrow(f"M {sx_:.1f},{cpu_y + 52:.1f} L {sx_:.1f},{mid:.1f} L {tx_:.1f},{mid:.1f} L {tx_:.1f},{dev_y - 2:.1f}", EMERALD, sw=1.5)
-d.text(x0 + 744 + 75 + 8, mid - 6, "queued on the stream", 11.5, EMERALD)
-d.text(x0 + 312, y1 + 80, "overlaps with forward N", 12, VIOLET, "bold")
-d.aside(x0 + 312 + 190, y1 + 80, ["(waits only on sample_end_evt of N-1)"])
+d.text(x0 + 432 + 43 - 10, mid + 4, "queued on the stream", 11.5, EMERALD, anchor="end")
+d.text(x0 + 220, y1 + 80, "overlaps with forward N", 12, VIOLET, "bold")
+d.aside(x0 + 220 + 160, y1 + 80, ["(waits only on sample_end_evt of N-1)"])
 
 # ============================================================================
 # Panel 3: one decode step
 # ============================================================================
 y2 = y1 + P2_H + 20
-P3_H = 330
+cw, cg = 128, 10
+cx0 = 190
+rows_y = [y2 + 80, y2 + 146, y2 + 212]
+oy = rows_y[2] + 44 + 34          # outcome box top
+OUT_H = 116
+P3_H = oy + OUT_H + 22 - y2
 d.panel(y2, P3_H, 3, "One decode step: 6 tokens in, 1 to 6 tokens out",
         "Input: the last token plus 5 drafts. The sampler accepts a prefix of the drafts and adds one token of its own.")
-cw, cg = 120, 10
-cx0 = 260
-rows_y = [y2 + 92, y2 + 158, y2 + 224]
 labels = ["position", "input_ids", "result"]
 for j, lab in enumerate(labels):
     d.text(46, rows_y[j] + 30, lab, 14, INK, "bold")
@@ -146,11 +183,10 @@ for k in range(6):
     if top:
         d.text(x + cw / 2, rows_y[2] + 18, top, 11.5, MUTE, anchor="middle")
     d.text(x + cw / 2, rows_y[2] + 36 if top else rows_y[2] + 28, word, 13, rc, "bold", "middle", mono=True)
-# outcome box
-ox = cx0 + 6 * (cw + cg) + 30
-ow = 1454 - ox
-d.rect(ox, rows_y[0], ow, 176, fill=VIOLET[1], stroke=VIOLET, sw=1.5)
-d.text(ox + 16, rows_y[0] + 26, "process_outputs() appends 3 tokens", 14, VIOLET, "bold")
+# outcome box, below the cells
+ox, ow = cx0, 6 * cw + 5 * cg
+d.rect(ox, oy, ow, OUT_H, fill=VIOLET[1], stroke=VIOLET, sw=1.5)
+d.text(ox + 16, oy + 26, "process_outputs() appends 3 tokens", 14, VIOLET, "bold")
 out_lines = [
     "d1, d2, then y (sampled at the d2 row)",
     "len 50 -> 53;  KV num_tokens 49 -> 52",
@@ -160,16 +196,19 @@ out_lines = [
     "then 5 new drafts for the next step",
 ]
 for i, s in enumerate(out_lines):
-    d.text(ox + 16, rows_y[0] + 52 + i * 20, s, 13, INK, mono=True)
-d.arrow(ox - 28, rows_y[2] + 22, ox - 2, rows_y[2] + 22, VIOLET, sw=1.6)
+    col_x = ox + 16 if i < 3 else ox + ow / 2 + 16
+    d.text(col_x, oy + 52 + (i % 3) * 20, s, 13, INK, mono=True)
+ax = cx0 + (cw + cg) + cw / 2      # below the "verify d2" cell: y is sampled there
+d.arrow(ax, rows_y[2] + 44, ax, oy - 2, VIOLET, sw=1.6)
 
 y = y2 + P3_H + 24
 d.legend(30, y, [(BLUE, "CPU work / the real last token"), (EMERALD, "device work / accepted"),
                  (VIOLET, "post-process"), (AMBER, "draft token / flush"), (PINK, "rejected draft")])
 y += 38
-y = d.footnotes(30, y, [
+notes = [
     "Illustrative: the numbers of accepted drafts, m, and the positions are examples. The first decode step after prefill has placeholder drafts (id vocab_size - 1).",
     "Not shown: the empty decode steps before step 1. The model class of this release has a vision part, so the request becomes schedulable only after the multimodal worker answers (see stop 5).",
     "Simplified: with DEEPINFER_ENABLE_MTP_VARLEN=1 the scheduler can verify fewer than 5 drafts (seqlen_q between 1 and 6).",
-])
+]
+y = d.footnotes(30, y, [ln for s in notes for ln in wrap(s, 12, W - 70)])
 d.save(height=y + 10)

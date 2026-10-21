@@ -21,9 +21,26 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from svglib import AMBER, BLUE, INK, MUTE, VIOLET, Diagram  # noqa: E402
+from svglib import AMBER, BLUE, INK, MUTE, VIOLET, Diagram, text_width  # noqa: E402
 
-d = Diagram()
+
+def wrap(lines, size=12, max_w=1030):
+    """Re-break footnote lines at word boundaries so each fits max_w; continuation lines indent 2 spaces."""
+    out = []
+    for line in lines:
+        cur = ""
+        for word in line.split(" "):
+            cand = word if not cur else cur + " " + word
+            if cur and text_width(cand, size) > max_w:
+                out.append(cur)
+                cur = "  " + word
+            else:
+                cur = cand
+        out.append(cur)
+    return out
+
+
+d = Diagram(width=1100)
 d.header(
     "Life of a request, part 1: from llm.generate() to a batch",
     "Stops 1-6 of the tour  ·  one text request, id \"1\", from examples/offline_inference.py  ·  commit 9bd9cf2",
@@ -31,9 +48,9 @@ d.header(
 )
 
 LANES = [
-    (30, 470, BLUE, "Python  ·  driver process", ["deepinfer/entrypoints, engine, worker", "one process per DP rank"]),
-    (520, 470, VIOLET, "C++ engine  ·  deepinfer._C", ["csrc/engine/*  (pybind11)", "same process, GIL released"]),
-    (1010, 460, AMBER, "Helpers  ·  other processes, threads", ["only when the request needs them", "or when there are many ranks"]),
+    (30, 336, BLUE, "Python  ·  driver process", ["deepinfer/entrypoints, engine, worker", "one process per DP rank"]),
+    (382, 336, VIOLET, "C++ engine  ·  deepinfer._C", ["csrc/engine/*  (pybind11)", "same process, GIL released"]),
+    (734, 336, AMBER, "Helpers  ·  other processes, threads", ["only when the request needs them", "or when there are many ranks"]),
 ]
 LANE_Y = 112
 HEADER_H = 64
@@ -135,14 +152,14 @@ link(1, 0, 5, None, BLUE)
 flow(1, 4, 1, 5, VIOLET)
 
 y = LANE_Y + lane_h + 22
-d.callout(30, y, 1440, "Next:", "stop 7 (part 2): Worker.execute_model_step() runs the batch on the device.", BLUE)
+d.callout(30, y, d.W - 60, "Next:", "stop 7 (part 2): Worker.execute_model_step() runs the batch on the device.", BLUE)
 y += 54
 d.legend(30, y, [(BLUE, "Python code in the driver process"), (VIOLET, "C++ engine (deepinfer._C)"),
                  (AMBER, "other processes and threads")])
 y += 38
-y = d.footnotes(30, y, [
+y = d.footnotes(30, y, wrap([
     "Solid arrows: the path of request \"1\". Dashed boxes and arrows: a side object or helper of that stop.",
     "Simplified: the example sends 5 x (dp_rank + 1) prompts on each DP rank (5 on rank 0); a prefill step can batch up to max_num_seqs = 4 of them.",
     "Values 41, [2] and the token ids are illustrative. Sources: see the docstring of diagrams/tour1_map_a.py.",
-])
+]))
 d.save(height=y + 10)

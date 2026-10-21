@@ -21,14 +21,30 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from svglib import AMBER, BLUE, EMERALD, INK, LINE, MUTE, VIOLET, Diagram  # noqa: E402
+from svglib import AMBER, BLUE, EMERALD, INK, LINE, MUTE, VIOLET, Diagram, text_width  # noqa: E402
 
-d = Diagram()
+d = Diagram(width=1100)
+W = d.W
+R = W - 46  # right edge of the panel content
 d.header(
     "Which processes and threads serve one request?",
     "Offline example on one node  ·  python examples/offline_inference.py --ep 8 --cp 1  ·  commit 9bd9cf2",
     params="dp_size = ep // cp = 8   world_size = dp_size x cp = 8   one device per rank",
 )
+
+
+def wrap(s, size, maxw, mono=False, indent="  "):
+    """Break s at spaces so that each line is at most maxw wide."""
+    out, cur = [], ""
+    for w in s.split(" "):
+        cand = w if not cur else cur + " " + w
+        if cur and text_width(cand, size, mono) > maxw:
+            out.append(cur)
+            cur = indent + w
+        else:
+            cur = cand
+    out.append(cur)
+    return out
 
 
 def card(x, y, w, h, title, lines, col, dash=None, tsize=15):
@@ -39,31 +55,34 @@ def card(x, y, w, h, title, lines, col, dash=None, tsize=15):
 
 
 # ============================================================================
-# Panel 1
+# Panel 1: the launcher on top, one replica process below it
 # ============================================================================
 y0 = 112
-P1_H = 470
+top = y0 + 70
+lx, lw, lh = 46, 430, 118            # launcher card
+ry = top + lh + 46                   # replica container top
+mh, hh = 130, 86                     # main-row card height, helper-row card height
+rh = 46 + mh + 44 + hh + 20          # replica container height
+P1_H = ry + rh + 20 - y0
 d.panel(y0, P1_H, 1, "Which processes and threads run?",
         "One process per DP rank. Each one is a full engine. Helpers start only when a model or a request needs them.")
 
-top = y0 + 78
 # launcher
-lx, lw, lh = 46, 330, 132
-card(lx, top + 120, lw, lh, "Launcher process", ["python offline_inference.py", "launch_dp() -> run_dp()", "spawn 8, then join()", "(dp_size 1: no spawn)"], AMBER)
+card(lx, top, lw, lh, "Launcher process", ["python offline_inference.py", "launch_dp() -> run_dp()", "spawn 8, then join()", "(dp_size 1: no spawn)"], AMBER)
 
 # replica container
-rx, rw = 430, 1024
-ry, rh = top, P1_H - 100
+rx, rw = 46, R - 46
 d.rect(rx, ry, rw, rh, fill=BLUE[2], stroke=BLUE, rx=12, sw=1.2, dash="4 4", stroke_op=0.5)
 d.text(rx + 18, ry + 26, "DP replica process  (dp_rank r, one device)", 15, BLUE, "bold")
 d.pill_auto(rx + rw - 200, ry + 10, "x 8, one per dp_rank", BLUE)
 
 # arrow launcher -> replica
-d.arrow(lx + lw, top + 120 + lh / 2, rx - 2, top + 120 + lh / 2, AMBER, sw=1.8)
-d.arrow_label((lx + lw + rx) / 2, top + 120 + lh / 2, "spawn", AMBER)
+ax = lx + lw / 2
+d.arrow(ax, top + lh, ax, ry - 2, AMBER, sw=1.8)
+d.text(ax + 10, (top + lh + ry) / 2 + 4, "spawn", 11.5, AMBER, "bold")
 
 # main thread
-mx, my, mw, mh = rx + 20, ry + 46, 420, 150
+mx, my, mw = rx + 20, ry + 46, 430
 card(mx, my, mw, mh, "Main thread (driver)", [
     "main() -> create_llm() -> LLM",
     "LLMEngine + C++ Scheduler",
@@ -72,14 +91,15 @@ card(mx, my, mw, mh, "Main thread (driver)", [
 ], BLUE)
 
 # SO threads
-sx, sy, sw_, sh = rx + 20, my + mh + 30, 420, 96
+sx, sy, sw_, sh = mx, my + mh + 44, mw, hh
 card(sx, sy, sw_, sh, "SO builder threads", [
     "ThreadPoolExecutor, 4 workers",
     "made on the first so_args request",
 ], AMBER, dash="4 3", tsize=14)
 
 # CP workers
-cx, cy, cw, ch = rx + 564, ry + 46, 440, 150
+cx, cy = mx + mw + 104, my
+cw, ch = rx + rw - 20 - cx, mh
 card(cx, cy, cw, ch, "CP worker processes (spawn)", [
     "cp_rank 1 .. cp-1  (none for --cp 1)",
     "start_slave_worker_loop()",
@@ -88,24 +108,24 @@ card(cx, cy, cw, ch, "CP worker processes (spawn)", [
 ], VIOLET, dash="4 3", tsize=14)
 
 # multimodal
-mmx, mmy, mmw, mmh = rx + 564, cy + ch + 30, 440, 96
+mmx, mmy, mmw, mmh = cx, sy, cw, hh
 card(mmx, mmy, mmw, mmh, "Multimodal worker process (fork)", [
     "VL models only, 1 worker",
     "input_queue -> preprocess -> output_queue",
 ], EMERALD, dash="4 3", tsize=14)
 
 # links main <-> helpers
-d.arrow(mx + mw, my + 60, cx - 2, cy + 60, VIOLET, sw=1.6, dash="5 4")
-d.arrow_label((mx + mw + cx) / 2, my + 60, "method name", VIOLET)
-d.arrow(mx + mw, my + 112, cx - 2, cy + 112, VIOLET, sw=1.6, dash="5 4")
-d.arrow_label((mx + mw + cx) / 2, my + 112, "input tensors", VIOLET)
+d.arrow(mx + mw, my + 44, cx - 2, cy + 44, VIOLET, sw=1.6, dash="5 4")
+d.arrow_label((mx + mw + cx) / 2, my + 44, "method name", VIOLET)
+d.arrow(mx + mw, my + 88, cx - 2, cy + 88, VIOLET, sw=1.6, dash="5 4")
+d.arrow_label((mx + mw + cx) / 2, my + 88, "input tensors", VIOLET)
 d.arrow(sx + sw_ / 2, my + mh, sx + sw_ / 2, sy - 2, AMBER, sw=1.6, dash="5 4")
-d.text(sx + sw_ / 2 + 10, my + mh + 16, "submit(); pump() each step", 12, AMBER, "bold")
+d.text(sx + sw_ / 2 + 10, my + mh + 27, "submit(); pump() each step", 12, AMBER, "bold")
 mid_y = mmy + mmh / 2
-vx = mmx - 44
-d.path_arrow(f"M {mx + mw:.1f},{my + 138:.1f} L {vx:.1f},{my + 138:.1f} L {vx:.1f},{mid_y:.1f} L {mmx - 2:.1f},{mid_y:.1f}",
+vx = mmx - 40
+d.path_arrow(f"M {mx + mw:.1f},{my + 116:.1f} L {vx:.1f},{my + 116:.1f} L {vx:.1f},{mid_y:.1f} L {mmx - 2:.1f},{mid_y:.1f}",
              EMERALD, sw=1.6, dash="5 4")
-d.text(vx - 8, (my + 138 + mid_y) / 2 + 4, "mp.Queue", 12, EMERALD, "bold", "end")
+d.text(vx + 8, my + mh + 27, "mp.Queue", 12, EMERALD, "bold")
 
 
 # ============================================================================
@@ -126,22 +146,24 @@ P2_H = 78 + len(rows) * ROW_H + 18
 d.panel(y1, P2_H, 2, "How do they talk?",
         "Each channel carries one kind of data. Only the driver talks to the user script.")
 ty = y1 + 84
+COL2, COL3 = 252, 800
 d.text(46, ty, "from -> to", 13, MUTE, "bold")
-d.text(330, ty, "channel and what it carries", 13, MUTE, "bold")
-d.text(1080, ty, "source", 13, MUTE, "bold")
+d.text(COL2, ty, "channel and what it carries", 13, MUTE, "bold")
+d.text(COL3, ty, "source", 13, MUTE, "bold")
 for i, (a, b, c, col) in enumerate(rows):
     yy = ty + 24 + i * ROW_H
-    d.line(46, yy - 19, 1454, yy - 19, LINE, 0.8)
+    d.line(46, yy - 19, R, yy - 19, LINE, 0.8)
     d.text(46, yy, a, 13, col, "bold", mono=True)
-    d.text(330, yy, b, 13, INK)
-    d.text(1080, yy, c, 13, INK, mono=True)
+    d.text(COL2, yy, b, 13, INK)
+    d.text(COL3, yy, c, 13, INK, mono=True)
 
 y = y1 + P2_H + 24
 d.legend(30, y, [(BLUE, "driver and engine work"), (VIOLET, "context parallelism (CP)"),
                  (EMERALD, "vision preprocessing"), (AMBER, "launcher and SO helpers")])
 y += 38
-y = d.footnotes(30, y, [
+notes = [
     "Dashed boxes: optional. CP workers exist only for --cp > 1, the multimodal worker only for VL models, SO threads only after a so_args request.",
     "Simplified: the profile HTTP server and the DP group objects are not shown. Sources: docstring of diagrams/tour1_processes.py.",
-])
+]
+y = d.footnotes(30, y, [ln for s in notes for ln in wrap(s, 12, W - 70)])
 d.save(height=y + 10)

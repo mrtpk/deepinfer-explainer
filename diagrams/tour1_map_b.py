@@ -19,9 +19,26 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from svglib import BLUE, EMERALD, INK, MUTE, VIOLET, Diagram  # noqa: E402
+from svglib import BLUE, EMERALD, INK, MUTE, VIOLET, Diagram, text_width  # noqa: E402
 
-d = Diagram()
+
+def wrap(lines, size=12, max_w=1030):
+    """Re-break footnote lines at word boundaries so each fits max_w; continuation lines indent 2 spaces."""
+    out = []
+    for line in lines:
+        cur = ""
+        for word in line.split(" "):
+            cand = word if not cur else cur + " " + word
+            if cur and text_width(cand, size) > max_w:
+                out.append(cur)
+                cur = "  " + word
+            else:
+                cur = cand
+        out.append(cur)
+    return out
+
+
+d = Diagram(width=1100)
 d.header(
     "Life of a request, part 2: one engine step, and back to the user",
     "Stops 7-13 of the tour  ·  request \"1\"  ·  ZOS on (default for the NORMAL engine)  ·  commit 9bd9cf2",
@@ -29,9 +46,9 @@ d.header(
 )
 
 LANES = [
-    (30, 470, BLUE, "Python  ·  worker and engine", ["deepinfer/worker, engine, entrypoints", "driver process (CP rank 0)"]),
-    (520, 470, VIOLET, "C++ engine  ·  deepinfer._C", ["csrc/engine/*", "scheduler state, output objects"]),
-    (1010, 460, EMERALD, "Device  ·  GPU or NPU", ["kernels launched by Python", "no CPU sync inside forward / sample"]),
+    (30, 336, BLUE, "Python  ·  worker and engine", ["deepinfer/worker, engine, entrypoints", "driver process (CP rank 0)"]),
+    (382, 336, VIOLET, "C++ engine  ·  deepinfer._C", ["csrc/engine/*", "scheduler state, output objects"]),
+    (734, 336, EMERALD, "Device  ·  GPU or NPU", ["kernels launched by Python", "no CPU sync inside forward / sample"]),
 ]
 LANE_Y = 112
 HEADER_H = 64
@@ -129,13 +146,13 @@ main_box(0, 6, 13, "Back to the user", ["RequestOutput.clone() per token", "sort
 flow(1, 5, 0, 6, BLUE)
 
 y = LANE_Y + lane_h + 22
-d.callout(30, y, 1440, "The loop:", "LLM._run_engine() calls step() again (stop 5) until no request is unfinished; then flush_inflight_reqs().", BLUE)
+d.callout(30, y, d.W - 60, "The loop:", "LLM._run_engine() calls step() again (stop 5) until no request is unfinished; then flush_inflight_reqs().", BLUE)
 y += 54
 d.legend(30, y, [(BLUE, "Python code"), (VIOLET, "C++ engine (deepinfer._C)"), (EMERALD, "work on the device (kernels)")])
 y += 38
-y = d.footnotes(30, y, [
+y = d.footnotes(30, y, wrap([
     "Graph size 8: one request with seqlen_q 6 uses the smallest captured size >= 6. With 4 requests, total_q is 24.",
     "Simplified: CP worker processes run stops 7-11 too, with inputs broadcast from the driver. Only the driver gets the sampled tokens and builds the outputs.",
     "Values (block 2, slot 2, sizes) are illustrative. Sources: see the docstring of diagrams/tour1_map_b.py.",
-])
+]))
 d.save(height=y + 10)

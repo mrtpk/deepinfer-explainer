@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from svglib import BLUE, EMERALD, INK, MUTE, VIOLET, WHITE, Diagram  # noqa: E402
 
-d = Diagram()
+d = Diagram(width=1100)
 d.header(
     "Where LLMEngine sits",
     "deepinfer/engine/llm_engine.py  ·  one engine per data-parallel rank  ·  each rank is its own process",
@@ -43,29 +43,31 @@ def card(x, y, w, h, title, lines, col, sub=None):
 
 
 y0 = 120
-P_H = 560
+top = y0 + 76
+# three columns, shared by the callers row (top) and the callees row (bottom)
+COLS = [(46, 290), (370, 360), (764, 290)]
+(sx_, sw_), (lx_, lw_), (nx_, nw_) = COLS
+ROWS = 6                                   # engine attributes: 2 columns of 6
+ey = top + 150 + 48                        # engine box top
+eh = 104 + (ROWS - 1) * 24 + 22            # engine box height
+by = ey + eh + 62                          # callees row top
+P_H = by + 150 + 26 + 34 - y0              # panel ends below the routed broadcast arrow
 d.panel(y0, P_H, 1, "Who calls LLMEngine, and what does it call?",
         "Solid arrows are calls. The dashed arrow is a callback: the driver Worker calls back into the engine during a step.")
 
-top = y0 + 76
-# column 1: callers
-c1x, c1w = 46, 380
-card(c1x, top, c1w, 150, "LLM", ["generate()", "  → add_request()", "  → step() / flush_inflight_reqs()", "close()"], BLUE,
+# ---- row 1: callers -------------------------------------------------------
+card(lx_, top, lw_, 150, "LLM", ["generate()", "  → add_request()", "  → step() / flush_inflight_reqs()", "close()"], BLUE,
      sub="deepinfer/entrypoints/llm.py")
-card(c1x, top + 176, c1w, 112, "scripts and tests", ["examples/benchmark.py", "calls llm.llm_engine.step()", "and reads .scheduler"], BLUE)
-d.rect(c1x, top + 314, c1w, 150, fill=WHITE, stroke=MUTE, sw=1.2, dash="4 3")
-d.text(c1x + 16, top + 340, "One process per DP rank", 14, INK, "bold")
-d.text(c1x + 16, top + 364, "examples/_launch.py starts one", 12.5, MUTE)
-d.text(c1x + 16, top + 383, "process per data-parallel rank.", 12.5, MUTE)
-d.text(c1x + 16, top + 402, "Each process makes its own LLM", 12.5, MUTE)
-d.text(c1x + 16, top + 421, "and its own LLMEngine.", 12.5, MUTE)
+card(sx_, top, sw_, 112, "scripts and tests", ["examples/benchmark.py", "calls llm.llm_engine.step()", "and reads .scheduler"], BLUE)
+d.rect(nx_, top, nw_, 150, fill=WHITE, stroke=MUTE, sw=1.2, dash="4 3")
+d.text(nx_ + 16, top + 26, "One process per DP rank", 14, INK, "bold")
+d.text(nx_ + 16, top + 50, "examples/_launch.py starts one", 12.5, MUTE)
+d.text(nx_ + 16, top + 69, "process per data-parallel rank.", 12.5, MUTE)
+d.text(nx_ + 16, top + 88, "Each process makes its own LLM", 12.5, MUTE)
+d.text(nx_ + 16, top + 107, "and its own LLMEngine.", 12.5, MUTE)
 
-# column 2: engine
-c2x, c2w = 466, 430
-eh = 464
-d.rect(c2x, top, c2w, eh, fill=BLUE[1], stroke=BLUE, sw=2.2)
-d.text(c2x + 16, top + 28, "LLMEngine", 17, BLUE[0], "bold", mono=True)
-d.text(c2x + 16, top + 50, "deepinfer/engine/llm_engine.py  ·  1,029 lines", 12.5, MUTE)
+# ---- row 2: the engine ------------------------------------------------------
+c2x, c2w = 46, d.W - 92
 own = [
     ("tokenizer", "Hugging Face tokenizer", False),
     ("multi_modal_processor", "or None", False),
@@ -80,38 +82,50 @@ own = [
     ("_so_matcher_builder", "made on first use", False),
     ("driver_worker", "Worker", False),
 ]
-d.text(c2x + 16, top + 80, "attributes (C++ objects in violet)", 12.5, MUTE)
+d.rect(c2x, ey, c2w, eh, fill=BLUE[1], stroke=BLUE, sw=2.2)
+d.text(c2x + 16, ey + 28, "LLMEngine", 17, BLUE[0], "bold", mono=True)
+d.text(c2x + 16, ey + 50, "deepinfer/engine/llm_engine.py  ·  1,029 lines", 12.5, MUTE)
+d.text(c2x + 16, ey + 80, "attributes (C++ objects in violet)", 12.5, MUTE)
+half = c2w / 2
 for i, (k, v, cpp) in enumerate(own):
-    yy = top + 104 + i * 26
-    d.text(c2x + 16, yy, k, MS, VIOLET[0] if cpp else INK, "bold" if cpp else "normal", mono=True)
+    col_x = c2x + (i // ROWS) * half
+    yy = ey + 104 + (i % ROWS) * 24
+    d.text(col_x + 16, yy, k, MS, VIOLET[0] if cpp else INK, "bold" if cpp else "normal", mono=True)
     if v:
-        d.text(c2x + c2w - 16, yy, v, 12, MUTE, anchor="end")
+        d.text(col_x + half - 40, yy, v, 12, MUTE, anchor="end")
 
-# column 3: callees
-c3x, c3w = 1010, 444
-card(c3x, top, c3w, 150, "deepinfer._C.engine  (C++)",
+# callers -> engine
+d.arrow(lx_ + lw_ / 2, top + 150, lx_ + lw_ / 2, ey - 2, BLUE, sw=2)
+d.arrow(sx_ + sw_ / 2, top + 112, sx_ + sw_ / 2, ey - 2, BLUE)
+
+# ---- row 3: what the engine calls -------------------------------------------
+(cx_, cw_), (wx_, ww_), (fx_, fw_) = COLS
+card(cx_, by, cw_, 150, "deepinfer._C.engine  (C++)",
      ["Scheduler.schedule()", "Scheduler.process_outputs()", "process_MTPInfo()", "build_request_outputs()"], VIOLET,
      sub="csrc/engine/  ·  pybind11")
-card(c3x, top + 176, c3w, 150, "driver Worker  (same process)",
+card(wx_, by, ww_, 150, "driver Worker  (same process)",
      ["load_model, profile_num_available_blocks", "init_cache_engine, warm_up_model", "execute_model_step", "clone_and_zero_..., flush_inflight_reqs"], EMERALD,
      sub="deepinfer/worker/worker.py")
-card(c3x, top + 352, c3w, 112, "CP follower Workers",
+card(fx_, by, fw_, 112, "CP follower Workers",
      ["cp_size − 1 spawned processes", "get (method, kwargs) by broadcast"], EMERALD,
      sub="only when context_parallel_size > 1")
 
-# arrows: callers -> engine
-d.arrow(c1x + c1w, top + 75, c2x - 2, top + 75, BLUE, sw=2)
-d.arrow(c1x + c1w, top + 232, c2x - 2, top + 232, BLUE)
+eb = ey + eh
 # engine -> C++
-d.arrow(c2x + c2w, top + 75, c3x - 2, top + 75, VIOLET, sw=2)
+d.arrow(cx_ + cw_ / 2, eb, cx_ + cw_ / 2, by - 2, VIOLET, sw=2)
 # engine -> worker (run_workers) and callback back
-d.arrow(c2x + c2w, top + 230, c3x - 2, top + 230, EMERALD, sw=2)
-d.text((c2x + c2w + c3x) / 2, top + 220, "_run_workers", 12, EMERALD[0], "bold", "middle", mono=True)
-d.arrow(c3x, top + 284, c2x + c2w + 2, top + 284, EMERALD, dash="5 4")
-d.text((c2x + c2w + c3x) / 2, top + 274, "callbacks", 12, EMERALD[0], "bold", "middle", mono=True)
-# worker -> followers
-d.arrow(c3x + c3w / 2, top + 326, c3x + c3w / 2, top + 350, EMERALD)
-d.text(c3x + c3w / 2 + 10, top + 343, "cp_broadcast_object", 11.5, EMERALD[0], "bold", mono=True)
+ax1, ax2 = wx_ + 110, wx_ + 250
+d.arrow(ax1, eb, ax1, by - 2, EMERALD, sw=2)
+d.text(ax1 + 8, eb + 36, "_run_workers", 12, EMERALD[0], "bold", mono=True)
+d.arrow(ax2, by, ax2, eb + 2, EMERALD, dash="5 4")
+d.text(ax2 + 8, eb + 36, "callbacks", 12, EMERALD[0], "bold", mono=True)
+# worker -> followers: routed under the boxes
+wb = by + 150
+ry_ = wb + 26
+fcx = fx_ + fw_ / 2
+d.path_arrow(f"M {wx_ + ww_ - 60:.1f},{wb:.1f} L {wx_ + ww_ - 60:.1f},{ry_:.1f} L {fcx:.1f},{ry_:.1f} L {fcx:.1f},{by + 112 + 2:.1f}",
+             EMERALD)
+d.text((wx_ + ww_ - 60 + fcx) / 2, ry_ + 18, "cp_broadcast_object", 11.5, EMERALD[0], "bold", "middle", mono=True)
 
 y = y0 + P_H + 24
 d.legend(30, y, [(BLUE, "Python, engine process"), (VIOLET, "C++ extension, called from the engine process"),
