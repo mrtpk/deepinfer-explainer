@@ -1,0 +1,248 @@
+---
+title: layers/sampler.py: the Sampler class
+nav_title: sampler.py
+level: Intermediate
+prerequisites: concepts/sampler, concepts/speculative-decoding
+related: concepts/sampler, concepts/speculative-decoding, concepts/dspark, concepts/structured-outputs, code/dflash, code/prepare-sample-cpp, code/model-runner, code/tilelang-ops, tours/spec-decode-round
+summary: sampler.py holds the Sampler module. It turns selected hidden states into float32 logits, samples prefill tokens, verifies draft tokens in decode steps and calls DFlash. sampler_utils.py holds the logits, sampling and prompt-logprob helpers.
+---
+<h2>Purpose</h2>
+<p><code>Sampler</code> turns the hidden states of one engine step into new tokens: one per request in prefill, and an accepted draft prefix plus one token per request in decode.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/model_executor/layers/sampler.py</code>, 683 lines; the header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/model_executor/layers/sampler.py:2}}). <code>deepinfer/model_executor/layers/sampler_utils.py</code>, 196 lines, with no origin note.</td></tr>
+    <tr><th>Main class</th><td><code>Sampler(nn.Module)</code> ({{cite deepinfer/model_executor/layers/sampler.py:59}}). It has no weights. The LM head weight comes in as an argument.</td></tr>
+    <tr><th>Runs in</th><td>The driver worker process of each data-parallel rank, on the main CUDA stream. The structured-output mask copy uses a second stream. Follower ranks of context parallelism also call it, but only for the collective parts.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekForCausalLM.sample</code> ({{cite deepinfer/model_executor/models/deepseek.py:383-400}}), which <code>ModelRunner.execute_sample</code> calls ({{cite deepinfer/worker/model_runner.py:337-367}}).</td></tr>
+    <tr><th>Calls</th><td>TileLang kernels in <code>tilelang_ops/</code> (<code>fused_sample</code>, <code>gather</code>, verification kernels), <code>topk</code> from DeepSelect, the xgrammar mask helpers, and <code>DFlash.decode_forward</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The per-sequence input arrays (C++ <code>prepare_sampler_inputs</code>), the kernel code, the draft model, and the update of the sequences (C++ <code>process_outputs</code>).</td></tr>
+  </tbody>
+</table>
+<p>The class docstring is in Chinese. It lists the core flow (translated): take the hidden states that need sampling, compute the logits, apply the logits processors, temperature and top-k/top-p, sample the output token, and optionally predict draft tokens with the nextn module for the next decode step ({{cite deepinfer/model_executor/layers/sampler.py:60-67}}).</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b9_sampler_flow" alt="Panel 1: model output hidden states, then gather of the selected rows, then get_logits makes float32 logits. Panel 2: the prefill path (EOS suppression, structured-output mask, _prefill_golden_gen, extras) and the decode path (verification metadata, masks, process_sampling with drafts, accept result and finalize, DFlash). Panel 3: the per-row fused_sample kernel." caption="Figure: the flow of <code>Sampler.forward</code>. The same diagram is on the page {{link concepts/sampler}}." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>ModelRunner.execute_sample</code></strong> builds <code>SamplerInputs</code> and calls <code>model.sample</code> inside <code>forbid_cuda_sync()</code> ({{cite deepinfer/worker/model_runner.py:348-365}}).</li>
+  <li><strong><code>DeepseekForCausalLM.sample</code></strong> calls the sampler with the DFlash module, the LM head weight as <code>embedding</code>, and the KV caches for DFlash ({{cite deepinfer/model_executor/models/deepseek.py:391-399}}).</li>
+  <li><strong><code>Worker.execute_model_step</code></strong> calls <code>execute_sample</code> after the forward pass and before <code>pre_sampler_sync</code> ({{cite deepinfer/worker/worker.py:154-164}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>Kernels and wrappers</strong> in <code>tilelang_ops/</code>: <code>gather</code>, <code>prepare_verification_metadata</code>, <code>get_accept_result</code>, <code>finalize_verification</code>, <code>map_lookup</code>, <code>apply_token_bitmask_by_step_inplace</code>, <code>get_sum_smaller_probs</code> ({{cite deepinfer/model_executor/layers/sampler.py:24-32}}). Through <code>sampler_utils</code>: <code>fused_sample</code>, <code>expand_sampling_params</code>, <code>remap_draft_topk</code> ({{cite deepinfer/model_executor/layers/sampler_utils.py:6-8}}).</li>
+  <li><strong>Vendor code:</strong> <code>topk</code> from <code>deep_select.interface</code> ({{cite deepinfer/model_executor/layers/sampler.py:12}}), and the BF16 GEMM <code>bf16_gemm_nt</code> ({{cite deepinfer/model_executor/layers/sampler_utils.py:6}}).</li>
+  <li><strong>Structured outputs:</strong> <code>XGrammarUtils</code> and <code>allocate_vocab_mask</code> ({{cite deepinfer/model_executor/layers/sampler.py:49}}).</li>
+  <li><strong>The draft model:</strong> <code>mtp_module.decode_forward</code> ({{cite deepinfer/model_executor/layers/sampler.py:237-251}}). See {{link code/dflash}}.</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>Sampler.__init__</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:96}}</td><td>Reads four environment variables; parses the token blacklist.</td></tr>
+    <tr><td><code>Sampler.forward</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:114}}</td><td>The whole sampler step: rows, logits, masks, prefill or decode path.</td></tr>
+    <tr><td><code>_get_so_mask</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:302}}</td><td>Fills the structured-output bit masks on the CPU and copies them on a side stream.</td></tr>
+    <tr><td><code>_verification</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:411}}</td><td>Decode: samples and verifies drafts, returns 8 values.</td></tr>
+    <tr><td><code>_prefill_golden_gen</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:597}}</td><td>Prefill: one token per request, with top logprobs and golden override.</td></tr>
+    <tr><td><code>_prepare_top_info</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:636}}</td><td>Top-<code>k</code> logprobs and their vocabulary ids.</td></tr>
+    <tr><td><code>_update_golden_tokens</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:650}}</td><td>Applies golden tokens and maps force-top-k columns back to ids.</td></tr>
+    <tr><td><code>get_logits</code></td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:20}}</td><td>float32 <code>[rows, V]</code> from a BF16 GEMM.</td></tr>
+    <tr><td><code>split_prompt_logprobs</code></td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:31}}</td><td>Splits the flat prompt logprobs into one list per request.</td></tr>
+    <tr><td><code>_compute_prompt_logprobs_chunk</code></td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:52}}</td><td>Logits and logprobs of one chunk of prompt rows.</td></tr>
+    <tr><td><code>compute_prompt_logprobs</code></td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:81}}</td><td>Loops over chunks of 8192 rows.</td></tr>
+    <tr><td><code>process_sampling</code></td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:113}}</td><td>Force top-k, draft remap, then the <code>fused_sample</code> kernel.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>: settings from the environment</h3>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="96-112" highlight="99,104-105,108-112">
+<x-tr line="106">The largest MTP value that this deployment supports. TODO: choose this value dynamically later.</x-tr>
+</x-code>
+<ol>
+  <li>Line 99: <code>force_topk</code> from <code>DEEPINFER_SAMPLER_FORCE_TOPK</code> (0 = off).</li>
+  <li>Line 104: <code>need_sum_smaller_probs</code> from <code>DEEPINFER_COMPUTE_SUM_SMALLER_PROBS</code>.</li>
+  <li>Line 105: <code>max_MTP_value</code> from <code>DEEPINFER_USE_NEXTN_DECODE</code> (default 5).</li>
+  <li>Lines 108-112: the blacklist string becomes an int64 tensor on the device. A bad string raises <code>ValueError</code>, so the model does not load.</li>
+</ol>
+
+<h3><code>forward</code>, part 1: rows, logits and the follower path</h3>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="124-161" highlight="131-133,137-138,141-142,145-161">
+<x-tr line="147">The result is valid only on the driver; the follower only takes part in the collective communication of the embedding gather.</x-tr>
+</x-code>
+<ol>
+  <li>Line 124: <code>hidden_states.move()</code> takes the tensor out of its <code>Movable</code> wrapper, so the caller no longer holds it.</li>
+  <li>Lines 131-133: prompt logprobs need their own rows, gathered before the main gather.</li>
+  <li>Lines 137-138: only the driver has <code>sampler_inputs.driver</code>. It starts the structured-output mask work on the CPU now, while the device works.</li>
+  <li>Lines 141-142: gather the selected rows and make float32 logits. Line 143 frees the hidden states.</li>
+  <li>Lines 145-161: a follower rank runs only the parts that contain collectives, then returns an empty <code>SamplerOutput</code>.</li>
+</ol>
+
+<h3><code>forward</code>, part 2: the prefill path</h3>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="163-193" highlight="164,169,184-185,187-188,190,193">
+<x-tr line="167">Mask the tokens in the blacklist.</x-tr>
+<x-tr line="183">first_n_token_no_eos can forbid EOS as the first output; the target rows were computed in the preparation step.</x-tr>
+</x-code>
+<ol>
+  <li>Line 164: wait for the event of the mask copy stream.</li>
+  <li>Line 169: the blacklist applies to both paths, because it runs before line 171.</li>
+  <li>Lines 184-185: EOS suppression, one element per listed row.</li>
+  <li>Line 190: <code>_prefill_golden_gen</code> samples one token per request.</li>
+  <li>Line 193: <code>sampler_epilogue()</code> starts the copies to the CPU.</li>
+</ol>
+<p>Lines 195-211 copy the prompt logprobs to the CPU and add a post function that splits them per request. Translated comment at line 206: <em>"With values=None, requests that asked for prompt logprobs get an empty list; the others get None."</em></p>
+
+<h3><code>forward</code>, part 3: the decode path</h3>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="212-254" highlight="225-233,235-237,243-244,252-254">
+<x-tr line="253">The request met EOS; set the confidence of its next-round draft tokens to 0.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 225-233: <code>_verification</code> returns 8 values. The DFlash pool is passed in, because the verification reads the drafts of the previous step from it.</li>
+  <li>Line 235: <code>golden_tokens</code> is the new token of each request (residual sample or bonus token).</li>
+  <li>Lines 236-251: if the step has drafts, DFlash makes the next drafts. It starts after <code>last_valid_offset</code> accepted drafts.</li>
+  <li>Lines 252-254: a request that emitted a stop token gets zero confidence for its next drafts.</li>
+</ol>
+<p>Lines 258-299 start the CPU copies, keep device copies for ZOS, and build the <code>SamplerOutput</code>. The counters <code>num_generated_tokens</code> and <code>num_verified_tokens</code> are filled later by <code>_decode_post_func</code>, when the CPU values are ready ({{cite deepinfer/model_executor/layers/sampler.py:293-298}}).</p>
+
+<h3><code>_verification</code>: sample, verify, finalize</h3>
+<p>The page {{link concepts/speculative-decoding}} reads lines 423-491 line by line. The second half collects the extra outputs and packs the results:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="493-541" highlight="494-499,501-509,511-515,519-536" />
+<ol>
+  <li>Lines 494-499: the logprob of each row's token. With force top-k, the lookup is by key in <code>token_index</code>.</li>
+  <li>Lines 501-509: <code>sum_smaller_probs</code>, only if the environment variable asks for it. With force top-k, the token first becomes a column index.</li>
+  <li>Lines 511-515: the top logprobs of every row.</li>
+  <li>Lines 519-536: <code>finalize_verification</code> makes the request results. The confidence inputs are passed only if the pool has confidences.</li>
+</ol>
+<p>Without drafts (<code>nextn = 0</code>), lines 567-583 return the fresh samples directly, and <code>last_valid_offset</code> is all zeros.</p>
+
+<h3><code>_prefill_golden_gen</code> and <code>_update_golden_tokens</code></h3>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="603-614" highlight="603-607,614" />
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="663-683" highlight="668-677,678-681" />
+<ol>
+  <li>Lines 603-607: <code>process_sampling</code> without draft arguments: temperature, top-p, top-k, log-softmax and a draw.</li>
+  <li>Line 614: golden override and token logprobs.</li>
+  <li>Lines 668-677: with golden tokens, the sample first becomes a vocabulary id (force top-k), then <code>torch.where</code> puts the golden token where it is not <code>-1</code>. The logprob lookup then uses the final id.</li>
+  <li>Lines 678-681: without golden tokens, the code reads the logprob by column first, then maps the column to a vocabulary id.</li>
+</ol>
+
+<h3><code>process_sampling</code> (sampler_utils.py)</h3>
+<x-code file="deepinfer/model_executor/layers/sampler_utils.py" lines="162-196" highlight="162-163,166-167,172-180,185-194" />
+<ol>
+  <li>Lines 162-163: with <code>row_to_req</code>, the per-sequence parameters become per-row parameters. The sample position of row <code>j</code> gets <code>j × 10000019</code> added.</li>
+  <li>Lines 166-167: force top-k. <code>sorted=False</code>: the kernel does not need sorted input.</li>
+  <li>Lines 172-180: the draft logprobs move into the target's top-k space.</li>
+  <li>Lines 185-194: one kernel launch. It returns five tensors; the last three are <code>None</code> without drafts.</li>
+</ol>
+
+<h3><code>compute_prompt_logprobs</code> (sampler_utils.py)</h3>
+<x-code file="deepinfer/model_executor/layers/sampler_utils.py" lines="93-110" />
+<p>Every context-parallel rank must call it with the same number of rows, so the chunk borders match (docstring, lines 89-92). Only rank 0 allocates the result. In each chunk, <code>get_logits</code> runs on all ranks; the rest runs on rank 0 only ({{cite deepinfer/model_executor/layers/sampler_utils.py:62-64}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<p><code>R</code> = selected rows (prefill: number of requests; decode: <code>total_q</code>). <code>S</code> = number of sequences. <code>V</code> = vocabulary size. <code>N</code> = force top-k (or <code>V</code>). <code>k</code> = largest <code>top_logprobs</code> in the batch.</p>
+<table>
+  <thead><tr><th>Value</th><th>Type and shape</th><th>Made by</th><th>Used by</th></tr></thead>
+  <tbody>
+    <tr><td><code>hidden_states</code></td><td>bf16 <code>[rows_out, H]</code> (in a <code>Movable</code>)</td><td>main model</td><td><code>gather</code></td></tr>
+    <tr><td><code>sampler_inputs.selected_token_indices</code></td><td>int32 <code>[R]</code></td><td>C++ <code>prepare_sampler_inputs</code></td><td><code>gather</code></td></tr>
+    <tr><td><code>driver.kernel</code></td><td>5 tensors <code>[S]</code>: float32, float32, int32, uint64, int32</td><td>C++</td><td><code>process_sampling</code></td></tr>
+    <tr><td><code>decode.mtp_first_token_positions</code>, <code>mtp_seqlens_q</code></td><td>int32 <code>[S]</code></td><td>C++ ({{cite csrc/engine/prepare_sample.cpp:109-110}})</td><td>verification, DFlash</td></tr>
+    <tr><td><code>speculative.mtp_info_read_rows</code></td><td>int32 <code>[R]</code></td><td>C++ ({{cite csrc/engine/prepare_sample.cpp:115}})</td><td><code>process_sampling</code>, <code>get_accept_result</code></td></tr>
+    <tr><td><code>speculative.mtp_info_write_slots</code></td><td>int32 <code>[S]</code></td><td>C++</td><td>DFlash pool store</td></tr>
+    <tr><td><code>speculative.stop_token_ids</code></td><td>int32 <code>[S, 2]</code></td><td>C++ ({{cite csrc/engine/prepare_sample.cpp:117}})</td><td><code>finalize_verification</code></td></tr>
+    <tr><td><code>driver.golden_output</code></td><td>int32 <code>[R]</code> or <code>None</code></td><td>C++</td><td>golden override</td></tr>
+    <tr><td><code>logits</code></td><td>float32 <code>[R, V]</code></td><td><code>get_logits</code></td><td>masks, <code>process_sampling</code></td></tr>
+    <tr><td><code>logprobs</code></td><td>float32 <code>[R, N]</code></td><td><code>fused_sample</code></td><td>lookups, top logprobs</td></tr>
+    <tr><td><code>top_logprobs_cur</code>, <code>top_token_ids_cur</code></td><td>float32 / int32 <code>[R, k]</code></td><td><code>_prepare_top_info</code></td><td>finalize</td></tr>
+    <tr><td><code>SamplerOutput.sampled_token</code></td><td><code>SampledInfo</code>, ids int32 <code>[S]</code>, on the CPU after the copy</td><td>sampler</td><td>engine</td></tr>
+    <tr><td><code>SamplerOutput.verified_tokens</code></td><td><code>SampledInfo</code>, ids int32 <code>[R]</code></td><td>sampler</td><td>C++ <code>process_outputs</code></td></tr>
+    <tr><td><code>SamplerOutput.predict_tokens</code></td><td><code>MTPPredictInfo</code>, int32 / float32 <code>[S, 5]</code></td><td>DFlash</td><td>C++ <code>process_MTPInfo</code></td></tr>
+  </tbody>
+</table>
+<p>The <code>SamplerOutput</code> fields are documented in {{cite deepinfer/sequence.py:171-269}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Streams, events and the no-sync rule">
+<ul>
+  <li><strong>Main stream.</strong> All sampler kernels and the DFlash pass run on the current stream. A note in the docstring says that the MTP info pool has a read-after-write dependency across steps: the verification of step N reads what the DFlash graph wrote in step N−1, and the shared stream keeps the order ({{cite deepinfer/model_executor/layers/sampler.py:85}}).</li>
+  <li><strong>Mask copy stream.</strong> <code>_get_so_mask</code> records an event on the main stream, makes the copy stream wait for it, copies the pinned masks, and records <code>so_mask_ready</code>. Then <code>record_stream</code> tells the allocator that the main stream uses these tensors ({{cite deepinfer/model_executor/layers/sampler.py:391-407}}).</li>
+  <li><strong>No CPU wait.</strong> All copies to the CPU are <code>non_blocking</code>. The worker reads the values after <code>sample_end_evt</code> in a later call ({{cite deepinfer/worker/worker.py:167-168}}). The function <code>execute_sample</code> must not contain a CUDA synchronize ({{cite deepinfer/worker/model_runner.py:344-347}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one decode call with numbers">
+<p>Two requests, nextn = 5, force top-k 4096, no grammar, no golden tokens. Request 0 has <code>seqlen_q = 6</code>, request 1 has <code>seqlen_q = 4</code> (DSpark cut it). Request 1 has <code>top_logprobs = 4</code>, request 0 has 0.</p>
+<ol>
+  <li><code>total_q = R = 10</code>. <code>logits</code> float32 <code>[10, V]</code>: with the inferred <code>V = 129280</code>, 5.17 MB.</li>
+  <li><code>prepare_verification_metadata</code>: <code>row_to_req = [0×6, 1×4]</code>, <code>is_verify</code> false at rows 5 and 9.</li>
+  <li><code>process_sampling</code>: <code>topk</code> gives values <code>[10, 4096]</code> and <code>token_index</code> int32 <code>[10, 4096]</code>. The draft rows are remapped. <code>fused_sample</code> returns <code>logprobs [10, 4096]</code> and four tensors of shape <code>[10]</code>.</li>
+  <li><code>map_lookup</code> turns the 10 column indices into vocabulary ids.</li>
+  <li><code>get_accept_result</code>: request 0 accepts 2 drafts, request 1 accepts 3 (all). <code>is_final</code> is true at rows 2 and 9.</li>
+  <li><code>_prepare_top_info</code> with <code>k = max(0, 4) = 4</code>: <code>[10, 4]</code> for every row, also for request 0.</li>
+  <li><code>finalize_verification</code>: <code>last_valid_offset = [2, 3]</code>, <code>sampled_token_ids [2]</code>, <code>verified_token_ids [10]</code> with 5 real ids and 5 times <code>-1</code>.</li>
+  <li>DFlash: drafts <code>[2, 5]</code> and confidences <code>[2, 5]</code>.</li>
+</ol>
+<p>The CPU later appends 3 tokens to request 0 and 4 tokens to request 1.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Bad <code>DEEPINFER_DECODE_TOKEN_BLACKLIST</code></td><td><code>ValueError</code> when the model is built</td><td>{{cite deepinfer/model_executor/utils.py:37-38}}</td></tr>
+    <tr><td>No matcher for a grammar request</td><td>warning log; only this request gets <code>so_status = -1</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:341-345}}</td></tr>
+    <tr><td>Matcher error or rejected step token</td><td>exception log; only this request is killed</td><td>{{cite deepinfer/model_executor/layers/sampler.py:352-386}}</td></tr>
+    <tr><td>Mask fill fails</td><td><code>AssertionError</code>, inside the same <code>try</code>, so also only this request</td><td>{{cite deepinfer/model_executor/layers/sampler.py:362-363}}</td></tr>
+    <tr><td>Top logprob width does not match</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:553-554}}</td></tr>
+    <tr><td>Golden output of the wrong shape</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/sampler.py:663-666}}</td></tr>
+    <tr><td>Logits width is not <code>vocab_size</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:27}}</td></tr>
+    <tr><td>Force top-k above 16384 (4096 on Ascend) with drafts</td><td><code>AssertionError</code> in <code>remap_draft_topk</code></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:189}}</td></tr>
+  </tbody>
+</table>
+<p>Translated comment at lines 378-379: <em>"This is the CP rank 0 sampling main path; a raise would take down all requests and time out the NCCL barrier. A structured-output bug only kills its own request and does not crash the engine."</em></p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_SAMPLER_FORCE_TOPK</code></td><td><code>0</code> ({{cite deepinfer/environ.py:150}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:99}}</td><td>Width of the sampling space.</td></tr>
+    <tr><td><code>DEEPINFER_COMPUTE_SUM_SMALLER_PROBS</code></td><td><code>0</code> ({{cite deepinfer/environ.py:104}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:104}}</td><td><code>sum_smaller_probs</code> and accepted draft logprobs.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:105}}</td><td>Number of mask steps; DFlash call in decode.</td></tr>
+    <tr><td><code>DEEPINFER_DECODE_TOKEN_BLACKLIST</code></td><td>empty ({{cite deepinfer/environ.py:151}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:108}}</td><td>Token ids with logit −inf in every row.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/sampler}}: temperature, top-p, top-k, seeds, force top-k and the prompt logprobs.</li>
+  <li>{{link concepts/speculative-decoding}}: the accept test, the residual and the accepted prefix.</li>
+  <li>{{link concepts/dspark}}: the draft model and the confidence-scheduled lengths.</li>
+  <li>{{link concepts/structured-outputs}}: the grammar matcher that fills the masks.</li>
+  <li>{{link code/dflash}}: the draft module that the sampler calls.</li>
+  <li>{{link tours/spec-decode-round}}: one decode step with drafts, stop by stop.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">In which two files is the sampler code, and which one holds the <code>fused_sample</code> call?
+    <x-a><p><code>layers/sampler.py</code> (the <code>Sampler</code> class) and <code>layers/sampler_utils.py</code>. <code>process_sampling</code> in <code>sampler_utils.py</code> calls <code>fused_sample</code> ({{cite deepinfer/model_executor/layers/sampler_utils.py:185-194}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A follower rank of context parallelism calls <code>Sampler.forward</code> in a decode step. What does it run, and what does it return?
+    <x-a><p>It gathers its rows and computes the logits, but does not use them. Then it runs <code>DFlash.decode_forward</code> without a driver input, and returns <code>SamplerOutput(post_funcs=[])</code> ({{cite deepinfer/model_executor/layers/sampler.py:141-161}}). Inside DFlash, it gets the driver's new tokens by a broadcast ({{cite deepinfer/model_executor/models/mtp/dflash.py:358-365}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the decode path keep <code>sampled_token_ids_gpu</code> and <code>num_accepted_tokens_gpu</code> on the device?
+    <x-a><p>With ZOS, the next step is scheduled before the CPU sees these values. The worker uses the device copies to fix the next step's inputs and <code>seqlens_k</code> without a sync ({{cite deepinfer/model_executor/layers/sampler.py:258-291}}, {{cite deepinfer/worker/worker.py:220-243}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the worked example, request 0 has <code>top_logprobs = 0</code>. Why does its row still get a top-logprob tensor of width 4?
+    <x-a><p><code>max_top_logprobs</code> is the maximum over all requests of the batch ({{cite csrc/engine/prepare_sample.cpp:157}}), and <code>_prepare_top_info</code> uses that one width for all rows ({{cite deepinfer/model_executor/layers/sampler.py:642-643}}). This is in the deep dive "Worked example".</p></x-a>
+  </x-q>
+</x-quiz>

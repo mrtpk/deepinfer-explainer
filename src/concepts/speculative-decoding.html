@@ -1,0 +1,245 @@
+---
+title: Speculative decoding
+level: Intermediate
+prerequisites: concepts/sampler, learn/prefill-decode
+related: concepts/dspark, concepts/sampler, concepts/zero-overhead-scheduling, code/sampler, code/dflash, tours/spec-decode-round, tours/life-of-a-request
+summary: A small draft model guesses the next 5 tokens. In the next decode step, the main model checks all 5 at the same time, keeps a prefix with rejection sampling, and samples one more token. The output distribution stays within a very small, proven bound of the target distribution (a 5e-5 penalty).
+scripts: viz/spec_decode.js
+---
+<x-sentence>A small draft model guesses the next 5 tokens. The main model checks all of them in one step, keeps a correct prefix and adds one token of its own.</x-sentence>
+
+<h2>The idea</h2>
+<p>A normal {{term decode}} step makes one {{term token}} per request. For that one token, the device reads all weights of the model. In a decode step, the device spends most of the time on these reads, not on math. So the step can process a few more tokens per request for a small extra cost.</p>
+<p>{{term speculative-decoding | Speculative decoding}} uses this. It has four parts:</p>
+<ol>
+  <li><strong>Draft.</strong> A small, fast model guesses the next tokens. In DeepInfer the draft model is {{term dflash | DFlash}}, and it makes 5 {{term draft-token | draft tokens}} per request ({{cite deepinfer/environ.py:129}}).</li>
+  <li><strong>Verify.</strong> The next step sends the last real token and the drafts to the main model, the <em>target model</em>. By default (<code>DEEPINFER_ENABLE_MTP_VARLEN</code> off) it sends all 5 drafts, so one forward pass gives 6 rows of probabilities ({{cite deepinfer/environ.py:131}}, {{cite csrc/engine/mtp_varlen.hpp:153-158}}). Row <code>j</code> says what the target model wants after input <code>j</code>.</li>
+  <li><strong>Accept or reject.</strong> Row 0 checks draft 1, row 1 checks draft 2, and so on. The first rejected draft stops the check. All drafts after it are dropped.</li>
+  <li><strong>One more token.</strong> At the first rejected row, the sampler draws a replacement token. If no draft is rejected, the last row gives a {{term bonus-token}}. So a step always makes at least 1 token and at most 6.</li>
+</ol>
+<p>The accept test is {{term rejection-sampling}}. It does not ask "is the draft equal to the best token". It accepts a draft with probability <code>min(1, q/p)</code>. Here <code>p</code> is the probability of the token in the draft model, and <code>q</code> is its probability in the target model. After a reject, it draws from the {{term residual-distribution}}. This rule makes the output follow <code>q</code> exactly, as if the target model made every token itself. DeepInfer changes the residual a little, so its output follows <code>q</code> up to a very small, bounded error (deep dive <em>DRAFT_PROB_PENALTY</em>).</p>
+
+<p><strong>An everyday comparison.</strong> Think of a junior writer and a senior editor. The junior writes the next five words fast. The editor reads all five at once and keeps the words she agrees with, up to the first word she does not like. She writes that word herself and stops. The comparison stops being true in one place. The editor does not accept only the words that she would choose. She accepts each word with a probability, and she chooses her replacement word from a special distribution. Only this makes the text statistically equal to text that the editor writes alone.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_spec_rejection" alt="Panel 1: six input tokens at positions 49 to 54: the last real token t and drafts d1 to d5. Each goes into one target row. Row 0 accepts d1, row 1 accepts d2, row 2 rejects d3 and samples r from the residual; rows 3 to 5 are not used. Output: d1, d2, r. Panel 2: a worked example with 4 tokens. Draft p = 0.6, 0.3, 0.1, 0.0. Target q = 0.4, 0.4, 0.1, 0.1. The result of the rule is accepted part min(p, q) plus the residual part, which gives exactly q." caption="Figure: panel 1 shows which row checks which draft. Panel 2 shows why accept plus residual gives exactly the target distribution q." />
+<p>In panel 1, read each column from top to bottom. Only rows up to the first rejected row count. In panel 2, the green part of each bar is the chance that the draft model proposes the token and the sampler accepts it. The amber part comes from the residual after a reject. Their sum is <code>q</code> for every token.</p>
+
+<h3>Try it: one verification, step by step</h3>
+<x-viz id="spec-decode" title="Speculative decoding: accept, reject, residual" caption="Click <em>Check next draft</em> to test one draft. The visual shows the random number u and the decision. <em>New round</em> makes new drafts with the same seed sequence; <em>Reset</em> starts again. Keyboard: Tab to a button, then Enter or Space." />
+<x-simplified>
+<p>The visual uses a toy vocabulary of 6 tokens, and each position has its own fixed draft and target distributions. In DeepInfer, draft <code>j</code> also depends on draft <code>j − 1</code> through the {{term markov-head}}, if the checkpoint has one ({{cite deepinfer/model_executor/models/mtp/dflash.py:155-156}}). The target rows come from one forward pass. The visual draws <code>u</code> with a seeded generator in your browser. DeepInfer hashes the seed and the position instead ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:239-242}}). The DSpark toggle uses one request and a toy cost line. The real scheduler sorts the drafts of all requests and uses a measured cost curve ({{cite csrc/engine/mtp_varlen.hpp:150-267}}).</p>
+</x-simplified>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the drafts wait in the MTP info pool</h3>
+<p>DFlash runs at the end of each decode step and stores its drafts in the {{term mtp-info-pool}}. Each request owns one slot of 5 rows. A row holds the draft token id, the draft logprobs and a confidence ({{cite deepinfer/model_executor/models/mtp/dflash.py:336-345}}). Slot 0 is special. It holds placeholder drafts for a request that has no real drafts yet:</p>
+<x-code file="deepinfer/model_executor/layers/mtp_info_pool.py" lines="33-52" highlight="36,47-49" caption="Slot 0: every draft is <code>vocab_size - 1</code>, and its draft logprob is 0, so p = 1 for that token." />
+<p>After a prefill step there are no real drafts. The first decode step reads slot 0 ({{cite csrc/engine/sequence.hpp:149-153}}). The target model almost never gives the token <code>vocab_size - 1</code> a high probability, so row 0 rejects the placeholder. The step then makes one token from the residual, which is almost the plain target distribution.</p>
+
+<h3>Step 2: which pool row each sampler row reads</h3>
+<p>C++ decides, for each row of the batch, which pool row holds its draft:</p>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="216-225" highlight="221-225" />
+<p>Row <code>j</code> of a request reads pool row <code>slot × 5 + j</code>, which is draft <code>j + 1</code>. The last row of the request reads slot 0, because it is a fresh sample and has no draft. <code>stop_token_ids</code> is int32 <code>[num_seqs, 2]</code>: the EOS id, or <code>-1</code> with <code>ignore_eos</code> (lines 217-219).</p>
+
+<h3>Step 3: map rows to requests</h3>
+<p><code>_verification</code> first labels every row ({{cite deepinfer/model_executor/layers/sampler.py:427-431}}). The reference code shows the rule in three lines:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/sampler.py" lines="13-25" />
+<p><code>row_to_req</code> gives the request of each row. <code>local_step</code> gives the row number inside the request. <code>is_verify</code> is false only for the last row of each request.</p>
+
+<h3>Step 4: the accept test and the residual sample</h3>
+<p>The rejection sampling happens inside the <code>fused_sample</code> kernel, in the same pass as temperature, top-p and top-k. The reference implementation shows the math:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/fused_sample.py" lines="227-246" highlight="232,238,241-243,245-246" />
+<ol>
+  <li><strong>Line 232.</strong> The residual weights: <code>r = max(q − α·p, 0)</code> for every token, with <code>α = exp(−5e-5)</code>. The deep dive explains <code>α</code>.</li>
+  <li><strong>Line 233.</strong> <code>accept_probs = max(1 − Σ r, 0)</code>, an estimate of the chance that this row accepts its draft. DSpark compares it with the confidence (page {{link concepts/dspark}}).</li>
+  <li><strong>Lines 235-237.</strong> Look up the logprob of the draft token in the draft row (<code>log p</code>) and in the target row (<code>log q</code>).</li>
+  <li><strong>Line 238.</strong> <code>accept_lp = min(log q − log p, 0)</code>, so <code>exp(accept_lp) = min(1, q/p)</code>.</li>
+  <li><strong>Lines 239-242.</strong> <code>U</code> is a seeded number in [0, 1), case 2 of the hash. Accept if <code>min(1, q/p) &gt; U</code>. A draft id of <code>-1</code> is always rejected.</li>
+  <li><strong>Line 245.</strong> Draw a replacement token from the residual weights, with hash case 1.</li>
+  <li><strong>Line 246.</strong> The candidate token of a verify row is the draft if accepted, else the residual sample. The last row keeps its fresh sample.</li>
+</ol>
+<p>The same file also holds the tests. They run the same checks on the TileLang kernel and on this reference ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:738-750}}). A distribution test counts the output tokens for 16 edge cases. On NVIDIA it uses a batch of 2,097,152 rows and 1024 rounds, so about 2.1 × 10<sup>9</sup> samples per case ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:528-531}}, {{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:714-733}}).</p>
+
+<h3>Step 5: keep only the accepted prefix</h3>
+<p>The kernel decides each row alone. But a draft counts only if all drafts before it were accepted. <code>get_accept_result</code> applies this rule:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/sampler.py" lines="227-248" highlight="243-247" />
+<ol>
+  <li>Lines 239-242: a {{term golden-tokens | golden token}} overrides the decision. The row accepts only if the draft equals the golden token.</li>
+  <li>Line 243: a row is <em>blocked</em> if it is the fresh row or a rejected row.</li>
+  <li>Lines 244-245: a running count of blocked rows. A row is <em>alive</em> if no row before it in the same request is blocked.</li>
+  <li>Line 246: an accepted draft counts only if its row is alive.</li>
+  <li>Line 247: <code>is_final</code> marks the first blocked row of each request. Its token is the new sampled token.</li>
+</ol>
+
+<h3>Step 6: pack the results</h3>
+<p><code>finalize_verification</code> turns the row results into request results ({{cite deepinfer/model_executor/layers/sampler.py:518-566}}). The reference shows the main outputs:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/sampler.py" lines="340-346" />
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/sampler.py" lines="384-396" highlight="385,390,395" />
+<ul>
+  <li><code>last_valid_offset</code> int32 <code>[num_reqs]</code>: the row of the final token inside its request. This is also the number of accepted drafts.</li>
+  <li><code>sampled_token_ids</code> int32 <code>[num_reqs]</code>: the token of the final row. It is either the residual sample or the bonus token.</li>
+  <li><code>verified_token_ids</code> int32 <code>[total_q]</code>: the draft id in accepted rows, <code>-1</code> in all other rows.</li>
+</ul>
+
+<h3>Step 7: the engine appends the tokens</h3>
+<p>The CPU reads these arrays one step later. <code>Scheduler::process_outputs</code> takes the accepted drafts of a request until the first <code>-1</code>, then adds the sampled token:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="955-971" highlight="958-965,969-971" />
+<p>So the request gets <code>accepted + 1</code> new tokens. The stop check runs after each token, so an EOS among the accepted drafts ends the request there ({{cite csrc/engine/scheduler.hpp:982-990}}). The KV cache then counts only the kept tokens ({{cite csrc/engine/scheduler.hpp:997-1000}}). The tour {{link tours/spec-decode-round}} follows these steps with real positions.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The math: why the output distribution equals q">
+<p>Take one position. The draft model proposes token <code>x</code> with probability <code>p(x)</code>. The target model wants probabilities <code>q(x)</code>. The rule:</p>
+<ol>
+  <li>Accept <code>x</code> with probability <code>min(1, q(x)/p(x))</code>.</li>
+  <li>On a reject, draw from <code>r(x) = max(q(x) − p(x), 0) / Z</code>, with <code>Z = Σ max(q − p, 0)</code>.</li>
+</ol>
+<p><strong>Proof.</strong> The chance to output <code>x</code> by acceptance is <code>p(x) · min(1, q(x)/p(x)) = min(p(x), q(x))</code>. The total chance of a reject is <code>1 − Σ min(p, q)</code>. Because <code>Σ p = Σ q = 1</code>, that is equal to <code>Σ max(q − p, 0) = Z</code>. So the residual adds <code>Z · max(q(x) − p(x), 0) / Z</code>, which is <code>max(q(x) − p(x), 0)</code>. The sum of both parts is <code>min(p, q) + max(q − p, 0) = q(x)</code>.</p>
+<p><strong>Worked example</strong> (panel 2 of the figure). Tokens A, B, C, D have <code>p = [0.6, 0.3, 0.1, 0]</code>. The target gives <code>q = [0.4, 0.4, 0.1, 0.1]</code>.</p>
+<table>
+  <thead><tr><th>Token</th><th>min(p, q)</th><th>max(q − p, 0)</th><th>Accept chance if proposed</th><th>Total</th></tr></thead>
+  <tbody>
+    <tr><td>A</td><td>0.4</td><td>0</td><td>0.4 / 0.6 = 0.667</td><td>0.4</td></tr>
+    <tr><td>B</td><td>0.3</td><td>0.1</td><td>1</td><td>0.4</td></tr>
+    <tr><td>C</td><td>0.1</td><td>0</td><td>1</td><td>0.1</td></tr>
+    <tr><td>D</td><td>0</td><td>0.1</td><td>never proposed</td><td>0.1</td></tr>
+  </tbody>
+</table>
+<p><code>Z = 0.2</code>, so the residual is <code>[0, 0.5, 0, 0.5]</code>. If the draft is A and <code>U = 0.8</code>, then <code>0.667 &gt; 0.8</code> is false: reject. The sampler draws B or D, each with chance 0.5 (about 0.5 in DeepInfer, because of the penalty in the next deep dive).</p>
+<p><strong>Many drafts.</strong> Each row applies the same rule, given that all drafts before it were accepted. So the accepted prefix plus the final token has the distribution of the target model, token by token. Take a general case: each draft passes with rate <code>a</code>, and there are <code>γ</code> drafts. Then a step gives <code>(1 − a^(γ+1)) / (1 − a)</code> tokens on average. For <code>a = 0.8</code> and <code>γ = 5</code>, that is about 3.69.</p>
+<p><strong>Measured numbers.</strong> The deployment Q&amp;A gives a "fixed-5 accepted length" of 3.25 to 3.32 ({{cite doc/inference_deployment_qa.md:249-256}}). The Q&amp;A does not say if this number includes the token that the last row adds.</p>
+</x-deepdive>
+
+<x-deepdive title="DRAFT_PROB_PENALTY: a small and bounded change to the rule">
+<p>DeepInfer does not use <code>max(q − p, 0)</code> for the residual. It uses <code>max(q − α·p, 0)</code> with <code>α = exp(−DRAFT_PROB_PENALTY)</code> and <code>DRAFT_PROB_PENALTY = 5e-5</code>:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/common.py" lines="51-53">
+<x-tr line="53">Prevents the case where reject sampling cannot sample anything.</x-tr>
+</x-code>
+<p><strong>Why.</strong> If <code>q</code> and <code>p</code> are equal up to rounding, <code>max(q − p, 0)</code> can be all zeros. Then a reject has nothing to sample. With <code>α &lt; 1</code>, a token with <code>q = p &gt; 0</code> keeps a weight of at least <code>(1 − α)·p</code>. A test checks such a case: all residual weights are below <code>2^-31</code>, and the kernel still returns a valid token ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:620-651}}).</p>
+<p><strong>The cost.</strong> The module docstring proves a bound. Translated from {{cite deepinfer/model_executor/layers/tilelang_ops/common.py:3-19}}:</p>
+<ul>
+  <li>Let <code>p</code> be the draft distribution and <code>q</code> the target distribution. Sample from <code>p</code>. If the sample <code>j</code> has <code>p[j] ≤ q[j]</code>, accept. Otherwise sample from the normalized weights <code>r[i] = max(q[i] − α·p[i], 0)</code>.</li>
+  <li>Let <code>ε = 1 − α</code>, and let <code>A[j]</code> be the real output probability of token <code>j</code>. Then <code>q[j] − ε/(1 + ε) ≤ A[j] ≤ (1 + ε)·q[j]</code>.</li>
+</ul>
+<p>With <code>DRAFT_PROB_PENALTY = 5e-5</code>, <code>ε ≈ 5.0e-5</code>. So no token gets more than 1.00005 times its target probability. No token loses more than about 0.00005 (an absolute amount, not a factor). The distribution test checks the upper bound: each count must stay below <code>(1 + ε)·q</code> times the number of samples, plus a statistical margin ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:566-573}}, {{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:598-600}}).</p>
+<p>The docstring shortens the accept step. The code accepts with the unchanged ratio <code>min(1, q/p)</code>, also when <code>p[j] &gt; q[j]</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:238}}). Only the residual uses <code>α</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="_verification, line by line">
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="423-491" highlight="430,437,446-457,461-467,471-480" />
+<ol>
+  <li><strong>Lines 423-425.</strong> <code>logits</code> is float32 <code>[total_q, V]</code>. <code>Movable</code> lets the function free the tensor early (line 458).</li>
+  <li><strong>Lines 428-430.</strong> <code>ftp</code> (first token positions) and <code>seqlen_q</code> are int32 <code>[req_cnt]</code>. The result tensors have shape <code>[total_q]</code>.</li>
+  <li><strong>Lines 434-437.</strong> One structured-output mask per step. Step <code>k</code> applies to row <code>ftp + k</code> of each listed request.</li>
+  <li><strong>Lines 446-457.</strong> <code>process_sampling</code> with the draft data of the pool: <code>logprobs</code> (and <code>logprobs_index</code> with force top-k), <code>token_ids</code> and the read rows. Without <code>speculative_inputs</code> (nextn = 0), the draft arguments are <code>None</code> and no row is verified.</li>
+  <li><strong>Lines 460-467.</strong> With force top-k, <code>candidate_token_ids</code> are column numbers. <code>map_lookup</code> turns them into vocabulary ids.</li>
+  <li><strong>Lines 470-480.</strong> <code>get_accept_result</code> gives the token per row, the accepted prefix and <code>is_final</code>.</li>
+  <li><strong>Lines 481-491.</strong> Without drafts, every row is a fresh sample. Only the golden override applies.</li>
+</ol>
+<p>The rest of the function (lines 493-595) looks up the token logprobs, computes the optional <code>sum_smaller_probs</code> and the top logprobs, and calls <code>finalize_verification</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: two requests through finalize_verification">
+<p>Request A has <code>seqlen_q = 6</code> and accepts drafts 1 and 2. Request B has <code>seqlen_q = 4</code> (3 drafts, for example after {{link concepts/dspark | DSpark}} shortened it) and accepts all 3. <code>nextn = 5</code>.</p>
+<pre><code class="language-python">ftp          = [0, 6]                        # int32 [2]
+row          =  0  1  2  3  4  5 |  6  7  8  9
+row_to_req   =  0  0  0  0  0  0 |  1  1  1  1
+local_step   =  0  1  2  3  4  5 |  0  1  2  3
+is_verify    =  T  T  T  T  T  F |  T  T  T  F
+raw accept   =  T  T  F  T  F  T |  T  T  T  T   # kernel decision per row (fresh rows: T)
+blocked      =  F  F  T  F  T  T |  F  F  F  T
+alive        =  T  T  T  F  F  F |  T  T  T  T
+eff. accept  =  T  T  F  F  F  F |  T  T  T  F
+is_final     =  F  F  T  F  F  F |  F  F  F  T
+
+last_valid_offset   = [2, 3]                 # int32 [2]
+sampled_token_ids   = [r_A, bonus_B]         # residual sample of row 2; fresh sample of row 9
+verified_token_ids  = [d1, d2, -1, -1, -1, -1, e1, e2, e3, -1]   # int32 [10]
+num_generated_tokens = [2, 2, 1, 0, 0]       # accepted drafts at step 0..4
+num_verified_tokens  = [2, 2, 2, 1, 1]       # verify rows at step 0..4</code></pre>
+<p>Row 3 of A has a raw accept, but row 2 before it is blocked, so row 3 does not count. A gets 3 tokens (d1, d2, r_A). B gets 4 tokens (e1, e2, e3, bonus_B). The counters come from a scatter-add by <code>local_step</code>; steps above <code>nextn − 1</code> go into the last slot ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:347-357}}). <code>_decode_post_func</code> later puts the request count in front: <code>[2, 2, 2, 1, 0, 0]</code> ({{cite deepinfer/model_executor/layers/sampler.py:293-296}}).</p>
+</x-deepdive>
+
+<x-deepdive title="How the accepted tokens and the bonus token reach the user">
+<ol>
+  <li>The sampler returns a <code>SamplerOutput</code> with <code>sampled_token</code> (one per request), <code>verified_tokens</code> (one per row) and <code>first_token_positions</code> (CPU int32 <code>[req_cnt]</code>) ({{cite deepinfer/model_executor/layers/sampler.py:277-291}}).</li>
+  <li><code>LLMEngine._process_model_outputs</code> passes the flat <code>[total_q]</code> array of accepted ids to C++ without a copy ({{cite deepinfer/engine/llm_engine.py:697-703}}).</li>
+  <li><code>Scheduler::process_outputs</code> appends the accepted drafts and the sampled token, and checks the stop conditions after each one (Step 7 above).</li>
+  <li><code>build_request_outputs</code> makes one <code>RequestOutput</code> per new token. The last one carries <code>draft_tok = drafts + 1</code> and <code>accept_tok = accepted + 1</code> ({{cite csrc/engine/outputs.hpp:214-216}}, {{cite csrc/engine/outputs.hpp:287-292}}).</li>
+</ol>
+<p>For request A of the previous example, the user gets three objects. The third has <code>draft_tok = 6</code> and <code>accept_tok = 3</code>. With {{term zos | ZOS}}, these objects arrive one <code>step()</code> call later ({{link concepts/zero-overhead-scheduling}}).</p>
+<p><strong>Device copies for the next step.</strong> With ZOS, the next step is already scheduled before the CPU sees these results. So the sampler also keeps device copies: <code>sampled_token_ids_gpu</code> <code>[num_seqs]</code>, <code>predict_token_ids_gpu</code> <code>[num_seqs, 5]</code> and <code>num_accepted_tokens_gpu</code> (= <code>last_valid_offset</code>) ({{cite deepinfer/model_executor/layers/sampler.py:258-291}}, {{cite deepinfer/sequence.py:259-269}}). A kernel uses them to fix <code>seqlens_k</code> of the next step on the device ({{cite deepinfer/worker/worker.py:220-227}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Stop tokens inside the drafts">
+<ul>
+  <li><strong>On the CPU.</strong> <code>_check_stop</code> runs after each appended token. A stop at accepted draft 1 drops draft 2 and the sampled token ({{cite csrc/engine/scheduler.hpp:982-990}}, {{cite csrc/engine/scheduler.hpp:1035-1052}}).</li>
+  <li><strong>On the device.</strong> <code>finalize_verification</code> sets <code>emitted_stop_token</code> for each request whose emitted tokens contain one of its <code>stop_token_ids</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:376-382}}). The sampler then sets the confidences of that request's next drafts to 0:</li>
+</ul>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="252-254">
+<x-tr line="253">The request met EOS; set the confidence of all its next-round draft tokens to 0.</x-tr>
+</x-code>
+<p>With DSpark, a confidence of 0 gives the request no drafts in the next step. This matters because the CPU schedules that step before it sees the stop.</p>
+</x-deepdive>
+
+<x-deepdive title="Backtracking limits: how far can the cache go back?">
+<p>A decode step writes cache entries for all 6 input tokens before the sampler knows which drafts survive. So every cache that keeps a fixed window must have room for these extra writes. DeepInfer calls this <em>backtracking</em>.</p>
+<table>
+  <thead><tr><th>Limit</th><th>Value (default)</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td><code>max(your value, nextn + 1)</code> = 6</td><td>{{cite deepinfer/environ.py:132}}</td></tr>
+    <tr><td>SWA ring per sequence</td><td><code>window + backtracking</code> = 128 + 6 = 134 tokens</td><td>{{cite deepinfer/worker/cache_engine.py:88-93}}</td></tr>
+    <tr><td>Compression state ring</td><td><code>compress_ratio + backtracking − 1</code></td><td>{{cite deepinfer/worker/cache_engine.py:130-133}}</td></tr>
+    <tr><td>Rows per request in a step</td><td><code>seqlen_q ≤ nextn + 1</code> (check)</td><td>{{cite csrc/engine/prepare_sample.cpp:212}}</td></tr>
+    <tr><td>Grammar matcher history</td><td><code>nextn + 2</code> tokens</td><td>{{cite deepinfer/structure_output/matcher.py:20}}</td></tr>
+    <tr><td>DFlash block</td><td>at most 32 drafts</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:240}}</td></tr>
+    <tr><td>YOCO keep tokens</td><td>must be ≥ window + backtracking</td><td>{{cite deepinfer/worker/model_runner.py:108-112}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Why 134 is enough.</strong> Let the cache hold tokens up to position <code>P − 1</code>. A step writes positions <code>P … P + 5</code> into ring slots <code>pos % 134</code>, before its attention reads the ring. These slots last held positions <code>P − 134 … P − 129</code>. The query at <code>P</code> is the oldest query of the step. With a 128-token window, it reads keys <code>P − 127 … P</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:631-649}}). So the writes never remove a key that a query of this step or a later step needs.</p>
+<p><strong>Why the rejected keys do no harm.</strong> A rejected key at position <code>y</code> is also never read. A query reads only keys up to its own position. The first later step with a query at <code>y</code> also writes the real key of <code>y</code> before its attention. The docs give the same number: "128-token window + 6 tokens of speculative backtracking" ({{cite doc/inference_deployment_qa.md:191}}).</p>
+<p>Nothing is copied back after a reject. The next step simply writes the same positions again. The tour {{link tours/spec-decode-round}} shows this for every cache.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129-130}})</td><td>Number of drafts per step. <code>0</code> turns speculative decoding off: no DFlash is loaded and every decode row is a fresh sample ({{cite deepinfer/model_executor/models/deepseek.py:276}}, {{cite deepinfer/model_executor/models/deepseek.py:300-306}}).</td></tr>
+    <tr><td><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code></td><td>at least <code>nextn + 1</code> ({{cite deepinfer/environ.py:132}})</td><td>Ring sizes of the window caches.</td></tr>
+    <tr><td><code>DEEPINFER_ENABLE_MTP_VARLEN</code></td><td>off ({{cite deepinfer/environ.py:131}})</td><td>DSpark: fewer drafts for requests with low confidence. See {{link concepts/dspark}}.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_ENFORCE_EAGER</code></td><td>off ({{cite deepinfer/environ.py:156}})</td><td>Runs DFlash without its CUDA graph ({{cite deepinfer/worker/model_runner.py:80-85}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The first decode step makes only one token.</strong> This is normal. The placeholder drafts of slot 0 almost always fail (Step 1).</li>
+  <li><strong>Low acceptance.</strong> If the drafts often fail, each step still costs 6 rows but gives about 1 token. DSpark reduces this waste ({{cite doc/inference_deployment_qa.md:243}}).</li>
+  <li><strong>Too many rows.</strong> <code>prepare_sampler_inputs</code> stops with a check failure in two cases. A request has more than <code>nextn + 1</code> rows, or its draft list does not have <code>nextn</code> entries ({{cite csrc/engine/prepare_sample.cpp:209-212}}).</li>
+  <li><strong>Small change in the distribution.</strong> The penalty <code>α</code> can raise a token probability by a factor of at most about <code>1.00005</code>. It can lower it by at most about 0.00005 (deep dive). Tests that need the exact target distribution must allow this.</li>
+  <li><strong>Memory.</strong> Without force top-k, the pool keeps full-vocabulary draft logprobs: about 168 MB for 64 sequences (see {{link concepts/sampler}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Speculative decoding lets one decode step make several tokens per request, without a change in the output distribution. The Q&amp;A measured an average "accepted length" of about 3.3 with 5 drafts ({{cite doc/inference_deployment_qa.md:249-256}}).</p>
+
+<x-quiz>
+  <x-q level="easy">A request has 5 drafts. What is the smallest and the largest number of new tokens that one decode step can give it?
+    <x-a><p>At least 1: the first draft fails, and the residual gives one token. At most 6: all 5 drafts pass, and the last row adds the bonus token ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:243-247}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which row of a request checks draft 3?
+    <x-a><p>Row 2. Row <code>j</code> reads pool row <code>slot × nextn + j</code>, which is draft <code>j + 1</code> ({{cite csrc/engine/prepare_sample.cpp:221-223}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The draft model gives a token p = 0.5 and the target model gives it q = 0.2. The hash gives U = 0.3. What happens?
+    <x-a><p><code>min(1, q/p) = 0.4 &gt; 0.3</code>, so the sampler accepts the draft ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:238-242}}). With U = 0.5, it rejects it and samples from <code>max(q − α·p, 0)</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">Row 1 rejects its draft, but the kernel accepts the draft of row 3. Does draft 4 count?
+    <x-a><p>No. Row 1 is blocked, so every later row of the request is not alive. <code>get_accept_result</code> keeps only the prefix before the first blocked row ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:243-247}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why can DeepInfer use <code>max(q − α·p, 0)</code> instead of <code>max(q − p, 0)</code>, and how large is the error?
+    <x-a><p>With <code>α &lt; 1</code>, the residual is never all zeros when q equals p, so a reject can always sample a token. The docstring proves <code>q[j] − ε/(1+ε) ≤ A[j] ≤ (1+ε)·q[j]</code> with <code>ε = 1 − exp(−5e-5) ≈ 5e-5</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/common.py:3-19}}, {{cite deepinfer/model_executor/layers/tilelang_ops/common.py:53}}). This is in the deep dive on DRAFT_PROB_PENALTY.</p></x-a>
+  </x-q>
+</x-quiz>

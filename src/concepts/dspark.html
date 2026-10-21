@@ -1,0 +1,231 @@
+---
+title: DSpark: DFlash drafts and confidence-scheduled verification
+nav_title: DSpark confidence scheduling
+level: Advanced
+prerequisites: concepts/speculative-decoding, concepts/zero-overhead-scheduling, concepts/cuda-graphs
+related: code/dflash, concepts/speculative-decoding, concepts/sampler, concepts/zero-overhead-scheduling, tours/spec-decode-round, code/scheduler-hpp, reference/env-vars
+summary: DSpark makes 5 drafts per request with the DFlash draft model and predicts how likely each draft is to pass. With DEEPINFER_ENABLE_MTP_VARLEN=1, the scheduler then sends only the drafts that give the most tokens per unit of device time.
+---
+<x-sentence>DFlash drafts 5 tokens and predicts the chance that each one passes. DSpark then checks only the drafts that are worth their cost.</x-sentence>
+
+<h2>The idea</h2>
+<p>{{term dspark}} is the name of the {{term speculative-decoding}} design of DeepInfer ({{cite README.md:13}}, {{cite README.md:24}}). It has two parts:</p>
+<ol>
+  <li><strong>The draft model DFlash.</strong> {{term dflash | DFlash}} is a small model with its own decoder layers. It reads hidden states of the main model and makes 5 {{term draft-token | draft tokens}} per request in one pass. It also has a {{term confidence-head}} that predicts, for each draft, the chance that the main model accepts it.</li>
+  <li><strong>Confidence-scheduled verification.</strong> Without it, every request sends all 5 drafts to the next step. With <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>, the scheduler uses the confidences to choose the {{term verification-length}} of each request. A draft that will probably fail costs device time and gives nothing.</li>
+</ol>
+<p>The deployment Q&amp;A gives the reason: "fixed-length verification wastes verification compute on low-probability tokens" ({{cite doc/inference_deployment_qa.md:243}}). On EP64/DP64 benchmark data, DSpark checks about 30 % fewer drafts per step (5.00 → 3.2–4.4). The accepted length stays almost the same (3.29 compared with 3.20). The estimated gain is +4–7 % throughput at about 60 sequences per rank ({{cite doc/inference_deployment_qa.md:247}}).</p>
+
+<p><strong>An everyday comparison.</strong> Think of a cashier with a queue of customers. Each customer hands over 5 coupons in a fixed order. A coupon counts only if all coupons before it were valid. Each check takes time. The cashier knows from experience how likely each coupon is to be valid. To give the most value per minute, the cashier checks the coupons that will probably count and hands the others back unchecked. The comparison stops being true in two places. The "experience" is a neural network head, not memory. And the time per check comes from a curve that DeepInfer measures on the real hardware.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_dflash_arch" alt="Panel 1: target layers of the main model copy their residual stream into dflash_input; update_main_cache projects it and writes one key per DFlash layer into the DFlash SWA cache. Panel 2: the draft block (golden token plus 4 noise tokens at positions a+1 to a+5) goes through the DFlash decoder layers, then the heads compute per step the logits with a Markov correction, the confidence c, and the sampled draft. A chain g, d1 to d5 shows the Markov dependency. The drafts, logprobs and confidences go into the MTP info pool." caption="Figure: the DFlash draft model. See that the draft keys come from main-model hidden states (panel 1), and that all 5 drafts come from one pass (panel 2)." />
+<p>Panel 1 runs inside the forward pass of the main model, in every step. Panel 2 runs inside the sampler, after the verification of a decode step. Read the chain at the bottom of panel 2 from left to right. Each draft depends on the draft before it only through the small {{term markov-head}} term.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: DFlash is built from extra layers of the checkpoint</h3>
+<p>The checkpoint has more layers than the main model. DFlash takes the layers after the main layers, the embedding layer and the LM head layer, and checks that each one is a DFlash block:</p>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="91-110">
+<x-tr line="92">Main model layers + embedding layer + LM head layer.</x-tr>
+<x-tr line="94">The model has no MTP layers, or the wrong number of layers.</x-tr>
+<x-tr line="104">Number of proposals that each sequence makes.</x-tr>
+<x-tr line="106">Dimension of the predicted logprobs. With force_topk, only force_topk values, plus their index.</x-tr>
+<x-tr line="110">The DFlash module should have nextn_predict layers.</x-tr>
+</x-code>
+<p>DFlash shares the embedding and the LM head of the main model ({{cite deepinfer/model_executor/models/deepseek.py:300-302}}). Its number of layers comes from <code>num_nextn_predict_layers</code> in the checkpoint config. The number of drafts comes from <code>DEEPINFER_USE_NEXTN_DECODE</code> (line 103). A comment says that the two numbers are independent ({{cite deepinfer/model_executor/models/deepseek.py:301}}).</p>
+
+<h3>Step 2: the main forward pass writes the draft model's keys</h3>
+<p>Some main layers, listed in <code>dspark_target_layer_ids</code>, copy their residual stream into one buffer <code>dflash_input [total_q, hidden × n_target]</code> ({{cite deepinfer/model_executor/models/deepseek.py:172-174}}, {{cite deepinfer/model_executor/models/decoder_layer.py:144-145}}). After the last layer, <code>update_main_cache</code> turns these features into keys:</p>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="198-228" highlight="219-220,222-228">
+<x-tr line="206-208">The row layout of input_metadata must match dflash_input (the consumer view with YOCO compaction). In decode it replays with the main model CUDA graph. The accept results do not exist yet, so all tokens are written with slot_mapping_store_swa. The rejected draft positions are exactly the positions where forward_drafts later writes draft keys, and they are overwritten before any read, so no mask by accept result is needed.</x-tr>
+<x-tr line="210">With prefill CP &gt; 1, dflash_input has the per-rank mirror layout; each layer all-gathers and writes in the original varlen order.</x-tr>
+</x-code>
+<ol>
+  <li>Line 219: a linear projection from <code>hidden × n_target</code> to <code>hidden</code>, then an RMSNorm.</li>
+  <li>Line 220: <code>main_kv_proj</code> makes one key of <code>head_dim</code> values per DFlash layer: <code>[total_q, n_layers, head_dim]</code>.</li>
+  <li>Lines 221-228: each DFlash layer writes its key into its own sliding-window cache, with the same slot map as the main model.</li>
+</ol>
+
+<h3>Step 3: one draft pass after the verification</h3>
+<p>The sampler calls <code>decode_forward</code> after the verification ({{cite deepinfer/model_executor/layers/sampler.py:236-251}}). It replays a CUDA graph, or runs <code>run_drafts</code> directly:</p>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="358-376" highlight="365,367-372,373,376" />
+<ol>
+  <li>Line 365: with context parallelism, the driver broadcasts <code>last_valid_offset</code> and <code>golden_tokens</code> to the other ranks.</li>
+  <li>Lines 367-372: <code>build_dflash_input</code> makes the metadata of a block of 5 positions per request. The block starts after the last accepted position: <code>a + 1 … a + 5</code>, with <code>a = positions[ftp] + last_valid_offset</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:168-174}}).</li>
+  <li>Line 373: <code>forward_drafts</code> embeds <code>[golden, noise, noise, noise, noise]</code> and runs the DFlash layers ({{cite deepinfer/model_executor/models/mtp/dflash.py:230-256}}). The golden token is the token that the sampler just made. The noise token id comes from the checkpoint config ({{cite deepinfer/hugging_face/config.py:186}}).</li>
+  <li>Line 376: only the driver samples.</li>
+</ol>
+<p>Every draft row attends to the same keys: the last <code>window_size</code> main positions up to <code>a</code> (128 in the docs), plus the 5 draft positions ({{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:183-197}}). So the 5 rows see each other, and they all come from one pass.</p>
+
+<h3>Step 4: per-step heads: Markov correction and confidence</h3>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="308-334" highlight="309,311-312,316-321,322-330" />
+<ol>
+  <li>Line 309: row <code>step_i</code> of every request. The rows of one request are 5 apart.</li>
+  <li>Lines 311-312: the Markov term. <code>markov_w1</code> embeds the previous token into a small vector (<code>dspark_markov_rank</code> values). <code>markov_w2</code> maps that vector to one score per vocabulary token and adds the scores to the logits (<code>out_acc</code>). For step 0 the previous token is the golden token; then it is the draft of the step before ({{cite deepinfer/model_executor/models/mtp/dflash.py:296}}).</li>
+  <li>Lines 316-321: the confidence head computes <code>sigmoid([h, markov_emb] · w / T)</code> for this step ({{cite deepinfer/model_executor/layers/tilelang_ops/dflash.py:10-28}}).</li>
+  <li>Lines 322-330: <code>process_sampling</code> with the request's temperature, top-p and top-k, and the seed namespace <code>"mtp"</code>. The processed logprobs go straight into <code>next_n_token_logprobs[:, step_i]</code>. The verification needs them in the next step.</li>
+</ol>
+<p>Lines 336-344 then store the drafts, the logprobs and the confidences in the {{term mtp-info-pool}}, and return <code>token_ids [req, 5]</code> and <code>confidence_rates [req, 5]</code>.</p>
+
+<h3>Step 5: confidences become accept rates in C++</h3>
+<p>After the step, <code>process_MTPInfo</code> copies the drafts and the confidences into each sequence. It stores the <em>running product</em> of the confidences:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="1239-1252" highlight="1243,1247,1249">
+<x-tr line="1244-1245">build output reads confidence_raw before this update (the value just moved into prev_confidence_raw), so processMTP must run before build output.</x-tr>
+<x-tr line="1248">The confidence rate from modeling is independent per token; multiply them before use.</x-tr>
+</x-code>
+<p>The running product is the estimated chance that drafts 1 to <code>j</code> <em>all</em> pass. Only then does draft <code>j</code> count. The rate never grows with <code>j</code>, so a sort by rate keeps the drafts of each request in order.</p>
+
+<h3>Step 6: MTPVarlen::schedule chooses the lengths</h3>
+<p>The decode scheduler sorts the batch and asks <code>MTPVarlen</code> for one <code>seqlen_q</code> per sequence ({{cite csrc/engine/scheduler.hpp:648-652}}). Without a performance curve, the answer is always <code>1 + 5</code> ({{cite csrc/engine/mtp_varlen.hpp:153-158}}). The curve exists only with <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code> ({{cite deepinfer/worker/base.py:280-281}}). Then:</p>
+<x-diagram name="b9_dspark_schedule" alt="Panel 1: a table of three requests A, B, C with five confidences each and their running products. Verified drafts are green: all 5 of A, 2 of B, 2 of C. seqlen_q is 6, 3, 3. Below: the sorted rates, a toy cost curve, and E divided by time for total_q 8 (0.676), 12 (0.741, best) and fixed 18 (0.686). Panel 2: the CPU MTPVarlen::schedule picks total_q; a GPU kernel splits it with the newest confidences; the CPU copies seqlens_q back and waits for d2h_evt; feedback updates the runtime model." caption="Figure: how confidences become verification lengths. Panel 1 is a worked example with toy numbers; panel 2 shows who decides what with ZOS." />
+<x-code file="csrc/engine/mtp_varlen.hpp" lines="228-266" highlight="231-232,243-248,252-258,263-266" />
+<ol>
+  <li>Lines 231-232: start with one row per sequence. Each sequence surely gives one token, so the expected count starts at <code>num_seqs</code>.</li>
+  <li>Lines 243-244: the time of a step with <code>cur_bsz</code> rows has three parts. They are the measured time of the smallest CUDA graph that fits, a slope term and the sampler time.</li>
+  <li>Lines 254-258: add the drafts one by one, best rate first. Each draft adds its rate to the expected tokens and one row to the batch. Keep the size with the best <code>expected / time</code>.</li>
+  <li>Lines 263-266: give the <code>best_bsz − num_seqs</code> best drafts to their sequences. Each won draft adds 1 to that sequence's <code>seqlen_q</code>.</li>
+</ol>
+<p>In the worked example of the figure, 12 rows give 8.59 expected tokens in 11.6 ms. All 18 rows would give 9.05 tokens in 13.2 ms. 12 rows are faster per token.</p>
+
+<h3>Step 7: with ZOS, the GPU splits the budget</h3>
+<p>With {{term zos | ZOS}}, the CPU schedules step N+1 before the confidences of step N reach the CPU. The Q&amp;A explains the solution: "CPU scheduling only fixes the total budget; the per-request lengths are recomputed on the GPU by a TileLang kernel" ({{cite doc/inference_deployment_qa.md:264}}). In the worker:</p>
+<x-code file="deepinfer/worker/worker.py" lines="218-234" highlight="219,230-234" />
+<p>The kernel uses the confidences of step N, which are still on the device. It computes the running products, sorts all drafts of the batch and gives each request its share of the same <code>total_q</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:51-98}}). The new lengths go back to pinned CPU memory. Before it samples, the worker waits for this copy with <code>d2h_evt</code> ({{cite deepinfer/worker/worker.py:146-152}}). This wait exists only with DSpark.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="DFlash tensors and shapes, with a worked example">
+<p>Names: <code>R</code> requests in the decode step, <code>B = 5</code> drafts (<code>dflash_block_size = DEEPINFER_USE_NEXTN_DECODE</code>, {{cite deepinfer/model_executor/models/mtp/dflash.py:141}}), <code>H</code> hidden size, <code>T</code> number of target layers, <code>L</code> number of DFlash layers.</p>
+<table>
+  <thead><tr><th>Tensor</th><th>dtype, shape</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>dflash_input</code></td><td><code>[total_q, H × T]</code>, the dtype of the hidden states</td><td>{{cite deepinfer/model_executor/models/deepseek.py:174}}</td></tr>
+    <tr><td><code>main_k</code></td><td><code>[total_q, L, head_dim]</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:220}}</td></tr>
+    <tr><td>draft block input ids</td><td>int32 <code>[R × B]</code>: golden, then <code>B − 1</code> noise ids</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:230-239}}</td></tr>
+    <tr><td><code>dflash_newx_slot_mapping_store</code></td><td>int32 <code>[R × B]</code></td><td>{{cite deepinfer/model_executor/input_metadata/dflash.py:30-31}}</td></tr>
+    <tr><td><code>dflash_kv_index</code></td><td>int32 <code>[R × B, pad64(window + B)]</code>; <code>-1</code> = invalid</td><td>{{cite deepinfer/model_executor/input_metadata/dflash.py:32-34}}</td></tr>
+    <tr><td><code>logits_next</code></td><td>float32 <code>[R × B, V]</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:289}}</td></tr>
+    <tr><td><code>next_n_token_logprobs</code></td><td>float32 <code>[R, B, V or N]</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:298-300}}</td></tr>
+    <tr><td><code>confidence_rates</code></td><td>float32 <code>[R, B]</code>, values from 0 to 1</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:302-306}}</td></tr>
+    <tr><td><code>token_ids</code> (drafts)</td><td>int32 <code>[R, B]</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:271-277}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example.</strong> Two requests. Request 0 had input positions 49 to 54 and accepted 2 drafts. Request 1 had positions 200 to 205 and accepted 5 drafts. So <code>ftp = [0, 6]</code> and <code>last_valid_offset = [2, 5]</code>.</p>
+<pre><code class="language-python">accepted_pos     = [49 + 2, 200 + 5]      = [51, 205]
+draft positions  = [[52, 53, 54, 55, 56],  # request 0: row 0 holds its golden token at 52
+                    [206, 207, 208, 209, 210]]
+kv_len           = 128 + 5 = 133 → padded to 192 columns
+keys of request 0 = positions 51 − 127 = −76 … 56 → negative positions become −1 (invalid)
+                    so it sees positions 0 … 51 (main keys) and 52 … 56 (draft keys)
+store slot       = state_offset + pos % 134    # same ring as the main SWA cache</code></pre>
+<p>The reference implementation gives these values ({{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:166-197}}). The SWA ring has 134 rows per state slot with default settings ({{cite deepinfer/worker/cache_engine.py:88-110}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The Markov head and the confidence head: exact formulas">
+<p><strong>Markov head.</strong> The checkpoint stores it as <code>markov_head.embed</code> and <code>markov_head.head</code> ({{cite deepinfer/hugging_face/names.py:92-93}}). The class docstring says: "Final DFlash head with a first-order Markov correction to logits" ({{cite deepinfer/model_executor/models/v4_modules/heads.py:26-34}}). For step <code>i</code> with previous token <code>x</code>:</p>
+<pre><code class="language-python">w1       = markov_w1[x]                    # [R, markov_rank], an embedding lookup
+logits_i = lm_head(post_norm(h_i)) + w1 @ markov_w2.T    # [R, V], float32 output (out_acc)</code></pre>
+<p>So the draft of step <code>i</code> depends on the sampled draft of step <code>i − 1</code>, through a rank-<code>markov_rank</code> table. This is cheap: the expensive layers run once for all 5 steps.</p>
+<p><strong>Confidence head.</strong> It is one linear layer from <code>H + markov_rank</code> inputs to 1 output (<code>AcceptRatePredictor</code>, {{cite deepinfer/model_executor/models/v4_modules/heads.py:37-42}}). The fused kernel computes:</p>
+<pre><code class="language-python">c_i = sigmoid( concat(h_i, w1) @ w / T_i )   # h_i: hidden state before the final norm, bf16</code></pre>
+<p>The reference clamps the scaled value to [−60, 60] before the sigmoid ({{cite deepinfer/model_executor/layers/tilelang_ops/dflash.py:49-51}}). <code>T_i</code> comes from <code>DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE</code>: one value for all steps (default <code>1.0</code>), or a comma list with exactly <code>nextn</code> values ({{cite deepinfer/environ.py:134-143}}). Values below <code>1e-5</code> become <code>1e-5</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:62-64}}).</p>
+<p><strong>Accuracy of the confidence.</strong> The verification computes an estimate of the accept chance of each row, <code>accept_probs = max(1 − Σ residual, 0)</code>. Because of the <code>α</code> penalty, it is a little lower than the exact chance <code>Σ min(p, q)</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:232-234}}). <code>finalize_verification</code> adds <code>|accept_prob − confidence|</code> over all verify rows into <code>batch_confidence_error</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:584-589}}). The statistics logger divides the sum by the number of verified drafts ({{cite deepinfer/engine/stats_logger.py:236}}).</p>
+<p><strong>After a stop token.</strong> If a request emits EOS in this step, the sampler sets all its new confidences to 0 ({{cite deepinfer/model_executor/layers/sampler.py:252-254}}). The scheduler then gives it no drafts.</p>
+</x-deepdive>
+
+<x-deepdive title="MTPVarlen::schedule: which round of rates it uses">
+<p>The C++ comment explains a timing problem ({{cite csrc/engine/mtp_varlen.hpp:160-168}}). Translated:</p>
+<blockquote><p>"Make sure that confidence_{i+1..nextn} does not decide whether draft_token_i is verified. In round N, we use the accept rates of round N−2 to compute best_bsz (total_q). We use the accept rates of round N−1 to give each request its seqlen_q (non-ZOS here; ZOS corrects it on the GPU). Each request keeps two counters, schedule_cnt and process_cnt. If they are equal, accept_rates is from round N−1 and prev_accept_rates from N−2. If schedule_cnt = process_cnt + 1 (as with ZOS), accept_rates is from N−2 and prev_accept_rates from N−3."</p></blockquote>
+<p>So the code fills two queues ({{cite csrc/engine/mtp_varlen.hpp:191-208}}):</p>
+<ul>
+  <li><code>acc_queue_for_bsz</code>: <code>prev_accept_rates</code> if the counters are paired, else <code>accept_rates</code>. This decides the total.</li>
+  <li><code>acc_queue_for_seqs_q</code>: always <code>accept_rates</code>. This decides the split.</li>
+</ul>
+<p><strong>No rates yet.</strong> A sequence with an empty rate list gets the value 1.0 for each draft if it has drafts, else 0.0 ({{cite csrc/engine/mtp_varlen.hpp:173-178}}). A request that the CPU schedules ahead of its post-processing always counts as "has drafts" ({{cite csrc/engine/mtp_varlen.hpp:200-201}}).</p>
+<p><strong>Sort order.</strong> Higher rate first; for equal rates, the lower sequence index first ({{cite csrc/engine/mtp_varlen.hpp:210-214}}). The scheduler sorted the batch by length, longest first, just before ({{cite csrc/engine/scheduler.hpp:648-649}}).</p>
+<p><strong>Checks.</strong> <code>TORCH_CHECK(best_bsz >= num_seqs)</code> ({{cite csrc/engine/mtp_varlen.hpp:260}}), and the counters must satisfy <code>process_cnt ≤ schedule_cnt ≤ process_cnt + 1</code> ({{cite csrc/engine/mtp_varlen.hpp:195-196}}). A preempted request resets both counters ({{cite csrc/engine/sequence.hpp:133-142}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The cost model: start-up curve and runtime feedback">
+<p><strong>Start-up curve.</strong> After the CUDA graph capture, <code>profile_decode_perf</code> replays the decode graph of every captured batch size. It does 1 warm-up and 5 timed runs, drops the fastest and the slowest run, and takes the mean. Then it averages over the expert-parallel group ({{cite deepinfer/worker/model_runner.py:586-623}}). The result is a list of <code>(graph_size, ms)</code> pairs, cached on disk by <code>DecodePerfCache</code> ({{cite deepinfer/worker/model_runner.py:570-579}}). The engine gives it to the C++ scheduler ({{cite deepinfer/engine/llm_engine.py:268}}). Without CUDA graphs, the curve is empty ({{cite deepinfer/worker/model_runner.py:563-564}}), and DSpark falls back to 1 + 5.</p>
+<p><strong>Runtime feedback.</strong> After each decode step, the engine passes the measured forward and sampler times ({{cite deepinfer/engine/llm_engine.py:995-1002}}). <code>update_runtime</code> keeps two estimators ({{cite csrc/engine/mtp_varlen.hpp:139-148}}):</p>
+<ul>
+  <li><strong>Sampler time.</strong> The median of the last 9 samples, used after at least 5 samples. There is one estimator per batch size (<code>num_seqs</code>) and one global fall-back ({{cite csrc/engine/mtp_varlen.hpp:20-42}}, {{cite csrc/engine/mtp_varlen.hpp:216-223}}).</li>
+  <li><strong>Forward slope.</strong> For each step, <code>(forward_ms − curve_ms) / graph_size</code>. The estimator keeps the last 5000 steps. It takes the median per graph size (only sizes with 10 or more samples), then the median of these medians ({{cite csrc/engine/mtp_varlen.hpp:44-131}}). The slope is clamped to at least 0 ({{cite csrc/engine/mtp_varlen.hpp:226}}).</li>
+</ul>
+<p>The time model is then <code>baseline_ms(graph) + slope_ms × graph_size + sampler_ms</code> ({{cite csrc/engine/mtp_varlen.hpp:242-244}}). The comment at line 44 gives the reason for the slope: the start-up curve does not include the effect of the context length.</p>
+<x-warning title="DSpark and deterministic sampling">
+<p>The lengths depend on measured times, so two runs can choose different lengths and batch shapes. The README asks for <code>DEEPINFER_ENABLE_MTP_VARLEN=0</code> for deterministic sampling ({{cite README.md:28}}).</p>
+</x-warning>
+</x-deepdive>
+
+<x-deepdive title="The GPU split under ZOS">
+<p><code>compute_seqlens_q_by_confidence_rates(total_q, remap, prev_confidence_rates, seqlens_q)</code> works in two phases ({{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:35-98}}):</p>
+<ol>
+  <li><strong>Gather and multiply.</strong> <code>remap[i]</code> is the row of sequence <code>i</code> in the previous batch, or <code>-1</code> for a new sequence. A new sequence gets rates of 0. The running product goes along the 5 drafts.</li>
+  <li><strong>Rank.</strong> Sort all <code>num_seqs × 5</code> rates (higher first, lower flat index first on ties). The first <code>total_q − num_seqs</code> win. Each sequence gets <code>1 + wins</code>.</li>
+</ol>
+<p>Two differences from the CPU split: the GPU uses the newest confidences (step N), and a new sequence gets the rate 0. So its drafts come after all drafts with a rate above 0. The sum of the lengths stays <code>total_q</code>, so the CUDA graph that the CPU chose still fits. On Ascend the kernel asserts <code>num_seqs × nextn × 4 ≤ 32 KB</code> of on-chip buffer ({{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:30-31}}).</p>
+<p>After the kernel, the CPU copy of the lengths updates each <code>SequenceMetadata</code> and the scheduler outputs before the sampler runs ({{cite csrc/engine/zos.cpp:279-305}}). <code>cu_seqlens_q</code> is also recomputed on the device ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:92-95}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Numbers from the deployment Q&amp;A">
+<p>The table compares fixed-5 verification with dynamic-length verification on EP64/DP64 benchmark data ({{cite doc/inference_deployment_qa.md:249-256}}):</p>
+<table>
+  <thead><tr><th>Seqs per rank</th><th>Verified, fixed-5</th><th>Verified, dynamic</th><th>Accepted, fixed-5</th><th>Accepted, dynamic</th><th>tok/s/rank, fixed-5</th><th>tok/s/rank, dynamic</th><th>Gain</th></tr></thead>
+  <tbody>
+    <tr><td>16</td><td>5</td><td>4.44</td><td>3.32</td><td>3.24</td><td>4891</td><td>4816</td><td>−1.5 %</td></tr>
+    <tr><td>32</td><td>5</td><td>3.65</td><td>3.25</td><td>3.17</td><td>8964</td><td>9111</td><td>+1.6 %</td></tr>
+    <tr><td>48</td><td>5</td><td>3.94</td><td>3.3</td><td>3.26</td><td>12032</td><td>12467</td><td>+3.6 %</td></tr>
+    <tr><td>60</td><td>5</td><td>3.58</td><td>3.3</td><td>3.21</td><td>13730</td><td>14466</td><td>+5.4 %</td></tr>
+    <tr><td>72</td><td>5</td><td>3.24</td><td>3.29</td><td>3.12</td><td>14962</td><td>15961</td><td>+6.7 %</td></tr>
+    <tr><td>96</td><td>5</td><td>3.24</td><td>3.3</td><td>3.15</td><td>16817</td><td>18660</td><td>+11.0 %</td></tr>
+  </tbody>
+</table>
+<p>How to read it: at low concurrency (16 sequences per rank) DSpark costs 1.5 %. At high concurrency it gains up to 11 %. The accepted length drops by 0.04 to 0.17 token.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_ENABLE_MTP_VARLEN</code></td><td>off ({{cite deepinfer/environ.py:131}})</td><td>{{cite deepinfer/worker/base.py:280}}, {{cite deepinfer/worker/worker.py:132}}, {{cite deepinfer/worker/worker.py:218}}, {{cite deepinfer/worker/worker.py:230}}</td><td>Profiles the cost curve, records runtimes, and turns on the GPU split.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}}); C++ also reads it with <code>getenv</code>, default 5 ({{cite csrc/engine/utils.hpp:36-40}})</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:103}}</td><td>The maximum draft length ({{cite README.md:24}}). 0 turns off DFlash.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE</code></td><td><code>1.0</code> ({{cite deepinfer/environ.py:134-143}})</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:62}}</td><td>Sigmoid temperature of the confidence head, one value or one per step.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_ENFORCE_EAGER</code></td><td>off ({{cite deepinfer/environ.py:156}})</td><td>{{cite deepinfer/worker/model_runner.py:80-85}}</td><td>No CUDA graph for the DFlash pass.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL</code></td><td><code>8</code> ({{cite deepinfer/environ.py:157}})</td><td>{{cite deepinfer/worker/dflash_cuda_graph_runner.py:36}}</td><td>Step between the captured batch sizes of the DFlash graph.</td></tr>
+  </tbody>
+</table>
+<p>The evaluation script turns DSpark on: <code>os.environ["DEEPINFER_ENABLE_MTP_VARLEN"] = "1"</code> ({{cite eval/run_eval.py:121}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>DSpark has no effect.</strong> Without CUDA graphs, the cost curve is empty and every request sends 1 + 5 tokens ({{cite deepinfer/worker/model_runner.py:563-564}}, {{cite csrc/engine/mtp_varlen.hpp:153-158}}).</li>
+  <li><strong>Different results in two runs.</strong> The chosen lengths depend on measured times. Turn DSpark off for deterministic sampling ({{cite README.md:28}}).</li>
+  <li><strong>Small batches.</strong> At 16 sequences per rank the Q&amp;A measured −1.5 % ({{cite doc/inference_deployment_qa.md:251}}).</li>
+  <li><strong>A sync point.</strong> With DSpark and ZOS, the worker waits for <code>d2h_evt</code> before each decode sample ({{cite deepinfer/worker/worker.py:147-149}}).</li>
+  <li><strong>Wrong temperature list.</strong> A comma list with a length other than <code>nextn</code> raises <code>ValueError</code> ({{cite deepinfer/environ.py:140-141}}).</li>
+  <li><strong>Counter mismatch.</strong> If the schedule and process counters drift apart, <code>MTPVarlen::schedule</code> stops with a check failure. A C++ comment notes that a preempted sequence must skip its MTP update for this reason ({{cite csrc/engine/scheduler.hpp:1214-1219}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Speculative decoding gives more tokens per step only when the drafts pass. DSpark spends the verification rows where they most likely pay off, and the gain grows with the batch size.</p>
+
+<x-quiz>
+  <x-q level="easy">Which environment variable turns on confidence-scheduled verification, and what is its default?
+    <x-a><p><code>DEEPINFER_ENABLE_MTP_VARLEN</code>; it is off by default ({{cite deepinfer/environ.py:131}}, {{cite README.md:24}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">The confidences of one request are 0.9, 0.5, 0.8. What accept rates does C++ store?
+    <x-a><p>The running products: 0.9, 0.45, 0.36 ({{cite csrc/engine/scheduler.hpp:1243-1249}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">DFlash makes 5 drafts. Does it run its decoder layers 5 times?
+    <x-a><p>No. It runs them once on a block of 5 positions: the golden token and 4 noise tokens ({{cite deepinfer/model_executor/models/mtp/dflash.py:230-256}}). Only the per-step heads and the small Markov term run 5 times ({{cite deepinfer/model_executor/models/mtp/dflash.py:308-334}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The draft keys of DFlash: from which data does DFlash compute the keys of the main tokens?
+    <x-a><p>From the residual streams of the target layers of the main model (<code>dspark_target_layer_ids</code>), concatenated, projected, normalized and passed through <code>main_kv_proj</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:219-228}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With ZOS and DSpark on, the CPU scheduled step N+1 with <code>total_q = 40</code> for 10 sequences. Which confidences decide how the 30 draft rows are shared, and who computes the split?
+    <x-a><p>The confidences of step N, still on the device. A TileLang kernel computes the running products, ranks all 50 rates, and gives each sequence 1 + its wins among the best 30 ({{cite deepinfer/worker/worker.py:218-219}}, {{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:67-98}}). The CPU only fixed <code>total_q</code>. Step N was not post-processed yet, so the CPU used the rates of step N−1, one round older ({{cite csrc/engine/mtp_varlen.hpp:160-168}}, {{cite csrc/engine/mtp_varlen.hpp:203-204}}). This is in the deep dives on MTPVarlen and the GPU split.</p></x-a>
+  </x-q>
+</x-quiz>

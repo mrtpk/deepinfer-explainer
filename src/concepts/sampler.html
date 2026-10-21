@@ -1,0 +1,232 @@
+---
+title: The sampler
+level: Intermediate
+prerequisites: learn/sampling, learn/prefill-decode, tours/life-of-a-request
+related: concepts/speculative-decoding, concepts/dspark, concepts/structured-outputs, concepts/determinism, code/sampler, code/prepare-sample-cpp, tours/spec-decode-round, tours/life-of-a-request
+summary: The sampler turns the hidden states of the rows that need a token into float32 logits, applies temperature, top-p and top-k, and draws one token per request with a seeded hash. In decode steps it also verifies the draft tokens.
+---
+<x-sentence>After each forward pass, the sampler makes float32 logits for the rows that need a token. Then it filters them and draws each token with a seed.</x-sentence>
+
+<h2>The idea</h2>
+<p>The model does not output a token. For each position, it outputs a {{term hidden-state}}. The sampler turns that vector into one score per vocabulary token: the {{term logits}}. Then it turns the scores into probabilities and selects one token. The page {{link learn/sampling}} explains the basic steps.</p>
+<p>Each request carries its own settings in {{term sampling-params | SamplingParams}}:</p>
+<ul>
+  <li>{{term temperature}} divides the logits before softmax. A low value makes the best token more likely.</li>
+  <li>{{term top-p}} and {{term top-k}} remove unlikely tokens. Their probability becomes zero.</li>
+  <li>{{term seq-seed | seq_seed}} fixes the random numbers of the request. The same seed and the same inputs give the same tokens.</li>
+</ul>
+<p>The DeepInfer sampler has two more jobs. In a {{term decode}} step, it checks the {{term draft-token | draft tokens}} of the previous step and keeps a prefix of them. This is {{term speculative-decoding}}. After the check, it calls the draft model {{term dflash | DFlash}}, which proposes the drafts for the next step.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a raffle drum. Each token has tickets in proportion to its probability. Temperature gives the favourite tokens more or fewer tickets. Top-p and top-k take the tickets of unlikely tokens out of the drum. Then a hand picks one ticket. The comparison stops being true at the last step. DeepInfer does not pick by chance in the usual sense. It computes a number <code>u</code> from the seed and the position. Then it walks the running sum of the probabilities until the sum is larger than <code>u</code>. So the same seed and position always give the same ticket.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_sampler_flow" alt="Panel 1: model output hidden states, then gather of the selected rows, then get_logits makes float32 logits of shape R by vocab_size. Panel 2: two columns. Prefill: EOS suppression, structured-output mask, _prefill_golden_gen, extras. Decode: prepare_verification_metadata, structured-output masks per step, process_sampling with drafts, get_accept_result and finalize, DFlash decode_forward. Panel 3: per row, the fused_sample kernel scales by temperature, filters with top-p then top-k, applies log-softmax, then samples a fresh token or verifies a draft." caption="Figure: one call of <code>Sampler.forward</code>. See that logits exist only for R rows, and that prefill and decode share the same per-row kernel." />
+<p>Read panel 1 from left to right. The sampler never makes logits for all rows of the batch. Panel 2 shows the split between {{term prefill}} and decode. Panel 3 shows the order of operations inside one row: scale, filter, normalize, then sample.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: who calls the sampler</h3>
+<p>The worker runs the sampler right after the forward pass. <code>ModelRunner.execute_sample</code> builds the sampler inputs and calls <code>DeepseekForCausalLM.sample</code> ({{cite deepinfer/worker/model_runner.py:337-367}}). That method passes the LM head weight as <code>embedding</code> and the draft module as <code>mtp_module</code>:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="383-400" highlight="391-399" />
+<p>The sampler inputs come from C++. <code>prepare_sampler_inputs</code> fills pinned CPU arrays and starts non-blocking copies to the device ({{cite csrc/engine/prepare_sample.cpp:40-284}}). The arrays of temperature, top-p, top-k, seed and sample position have one entry per sequence, not per row ({{cite csrc/engine/prepare_sample.cpp:82-88}}).</p>
+
+<h3>Step 2: select rows, then make logits</h3>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="140-143" caption="<code>gather</code> keeps only the rows in <code>selected_token_indices</code>. The comment says that the CUDA graph output also contains padding rows." />
+<p>In a prefill step, the selected row is the last token of each prompt ({{cite csrc/engine/prepare_sample.cpp:197}}). In a decode step, all <code>seqlen_q</code> rows of each request are selected, because each row checks one draft ({{cite csrc/engine/prepare_sample.cpp:202-205}}). Then <code>get_logits</code> makes a float32 tensor and fills it with a BF16 matrix multiply:</p>
+<x-code file="deepinfer/model_executor/layers/sampler_utils.py" lines="20-28" />
+
+<h3>Step 3: masks before the sampling</h3>
+<p>Three masks can set logits to minus infinity. A token with a logit of minus infinity has probability zero.</p>
+<ol>
+  <li><strong>Token blacklist.</strong> <code>DEEPINFER_DECODE_TOKEN_BLACKLIST</code> lists token ids, for example <code>0..3,7</code> ({{cite deepinfer/model_executor/utils.py:29-35}}). The sampler fills them with minus infinity in all rows ({{cite deepinfer/model_executor/layers/sampler.py:167-169}}).</li>
+  <li><strong>EOS suppression.</strong> With <code>first_n_token_no_eos=1</code>, the first output token cannot be EOS ({{cite deepinfer/model_executor/layers/sampler.py:183-185}}).</li>
+  <li><strong>Structured output.</strong> A grammar matcher fills a bit mask for each request that has a {{term structured-output}} grammar ({{cite deepinfer/model_executor/layers/sampler.py:187-188}}). In decode, there is one mask per draft step ({{cite deepinfer/model_executor/layers/sampler.py:433-437}}).</li>
+</ol>
+<x-note title="The blacklist also applies to prefill">
+<p>The name says "DECODE", but line 169 runs before the split into prefill and decode at line 171. So the blacklist also applies to the first token of each request.</p>
+</x-note>
+
+<h3>Step 4: one kernel for temperature, top-p, top-k and the draw</h3>
+<p><code>process_sampling</code> prepares the inputs. Then it calls <code>fused_sample</code>, a {{term tilelang}} kernel that does all per-row work in one launch ({{cite deepinfer/model_executor/layers/sampler_utils.py:162-196}}). The reference code in the same file shows the order of the operations:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/fused_sample.py" lines="209-225" highlight="209-211,223-225" caption="Scale by 1/temperature, filter with top-p and then top-k, log-softmax, then sample from exp(logprobs)." />
+<ol>
+  <li>Line 209: each row is divided by its temperature.</li>
+  <li>Line 210: top-p, then top-k, set removed tokens to minus infinity ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:121-150}}).</li>
+  <li>Line 211: <code>log_softmax</code> gives the logprobs of the filtered distribution.</li>
+  <li>Lines 223-225: the draw uses the seed and the sample position of the row.</li>
+</ol>
+<p>The same file also holds the tests. They run the same checks on the TileLang kernel and on this reference ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:738-750}}).</p>
+
+<h3>Step 5: the seeded draw</h3>
+<p>The draw does not use a global random generator. It hashes the seed and the position into one number <code>u</code> in [0, 1). Then it walks the running sum of the probabilities until the sum is larger than <code>u</code> times the row sum (line 83):</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/random_sampling.py" lines="70-84" highlight="78-84" />
+<p>The docstring states the property that matters: the result depends only on the seed, the position and the case. It does not depend on the batch size or on the row order ({{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:17-21}}). The deep dive <a href="#seeds">Seeds and positions</a> lists all three cases.</p>
+
+<h3>Step 6: prefill output</h3>
+<p>In a prefill step, <code>_prefill_golden_gen</code> runs <code>process_sampling</code>, then adds the extras: the top logprobs, the {{term golden-tokens | golden-token}} override and <code>sum_smaller_probs</code> ({{cite deepinfer/model_executor/layers/sampler.py:597-634}}). The result has one token per request. The sampler starts the copies to the CPU and returns ({{cite deepinfer/model_executor/layers/sampler.py:190-211}}).</p>
+
+<h3>Step 7: decode output</h3>
+<p>In a decode step, the sampler calls <code>_verification</code> with the drafts of the previous step ({{cite deepinfer/model_executor/layers/sampler.py:213-233}}). The result is one sampled token per request, plus the accepted drafts. Then DFlash makes the next drafts from the sampled token ({{cite deepinfer/model_executor/layers/sampler.py:235-251}}). The page {{link concepts/speculative-decoding}} explains the verification.</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="258-291" highlight="259,263-265,273-275,287-289" caption="<code>sampler_epilogue()</code> starts <code>non_blocking</code> copies to the CPU. Some results stay on the device too, for zero-overhead scheduling." />
+<p>The sampler never waits for the device. <code>execute_sample</code> runs inside <code>forbid_cuda_sync()</code> ({{cite deepinfer/worker/model_runner.py:356-360}}). The CPU reads the results later, after the event <code>sample_end_evt</code> ({{cite deepinfer/worker/worker.py:167-168}}). Work that needs CPU values goes into <code>post_funcs</code>, for example the counters of a decode step ({{cite deepinfer/model_executor/layers/sampler.py:293-298}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Tensor shapes of one sampler call, with a worked example">
+<p>Names: <code>R</code> is the number of selected rows, <code>V</code> is <code>vocab_size</code>, <code>N</code> is <code>DEEPINFER_SAMPLER_FORCE_TOPK</code>. With force top-k off, read <code>N</code> as <code>V</code>.</p>
+<table>
+  <thead><tr><th>Tensor</th><th>dtype, shape</th><th>Meaning</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>selected_token_indices</code></td><td>int32 <code>[R]</code></td><td>Rows of the model output to sample</td><td>{{cite csrc/engine/prepare_sample.cpp:83}}</td></tr>
+    <tr><td><code>kernel.logits.temperatures</code>, <code>top_ps</code></td><td>float32 <code>[num_seqs]</code></td><td>Per sequence</td><td>{{cite csrc/engine/prepare_sample.cpp:84-85}}</td></tr>
+    <tr><td><code>kernel.logits.top_ks</code>, <code>sample_positions</code></td><td>int32 <code>[num_seqs]</code></td><td>Per sequence</td><td>{{cite csrc/engine/prepare_sample.cpp:86-88}}</td></tr>
+    <tr><td><code>kernel.seq_seeds</code></td><td>uint64 <code>[num_seqs]</code></td><td>Per sequence</td><td>{{cite csrc/engine/prepare_sample.cpp:87}}</td></tr>
+    <tr><td><code>logits</code></td><td>float32 <code>[R, V]</code></td><td>Output of <code>get_logits</code></td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:25}}</td></tr>
+    <tr><td><code>logits</code> after force top-k</td><td>float32 <code>[R, N]</code> + int32 <code>token_index [R, N]</code></td><td>Values and their vocabulary ids</td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:166-167}}</td></tr>
+    <tr><td><code>logprobs</code></td><td>float32 <code>[R, N]</code></td><td>After temperature, top-p, top-k, log-softmax</td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:151-153}}</td></tr>
+    <tr><td><code>candidate_token_ids</code></td><td>int32 <code>[R]</code></td><td>Column index (force top-k) or vocabulary id</td><td>{{cite deepinfer/model_executor/layers/sampler_utils.py:154-155}}</td></tr>
+    <tr><td><code>sampled_token.token_ids</code></td><td>int32 <code>[num_seqs]</code></td><td>One new token per request</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:470-471}}</td></tr>
+    <tr><td><code>verified_tokens.token_ids</code></td><td>int32 <code>[R]</code></td><td>Accepted draft ids; <code>-1</code> elsewhere</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:479-480}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example (prefill).</strong> Two prompts of 41 and 100 tokens are in one prefill step. The model output has 141 rows. <code>selected_token_indices = [40, 140]</code>, so <code>R = 2</code> ({{cite csrc/engine/prepare_sample.cpp:197-199}}). <code>sample_positions = [41, 100]</code>, the <code>seqlen_k</code> of each prompt ({{cite csrc/engine/prepare_sample.cpp:198}}). The logits use <code>2 × V × 4</code> bytes. With the inferred <code>V = 129280</code>, that is 1,034,240 bytes, about 1 MB.</p>
+<p><strong>Worked example (decode).</strong> Three requests have <code>seqlen_q = 6, 6, 4</code>. Then <code>R = total_q = 16</code> and <code>mtp_first_token_positions = [0, 6, 12]</code> ({{cite csrc/engine/prepare_sample.cpp:152-153}}). <code>prepare_verification_metadata</code> makes three tensors of shape <code>[16]</code>:</p>
+<pre><code class="language-python">row_to_req = [0,0,0,0,0,0, 1,1,1,1,1,1, 2,2,2,2]
+local_step = [0,1,2,3,4,5, 0,1,2,3,4,5, 0,1,2,3]
+is_verify  = [T,T,T,T,T,F, T,T,T,T,T,F, T,T,T,F]   # the last row of each request is a fresh sample</code></pre>
+<p>The reference implementation shows the rule ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:13-25}}). <code>expand_sampling_params</code> then copies the per-sequence parameters to the 16 rows ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:56-66}}). The logits use <code>16 × 129280 × 4</code> bytes, about 8.3 MB.</p>
+</x-deepdive>
+
+<x-deepdive title="Seeds and positions: how the random number is made">
+<p id="seeds">Every random number of the sampler comes from a hash of two values: the 64-bit <code>seq_seed</code> of the request and a 64-bit sequence number. The hash is SplitMix64, and the result is a float64 in [0, 1) ({{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:58-67}}). The sequence number is <code>3 × position + case</code>:</p>
+<table>
+  <thead><tr><th>Case</th><th>Use</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>A fresh sample (prefill token, bonus token, draft token)</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:78}}</td></tr>
+    <tr><td>1</td><td>A sample from the {{term residual-distribution}} after a rejected draft (<code>is_nextn_predict=True</code>)</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:245}}</td></tr>
+    <tr><td>2</td><td>The number <code>U</code> that decides accept or reject</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:239-242}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Which position.</strong></p>
+<ul>
+  <li>Prefill: <code>sample_position = seqlen_k</code>, the prompt length after this chunk ({{cite csrc/engine/prepare_sample.cpp:198}}).</li>
+  <li>Decode: <code>sample_position = seqlen_k - seqlen_q + 1</code> per request ({{cite csrc/engine/prepare_sample.cpp:206}}). Row <code>j</code> of the request uses <code>sample_position + j × 10000019</code>, so every row has its own stream ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:65}}, {{cite deepinfer/model_executor/layers/tilelang_ops/common.py:52}}).</li>
+  <li>Draft model: the seed gets an offset of <code>1000000007</code> (tag <code>"mtp"</code>), so drafts and target use different streams ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:15}}, {{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:93}}). Draft <code>i</code> (1 to 5) uses position <code>sample_position + last_valid_offset + i</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:290-294}}).</li>
+</ul>
+<p><strong>Worked example.</strong> Request <code>"1"</code> of the tour {{link tours/life-of-a-request}} has <code>seq_seed = 1</code> and a 41-token prompt. Its prefill token uses position 41, case 0. In a decode step with input positions 49 to 54, <code>seqlen_k = 55</code> and <code>seqlen_q = 6</code>, so <code>sample_position = 50</code>. Row 2 then uses position <code>50 + 2 × 10000019 = 20000088</code>.</p>
+<p><strong>No seed given.</strong> <code>SamplingParams</code> takes 64 random bits from Python's <code>random</code> module ({{cite deepinfer/sampling_params.py:85-91}}). So two runs differ, unless you pass <code>seq_seed</code>. The README gives the full recipe for equal outputs: <code>DEEPINFER_BATCH_INVARIANT=1 DEEPINFER_ENABLE_MTP_VARLEN=0</code> and a fixed <code>seq_seed</code>, on NVIDIA only ({{cite README.md:28}}). See {{link concepts/determinism}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Temperature, top-p and top-k: the exact rules">
+<p><strong>Parameter checks.</strong> <code>SamplingParams</code> raises <code>ValueError</code> for a negative temperature, for <code>top_p</code> outside (0, 1], and for <code>top_k</code> that is 0, below -1 or above the int32 maximum ({{cite deepinfer/sampling_params.py:93-99}}). A temperature below <code>SAMPLING_EPS = 1e-5</code> becomes <code>1e-5</code>, and top-p and top-k are then turned off ({{cite deepinfer/sampling_params.py:76-79}}). So "temperature 0" is very close to greedy, but it is still a seeded draw.</p>
+<p><strong>Order.</strong> The reference applies top-p first and top-k second. Both use a stable sort, so equal values keep their token order ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:121-150}}):</p>
+<ol>
+  <li>Sort the probabilities in descending order.</li>
+  <li>Remove a token if the sum of the probabilities <em>before</em> it is larger than <code>top_p</code> (line 139). So the kept set is the shortest prefix whose sum is larger than <code>top_p</code>, or the full row.</li>
+  <li>On the remaining logits, remove every token with rank <code>≥ top_k</code> (lines 145-150). <code>top_k = -1</code> removes nothing.</li>
+  <li><code>log_softmax</code> normalizes the kept tokens again.</li>
+</ol>
+<p><strong>Worked example.</strong> After temperature, five tokens have probabilities <code>[0.50, 0.25, 0.15, 0.06, 0.04]</code>. With <code>top_p = 0.8</code>, the sums before each token are <code>[0, 0.50, 0.75, 0.90, 0.96]</code>. Tokens 4 and 5 have sums above 0.8, so they go. With <code>top_k = 2</code>, token 3 also goes. The result is <code>[0.667, 0.333, 0, 0, 0]</code>.</p>
+<p><strong>The logprobs are of the filtered distribution.</strong> All later values use these processed logprobs: the token logprob, the top logprobs and the prompt logprobs. A token that top-p removed has logprob minus infinity.</p>
+</x-deepdive>
+
+<x-deepdive title="Force top-k (DEEPINFER_SAMPLER_FORCE_TOPK)">
+<p>A full row has about 129280 floats (vocabulary size inferred). Sorting it for top-p is expensive. With {{term force-topk}}, the sampler first keeps only the <code>N</code> largest logits of each row, with their ids, and does all later work on <code>N</code> columns:</p>
+<x-code file="deepinfer/model_executor/layers/sampler_utils.py" lines="165-183" highlight="166-167,172-180" />
+<ol>
+  <li>Line 167: <code>topk(..., sorted=False)</code> returns float32 values <code>[R, N]</code> and int32 <code>token_index [R, N]</code>. The function comes from the vendor library DeepSelect. On Ascend, an import hook replaces it ({{link concepts/hardware-platforms}}).</li>
+  <li>Lines 172-180: the drafts of the previous step live in the top-<code>N</code> space of the <em>draft</em> model. <code>remap_draft_topk</code> moves them into the top-<code>N</code> space of the target row ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:165-203}}). A draft token that is not in the target top-<code>N</code> gets id <code>-1</code>, and <code>-1</code> forces a reject ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:221-222}}, {{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:46-48}}).</li>
+  <li>After the kernel, <code>map_lookup</code> turns column indices back into vocabulary ids ({{cite deepinfer/model_executor/layers/sampler.py:460-467}}).</li>
+</ol>
+<p><strong>What it changes.</strong> A token outside the top <code>N</code> can never be sampled, and its logprob is minus infinity. A script that needs full-vocabulary logprobs sets <code>sampler_force_topk=0</code> for this reason ({{cite examples/yoco/yoco_equiv.py:559}}).</p>
+<p><strong>Memory.</strong> The draft logprobs live in the {{term mtp-info-pool}}, with <code>(max_num_seqs + 1) × nextn</code> rows of <code>N</code> floats, plus <code>N</code> int32 ids with force top-k ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:20-23}}). Example with <code>max_num_seqs = 64</code> and <code>nextn = 5</code>: 325 rows. With <code>N = V = 129280</code>, the pool needs 325 × 129280 × 4 bytes, about 168 MB. With <code>N = 4096</code>, it needs 325 × 4096 × 8 bytes, about 10.6 MB.</p>
+<p><strong>Limits and settings.</strong> <code>remap_draft_topk</code> asserts <code>N ≤ 16384</code> on NVIDIA and <code>N ≤ 4096</code> on Ascend ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:189}}). The code default is 0, off ({{cite deepinfer/environ.py:150}}). <code>examples/offline_inference.py</code> uses 4096 ({{cite examples/offline_inference.py:17}}), and <code>examples/benchmark.py</code> uses 1024 ({{cite examples/benchmark.py:54}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Logprobs, top logprobs, sum_smaller_probs and prompt logprobs">
+<p><strong>Token logprob.</strong> For each sampled token, the sampler looks up its processed {{term logprob}} with <code>map_lookup</code> ({{cite deepinfer/model_executor/layers/sampler.py:494-499}}).</p>
+<p><strong>Top logprobs.</strong> <code>_prepare_top_info</code> takes the <code>k</code> largest logprobs of each row, sorted ({{cite deepinfer/model_executor/layers/sampler.py:636-648}}). <code>k</code> is the <em>largest</em> <code>top_logprobs</code> of all requests in the batch ({{cite csrc/engine/prepare_sample.cpp:157}}). So the tensor has the same width for all rows.</p>
+<p><strong>sum_smaller_probs.</strong> With <code>DEEPINFER_COMPUTE_SUM_SMALLER_PROBS=1</code>, the sampler also returns one more value per row. It is the probability sum of all tokens that are less likely than the sampled token, plus the sampled token itself. Equal probabilities are ordered by column index:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/sum_smaller_probs.py" lines="31-44" caption="Reference implementation. Example: probabilities [0.5, 0.3, 0.2], sampled token 1 (0.3): the result is 0.2 + 0.3 = 0.5." />
+<p><strong>{{term prompt-logprobs | Prompt logprobs}}.</strong> With <code>SamplingParams(prompt_logprobs=True)</code>, a prefill step also returns the logprob of each prompt token, given the tokens before it:</p>
+<ol>
+  <li>C++ selects every row of the chunk except the last row of the last chunk, and stores the <em>next</em> prompt token as the target ({{cite csrc/engine/prepare_sample.cpp:12-18}}, {{cite csrc/engine/prepare_sample.cpp:181-189}}).</li>
+  <li><code>compute_prompt_logprobs</code> works in chunks of 8192 rows, so the float32 logits never exceed <code>8192 × V</code> ({{cite deepinfer/model_executor/layers/sampler_utils.py:17}}, {{cite deepinfer/model_executor/layers/sampler_utils.py:93-110}}).</li>
+  <li>Each chunk runs <code>fused_sample</code> without a draw, with the temperature, top-p and top-k of the request ({{cite deepinfer/model_executor/layers/sampler_utils.py:69-78}}).</li>
+  <li>A post function splits the flat result back into one list per request ({{cite deepinfer/model_executor/layers/sampler.py:205-210}}).</li>
+</ol>
+<p>Example: a 41-token prompt in one chunk gives 40 prompt logprobs. With 8192 × 129280 × 4 bytes, one chunk of logits needs about 4.2 GB. YOCO truncation turns prompt logprobs off ({{cite deepinfer/engine/llm_engine.py:529-537}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Golden tokens: teacher forcing">
+<p>The docstring of the class names this feature "golden teacher forcing" ({{cite deepinfer/model_executor/layers/sampler.py:92}}). A request can pass <code>golden_token_ids</code>, a list of output tokens ({{cite deepinfer/sampling_params.py:60}}). The sampler then outputs these tokens instead of its own samples, while it still computes all logprobs.</p>
+<ol>
+  <li>The C++ sequence stores the list ({{cite csrc/engine/pybind_sequence.cpp:36}}). At each step, <code>next_golden_tokens</code> returns <code>2 × nextn + 1</code> values from the current output length, padded with <code>-1</code> ({{cite csrc/engine/sequence.hpp:155-165}}).</li>
+  <li><code>prepare_sampler_inputs</code> writes up to <code>min(seqlen_q, nextn + 1)</code> of them into <code>golden_output</code>, one per row; other rows get <code>-1</code> ({{cite csrc/engine/prepare_sample.cpp:229-248}}).</li>
+  <li>Prefill: <code>_update_golden_tokens</code> replaces the sample where <code>golden_output != -1</code>, and looks up the logprob of the golden token ({{cite deepinfer/model_executor/layers/sampler.py:665-677}}).</li>
+  <li>Decode: a row with a golden token accepts its draft only if the draft equals the golden token, and outputs the golden token ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:239-242}}).</li>
+</ol>
+<p>Result: the request follows the golden text exactly. The logprobs show how likely the model finds that text, and the accept counts show how well the drafts match it.</p>
+</x-deepdive>
+
+<x-deepdive title="Structured-output masks inside the sampler">
+<p><code>_get_so_mask</code> runs on the CPU while the device computes the logits ({{cite deepinfer/model_executor/layers/sampler.py:135-138}}). It returns nothing when no request in the batch has a grammar ({{cite deepinfer/model_executor/layers/sampler.py:318-319}}).</p>
+<ul>
+  <li><strong>Layout.</strong> One pinned int32 bit mask <code>[batch, ceil(V / 32)]</code> per step: <code>max_MTP_value + 1</code> masks, so 6 by default ({{cite deepinfer/model_executor/layers/sampler.py:323-327}}). Mask 0 is for row 0, whose input is the last real token. Mask <code>j</code> (1 to 5) is for row <code>j</code>, whose input is draft <code>j</code>.</li>
+  <li><strong>Drafts.</strong> The matcher accepts the drafts one by one and fills one mask per accepted draft. It stops at the first draft that the grammar forbids. Then <code>rollback</code> undoes the trial ({{cite deepinfer/model_executor/layers/sampler.py:366-376}}).</li>
+  <li><strong>Copy.</strong> A side stream copies the masks to the device and records an event. The main stream waits for that event before it applies the masks ({{cite deepinfer/model_executor/layers/sampler.py:391-404}}, {{cite deepinfer/model_executor/layers/sampler.py:163-164}}).</li>
+  <li><strong>Errors.</strong> A matcher error kills only its own request (<code>so_status = -1</code>). A comment explains why: an exception here would stop all requests and time out the NCCL barrier ({{cite deepinfer/model_executor/layers/sampler.py:377-386}}).</li>
+</ul>
+<p>The page {{link concepts/structured-outputs}} explains the grammar matcher.</p>
+</x-deepdive>
+
+<x-deepdive title="Follower ranks of context parallelism">
+<p>With context parallelism, only the driver rank samples. On a follower rank, <code>sampler_inputs.driver</code> is <code>None</code> ({{cite deepinfer/model_executor/layers/sampler.py:136-137}}). The follower still does two things, because they contain collective operations ({{cite deepinfer/model_executor/layers/sampler.py:145-161}}):</p>
+<ul>
+  <li>It runs <code>compute_prompt_logprobs</code>. Translated comment: <em>"The result is valid only on the driver; the follower only takes part in the collective communication of the embedding gather."</em></li>
+  <li>In a decode step, it runs <code>DFlash.decode_forward</code> without a driver input. It gets the sampled tokens of the driver by a broadcast ({{cite deepinfer/model_executor/models/mtp/dflash.py:358-365}}).</li>
+</ul>
+<p>Then it returns an empty <code>SamplerOutput</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables that the sampler reads">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_SAMPLER_FORCE_TOPK</code></td><td><code>0</code> (off) ({{cite deepinfer/environ.py:150}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:99}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:102}}</td><td>Width <code>N</code> of the sampling space; also of the draft logprobs.</td></tr>
+    <tr><td><code>DEEPINFER_COMPUTE_SUM_SMALLER_PROBS</code></td><td><code>0</code> ({{cite deepinfer/environ.py:104}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:104}}</td><td>Adds <code>sum_smaller_probs</code> and the accepted draft logprobs to the output.</td></tr>
+    <tr><td><code>DEEPINFER_DECODE_TOKEN_BLACKLIST</code></td><td>empty ({{cite deepinfer/environ.py:151}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:108-112}}</td><td>Token ids that can never be sampled. Format <code>0..3,7,10..12</code>; ids must be in <code>[0, V - 1]</code>.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/layers/sampler.py:105}}</td><td>Number of drafts; number of structured-output masks minus 1.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Bad parameters.</strong> <code>SamplingParams</code> raises <code>ValueError</code>, for example for <code>top_k=0</code> or <code>top_p=0</code> ({{cite deepinfer/sampling_params.py:93-105}}). Use <code>top_k=-1</code> to turn top-k off.</li>
+  <li><strong>Bad blacklist.</strong> A wrong format or an id outside the vocabulary raises <code>ValueError</code> when the sampler is made ({{cite deepinfer/model_executor/utils.py:37-38}}). The engine does not start.</li>
+  <li><strong>Unexpected logprobs.</strong> The returned logprobs come from the filtered distribution, and with force top-k from <code>N</code> columns only. They are not the raw model probabilities.</li>
+  <li><strong>Different outputs in two runs.</strong> Without a fixed <code>seq_seed</code>, every request gets a new random seed ({{cite deepinfer/sampling_params.py:87-88}}).</li>
+  <li><strong>Mixed batch.</strong> <code>prepare_sampler_inputs</code> stops with a check failure if one batch mixes prefill and decode sequences ({{cite csrc/engine/prepare_sample.cpp:61}}). The scheduler never makes such a batch.</li>
+  <li><strong>Grammar failure.</strong> A matcher error ends only that request with <code>so_status = -1</code> ({{cite deepinfer/model_executor/layers/sampler.py:377-386}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The sampler decides every output token. Its float32 logits for only the needed rows keep memory small. Its seeded hash makes the output repeatable. Its verification turns the drafts into extra tokens per step.</p>
+
+<x-quiz>
+  <x-q level="easy">A prefill step has 3 prompts of 10, 20 and 30 tokens. How many rows of logits does the sampler make, and of what dtype?
+    <x-a><p>3 rows, one for the last token of each prompt, in float32 ({{cite csrc/engine/prepare_sample.cpp:197}}, {{cite deepinfer/model_executor/layers/sampler_utils.py:25}}). The <code>selected_token_indices</code> are <code>[9, 29, 59]</code>.</p></x-a>
+  </x-q>
+  <x-q level="easy">A request sets <code>temperature=0</code>. What does DeepInfer do with this value?
+    <x-a><p>It replaces it with <code>SAMPLING_EPS = 1e-5</code> and sets <code>top_p=1.0</code> and <code>top_k=-1</code> ({{cite deepinfer/sampling_params.py:76-79}}). The draw is then almost always the most likely token.</p></x-a>
+  </x-q>
+  <x-q level="medium">Two runs use the same prompt and the same <code>seq_seed</code>, but the second run has more requests in the batch. Why can the sampler still give the same token?
+    <x-a><p>The draw hashes only the seed, the sample position and the case. It does not use the batch size or the row order ({{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:17-21}}). For fully equal outputs, the logits must also be equal, so the README also asks for <code>DEEPINFER_BATCH_INVARIANT=1</code> and <code>DEEPINFER_ENABLE_MTP_VARLEN=0</code> ({{cite README.md:28}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>DEEPINFER_DECODE_TOKEN_BLACKLIST=5</code>. Can token 5 be the first token after the prompt?
+    <x-a><p>No. The blacklist fill at line 169 runs before the prefill and decode split at line 171, so it applies to prefill rows too ({{cite deepinfer/model_executor/layers/sampler.py:167-171}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>DEEPINFER_SAMPLER_FORCE_TOPK=4096</code>, a request asks for prompt logprobs. One prompt token is the 5000th most likely token at its position. What logprob does it get, and why?
+    <x-a><p>Minus infinity. Each chunk keeps only the 4096 largest logits and their ids, then looks up the prompt token by key; a missing key gives minus infinity ({{cite deepinfer/model_executor/layers/sampler_utils.py:67-78}}, {{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:149-152}}). This is in the deep dive "Force top-k".</p></x-a>
+  </x-q>
+</x-quiz>

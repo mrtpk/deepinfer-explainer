@@ -1,0 +1,222 @@
+---
+title: models/mtp/dflash.py: the DFlash draft model
+nav_title: mtp/dflash.py
+level: Advanced
+prerequisites: concepts/speculative-decoding, concepts/dspark
+related: concepts/dspark, concepts/speculative-decoding, code/sampler, code/deepseek, code/decoder-layer, code/v4-attn, concepts/sliding-window-attention, concepts/cuda-graphs, tours/spec-decode-round
+summary: dflash.py holds DFlash, the draft model of DSpark. It writes draft keys from main-model features during the forward pass, makes 5 drafts per request in one pass after the verification, and stores drafts, logprobs and confidences in the MTP info pool.
+---
+<h2>Purpose</h2>
+<p><code>DFlash</code> proposes the draft tokens of the next decode step, with their logprobs and their predicted accept chances, from the hidden states of the main model.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/mtp/dflash.py</code>, 392 lines. The folder <code>mtp/</code> has only this file and an empty <code>__init__.py</code>.</td></tr>
+    <tr><th>Main class</th><td><code>DFlash(nn.Module)</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:82}}). Also <code>ConfidenceHead</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:46}}) and <code>_clone_linear_weight</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:38}}).</td></tr>
+    <tr><th>Runs in</th><td>Every rank that runs the model. Only the driver rank samples drafts and owns the MTP info pool ({{cite deepinfer/worker/model_runner.py:97-99}}).</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekModel.forward</code> (<code>update_main_cache</code>, every step) and <code>Sampler.forward</code> (<code>decode_forward</code>, decode steps).</td></tr>
+    <tr><th>Calls</th><td><code>DFlashDecoderLayer</code> (attention and MLP/MoE), <code>process_sampling</code> and <code>get_logits</code> from the sampler helpers, <code>confidence_head_fused</code>, <code>MTPInfoPool.store</code>, <code>build_dflash_input</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The accept test (sampler), the confidence scheduling (C++ <code>MTPVarlen</code>), the CUDA graph capture (<code>DFlashCudaGraphRunner</code>), the attention kernel (FlashMLA).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b9_dflash_arch" alt="Panel 1: target layers of the main model copy features into dflash_input; update_main_cache writes keys into the DFlash SWA cache. Panel 2: the draft block goes through the DFlash layers; per-step heads compute logits with a Markov term, a confidence and a sampled draft; results go to the MTP info pool." caption="Figure: the two entry points of DFlash. Panel 1 is <code>update_main_cache</code>; panel 2 is <code>run_drafts</code>. The same diagram is on the page {{link concepts/dspark}}." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>DeepseekForCausalLM.__init__</code></strong> makes it when <code>DEEPINFER_USE_NEXTN_DECODE &gt; 0</code>, with the main model's embedding and LM head ({{cite deepinfer/model_executor/models/deepseek.py:300-306}}).</li>
+  <li><strong><code>DeepseekModel.forward</code></strong> calls <code>update_main_cache</code> after the last main layer, in prefill and in decode ({{cite deepinfer/model_executor/models/deepseek.py:220-223}}).</li>
+  <li><strong><code>Sampler.forward</code></strong> calls <code>decode_forward</code> in decode steps: on the driver after the verification, on followers with no driver input ({{cite deepinfer/model_executor/layers/sampler.py:155-160}}, {{cite deepinfer/model_executor/layers/sampler.py:236-251}}).</li>
+  <li><strong><code>ModelRunner</code></strong> makes the pool on the driver of non-PROMPT engines and captures the DFlash CUDA graphs after the main graphs ({{cite deepinfer/worker/model_runner.py:97-99}}, {{cite deepinfer/worker/model_runner.py:532-550}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>DFlashDecoderLayer.update_main_cache</code> and <code>forward_drafts</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:208-239}}), which use <code>DFlashAttention</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:928-1008}}).</li>
+  <li><code>InputMetadataV4.build_dflash_input</code> for the fixed-stride metadata of the draft block ({{cite deepinfer/model_executor/input_metadata/dflash.py:36-84}}).</li>
+  <li><code>get_logits</code> and <code>process_sampling</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:14}}), <code>confidence_head_fused</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:15}}).</li>
+  <li><code>MTPInfoPool.store</code> ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:54-78}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_clone_linear_weight</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:38}}</td><td>Copies a weight (and its FP8 scale) so the main-key projection can have its own layout.</td></tr>
+    <tr><td><code>ConfidenceHead</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:46}}</td><td>One linear output + sigmoid with a per-step temperature.</td></tr>
+    <tr><td><code>DFlash.__init__</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:83}}</td><td>Takes the DFlash layers and heads from the checkpoint modules.</td></tr>
+    <tr><td><code>init_mtp_info_pool</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:188}}</td><td>Allocates the pool on the driver.</td></tr>
+    <tr><td><code>update_main_cache</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:198}}</td><td>Writes the main-token keys of every DFlash layer.</td></tr>
+    <tr><td><code>_embed_draft_init_tokens</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:230}}</td><td>Embeds <code>[golden, noise × 4]</code>.</td></tr>
+    <tr><td><code>forward_drafts</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:241}}</td><td>Runs the DFlash layers on the draft block.</td></tr>
+    <tr><td><code>allocate_output</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:271}}</td><td>Output buffers for the CUDA graph.</td></tr>
+    <tr><td><code>sample_drafts</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:279}}</td><td>Per step: logits, Markov term, confidence, sample; then the pool store.</td></tr>
+    <tr><td><code>run_drafts</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:347}}</td><td>The whole decode pass (broadcast, metadata, layers, sampling).</td></tr>
+    <tr><td><code>decode_forward</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:379}}</td><td>Graph replay, or <code>run_drafts</code> in eager mode.</td></tr>
+    <tr><td><code>moe_layer_list</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:389}}</td><td>DFlash MoE layers, for expert load balancing.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>, part 1: layers and the main-key projection</h3>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="111-153" highlight="112-114,117-123,126-136,139-144,146-152">
+<x-tr line="114">DFlash prefill_only mode: load only the parameters of the main-cache path.</x-tr>
+<x-tr line="117">The main and draft projections need different contiguous layouts; the KV weights are kept twice, so memory grows a little.</x-tr>
+<x-tr line="125">The number of main model layers; used to give the MTP layers their layer ids.</x-tr>
+<x-tr line="143">The DFlash window_size must equal the main model's, or it cannot use the same SWA cache layout.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 112-114: a PROMPT engine (prefill only) needs only the main-key path. It skips the MLP, the layer norms of the DFlash layers and the heads ({{cite deepinfer/model_executor/models/decoder_layer.py:197-200}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:162}}).</li>
+  <li>Lines 117-123: <code>main_kv_proj</code> joins the KV-A weights of all DFlash layers into one linear layer with <code>L × head_dim</code> outputs. One matrix multiply then makes the keys of all layers.</li>
+  <li>Lines 126-136: one <code>DFlashDecoderLayer</code> per checkpoint block. Their layer ids follow the main layers, so the KV cache has an entry for each of them.</li>
+  <li>Lines 139-141: the noise token id and the window come from the checkpoint config. The block size is the number of drafts, not a config value.</li>
+  <li>Lines 146-152: <code>projection</code> maps <code>H × T</code> concatenated features to <code>H</code>.</li>
+</ol>
+
+<h3><code>__init__</code>, part 2: the heads</h3>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="155-186" highlight="155-156,159,163,165-176,180-186">
+<x-tr line="159">The HF DFlash always contains a confidence head.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 155-156: the Markov term exists only if <code>dspark_markov_rank &gt; 0</code>.</li>
+  <li>Line 159: <code>enable_confidence</code> is always <code>True</code>.</li>
+  <li>Lines 165-176: <code>markov_w1</code> is an embedding table <code>[V, rank]</code>; <code>markov_w2</code> is a linear layer <code>rank → V</code> with float32 output.</li>
+  <li>Lines 180-186: the confidence head weight is cast to BF16.</li>
+</ol>
+
+<h3><code>update_main_cache</code>: keys from the target layers</h3>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="211-228" highlight="213-217,219-220,221-228" />
+<ol>
+  <li>Lines 213-217: without prefill context parallelism, there is one feature row per query token. With it, the rows are in the mirror layout of the rank, and the positions come from <code>positions_cp</code>.</li>
+  <li>Line 219: <code>[rows, H × T] → [rows, H]</code>, then RMSNorm.</li>
+  <li>Line 220: <code>[rows, H] → [rows, L, head_dim]</code>.</li>
+  <li>Lines 221-228: each layer normalizes, applies RoPE, casts to FP8 (e4m3 with ue8m0 scales) and writes its key into its SWA cache ({{cite deepinfer/model_executor/models/v4_modules/attn.py:928-961}}).</li>
+</ol>
+<x-note title="Rejected drafts need no mask here">
+<p>In decode, this method replays inside the main CUDA graph. The verification has not run yet, so it also writes keys for drafts that the sampler will reject. The docstring explains why this is safe: the next draft block writes its keys at exactly those positions, before any read ({{cite deepinfer/model_executor/models/mtp/dflash.py:204-209}}).</p>
+</x-note>
+
+<h3><code>forward_drafts</code>: one pass over the draft block</h3>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="230-269" highlight="232-239,248,250-256,258-267" />
+<ol>
+  <li>Lines 232-239: an int tensor <code>[R, 5]</code>, all noise ids, then column 0 = the golden token. It is flattened to <code>[R × 5]</code> and embedded.</li>
+  <li>Lines 250-256: every DFlash layer runs on the block. Each layer writes the 5 draft keys into its cache, then attends to the main-key window (128 tokens in the docs) plus the 5 draft keys ({{cite deepinfer/model_executor/models/v4_modules/attn.py:963-1008}}).</li>
+  <li>Lines 258-267: with hyper-connections, the residual streams are mixed back into one hidden state; else the residual is added.</li>
+</ol>
+
+<h3><code>sample_drafts</code>: 5 drafts, one step at a time</h3>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="285-306" highlight="288-289,290-294,298-306" />
+<ol>
+  <li>Lines 288-289: final norm, then logits for all <code>R × 5</code> rows at once: float32 <code>[R × 5, V]</code>.</li>
+  <li>Lines 290-294: the sample positions of the drafts: <code>sample_position + last_valid_offset + (1 … 5)</code>, int32 <code>[5, R]</code>.</li>
+  <li>Lines 298-306: output buffers. The logprobs have width <code>V</code>, or <code>force_topk</code> with force top-k.</li>
+</ol>
+<p>The loop over the 5 steps (lines 308-334) is explained on {{link concepts/dspark}}, Step 4. After the loop:</p>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="336-345" />
+<p>The pool store skips requests whose write slot is 0, so the placeholder slot keeps its padding ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:61-66}}).</p>
+
+<h3><code>run_drafts</code> and <code>decode_forward</code></h3>
+<x-code file="deepinfer/model_executor/models/mtp/dflash.py" lines="347-387" highlight="353-357,362,365,367-372,374-376,385-387" />
+<ol>
+  <li>Lines 353-357: the docstring. With the DFlash CUDA graph, the broadcast, the metadata, the layers and the sampling (with the pool write) are all one graph.</li>
+  <li>Line 362: a rank without driver input must be a context-parallel follower, else an assertion fails.</li>
+  <li>Line 365: <code>cp_broadcast_multi_tensor</code> sends <code>last_valid_offset</code> and <code>golden_tokens</code> from the driver.</li>
+  <li>Lines 374-376: followers stop after the layers and return <code>None</code>.</li>
+  <li>Lines 385-387: if a graph runner exists, replay; else run eagerly.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<p><code>R</code> requests, <code>B = 5</code> drafts, <code>H</code> hidden size, <code>T</code> target layers, <code>L</code> DFlash layers, <code>V</code> vocabulary, <code>N</code> force top-k width.</p>
+<table>
+  <thead><tr><th>Value</th><th>Type and shape</th><th>Producer → consumer</th></tr></thead>
+  <tbody>
+    <tr><td><code>dflash_input</code></td><td><code>[total_q, H × T]</code></td><td>main layers ({{cite deepinfer/model_executor/models/decoder_layer.py:92-95}}) → <code>update_main_cache</code></td></tr>
+    <tr><td><code>main_k</code></td><td><code>[total_q, L, head_dim]</code></td><td><code>main_kv_proj</code> → SWA cache of each layer</td></tr>
+    <tr><td><code>MTPDriverInput.last_valid_offset</code></td><td>int32 <code>[R]</code>: accepted drafts</td><td>sampler → <code>run_drafts</code> ({{cite deepinfer/model_executor/sampling_inputs.py:72-75}})</td></tr>
+    <tr><td><code>MTPDriverInput.golden_tokens</code></td><td>int32 <code>[R]</code>: the new token</td><td>sampler → <code>run_drafts</code></td></tr>
+    <tr><td><code>MTPDecodeInput.first_token_positions</code></td><td>int32 <code>[R]</code>; <code>-1</code> = graph padding</td><td>C++ → <code>build_dflash_input</code> ({{cite deepinfer/model_executor/sampling_inputs.py:98-100}})</td></tr>
+    <tr><td><code>hidden_states_before_norm</code></td><td><code>[R × B, H]</code></td><td><code>forward_drafts</code> → <code>sample_drafts</code></td></tr>
+    <tr><td><code>logits_next</code></td><td>float32 <code>[R × B, V]</code></td><td><code>get_logits</code></td></tr>
+    <tr><td><code>next_n_token_logprobs</code></td><td>float32 <code>[R, B, N or V]</code></td><td>kernel → pool</td></tr>
+    <tr><td><code>MTPPredictInfo.token_ids</code>, <code>confidence_rates</code></td><td>int32 / float32 <code>[R, B]</code></td><td>→ pool and C++ <code>process_MTPInfo</code> ({{cite deepinfer/sequence.py:76-91}})</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="The MTP info pool">
+<p>The pool is device memory that keeps the draft data from one step to the next ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:14-52}}):</p>
+<ul>
+  <li><code>token_ids</code> int32 <code>[pool_rows]</code>, <code>logprobs</code> float32 <code>[pool_rows, N or V]</code>, <code>confidence</code> float32 <code>[pool_rows]</code> (initialized to 1), and <code>logprobs_index</code> int32 <code>[pool_rows, N]</code> with force top-k.</li>
+  <li><code>pool_rows = (max_num_seqs + 1) × nextn</code>. The scheduler gives each running sequence one slot ({{cite csrc/engine/scheduler.hpp:792-800}}).</li>
+  <li>Slot 0: token <code>V − 1</code> with logprob 0 (probability 1). With force top-k, column 0 holds id <code>V − 1</code>.</li>
+</ul>
+<p><strong>Worked example.</strong> <code>max_num_seqs = 64</code>, <code>nextn = 5</code>, force top-k 4096: 325 rows. Token ids 1.3 KB, logprobs 5.3 MB, index 5.3 MB, confidence 1.3 KB. Without force top-k and with the inferred <code>V = 129280</code>, the logprobs need 168 MB.</p>
+<p><strong>Who reads which slot.</strong> A sequence reads its own slot only if it has unread draft info; else it reads slot 0 ({{cite csrc/engine/sequence.hpp:149-153}}). It always writes its own slot ({{cite csrc/engine/sequence.hpp:409-413}}). The verification of step N reads what DFlash wrote in step N−1, and DFlash then writes the slot again in step N. A docstring note says that both run on the same stream, so the stream keeps this order ({{cite deepinfer/model_executor/layers/sampler.py:85}}).</p>
+</x-deepdive>
+
+<x-deepdive title="CUDA graph of the DFlash pass">
+<p><code>DFlashCudaGraphRunner</code> captures one graph per batch size. The sizes come from <code>build_graph_batch_sizes(max_num_seqs, DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL)</code>, with the default step 8 ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:32-40}}).</p>
+<ul>
+  <li><strong>Capture.</strong> Largest size first, with a warm-up run, on the graph stream and memory pool of the main graphs. The inputs are padding buffers with the noise token as golden token ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:42-75}}). The main graphs must exist first ({{cite deepinfer/worker/model_runner.py:539}}).</li>
+  <li><strong>Replay.</strong> Pick the smallest captured size that fits, copy the real inputs into the graph buffers, replay, and cut the output to the real request count ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:77-91}}).</li>
+  <li><strong>Too many requests.</strong> A batch larger than the largest size raises <code>ValueError("No DFlash CUDA graph for ...")</code> ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:79-80}}).</li>
+  <li><strong>Off switch.</strong> <code>DEEPINFER_DFLASH_ENFORCE_EAGER=1</code>, or no CUDA graphs at all ({{cite deepinfer/worker/model_runner.py:80-85}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>The checkpoint has no layers after the main model</td><td><code>IndexError</code> (message in Chinese: "the model has no MTP layers / wrong layer count")</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:93-94}}</td></tr>
+    <tr><td>An extra layer is not a DFlash block</td><td><code>NotImplementedError("Only DFlash speculative heads are supported")</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:96-97}}</td></tr>
+    <tr><td>Layer count is not <code>num_nextn_predict_layers</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:110}}</td></tr>
+    <tr><td>DFlash window differs from the main window</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:144}}</td></tr>
+    <tr><td>Follower without context parallelism</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:362}}</td></tr>
+    <tr><td>More than 32 drafts</td><td><code>AssertionError</code> in <code>get_fused_dflash_get_input</code></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:240}}</td></tr>
+    <tr><td>Wrong temperature list length</td><td><code>ValueError</code> at first access</td><td>{{cite deepinfer/environ.py:140-141}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:103}}</td><td>Drafts per request; also the block size (line 141).</td></tr>
+    <tr><td><code>DEEPINFER_SAMPLER_FORCE_TOPK</code></td><td><code>0</code> ({{cite deepinfer/environ.py:150}})</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:102}}</td><td>Width of the stored draft logprobs.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE</code></td><td><code>1.0</code> ({{cite deepinfer/environ.py:134-143}})</td><td>{{cite deepinfer/model_executor/models/mtp/dflash.py:62}}</td><td>Sigmoid temperature per step.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_ENFORCE_EAGER</code></td><td>off ({{cite deepinfer/environ.py:156}})</td><td>{{cite deepinfer/worker/model_runner.py:82}}</td><td>No DFlash CUDA graph.</td></tr>
+    <tr><td><code>DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL</code></td><td><code>8</code> ({{cite deepinfer/environ.py:157}})</td><td>{{cite deepinfer/worker/dflash_cuda_graph_runner.py:36}}</td><td>Step between captured batch sizes.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/dspark}}: why DFlash predicts confidences, and how the scheduler uses them.</li>
+  <li>{{link concepts/speculative-decoding}}: how the sampler checks the drafts.</li>
+  <li>{{link concepts/sliding-window-attention}}: the window cache that DFlash shares in layout with the main model.</li>
+  <li>{{link concepts/cuda-graphs}}: graph capture and replay.</li>
+  <li>{{link code/sampler}}: the caller of <code>decode_forward</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which two methods of <code>DFlash</code> run in every decode step, and who calls them?
+    <x-a><p><code>update_main_cache</code>, called by <code>DeepseekModel.forward</code> ({{cite deepinfer/model_executor/models/deepseek.py:220-223}}), and <code>decode_forward</code>, called by <code>Sampler.forward</code> ({{cite deepinfer/model_executor/layers/sampler.py:236-251}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does DFlash keep a second copy of the KV-A weights of its layers?
+    <x-a><p>The main-key projection joins the weights of all layers into one matrix, and needs another contiguous layout than the draft projection. The comment says that the KV weights are kept twice and memory grows a little ({{cite deepinfer/model_executor/models/mtp/dflash.py:117-123}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request accepted 2 drafts at input positions 49 to 54. At which positions does DFlash place its draft block, and what is the input token at the first position?
+    <x-a><p>Positions 52 to 56 (<code>a = 49 + 2 = 51</code>, block <code>a + 1 … a + 5</code>) ({{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:168-174}}). The first input is the golden token, the token that the sampler just made; the others are the noise token ({{cite deepinfer/model_executor/models/mtp/dflash.py:230-239}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>max_num_seqs = 64</code> and no force top-k, how much memory do the draft logprobs of the pool use, and why so much?
+    <x-a><p>325 rows × 129280 × 4 bytes ≈ 168 MB (vocabulary size inferred). The pool keeps a full row of logprobs for every draft of every slot, because the verification needs <code>p</code> for every token to build the residual ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:20-37}}). This is in the deep dive "The MTP info pool".</p></x-a>
+  </x-q>
+</x-quiz>

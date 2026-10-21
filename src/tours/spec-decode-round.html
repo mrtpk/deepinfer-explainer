@@ -1,0 +1,240 @@
+---
+title: Tour: One speculative decoding round
+nav_title: One speculative decoding round
+level: Advanced
+prerequisites: tours/life-of-a-request, concepts/speculative-decoding, concepts/dspark
+related: concepts/speculative-decoding, concepts/dspark, concepts/sampler, code/sampler, code/dflash, concepts/zero-overhead-scheduling, concepts/sliding-window-attention, tours/life-of-a-request
+summary: Follow request "1" through one decode step with 5 drafts, in 12 stops: verification length, inputs, forward pass, sampler inputs, accept test, residual, DFlash drafts, confidences, results, cache rollback, and the length of the next check.
+---
+<x-sentence>We follow one request through one decode step with 5 drafts. We start at the scheduler and end at the length of the next check.</x-sentence>
+
+<h2>The idea</h2>
+<p>The tour {{link tours/life-of-a-request}} showed one request from the prompt to the output. Its stops 10 and 11 touched the sampler and the drafts only briefly. This tour stays inside <em>one</em> {{term decode}} step with {{term draft-token | draft tokens}} and reads every part of it.</p>
+<p>We use the same request <code>"1"</code> as Tour 1 (<code>temperature=0.4</code>, <code>seq_seed=1</code>, <code>top_logprobs=4</code>). The step is a later decode step, the same one as the worked example in Tour 1, stop 12:</p>
+<ul>
+  <li>Before the step, the sequence has 50 tokens (positions 0 to 49). The KV cache holds 49 of them: <code>cache.num_tokens = 49</code>. Token 49 is the last real token <code>t</code>; it is not in the cache yet.</li>
+  <li>The previous step left 5 drafts <code>d1 … d5</code> in the {{term mtp-info-pool}}, in slot 2 (Tour 1, stop 5).</li>
+  <li>In this step the sampler accepts <code>d1</code> and <code>d2</code>, rejects <code>d3</code>, and samples <code>r</code> from the {{term residual-distribution}}. DFlash then drafts <code>e1 … e5</code>.</li>
+</ul>
+<p>Token ids, probabilities and random numbers in this tour are illustrative. Positions, shapes and slot numbers follow the code.</p>
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Where</th><th>Runs in</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The scheduler sets the verification length</td><td><code>scheduler.hpp</code>, <code>mtp_varlen.hpp</code></td><td>C++</td></tr>
+    <tr><td>2</td><td>Six input tokens and their cache slots</td><td><code>prepare_tensor_input_base.cpp</code>, <code>_v4.cpp</code></td><td>C++</td></tr>
+    <tr><td>3</td><td>The forward pass, and the DFlash keys</td><td><code>DeepseekModel.forward</code>, <code>DFlash.update_main_cache</code></td><td>device</td></tr>
+    <tr><td>4</td><td>Sampler inputs: positions, pool rows, stop ids</td><td><code>prepare_sample.cpp</code></td><td>C++</td></tr>
+    <tr><td>5</td><td>Six rows of logits and their labels</td><td><code>Sampler.forward</code>, <code>_verification</code></td><td>device</td></tr>
+    <tr><td>6</td><td>The accept test, row by row</td><td><code>fused_sample</code></td><td>device</td></tr>
+    <tr><td>7</td><td>The accepted prefix and the new token</td><td><code>get_accept_result</code>, <code>finalize_verification</code></td><td>device</td></tr>
+    <tr><td>8</td><td>DFlash drafts the next 5 tokens</td><td><code>DFlash.run_drafts</code></td><td>device</td></tr>
+    <tr><td>9</td><td>Results leave the sampler</td><td><code>Sampler.forward</code>, <code>SamplerOutput</code></td><td>device → CPU</td></tr>
+    <tr><td>10</td><td>C++ appends the tokens</td><td><code>process_MTPInfo</code>, <code>process_outputs</code>, <code>outputs.hpp</code></td><td>C++</td></tr>
+    <tr><td>11</td><td>What happens to the rejected drafts</td><td>cache slot maps, DFlash docstring</td><td>C++, device</td></tr>
+    <tr><td>12</td><td>The length of the next check</td><td><code>MTPVarlen</code>, <code>worker.py</code></td><td>C++, device</td></tr>
+  </tbody>
+</table>
+
+<h2>The picture</h2>
+<x-diagram name="b9_tour_round" alt="Panel 1: step N on the device: forward pass on t and d1 to d5 at positions 49 to 54; verification accepts d1 and d2, rejects d3 and samples r; DFlash puts r and 4 noise tokens at positions 52 to 56 and drafts e1 to e5 with confidences into pool slot 2. Panel 2: a table of what happens to the rejected data in each store: the KV count goes from 49 to 52, the SWA ring and compressed KV are written again, the DFlash cache is overwritten in the same step, the MTP pool slot is replaced, and the grammar matcher rolls back. Panel 3: confidences and running products of e1 to e5; without DSpark the next step sends r and e1 to e5, with DSpark for example only r and e1 to e3." caption="Figure: one round for request &quot;1&quot;. Panel 1 is stops 2-8, panel 2 is stop 11, panel 3 is stop 12." />
+<p>Read panel 1 from left to right: the three boxes are the three device phases of one step. Panel 2 is the answer to "how does DeepInfer undo the rejected drafts". The short answer is: it does not copy anything back. Panel 3 shows the decision for the next step.</p>
+
+<x-stop n="1" title="The scheduler sets the verification length">
+<p>We are in <code>Scheduler::_schedule</code>, in the decode branch. After the scheduler has picked the running sequences, it sorts them by length and asks <code>MTPVarlen</code> for one <code>seqlen_q</code> per sequence:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="648-659" />
+<p>Without DSpark there is no cost curve, so every sequence gets <code>1 + 5 = 6</code> ({{cite csrc/engine/mtp_varlen.hpp:153-158}}). Then <code>schedule()</code> builds the metadata of our sequence:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="694-700" highlight="694,696-697" />
+<p>For request <code>"1"</code>: <code>seqlen_q = 6</code> and <code>seqlen_k = 49 + inflight + 6</code>. Without ZOS, <code>inflight = 0</code>, so <code>seqlen_k = 55</code>. The step will compute positions 49 to 54. <code>start_inflight_step(nextn + 1)</code> then reserves 6 positions for the in-flight step ({{cite csrc/engine/scheduler.hpp:726}}).</p>
+<x-deepdive title="Stop 1 in detail: ZOS and the in-flight count">
+<p>With {{term zos | ZOS}}, the CPU schedules step N+1 before it knows how many drafts step N accepted. So it assumes the most: <code>total_inflight_tokens</code> grows by <code>nextn + 1</code> per step ({{cite csrc/engine/sequence.hpp:244-247}}), and <code>seqlen_k</code> includes it. A device kernel later fixes <code>seqlens_k</code>: it adds <code>seqlens_q</code> and subtracts <code>nextn − accepted</code> of the previous step ({{cite deepinfer/model_executor/layers/tilelang_ops/compute_seqlens_k_zos.py:10-31}}). Before sampling, the worker also sets <code>seqlen_k = seqlen_q + cache.num_tokens</code> on the CPU side ({{cite csrc/engine/zos.cpp:297-299}}). So in all cases the sampler sees <code>seqlen_k = 55</code> for our step.</p>
+<p>The counter <code>seq.mtp.schedule_cnt</code> grows by 1 here ({{cite csrc/engine/scheduler.hpp:694}}). DSpark compares it with <code>process_cnt</code> to know how old the stored accept rates are (stop 12).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="2" title="Six input tokens and their cache slots">
+<p>The batch metadata turns the sequence into tensors (Tour 1, stop 6). In a decode step, the input ids are the last real token, then <code>seqlen_q − 1</code> drafts:</p>
+<x-code file="csrc/engine/input_metadata/prepare_tensor_input_base.cpp" lines="104-120" highlight="109-110,112,114-118" />
+<p>Line 109 checks the length rule: <code>len − 1 + seqlen_q = seqlen_k</code>, so <code>50 − 1 + 6 = 55</code>. Line 112 copies token 49, and lines 114-118 add <code>d1 … d5</code>.</p>
+<p>The sliding-window cache slot of each token is <code>state_id × 134 + position % 134</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:98-107}}). The ZOS path on the device uses the same formula ({{cite deepinfer/model_executor/layers/tilelang_ops/prepare_v4_decode_metadata.py:217}}).</p>
+<p><strong>What the data looks like now</strong> (illustrative ids):</p>
+<pre><code class="language-python">input_ids  int32 [6] = [t, d1, d2, d3, d4, d5]     # e.g. [9021, 1735, 304, 6040, 13, 418]
+positions  int32 [6] = [49, 50, 51, 52, 53, 54]
+slot_mapping_store_swa = state_id * 134 + [49, 50, 51, 52, 53, 54]   # 134 = 128 + 6</code></pre>
+<x-deepdive title="Stop 2 in detail: compressed KV entries">
+<p>Compressed layers write a new entry only for a token where <code>(position + 1) % ratio == 0</code>. All other rows get slot <code>-1</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:71-91}}). The slot depends only on <code>position / ratio</code>. For a ratio of 4, this step writes one entry at position 51 (the group 48-51). Position 52 to 54 start the next group. Stop 11 explains what this means for rejected drafts.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="3" title="The forward pass, and the DFlash keys">
+<p>The main model runs once on all 6 tokens. It returns 6 {{term hidden-state | hidden states}}, not logits (Tour 1, stop 8). It also feeds the draft model. Some layers copy their residual stream into <code>dflash_input</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:144-145}}). After the last layer:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="219-223">
+<x-tr line="221">The target-layer features are used only here: write the DFlash main cache. In decode this is captured in the main CUDA graph, which saves the CPU launch cost of each kernel.</x-tr>
+<x-tr line="222">The padding rows of the CUDA graph go to state 0 of the placeholder (a dummy slot that the BlockManager never hands out).</x-tr>
+</x-code>
+<p><code>update_main_cache</code> writes one key per DFlash layer for positions 49 to 54, into the DFlash sliding-window cache ({{cite deepinfer/model_executor/models/mtp/dflash.py:219-228}}). The keys of 52 to 54 belong to drafts that will be rejected. That is fine (stop 11).</p>
+<pre><code class="language-python">hidden_states  bf16 [rows_out, H]      # rows_out = 6 + CUDA graph padding
+dflash_input        [rows_out, H × T]   # same rows as hidden_states; T target layers
+DFlash cache        keys for positions 49 … 54 in every DFlash layer</code></pre>
+</x-stop>
+
+<x-stop n="4" title="Sampler inputs: positions, pool rows, stop ids">
+<p>Now <code>execute_sample</code> builds the sampler inputs in C++ ({{cite deepinfer/worker/model_runner.py:348}}). For a decode sequence:</p>
+<x-code file="csrc/engine/prepare_sample.cpp" lines="200-225" highlight="202-206,216,218,221-225" />
+<ol>
+  <li>Lines 202-204: all 6 rows of the request are selected.</li>
+  <li>Line 206: <code>sample_position = seqlen_k − seqlen_q + 1 = 55 − 6 + 1 = 50</code>.</li>
+  <li>Line 216: the write slot is the request's own slot, 2.</li>
+  <li>Line 218: <code>ignore_eos=False</code>, so the stop ids are <code>[1, -1]</code> (EOS id 1).</li>
+  <li>Lines 221-225: rows 0 to 4 read pool rows <code>2 × 5 + j = 10 … 14</code>; row 5 reads row 0.</li>
+</ol>
+<p>The read slot is 2 only because the sequence has unread draft info; otherwise it is 0, the placeholder slot ({{cite csrc/engine/sequence.hpp:149-153}}).</p>
+<pre><code class="language-python">selected_token_indices  int32 [6]  = [0, 1, 2, 3, 4, 5]   # our request is first in the batch
+kernel.sample_positions int32 [1]  = [50]
+kernel.seq_seeds        uint64 [1] = [1]
+mtp_first_token_positions          = [0];  mtp_seqlens_q = [6]
+mtp_info_read_rows      int32 [6]  = [10, 11, 12, 13, 14, 0]
+mtp_info_write_slots    int32 [1]  = [2]
+stop_token_ids          int32 [1, 2] = [[1, -1]]</code></pre>
+</x-stop>
+
+<x-stop n="5" title="Six rows of logits and their labels">
+<p><code>Sampler.forward</code> gathers the 6 rows and makes float32 logits <code>[6, V]</code> ({{cite deepinfer/model_executor/layers/sampler.py:141-142}}). Then <code>_verification</code> labels the rows:</p>
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="427-431" />
+<pre><code class="language-python">row_to_req = [0, 0, 0, 0, 0, 0]
+local_step = [0, 1, 2, 3, 4, 5]
+is_verify  = [T, T, T, T, T, F]     # row 5 is the fresh row
+# per-row sample positions after expand_sampling_params:
+#   50 + local_step × 10000019 = [50, 10000069, 20000088, 30000107, 40000126, 50000145]</code></pre>
+<p>With <code>DEEPINFER_SAMPLER_FORCE_TOPK=4096</code> (the example script), the logits shrink to <code>[6, 4096]</code> plus <code>token_index [6, 4096]</code> ({{cite deepinfer/model_executor/layers/sampler_utils.py:166-167}}). The draft logprobs of pool rows 10 to 14 are moved into the same top-4096 space ({{cite deepinfer/model_executor/layers/sampler_utils.py:172-180}}).</p>
+</x-stop>
+
+<x-stop n="6" title="The accept test, row by row">
+<p>One <code>fused_sample</code> launch does temperature (0.4), top-p, top-k, log-softmax and the test for all 6 rows. The math, from the reference implementation:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/fused_sample.py" lines="235-246" highlight="238,241-242,245" />
+<p>Row <code>j</code> accepts its draft if <code>min(1, q/p) &gt; U</code>. <code>U</code> is the hash of seed 1 and <code>3 × position + 2</code>. With illustrative values:</p>
+<table>
+  <thead><tr><th>Row</th><th>Draft</th><th>p (draft)</th><th>q (target)</th><th>min(1, q/p)</th><th>U</th><th>Kernel result</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>d1</td><td>0.81</td><td>0.88</td><td>1</td><td>0.42</td><td>accept</td></tr>
+    <tr><td>1</td><td>d2</td><td>0.64</td><td>0.51</td><td>0.797</td><td>0.35</td><td>accept</td></tr>
+    <tr><td>2</td><td>d3</td><td>0.58</td><td>0.12</td><td>0.207</td><td>0.66</td><td>reject → residual sample <code>r</code></td></tr>
+    <tr><td>3</td><td>d4</td><td>0.70</td><td>0.65</td><td>0.929</td><td>0.10</td><td>accept (but not used)</td></tr>
+    <tr><td>4</td><td>d5</td><td>0.33</td><td>0.05</td><td>0.152</td><td>0.80</td><td>reject (not used)</td></tr>
+    <tr><td>5</td><td>none</td><td></td><td></td><td></td><td></td><td>fresh sample (not used)</td></tr>
+  </tbody>
+</table>
+<p>The kernel decides every row on its own. It does not know yet that rows 3 to 5 come after a reject. The residual sample of row 2 uses <code>max(q − α·p, 0)</code> and hash case 1 ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:232}}).</p>
+<x-deepdive title="Stop 6 in detail: the three hash cases of row 2">
+<p>Row 2 has position <code>20000088</code>. The kernel uses three different sequence numbers for it ({{cite deepinfer/model_executor/layers/tilelang_ops/random_sampling.py:76-81}}, {{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:239-245}}):</p>
+<ul>
+  <li><code>3 × 20000088 + 0</code>: the fresh sample of the row (not used, because the row verifies).</li>
+  <li><code>3 × 20000088 + 1</code>: the residual sample <code>r</code>.</li>
+  <li><code>3 × 20000088 + 2</code>: the number <code>U</code> of the accept test.</li>
+</ul>
+<p>So the accept decision and the residual draw are independent, and both are the same in every run with <code>seq_seed = 1</code>. The kernel also writes <code>accept_probs = max(1 − Σ residual, 0)</code> for each verify row ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:233-234}}). For row 2 that is an estimate of the chance that the row accepts a draft of the draft model. The <code>α</code> penalty makes it a little lower than the exact chance.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="7" title="The accepted prefix and the new token">
+<p><code>get_accept_result</code> keeps only the prefix before the first blocked row ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:243-247}}):</p>
+<pre><code class="language-python">blocked     = [F, F, T, F, T, T]     # rejected verify rows and the fresh row
+alive       = [T, T, T, F, F, F]     # no blocked row before it
+eff_accept  = [T, T, F, F, F, F]     # row 3 had a raw accept, but it is not alive
+is_final    = [F, F, T, F, F, F]     # first blocked row</code></pre>
+<p><code>finalize_verification</code> then packs the request results ({{cite deepinfer/model_executor/layers/sampler.py:518-566}}):</p>
+<pre><code class="language-python">last_valid_offset        int32 [1] = [2]          # accepted drafts
+sampled_token.token_ids  int32 [1] = [r]          # token of row 2 (residual sample)
+verified_tokens.token_ids int32 [6] = [d1, d2, -1, -1, -1, -1]
+num_generated_tokens  [5] = [1, 1, 0, 0, 0]
+num_verified_tokens   [5] = [1, 1, 1, 1, 1]
+emitted_stop_token    [1] = [False]           # r, d1, d2 are not EOS</code></pre>
+<p>The logprob of <code>r</code> and its 4 top logprobs come from row 2, the final row. The logprobs of <code>d1</code> and <code>d2</code> come from rows 0 and 1 ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:390-399}}).</p>
+</x-stop>
+
+<x-stop n="8" title="DFlash drafts the next 5 tokens">
+<p>Still inside the sampler, DFlash starts from <code>r</code> ({{cite deepinfer/model_executor/layers/sampler.py:235-251}}). <code>build_dflash_input</code> places a block of 5 positions after the last accepted position:</p>
+<x-code file="deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py" lines="166-174" highlight="169,172" />
+<p><code>accepted_pos = 49 + 2 = 51</code>, so the block covers positions 52 to 56. Row 0 holds <code>r</code> at position 52; rows 1 to 4 hold the noise token. Every row attends to the main keys of positions up to 51 (128-token window) and to the 5 block keys. The block keys at 52 to 56 are written over the main keys of the rejected drafts.</p>
+<p><code>sample_drafts</code> then makes the drafts one step at a time. Step <code>i</code> adds the Markov term of the previous token and computes the confidence. Then it samples with seed namespace <code>"mtp"</code> at position <code>50 + 2 + (i + 1)</code> ({{cite deepinfer/model_executor/models/mtp/dflash.py:290-294}}, {{cite deepinfer/model_executor/models/mtp/dflash.py:308-334}}).</p>
+<pre><code class="language-python">draft positions        [52, 53, 54, 55, 56]      # inputs: r, noise × 4
+predict_tokens.token_ids        int32 [1, 5] = [[e1, e2, e3, e4, e5]]   # predict positions 53 … 57
+predict_tokens.confidence_rates fp32  [1, 5] = [[0.92, 0.80, 0.60, 0.30, 0.20]]   # illustrative
+draft sample positions          [53, 54, 55, 56, 57]   # 50 + 2 + 1 … 5
+MTP info pool rows 10 … 14 ← e1 … e5, their logprobs and confidences</code></pre>
+<x-deepdive title="Stop 8 in detail: why drafts and target use different random streams">
+<p>The draft sample of step 1 uses position 53, case 0, with seed <code>1 + 1000000007</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:93}}). In the next step, the target model checks <code>e1</code> at row 0 with position 53, but with seed 1 and case 2. If both used the same number, the draft choice and the accept test would be correlated. The offset keeps them apart. The fused-sample test checks the <code>"mtp"</code> stream as its own case ({{cite deepinfer/model_executor/layers/tilelang_ops/fused_sample.py:686-697}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="9" title="Results leave the sampler">
+<x-code file="deepinfer/model_executor/layers/sampler.py" lines="258-275" highlight="258-259,261-265,273-275" />
+<p>The sampler starts <code>non_blocking</code> copies of all results to the CPU. It also keeps device copies for ZOS: the sampled token, the 5 new drafts, the confidences and <code>last_valid_offset</code> ({{cite deepinfer/model_executor/layers/sampler.py:287-290}}). Then the worker calls <code>pre_sampler_sync</code> and records <code>sample_end_evt</code> ({{cite deepinfer/worker/worker.py:162-168}}). With ZOS, the CPU reads these results during the next call of <code>execute_model_step</code> (Tour 1, stop 7).</p>
+</x-stop>
+
+<x-stop n="10" title="C++ appends the tokens">
+<p><code>LLMEngine._process_model_outputs</code> makes three C++ calls in a fixed order (Tour 1, stop 12). First, <code>process_MTPInfo</code> stores the new drafts and the running product of the confidences:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="1234-1251" highlight="1236-1238,1243-1249" />
+<p>For our request: <code>draft_tokens = [e1 … e5]</code> and <code>accept_rates = [0.92, 0.736, 0.442, 0.132, 0.026]</code>. Second, <code>process_outputs</code> reads the accepted ids until the first <code>-1</code>, appends <code>d1, d2, r</code>, and fixes the cache count ({{cite csrc/engine/scheduler.hpp:955-1000}}):</p>
+<pre><code class="language-python">seq.input.tokens   len 50 → 53         # d1 at 50, d2 at 51, r at 52
+seq.cache.num_tokens   49 → 52         # commit_processed_tokens(3): t, d1, d2 are cached
+seq.mtp.last_output_token = r          # the input token of the next step
+seq.mtp.accepted_tokens   = [d1, d2]</code></pre>
+<p>Third, <code>build_request_outputs</code> makes 3 <code>RequestOutput</code> objects. The last one (for <code>r</code>) has <code>draft_tok = 6</code> and <code>accept_tok = 3</code> ({{cite csrc/engine/outputs.hpp:214-216}}, {{cite csrc/engine/outputs.hpp:287-292}}).</p>
+<x-deepdive title="Stop 10 in detail: why num_tokens becomes 52, not 53">
+<p>The cache count is the number of tokens whose keys and values are valid in the cache. This step computed keys for positions 49 to 54. Only 49 (<code>t</code>), 50 (<code>d1</code>) and 51 (<code>d2</code>) are real tokens now. <code>r</code> at position 52 was <em>sampled</em> in this step, so the model has not seen it as an input yet. It is the first input of the next step. So <code>num_tokens = 49 + 3 = 52</code>, where 3 is the number of appended tokens (<code>token_cnt</code>) ({{cite csrc/engine/scheduler.hpp:997-1000}}, {{cite csrc/engine/sequence.hpp:216-221}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="11" title="What happens to the rejected drafts">
+<p>The step wrote cache entries for <code>d3</code>, <code>d4</code> and <code>d5</code> at positions 52 to 54. DeepInfer never copies anything back. Every store is indexed by position, and the next step writes the same positions again:</p>
+<ul>
+  <li><strong>KV count.</strong> <code>num_tokens = 52</code> says that positions 52 and later are not valid (stop 10). The next step writes them again.</li>
+  <li><strong>Sliding-window ring.</strong> Positions 52 to 54 sit in ring slots <code>52 … 54 % 134</code>. The next step writes positions 52 to 57 into the same slots. The ring has 6 extra slots, so the rejected writes never cover a key that a query still needs ({{cite deepinfer/worker/cache_engine.py:88-93}}).</li>
+  <li><strong>Compressed KV.</strong> An entry exists only at the end of a group. Its slot depends only on the group number, so the real token writes the same slot later ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:78-91}}). The float32 compression state uses a ring of <code>ratio + 5</code> positions for the same reason ({{cite deepinfer/worker/cache_engine.py:130-133}}).</li>
+  <li><strong>DFlash cache.</strong> Stop 8 already wrote the block keys of 52 to 56 over the rejected main keys, in this step ({{cite deepinfer/model_executor/models/mtp/dflash.py:204-209}}).</li>
+  <li><strong>MTP info pool.</strong> Slot 2 now holds <code>e1 … e5</code>. <code>d3 … d5</code> are gone.</li>
+  <li><strong>Grammar matcher.</strong> With a grammar, the sampler tried the drafts to build the masks, and then rolled the matcher back ({{cite deepinfer/model_executor/layers/sampler.py:366-376}}). Next step it accepts only <code>d1, d2, r</code> ({{cite deepinfer/model_executor/layers/sampler.py:352-355}}).</li>
+</ul>
+<x-deepdive title="Stop 11 in detail: the backtracking limit">
+<p>The ring sizes come from <code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code>, which is at least <code>nextn + 1 = 6</code> ({{cite deepinfer/environ.py:132}}).</p>
+<p>Proof for the ring of 134: this step wrote positions 49 to 54. Before that, slots <code>49 % 134</code> to <code>54 % 134</code> held positions <code>−85</code> to <code>−80</code>, which never existed. In general, a step that writes <code>P … P + 5</code> overwrites <code>P − 134 … P − 129</code>. Its oldest query is at <code>P</code>, and with a 128-token window it needs keys back to <code>P − 127</code> ({{cite csrc/engine/input_metadata/prepare_tensor_input_v4.cpp:644-649}}). The next step writes 52 to 57 over the rejected keys of 52 to 54 before its attention reads them. The docs state the same budget: "128-token window + 6 tokens of speculative backtracking" ({{cite doc/inference_deployment_qa.md:191}}).</p>
+<p>A preempted sequence goes back to the waiting queue. Its MTP counters and accept rates are cleared ({{cite csrc/engine/sequence.hpp:133-142}}), and its next prefill starts without drafts.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="12" title="The length of the next check">
+<p>The next step must send <code>r</code> and some of <code>e1 … e5</code>. Without DSpark, it sends all 5: <code>seqlen_q = 6</code>, positions 52 to 57. With <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>, the scheduler can send fewer. It sorts the accept rates of all requests and keeps the drafts with the best expected tokens per millisecond ({{cite csrc/engine/mtp_varlen.hpp:228-266}}).</p>
+<p>Our request has the running products <code>[0.92, 0.736, 0.442, 0.132, 0.026]</code>. If the batch budget keeps its first 3 drafts, then <code>seqlen_q = 4</code> and the inputs are <code>r, e1, e2, e3</code> at positions 52 to 55. The page {{link concepts/dspark}} shows how the budget comes from all requests together.</p>
+<x-code file="deepinfer/worker/worker.py" lines="218-234" highlight="219,231-234" />
+<p>With ZOS, the CPU scheduled the next step before it saw these confidences. So the CPU fixes only the total <code>total_q</code>, and line 219 recomputes the split on the device with the confidences of this step. Lines 231-234 copy the new lengths back, and the worker waits for this copy before it samples ({{cite deepinfer/worker/worker.py:146-152}}). Then the round starts again at stop 1.</p>
+<x-deepdive title="Stop 12 in detail: which accept rates the CPU uses">
+<p>When the CPU schedules step N+1 with ZOS, step N is not post-processed yet. So <code>schedule_cnt = process_cnt + 1</code> for our request, and its <code>accept_rates</code> are one round older than usual ({{cite csrc/engine/mtp_varlen.hpp:160-168}}). The CPU uses them for the total and for its own split, but the device replaces that split. The GPU kernel uses the newest confidences, <code>confidence_rates_gpu</code> of step N, for the split ({{cite deepinfer/worker/worker.py:219}}). A request that was not in step N gets the rate 0 in the GPU split. So its drafts come after all drafts with a rate above 0 ({{cite deepinfer/model_executor/layers/tilelang_ops/schedule_mtp_varlen.py:57-65}}).</p>
+</x-deepdive>
+</x-stop>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A stop token among the accepted drafts.</strong> <code>_check_stop</code> runs after each appended token, so the request ends at that token and the rest is dropped ({{cite csrc/engine/scheduler.hpp:982-990}}). The sampler also sets the confidences of the next drafts to 0 ({{cite deepinfer/model_executor/layers/sampler.py:252-254}}).</li>
+  <li><strong>The first decode step after prefill.</strong> It reads the placeholder slot 0, so it almost always makes only 1 token ({{cite deepinfer/model_executor/layers/mtp_info_pool.py:47-49}}).</li>
+  <li><strong>Inconsistent lengths.</strong> The input builder checks <code>len − 1 + seqlen_q = seqlen_k</code> and that the sequence has enough drafts ({{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:109}}, {{cite csrc/engine/input_metadata/prepare_tensor_input_base.cpp:115}}). A failure stops the engine.</li>
+  <li><strong>Reading the outputs too early.</strong> With ZOS, the tokens of this round arrive one <code>step()</code> call later ({{link concepts/zero-overhead-scheduling}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> One round made 3 tokens from one forward pass, and it prepared 5 new drafts in the same step. Rejected work costs device time, but it never needs a copy or an undo. The position-indexed caches simply write the same positions again.</p>
+
+<x-quiz>
+  <x-q level="easy">In this round, how many tokens does request "1" get, and which ones?
+    <x-a><p>Three: the accepted drafts <code>d1</code> and <code>d2</code>, and the residual sample <code>r</code> from row 2 ({{cite csrc/engine/scheduler.hpp:955-971}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which pool rows does the sampler read for request "1", and why is the last one 0?
+    <x-a><p>Rows 10 to 14 (<code>slot 2 × 5 + j</code>) hold the 5 drafts. The last row reads row 0, because it is a fresh sample with no draft ({{cite csrc/engine/prepare_sample.cpp:221-225}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Row 3 accepted <code>d4</code> in the kernel. Why does <code>d4</code> not appear in the output?
+    <x-a><p>Row 2 is blocked (it rejected <code>d3</code>), so row 3 is not alive. Only accepted rows before the first blocked row count ({{cite deepinfer/model_executor/layers/tilelang_ops/sampler.py:243-247}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">At which positions does DFlash place its draft block in this round, and why there?
+    <x-a><p>52 to 56. The last accepted position is <code>49 + last_valid_offset = 51</code>, and the block starts one position after it ({{cite deepinfer/model_executor/layers/tilelang_ops/get_kv_index.py:169-172}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The step wrote sliding-window keys for the rejected <code>d3</code> at position 52. Show that this write cannot destroy a key that a later query needs.
+    <x-a><p>The ring has 134 slots per sequence (128 window + 6 backtracking) ({{cite deepinfer/worker/cache_engine.py:88-93}}). Slot <code>52 % 134</code> last held position <code>52 − 134 = −82</code>, which never existed. In general, writes at <code>P … P + 5</code> overwrite <code>P − 134 … P − 129</code>. The oldest query of the step is at <code>P</code>, and it needs keys back to <code>P − 127</code> only. The next step then writes the real token <code>r</code> at position 52 into the same slot. This is the deep dive of stop 11.</p></x-a>
+  </x-q>
+</x-quiz>

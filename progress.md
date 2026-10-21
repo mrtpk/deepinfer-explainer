@@ -17,8 +17,8 @@ Current phase: **Full build — wave 1** (plan section 13)
 |---|---|---|---|
 | B1 Basics I | done | done (23 defects fixed) | yes |
 | B2 Basics II | done | done (16 defects fixed) | yes |
-| B3a Engine + scheduler | done | running | — |
-| B3b API + cache | running | — | — |
+| B3a Engine + scheduler | done | done (26 defects fixed) | yes |
+| B3b API + cache | done | running | — |
 | B4a Inputs + graphs | running | — | — |
 | B4b Worker + ZOS | running | — | — |
 | B5a Attention I | done | done (43 defects fixed) | yes |
@@ -27,14 +27,14 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B6b Engram + VL | running | — | — |
 | B7 MoE + EP | done | running | — |
 | B8 Scale | wave 3 | — | — |
-| B9 Decoding | done | running | — |
+| B9 Decoding | done | done (25 defects fixed) | yes |
 | B10a SO + precision | wave 3 | — | — |
 | B10b Kernels + loading | wave 3 | — | — |
 | B11 Start-up + reference | wave 3 | — | — |
 | D Diagrams to 1100 | done | n/a | yes |
 | F Final pass | later | — | — |
 
-## STOPPED 2026-10-21 18:21 (Dubai): usage limit reached (resets 20:30 Dubai)
+## RESUMED after the usage limit (was stopped 2026-10-21 18:21 Dubai)
 
 Subagents were cut off. Their files on disk are partial and NOT committed.
 Resume order after the reset:
@@ -43,6 +43,8 @@ Resume order after the reset:
 Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
+
+- FINAL-PASS TODO: Tour 1 stop 5: item 6 sums full lengths (incl. outputs after recompute), not prompt lengths; the token limit when unset is 2**30; structured output stops on preempt only when status != 0. learn/kv-cache: with ZOS the decode slot mapping is computed on the device.
 
 - FINAL-PASS TODO: code/llm-engine.html says no Python code calls fork_seq — examples/benchmark.py does (facts.md). Tour 1 simplification box: the fifth request starts at the next attempt point after a slot frees, not when another finishes.
 - FINAL-PASS TODO (CSS): wide tables inside deep dives scroll sideways; add a wrapping table style.
