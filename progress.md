@@ -20,7 +20,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B3a Engine + scheduler | done | done (26 defects fixed) | yes |
 | B3b API + cache | done | done (16 defects fixed) | yes |
 | B4a Inputs + graphs | running | — | — |
-| B4b Worker + ZOS | running | — | — |
+| B4b Worker + ZOS | done | running | — |
 | B5a Attention I | done | done (43 defects fixed) | yes |
 | B5b Attention II | running | — | — |
 | B6a Layer + mHC | running | — | — |
@@ -29,7 +29,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B8 Scale | running | — | — |
 | B9 Decoding | done | done (25 defects fixed) | yes |
 | B10a SO + precision | running | — | — |
-| B10b Kernels + loading | wave 3 | — | — |
+| B10b Kernels + loading | running | — | — |
 | B11 Start-up + reference | wave 3 | — | — |
 | D Diagrams to 1100 | done | n/a | yes |
 | F Final pass | later | — | — |
@@ -43,6 +43,8 @@ Resume order after the reset:
 Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
+
+- DECISION 2026-10-21: doc QA ~274 "post-process(N−1) while device runs N" and the code (post-process N in the call that launches N+1) are the same overlap with shifted numbering — not a contradiction. Pages use the code's numbering.
 
 - FINAL-PASS TODO: Tour 1 stop 5: item 6 sums full lengths (incl. outputs after recompute), not prompt lengths; the token limit when unset is 2**30; structured output stops on preempt only when status != 0. learn/kv-cache: with ZOS the decode slot mapping is computed on the device.
 
