@@ -34,6 +34,14 @@ Current phase: **Full build — wave 1** (plan section 13)
 | D Diagrams to 1100 | done | n/a | yes |
 | F Final pass | later | — | — |
 
+## STOPPED 2026-10-21 18:21 (Dubai): usage limit reached (resets 20:30 Dubai)
+
+Subagents were cut off. Their files on disk are partial and NOT committed.
+Resume order after the reset:
+1. Resume (continue, not restart): writers B3b, B4a, B4b, B5b, B6a, B6b; fact checks B3a, B7, B9.
+2. Then: fact checks for B3b, B4a, B4b, B5b, B6a, B6b; writers B8, B10a, B10b, B11; final pass F (TODOs below).
+Committed so far: Phase 1, D, B1, B2, B5a.
+
 ## Done
 
 - FINAL-PASS TODO: code/llm-engine.html says no Python code calls fork_seq — examples/benchmark.py does (facts.md). Tour 1 simplification box: the fifth request starts at the next attempt point after a slot frees, not when another finishes.
