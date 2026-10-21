@@ -28,6 +28,7 @@ cd deepinfer-explainer
 python3 build.py                 # build site/ (runs stale diagram scripts first)
 python3 build.py --strict        # also fail on warnings (use before hand-in)
 python3 build.py --force-diagrams
+python3 build.py --preview         # write site/ even if another writer's page has an error
 ```
 
 Open `site/index.html` with a double-click. The site works from disk (`file://`).

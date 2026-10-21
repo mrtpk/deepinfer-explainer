@@ -20,14 +20,14 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B3a Engine + scheduler | running | — | — |
 | B3b API + cache | running | — | — |
 | B4a Inputs + graphs | running | — | — |
-| B4b Worker + ZOS | wave 2 | — | — |
-| B5a Attention I | running | — | — |
+| B4b Worker + ZOS | running | — | — |
+| B5a Attention I | done | running | — |
 | B5b Attention II | wave 2 | — | — |
 | B6a Layer + mHC | wave 2 | — | — |
 | B6b Engram + VL | wave 2 | — | — |
 | B7 MoE + EP | running | — | — |
 | B8 Scale | wave 3 | — | — |
-| B9 Decoding | running | — | — |
+| B9 Decoding | done | running | — |
 | B10a SO + precision | wave 3 | — | — |
 | B10b Kernels + loading | wave 3 | — | — |
 | B11 Start-up + reference | wave 3 | — | — |
@@ -35,6 +35,9 @@ Current phase: **Full build — wave 1** (plan section 13)
 | F Final pass | later | — | — |
 
 ## Done
+
+- FINAL-PASS TODO: learn/kv-cache.html (already fact-checked) may say ica_state is float32 state for ratio-2 layers and that the main KV entry is 528 B; per B5a, ica_state is None in practice and the loader default is FP4 (288 B). Check and fix in pass F.
+- 2026-10-21: build.py --preview writes site/ even with errors (writers asked: one broken page blocked all previews).
 
 - 2026-10-21: User asked to change the commit email to contact@thomaspaul.dev; history rewritten (backup ref refs/backup/before-email-rewrite, not pushed). Repo-local user.email set.
 - 2026-10-21: User pushed main to https://github.com/mrtpk/deepinfer-explainer (origin). RULE from now: never rewrite pushed history; only add new local commits; push only when the user asks (works with: git -c credential.helper= -c credential.helper="/mnt/c/Program\ Files/Git/mingw64/bin/git-credential-manager.exe" push origin main).

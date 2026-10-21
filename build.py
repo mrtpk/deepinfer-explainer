@@ -1275,6 +1275,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--strict", action="store_true", help="treat warnings as errors")
     ap.add_argument("--force-diagrams", action="store_true", help="re-run all diagram scripts")
+    ap.add_argument("--preview", action="store_true",
+                    help="write site/ even when there are errors (to preview your pages while another page is broken)")
     args = ap.parse_args()
     t0 = time.time()
 
@@ -1358,7 +1360,9 @@ def main() -> int:
             print(e)
         print(f"\nBUILD FAILED: {len(R.errors)} error(s), {len(R.warnings)} warning(s)."
               + (" (--strict: warnings count as errors)" if strict_fail and not R.errors else ""))
-        return 1
+        if not args.preview:
+            return 1
+        print("--preview: writing site/ anyway. Do not hand in work while the build has errors.")
 
     # write into a private temp folder, then swap it in, so that parallel builds do not clash
     out = ROOT / f".site-tmp-{os.getpid()}"
@@ -1388,6 +1392,9 @@ def main() -> int:
     planned = sum(1 for e in ctx.entries.values() if not ctx.live(e.id))
     print(f"\nBuilt {len(rendered)} pages ({planned} planned pages shown as 'coming soon'), "
           f"{len(glossary)} glossary terms, {len(diagrams)} diagrams in {time.time() - t0:.1f}s.")
+    if R.errors:
+        print(f"PREVIEW ONLY: {len(R.errors)} error(s). Open site/index.html in a browser.")
+        return 1
     print(f"{len(R.warnings)} warning(s), 0 errors. Open site/index.html in a browser.")
     return 0
 
