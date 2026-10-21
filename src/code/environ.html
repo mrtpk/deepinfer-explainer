@@ -1,0 +1,117 @@
+---
+title: deepinfer/environ.py: the envs class and its EnvVar descriptors
+nav_title: environ.py
+level: Intermediate
+prerequisites: reference/env-vars
+related: reference/env-vars, code/config, tours/startup, concepts/hardware-platforms
+summary: environ.py declares all 59 DEEPINFER_* variables as EnvVar descriptors on one class, envs. A variable is parsed on its first read and then cached; rearm() makes the next read parse it again. The full variable table is on reference/env-vars.
+---
+<h2>Purpose</h2>
+<p><code>environ.py</code> is the one place where DeepInfer reads its <code>DEEPINFER_*</code> {{term environment-variable | environment variables}}: it parses each one on first use and keeps the result.</p>
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/environ.py</code>, 221 lines. No other <code>deepinfer</code> import, so any module can import it early.</td></tr>
+    <tr><th>Main class</th><td><code>envs</code> ({{cite deepinfer/environ.py:97}}), with 59 class attributes in 16 groups. The descriptor class is <code>EnvVar</code> ({{cite deepinfer/environ.py:31}}).</td></tr>
+    <tr><th>Runs in</th><td>Every process, on the first read of each attribute. A spawned process reads its own copy of the environment again.</td></tr>
+    <tr><th>Called by</th><td>Almost every module, as <code>envs.DEEPINFER_X</code>. The package exports <code>envs</code> at the top level ({{cite deepinfer/__init__.py:6}}).</td></tr>
+    <tr><th>Calls</th><td><code>os.getenv</code> only.</td></tr>
+    <tr><th>Not in this file</th><td>Five <code>DEEPINFER_*</code> names that other code reads with <code>os.getenv</code> or C++ <code>getenv</code>, and the <code>NCCL_*</code> and visible-device variables. The page {{link reference/env-vars}} lists them all.</td></tr>
+  </tbody>
+</table>
+<p>This page reads the mechanism. For the effect and the default of each variable, use {{link reference/env-vars}}.</p>
+
+<h2>Where it sits</h2>
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Readers.</strong> Code reads a value as an attribute, for example <code>envs.DEEPINFER_USE_NEXTN_DECODE</code> in <code>config.py</code> ({{cite deepinfer/config.py:13}}).</li>
+  <li><strong><code>rearm</code>.</strong> <code>EngineArgs.__post_init__</code> sets two variables with <code>os.environ.setdefault</code> and then calls <code>environ.rearm</code> for each ({{cite deepinfer/engine/arg_utils.py:51-60}}).</li>
+  <li><strong><code>rearm_all</code>.</strong> The test fixture in <code>tests/conftest.py</code> restores <code>os.environ</code> after each test and re-arms every descriptor ({{cite tests/conftest.py:21-26}}).</li>
+  <li><strong>Writers.</strong> Three places assign a value directly to the class: the memory profile ({{cite deepinfer/worker/model_runner.py:510-512}}), the userbuffer setup ({{cite deepinfer/model_executor/parallel_utils/userbuffer.py:90}}) and the benchmark script ({{cite examples/benchmark.py:148}}).</li>
+</ul>
+<h3>What it calls</h3>
+<p>Only <code>os.getenv(name)</code>, inside <code>EnvVar.__get__</code> ({{cite deepinfer/environ.py:50}}). It does not import <code>torch</code>.</p>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEFAULT_PREFILL_MAX_SUM_SEQLEN_K</code></td><td>{{cite deepinfer/environ.py:9}}</td><td><code>2**30</code>: the value that the scheduler gets when the prefill sum limit is unset.</td></tr>
+    <tr><td><code>_bool</code>, <code>_int</code>, <code>_float</code>, <code>_str</code></td><td>{{cite deepinfer/environ.py:12-25}}</td><td>Parse the text, or the default when the variable is unset.</td></tr>
+    <tr><td><code>_descriptors</code></td><td>{{cite deepinfer/environ.py:28}}</td><td>Name → descriptor, for <code>rearm</code>.</td></tr>
+    <tr><td><code>EnvVar</code></td><td>{{cite deepinfer/environ.py:31}}</td><td>The {{term descriptor}}: parse on the first read, then replace itself with the value.</td></tr>
+    <tr><td><code>EnvVar.int</code> … <code>EnvVar.choice</code></td><td>{{cite deepinfer/environ.py:61-94}}</td><td>Seven factory methods, one per value type.</td></tr>
+    <tr><td><code>envs</code></td><td>{{cite deepinfer/environ.py:97-210}}</td><td>The 59 variables, in 16 groups.</td></tr>
+    <tr><td><code>rearm(name)</code></td><td>{{cite deepinfer/environ.py:213-215}}</td><td>Put one descriptor back, so the next read parses again.</td></tr>
+    <tr><td><code>rearm_all()</code></td><td>{{cite deepinfer/environ.py:218-221}}</td><td>The same for all 59.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+<h3><code>EnvVar.__get__</code>: parse once, then step aside</h3>
+<x-code file="deepinfer/environ.py" lines="31-57" highlight="40-42,45-48,50,52-55,56" />
+<ol>
+  <li>Lines 40-42: when Python makes the class <code>envs</code>, each descriptor learns its own name and registers itself in <code>_descriptors</code>.</li>
+  <li>Lines 45-48: a lock makes the first read safe with threads. If the class dict already holds a plain value, the descriptor returns it. (Normally Python does not call <code>__get__</code> at all then, see line 56.)</li>
+  <li>Line 50: parse the text from <code>os.getenv</code>.</li>
+  <li>Lines 52-55: on a parse error, raise the same exception type with the variable name in front.</li>
+  <li>Line 56: <code>setattr(owner, name, value)</code> replaces the descriptor in the class with the value. Later reads are plain attribute reads.</li>
+</ol>
+<x-simplified><p>The page {{link reference/env-vars}} explains the descriptor protocol and each parse rule, with examples ("How DeepInfer reads a variable"). This page gives only the short version.</p></x-simplified>
+
+<h3>The groups and the derived variables</h3>
+<x-code file="deepinfer/environ.py" lines="128-147" highlight="132,134-143,147">
+  <x-tr line="130">The largest number of speculative tokens; default 5. Set it to 0 explicitly to turn speculative decoding off.</x-tr>
+</x-code>
+<p>Comments such as <code># -- MTP --</code> split the class into 16 groups. Three variables depend on others when they are read:</p>
+<ul>
+  <li><code>DEEPINFER_MAX_BACKTRACKING_TOKENS</code> is at least <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> (line 132).</li>
+  <li><code>DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE</code> accepts one float or a list with exactly <code>nextn</code> items (lines 134-143).</li>
+  <li><code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> is always on when <code>DEEPINFER_ACCELERATOR</code> is <code>"ascend"</code> (line 147).</li>
+</ul>
+
+<h3><code>rearm</code>: read the environment again</h3>
+<x-code file="deepinfer/environ.py" lines="213-221" />
+<p><code>rearm</code> puts the descriptor back into the class. The next read calls <code>__get__</code> and parses the current <code>os.environ</code>. <code>EngineArgs</code> needs this: an import before <code>LLM(...)</code> may already have read <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> as off.</p>
+
+<h2>Deep dive</h2>
+<x-deepdive title="Four ways a value can stay old">
+<ol>
+  <li><strong>Cached after the first read.</strong> A change of <code>os.environ</code> after the first read has no effect until <code>rearm</code> ({{cite deepinfer/environ.py:56}}).</li>
+  <li><strong>Copied at import time.</strong> A default argument or a module constant keeps the value from the import. Example: <code>SchedulerConfig</code> ({{cite deepinfer/config.py:193-194}}). <code>rearm</code> does not help here. The {{link reference/env-vars#import-time-table | import-time table}} lists six such variables.</li>
+  <li><strong>Overwritten by code.</strong> A direct assignment such as <code>envs.DEEPINFER_FORCE_IMBALANCE_RATIO = 0.0</code> replaces the descriptor with a plain value ({{cite deepinfer/worker/model_runner.py:512}}). Your exported value never takes effect after start-up.</li>
+  <li><strong>Another process.</strong> A spawned CP follower has its own <code>envs</code> class. It reads the environment that it got at its start, not later changes in the parent.</li>
+</ol>
+<p><strong>Worked example.</strong> A script runs <code>import deepinfer</code>, then <code>print(envs.DEEPINFER_ZERO_OVERHEAD_SCHEDULING)</code> (prints <code>False</code>, the default), then <code>LLM(...)</code>. <code>__post_init__</code> sets the variable to <code>"1"</code> and calls <code>rearm</code>. The next read returns <code>True</code>, so the engine runs with ZOS. Without line 55 of <code>arg_utils.py</code>, the engine would keep <code>False</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Parse rules and error paths">
+<table>
+  <thead><tr><th>Input</th><th>Result</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>bool: <code>"0"</code>, <code>""</code>, <code>"false"</code>, <code>"False"</code></td><td><code>False</code>; every other text is <code>True</code> (also <code>"off"</code>)</td><td>{{cite deepinfer/environ.py:12-13}}</td></tr>
+    <tr><td>int: <code>""</code> or <code>"1e3"</code></td><td><code>ValueError: DEEPINFER_X: invalid literal ...</code></td><td>{{cite deepinfer/environ.py:16-17}}, {{cite deepinfer/environ.py:51-55}}</td></tr>
+    <tr><td>choice: a text not in the list</td><td><code>ValueError</code> with the allowed values</td><td>{{cite deepinfer/environ.py:86-94}}</td></tr>
+    <tr><td>temperature list with the wrong length</td><td><code>ValueError</code></td><td>{{cite deepinfer/environ.py:140-141}}</td></tr>
+  </tbody>
+</table>
+<p>An error comes at the first read, not at import. So a bad value in a variable that no code reads gives no error.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link reference/env-vars}}: all variables, defaults, readers and recipes.</li>
+  <li>{{link code/config}}: the config classes that read four variables.</li>
+  <li>{{link tours/startup}}: when the variables are set and read during start-up (stops 2 and 3).</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">You export <code>DEEPINFER_ENFORCE_EAGER=off</code>. Is eager mode on or off?
+    <x-a><p>On. Only <code>"0"</code>, <code>""</code>, <code>"false"</code> and <code>"False"</code> parse as <code>False</code> ({{cite deepinfer/environ.py:12-13}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What does <code>environ.rearm("DEEPINFER_USE_MULTIMODAL_POOL")</code> do, and why does <code>EngineArgs</code> call it?
+    <x-a><p>It puts the descriptor back into <code>envs</code> ({{cite deepinfer/environ.py:213-215}}), so the next read parses <code>os.environ</code> again. <code>EngineArgs</code> has just set the variable with <code>setdefault</code>, and an earlier read could have cached the old value ({{cite deepinfer/engine/arg_utils.py:56-60}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In a running engine, you call <code>os.environ["DEEPINFER_FORCE_IMBALANCE_RATIO"] = "2"</code> and then <code>environ.rearm("DEEPINFER_FORCE_IMBALANCE_RATIO")</code>. Does the next read return 2.0? Why can it be different without the <code>rearm</code>?
+    <x-a><p>Yes, after <code>rearm</code> the next read parses "2" and returns 2.0. Without it, the read returns 0.0: the memory profile assigned <code>envs.DEEPINFER_FORCE_IMBALANCE_RATIO = 0.0</code>, which put a plain value in the class ({{cite deepinfer/worker/model_runner.py:510-512}}). See the deep dive "Four ways a value can stay old".</p></x-a>
+  </x-q>
+</x-quiz>

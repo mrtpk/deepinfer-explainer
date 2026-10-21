@@ -1,0 +1,138 @@
+---
+title: FAQ
+nav_title: FAQ
+level: Intermediate
+related: concepts/hardware-platforms, tours/life-of-a-request, tours/startup, concepts/zero-overhead-scheduling, concepts/dp-step-votes, reference/env-vars, reference/config-classes, code/stats-logger
+summary: Short answers with citations: AFD, what this release leaves out, the wait before the first prefill, one-step-late outputs, cloning RequestOutput, model sizes, hardware, where docs and code disagree, open questions, and questions from the deployment Q&A.
+---
+<p>Each answer is short and links to the page with the full explanation. Every statement about the code has a citation at commit <code>9bd9cf2</code>. "QA doc" means <code>doc/inference_deployment_qa.md</code>.</p>
+<ul>
+  <li><a href="#is-it-afd">Is DeepInfer AFD?</a> · <a href="#not-in-release">What is not in this release?</a> · <a href="#first-request-wait">Why does my first request wait about 70 steps?</a></li>
+  <li><a href="#previous-step-output">Why does step() return the previous step's output?</a> · <a href="#clone-output">Why must I clone RequestOutput?</a></li>
+  <li><a href="#model-sizes">Which model sizes are in the repo?</a> · <a href="#hardware">Which hardware does it run on?</a></li>
+  <li><a href="#docs-vs-code">Where do docs and code disagree?</a> · <a href="#open-questions">Known open questions</a> · <a href="#code-version">How do I get exactly this code version?</a></li>
+  <li><a href="#from-qa-doc">Questions from the deployment Q&amp;A</a></li>
+</ul>
+
+<h2 id="is-it-afd">Is DeepInfer AFD (Attention-FFN Disaggregation)?</h2>
+<p><strong>No.</strong> In {{term afd | AFD}}, attention layers and FFN layers run on different groups of devices. In DeepInfer, every device runs attention and its share of the MoE experts. Hidden states never go to a separate FFN group: the MoE layer sends tokens to the devices of their experts with expert-parallel dispatch and combine ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:461-511}}). One deployment also uses one hardware type: each process picks one platform, and its device groups use NCCL on NVIDIA or HCCL on Ascend ({{cite deepinfer/platform.py:222-227}}, {{cite deepinfer/model_executor/parallel_utils/parallel_state.py:82}}). The only split that the docs describe is between vision encoder, prefill and decode instances (E/P/D), and that split is not in this release ({{cite README.md:38-42}}). Read {{link concepts/hardware-platforms#is-it-afd | Is DeepInfer AFD?}} for the four reasons.</p>
+
+<h2 id="not-in-release">What is not in this release?</h2>
+<p>The README names three parts of a full service that the release does not include ({{cite README.md:38-42}}):</p>
+<ul>
+  <li>a KV cache system (the QA doc describes a 3FS store with prefix matching, {{cite doc/inference_deployment_qa.md:137-157}});</li>
+  <li>VE / prefill / decode disaggregation ("most required engine functionality is already implemented");</li>
+  <li>load balancing across data-parallel replicas for prefill and decode.</li>
+</ul>
+<p>The code agrees, and shows more gaps:</p>
+<table>
+  <thead><tr><th>Missing part</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>An online server. Only the offline <code>LLM</code> class exists.</td><td>Docstring: "This release does not include an online-serving wrapper" ({{cite deepinfer/engine/llm_engine.py:140-141}}).</td></tr>
+    <tr><td>KV saving and P/D hooks: the methods exist, but most are empty. Only <code>finalize_seq</code> does work: it frees the sequence.</td><td>Translated comment: "from here on, all are virtual functions" ({{cite deepinfer/engine/llm_engine.py:800-828}}); <code>copy_state</code> stays <code>None</code> ({{cite deepinfer/engine/llm_engine.py:284-285}}).</td></tr>
+    <tr><td>Tensor and pipeline parallelism. There is no TP group and no PP group.</td><td>The groups are world, local, DP, CP, EP, EP-in-DP and Engram ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:51-68}}). <code>model_parallel_size</code> is the CP size ({{cite deepinfer/config.py:171}}).</td></tr>
+    <tr><td>Other model architectures.</td><td>The registry has one entry: <code>DeepseekV41ForCausalLM</code> → <code>DeepseekVLForCausalLM</code> ({{cite deepinfer/model_executor/models/__init__.py:15-17}}). A config without <code>vl_aligner</code> fails an assert ({{cite deepinfer/model_config_loader.py:22}}).</td></tr>
+    <tr><td>DeepSeek Recipe (conversion between API protocols and token sequences).</td><td>A separate project ({{cite doc/inference_deployment_qa.md:19}}).</td></tr>
+    <tr><td>The kernel libraries' source code.</td><td>FlashMLA, DeepGEMM, DeepEP and DeepSelect are git submodules in <code>vendor/</code> ({{cite .gitmodules}}). This site does not explain their insides.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="first-request-wait">Why does my first request wait about 70 steps?</h2>
+<p>Three rules combine. This site derived the result from the code and did not run it.</p>
+<ol>
+  <li>A NORMAL engine tries a prefill only at <em>attempt points</em>: every 70 decode steps (ALL vote) or every 100 (ANY vote) ({{cite csrc/engine/scheduler.hpp:308-319}}, {{cite deepinfer/environ.py:174-178}}).</li>
+  <li>The only model class has a vision part, so the engine has a multimodal processor, and <code>LLM</code> gives every request multimodal data, also a text-only request ({{cite deepinfer/entrypoints/llm.py:158-159}}). A sequence with multimodal data starts with <code>schedulable = False</code> ({{cite csrc/engine/pybind_sequence.cpp:35}}). Only the multimodal processor's <code>fetch()</code> makes it schedulable.</li>
+  <li>In each step, <code>schedule()</code> runs before <code>fetch()</code> ({{cite deepinfer/engine/llm_engine.py:885}}, {{cite deepinfer/engine/llm_engine.py:939-941}}). So step 1 (an ALL point) finds no schedulable request.</li>
+</ol>
+<p>So <code>step()</code> calls 1 to 70 are empty decode steps, and call 71 is the earliest prefill. With more than one DP rank, the ALL vote can fail, so the wait can be up to 100 steps (the ANY point). An empty step runs the model on one placeholder sequence ({{cite deepinfer/worker/worker.py:121-126}}). To change the intervals, set <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> and <code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code> before the first import of <code>deepinfer.config</code>, because they are read at import time ({{cite deepinfer/config.py:193-194}}). Read {{link tours/life-of-a-request}}, stop 5, deep dive, and {{link concepts/dp-step-votes}}.</p>
+
+<h2 id="previous-step-output">Why does step() return the previous step's output?</h2>
+<p>Because of {{term zos | zero-overhead scheduling}} (ZOS), which is on by default for the NORMAL engine ({{cite deepinfer/engine/arg_utils.py:51-55}}). The worker starts forward pass N on the device, then post-processes step N−1 on the CPU while the device works ({{cite deepinfer/worker/worker.py:143-144}}). A ZOS decode step is kept for the next call ({{cite deepinfer/worker/worker.py:182-187}}). So call N returns the tokens of decode step N−1. Prefill steps return their token at once. After the last step, <code>LLM</code> calls <code>flush_inflight_reqs()</code> to get the outputs that the worker still holds ({{cite deepinfer/entrypoints/llm.py:177-178}}). Set <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING=0</code> to turn ZOS off. Read {{link concepts/zero-overhead-scheduling}}.</p>
+
+<h2 id="clone-output">Why must I clone RequestOutput?</h2>
+<p><code>step()</code> returns a NumPy array of <code>uint64</code> raw pointers into a C++ {{term request-output-pool}} with 10000 slots ({{cite csrc/engine/outputs.hpp:45-81}}). The engine gives the objects back to the pool in the next <code>pre_sampler_sync</code>, so they become invalid during the next <code>step()</code> ({{cite deepinfer/engine/llm_engine.py:830-831}}). <code>RequestOutput.clone(ptr)</code> makes an independent copy ({{cite csrc/engine/pybind_output.cpp:17-18}}). <code>LLM._run_engine</code> does it for every pointer ({{cite deepinfer/entrypoints/llm.py:179-182}}). Code that calls <code>llm.llm_engine.step()</code> directly must do the same. If the pool is full, the engine raises "RequestOutputPool exhausted (max_size=10000)" ({{cite csrc/engine/outputs.hpp:65}}).</p>
+
+<h2 id="model-sizes">Which model sizes are in the repo?</h2>
+<p><strong>None.</strong> All sizes come from the checkpoint <code>config.json</code>, which the parser reads at start-up ({{cite deepinfer/hugging_face/config.py:237-311}}). The repo names the model, DeepSeek-V4.1-Flash ({{cite README.md:5-7}}), and the default checkpoint id <code>deepseek-ai/DeepSeek-V4.1-Flash-1017</code> ({{cite examples/_config.py:32}}). These values are not in the repository; pages on this site that show them mark them as examples:</p>
+<ul>
+  <li>number of layers, hidden size, attention heads, <code>q_lora_rank</code>, <code>o_lora_rank</code>, <code>o_groups</code>, <code>head_dim</code>;</li>
+  <li>vocabulary size (129280 is only <em>inferred</em> from the image-token ids, {{cite deepinfer/hugging_face/tokenizer.py:48-56}});</li>
+  <li>sliding window, compress ratios per layer, indexer top-k, indexer heads and head size;</li>
+  <li>routed and shared expert counts, experts per token, <code>routed_scaling_factor</code>;</li>
+  <li><code>hc_mult</code>, number of DFlash layers (<code>num_nextn_predict_layers</code>), the KV-sharing source lists.</li>
+</ul>
+<p>The code fixes only a few values: the block size of 128 tokens ({{cite deepinfer/model_executor/model_metadata_utils.py:133-135}}), one KV head, SwiGLU and BF16 ({{cite deepinfer/hugging_face/config.py:51-59}}), FP8 weights with FP4 experts in 32 × 32 blocks (lines 254-262), and a RoPE part of 64 values in the layers with an indexer ({{cite deepinfer/model_executor/models/v4_modules/mla_attn.py:121}}). The QA doc gives a few numbers, for example "the first 20" stored layers ({{cite doc/inference_deployment_qa.md:163}}).</p>
+
+<h2 id="hardware">Which hardware does it run on?</h2>
+<p>The README lists NVIDIA SM100 GPUs and Huawei Ascend 950 NPUs ({{cite README.md:33-36}}). The code enforces this at the very end of start-up: <code>get_bf16_tflops_limit()</code> returns a peak only for Ascend and for NVIDIA devices with compute capability 10.x, and raises <code>RuntimeError("unknown GPU type")</code> for all others ({{cite deep_cluster/hardware/device.py:151-156}}). The engine always calls it when it makes the statistics logger ({{cite deepinfer/engine/llm_engine.py:298-305}}). So on an older GPU, start-up fails after it loads the weights and captures the graphs. Build with <code>DEEPINFER_ACCELERATOR=nvidia</code> or <code>ascend</code>, and keep it exported ({{cite README.md:59-62}}). Read {{link concepts/hardware-platforms}} and {{link tours/startup}}, stop 14.</p>
+
+<h2 id="docs-vs-code">Where do docs and code disagree?</h2>
+<p>This site always describes the code. The table lists each known difference with both citations.</p>
+<table>
+  <thead><tr><th>The doc or comment says</th><th>The code does</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Decode preemption.</strong> Preempt the sequence with the <em>shortest</em> output (translated comment, {{cite csrc/engine/scheduler.hpp:556-557}}).</td><td>Sorts by output length, longest first, and preempts from the front: the <em>longest</em> output ({{cite csrc/engine/scheduler.hpp:624-634}}).</td></tr>
+    <tr><td><strong>KV block count over ranks.</strong> "we take the minimum number of blocks across all workers" ({{cite deepinfer/engine/llm_engine.py:426-428}}).</td><td>All-reduce SUM, divided by the world size, rounded down to even: the <em>mean</em> ({{cite deepinfer/worker/base.py:264-266}}).</td></tr>
+    <tr><td><strong>Extra experts default.</strong> <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code> "defaulting to 32" ({{cite examples/README.md:63}}).</td><td>The library default is 0 ({{cite deepinfer/environ.py:114}}). The example scripts set 32: <code>offline_inference.py</code> only with EPLB on ({{cite examples/_config.py:77-79}}).</td></tr>
+    <tr><td><strong>First ratio-1 layer.</strong> "it and everything before it form the prefill side" ({{cite deepinfer/hugging_face/config.py:159}}).</td><td>Consumer layers are <code>[n_prefill_layer, n_layer)</code>, so that layer is the <em>first YOCO consumer</em> ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:19-21}}, {{cite deepinfer/model_executor/models/v4_modules/attn.py:245-247}}).</td></tr>
+    <tr><td><strong>ZOS step numbering.</strong> The CPU runs "post-process(N−1)" while the GPU runs forward(N) ({{cite doc/inference_deployment_qa.md:274}}).</td><td>The call that launches forward N+1 post-processes step N ({{cite deepinfer/worker/worker.py:143-144}}). Same overlap, numbers shifted by one; this site uses the code's numbering.</td></tr>
+    <tr><td><strong>TP and CP.</strong> "TP and CP are not used for now" in production ({{cite doc/inference_deployment_qa.md:53}}).</td><td>CP is supported: CP groups, follower processes and <code>--cp</code> in the examples ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:96-99}}, {{cite deepinfer/engine/llm_engine.py:377-395}}). TP does not exist.</td></tr>
+    <tr><td><strong><code>moe_lb</code>.</strong> "slowest rank / mean" ({{cite doc/inference_deployment_qa.md:99}}).</td><td>Sum over steps and layers of the per-step maximum, divided by the sum of the means ({{cite deepinfer/engine/stats_logger.py:238-241}}, {{cite deepinfer/model_executor/eplb/__init__.py:189-193}}).</td></tr>
+    <tr><td><strong><code>max_model_len=None</code>.</strong> "will be derived from the model" ({{cite deepinfer/config.py:39-40}}).</td><td>Uses 4096 ({{cite deepinfer/config.py:69}}).</td></tr>
+    <tr><td><strong><code>gpu_memory_utilization</code> limit.</strong> "must be less than 1.0" ({{cite deepinfer/config.py:147}}).</td><td>The test is <code>&gt; 1.0</code>, so 1.0 passes ({{cite deepinfer/config.py:146}}).</td></tr>
+    <tr><td><strong>Keeping outputs.</strong> The <code>step()</code> docstring says to call <code>pool.clone(...)</code> and <code>pool.release(...)</code> ({{cite deepinfer/engine/llm_engine.py:868-870}}).</td><td><code>RequestOutputPool</code> has only <code>release</code>; <code>clone</code> is a static method of <code>RequestOutput</code> that takes one pointer ({{cite csrc/engine/pybind_output.cpp:17-18}}, {{cite csrc/engine/pybind_output.cpp:37-39}}).</td></tr>
+    <tr><td><strong>Preemption victim (status comment).</strong> <code>FINISHED_PREEMPTED</code>: the task that uses the most KV cache is stopped (translated, {{cite csrc/engine/sequence.hpp:55-56}}).</td><td>The sort uses output length only, not the total length with the prompt ({{cite csrc/engine/scheduler.hpp:624-625}}).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="open-questions">Known open questions</h2>
+<p>These are questions that this site could not close by reading the code. Each one gives the evidence.</p>
+<h3 id="open-block-leak">Do aborted chunked prompts leak KV blocks?</h3>
+<p>Possibly. This is derived from the code and not run. It needs <code>chunked_prefill=True</code> and an abort between two chunks.</p>
+<ol>
+  <li>After a chunk that is not the last one, the prompt goes back to the front of <code>waiting</code> and keeps its blocks and its state slot ({{cite csrc/engine/scheduler.hpp:1015-1019}}).</li>
+  <li><code>abort_sequence</code> marks a waiting sequence <code>FINISHED_ABORTED</code> and does not free anything ({{cite csrc/engine/scheduler.hpp:144-162}}).</li>
+  <li>The next prefill schedule moves it to <code>ignored_seqs</code> ({{cite csrc/engine/scheduler.hpp:362-367}}); a decode schedule does the same ({{cite csrc/engine/scheduler.hpp:569-577}}). Neither path frees blocks.</li>
+  <li>An ignored sequence gets one output with its finish reason ({{cite csrc/engine/outputs.hpp:297-304}}). Python frees only <code>finished_seqs</code>, through <code>finalize_seq</code> ({{cite deepinfer/engine/llm_engine.py:844-846}}). <code>abort_request</code> frees only multimodal pool handles ({{cite deepinfer/engine/llm_engine.py:651-656}}).</li>
+</ol>
+<p>In this release the offline <code>LLM</code> never calls <code>abort_request</code>. The engine calls it only for multimodal failures ({{cite deepinfer/engine/llm_engine.py:939-945}}), and those requests own no blocks. So the leak, if real, needs a caller that aborts a request in the middle of a chunked prefill.</p>
+<h3 id="open-sorted-index">What does DeepSelect's <code>sorted_index=True</code> guarantee?</h3>
+<p>The sparse indexer calls <code>deep_select.interface.topk</code> with <code>sorted=False</code> and <code>sorted_index=True</code>, and then converts the indices to physical cache slots ({{cite deepinfer/model_executor/models/v4_modules/index_attn.py:494-513}}). DeepSelect is a git submodule that is not checked out here, so the exact meaning of <code>sorted_index</code>, and whether the later kernels depend on the order, cannot be confirmed from this repository. On Ascend the same call goes to a wrapper that passes through to the library when <code>return_value=False</code> ({{cite deepinfer/npu_ops/deep_select.py:20-26}}).</p>
+<h3 id="open-shared-expert-overlap">Does the combine transfer overlap the shared expert?</h3>
+<p>The code launches the shared expert before the combine. The combine gets an event captured <em>before</em> the shared expert, and <code>limit_num_sms</code> keeps some SMs free for communication ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:600-609}}). Whether the device really runs the combine transfer at the same time as the shared expert is decided inside DeepEP, which is not checked out. So this site does not claim either answer. Read {{link concepts/expert-parallelism}}.</p>
+
+<h2 id="code-version">How do I get exactly this code version?</h2>
+<p>Clone the repository, check out commit <code>9bd9cf243fc53ef9afbf8f04d391d989117d6ab9</code>, and get the submodules at their pinned commits. The home page has the commands and the submodule table: {{link index#code-version | The code version this site explains}}.</p>
+
+<h2 id="from-qa-doc">Questions from the deployment Q&amp;A</h2>
+<p>The QA doc describes DeepSeek's production service. Some of it is outside this repository. Each answer says what the doc says and what this release has.</p>
+
+<h3 id="qa-parallelism">Which parallel sizes does production use?</h3>
+<p>Prefill: EP 2–8 with DP 2–8, the smallest that memory allows. Decode: EP 64–128 ("Wide-EP"), the largest that the GPUs allow. The vision encoder uses one GPU per instance ({{cite doc/inference_deployment_qa.md:45-53}}). Attention uses DP with <code>#DP = #EP</code> ({{cite doc/inference_deployment_qa.md:33}}). In this release, one NORMAL engine does prefill and decode, and the example script sets <code>dp = ep // cp</code> ({{cite examples/offline_inference.py:27}}). Read {{link learn/parallelism}} and {{link concepts/expert-parallelism}}.</p>
+
+<h3 id="qa-smallest">What is the smallest deployment?</h3>
+<p>The doc says 1P + 1D works, and the smallest efficient unit is 64 prefill GPUs plus 64 decode GPUs ({{cite doc/inference_deployment_qa.md:65-67}}). This release has no P/D split, so the offline example runs on one host with 8 devices by default ({{cite examples/offline_inference.py:13}}).</p>
+
+<h3 id="qa-redundant-experts">How many redundant experts does production use?</h3>
+<p>Prefill starts from 4 per GPU with a 100-step window and a rearrangement every 1,000 steps; decode starts from 1 per GPU with a 1,000-step window and a rearrangement every 10,000 steps ({{cite doc/inference_deployment_qa.md:95-103}}). Both round up so that the expert count divides by <code>ep_size</code>, as the code does ({{cite deepinfer/model_executor/eplb/__init__.py:21-28}}). In this release the count is a total, not per GPU: <code>DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS</code>, default 0 ({{cite deepinfer/environ.py:114}}), and rearrangement is off by default (<code>DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL</code> = 0, {{cite deepinfer/environ.py:116}}). Read {{link concepts/eplb}}.</p>
+
+<h3 id="qa-swa">Where does the sliding-window cache live, and how large is one slot?</h3>
+<p>Not in the paged blocks: each sequence has one fixed state slot ({{cite doc/inference_deployment_qa.md:163}}). The stored part is "20 layers × 134 tokens × 528 B = 1,415,040 B per sequence" ({{cite doc/inference_deployment_qa.md:169}}). In the code, the ring has <code>window + DEEPINFER_MAX_BACKTRACKING_TOKENS</code> rows ({{cite deepinfer/worker/cache_engine.py:88-93}}) and one entry is 512 B of FP8 data plus 16 B of scale ({{cite deepinfer/worker/cache_engine.py:216-218}}). Read {{link concepts/sliding-window-attention}}.</p>
+
+<h3 id="qa-fp4">Where is FP4 used?</h3>
+<p>The doc lists three places: the main KV cache (per-16 blocks, e4m3 scales), the indexer keys (MXFP4) and the routed-expert weights (MXFP4) ({{cite doc/inference_deployment_qa.md:215-221}}). In the code, the expert format must be FP4 ({{cite deepinfer/hugging_face/config.py:254-262}}), and the main KV cache is FP4 unless <code>config.json</code> sets <code>use_fp4_sparse_kv</code> to false ({{cite deepinfer/hugging_face/config.py:303}}). Read {{link learn/number-formats}}.</p>
+
+<h3 id="qa-dspark">How much does DSpark gain, and how do I turn it on?</h3>
+<p>The doc reports about 30 % fewer verified drafts per step (5.00 → 3.2–4.4) and +4–7 % throughput at about 60 sequences per rank, from EP64/DP64 benchmark data ({{cite doc/inference_deployment_qa.md:245-256}}). These are benchmark figures. Turn it on with <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code> ({{cite README.md:24}}). It needs CUDA graphs: start-up measures the decode time per graph size only when graphs are on ({{cite deepinfer/worker/base.py:276-281}}), and with no measured curve the scheduler verifies all drafts ({{cite csrc/engine/mtp_varlen.hpp:153-157}}). Read {{link concepts/dspark}}.</p>
+
+<h3 id="qa-zos">How does asynchronous scheduling work?</h3>
+<p>While the device runs forward and sample, the CPU schedules the next step, launches it, and post-processes the step before ({{cite doc/inference_deployment_qa.md:268-274}}). It is on by default ({{cite README.md:26}}). See <a href="#previous-step-output">the answer above</a> for the step numbering, and {{link concepts/zero-overhead-scheduling}}.</p>
+
+<h3 id="qa-kernels">How do I see which kernels run?</h3>
+<p>The doc says: profile with <code>examples/benchmark.py</code> and read the trace ({{cite doc/inference_deployment_qa.md:225-227}}). With <code>PROFILE=1</code>, the benchmark writes one trace with 2 prefill steps and 3 decode steps ({{cite examples/README.md:47}}). For a running engine, <code>DEEPINFER_PROFILE_HTTP_ENABLE=1</code> starts an HTTP endpoint that writes a {{term profiler-trace}} for a number of steps ({{cite deepinfer/engine/profile_server.py:1-11}}). Read {{link code/stats-logger}}.</p>
+
+<h3 id="qa-mega-moe">When is Mega-MoE used?</h3>
+<p>The doc calls Mega-MoE the general solution inside one scale-up domain ({{cite doc/inference_deployment_qa.md:229-231}}). The code uses it when the MMA type is supported and the EP group fits in one NVLink domain; on Ascend the domain check is always true ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:184-188}}, {{cite deepinfer/model_executor/parallel_utils/parallel_state.py:130-134}}). With the released checkpoint format, the MMA type is always <code>fp8xfp4</code>. Read {{link concepts/mega-moe}}.</p>
+
+<h3 id="qa-kv-store">Is the 3FS KV cache store in this repository?</h3>
+<p>No. The doc describes a dedicated 3FS cluster and its time-to-live of 3 to 7 days ({{cite doc/inference_deployment_qa.md:129-153}}). The KV cache management code is "not yet fully open-sourced" ({{cite doc/inference_deployment_qa.md:21}}). In this release the cache lives only in device memory, and the engine frees the blocks of a sequence when it finishes ({{cite deepinfer/engine/llm_engine.py:804-806}}, {{cite deepinfer/engine/llm_engine.py:844-846}}). Read {{link concepts/paged-kv-cache}}.</p>

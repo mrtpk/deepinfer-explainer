@@ -1,0 +1,220 @@
+---
+title: Config classes
+nav_title: Config classes
+level: Intermediate
+related: code/config, code/llm-engine, code/entrypoints-llm, reference/env-vars, tours/startup, code/worker-base
+summary: Every field of EngineArgs, ModelConfig, CacheConfig, ParallelConfig and SchedulerConfig, with its type, default, meaning, the line that sets it and the code that reads it. Also the derived values, the checks, and the fields that nothing reads.
+---
+<x-sentence>The engine reads all its settings from one {{term engine-args | EngineArgs}} object, which becomes four {{term engine-configs | config objects}} at start-up.</x-sentence>
+
+<p>Use this page to look up one setting. The page {{link code/config}} explains the code of <code>deepinfer/config.py</code>. The page {{link reference/env-vars}} lists the <code>DEEPINFER_*</code> {{term environment-variable | environment variables}}, which are a second, separate way to set the engine.</p>
+
+<h2 id="the-path">From keyword arguments to config objects</h2>
+<ol>
+  <li><code>LLM(model, **kwargs)</code> adds its own defaults and makes an <code>EngineArgs</code> ({{cite deepinfer/entrypoints/llm.py:67-81}}).</li>
+  <li><code>EngineArgs.__post_init__</code> uses the model path as the tokenizer path if you give no tokenizer. It also sets two environment variables if they are not set ({{cite deepinfer/engine/arg_utils.py:48-60}}).</li>
+  <li><code>LLMEngine.from_engine_args</code> calls <code>create_engine_configs()</code> ({{cite deepinfer/engine/llm_engine.py:460-469}}). That method makes the four objects in this order: <code>ModelConfig</code>, <code>CacheConfig</code>, <code>ParallelConfig</code>, <code>SchedulerConfig</code> ({{cite deepinfer/engine/arg_utils.py:62-114}}).</li>
+  <li>The engine gives the same four objects to the driver Worker. It gives copies to each {{term cp-follower | CP follower}} process as spawn arguments ({{cite deepinfer/engine/llm_engine.py:377-413}}).</li>
+  <li>Some fields are empty at first. Other files fill them later, during start-up (the "Set later" rows below).</li>
+</ol>
+
+<table>
+  <thead><tr><th>Object</th><th>Main readers</th></tr></thead>
+  <tbody>
+    <tr><td><code>ModelConfig</code></td><td>tokenizer loader, model loader, Worker, ModelRunner. Four of its fields are also copied into <code>model_cfg.gpt</code>, which the model layers read ({{cite deepinfer/config.py:82-94}}).</td></tr>
+    <tr><td><code>CacheConfig</code></td><td>Worker (memory profile), <code>CacheEngine</code>, the two <code>BlockManager</code> objects, the statistics logger.</td></tr>
+    <tr><td><code>ParallelConfig</code></td><td>Worker (ranks and process groups), ModelRunner, the TCP address of the {{term rendezvous}}.</td></tr>
+    <tr><td><code>SchedulerConfig</code></td><td>The C++ {{term scheduler}}: its constructor reads nine attributes from the Python object ({{cite csrc/engine/scheduler.hpp:94-108}}). Also ModelRunner.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="engine-args">EngineArgs</h2>
+<p><code>EngineArgs</code> is a dataclass in <code>deepinfer/engine/arg_utils.py</code> ({{cite deepinfer/engine/arg_utils.py:17-46}}). The column "LLM default" shows the value that you get through the offline class <code>LLM</code>, when it is different.</p>
+<table>
+  <thead><tr><th>Field, type, default</th><th>Meaning</th><th>Goes to</th></tr></thead>
+  <tbody>
+    <tr><td><code>model</code><br><code>str</code>, required ({{cite deepinfer/engine/arg_utils.py:21}})</td><td>Path of the {{term hf-checkpoint}} folder.</td><td><code>ModelConfig.model</code></td></tr>
+    <tr><td><code>served_model_name</code><br><code>str</code>, <code>"deepinfer-model"</code> ({{cite deepinfer/engine/arg_utils.py:22}})</td><td>A name. Nothing reads it.</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>tokenizer</code><br><code>str | None</code>, <code>None</code> ({{cite deepinfer/engine/arg_utils.py:23}})</td><td>Tokenizer folder. <code>None</code> means the model folder ({{cite deepinfer/engine/arg_utils.py:49-50}}).</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>trust_remote_code</code><br><code>bool</code>, <code>False</code> ({{cite deepinfer/engine/arg_utils.py:24}})</td><td>Allow Python code from the checkpoint in the tokenizer loader.</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>load_format</code><br><code>str</code>, <code>"auto"</code> ({{cite deepinfer/engine/arg_utils.py:25}})</td><td><code>"auto"</code> loads the weights. <code>"dummy"</code> makes random weights.</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>seed</code><br><code>int</code>, <code>0</code> ({{cite deepinfer/engine/arg_utils.py:26}})<br>LLM: <code>0</code> ({{cite deepinfer/entrypoints/llm.py:62}})</td><td>Random seed. Each rank adds its global rank.</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>max_model_len</code><br><code>int | None</code>, <code>None</code> ({{cite deepinfer/engine/arg_utils.py:27}})</td><td>Maximum tokens of one sequence, prompt and output. <code>None</code> becomes 4096.</td><td><code>ModelConfig</code>, <code>SchedulerConfig</code></td></tr>
+    <tr><td><code>data_parallel_size</code><br><code>int</code>, <code>0</code> ({{cite deepinfer/engine/arg_utils.py:28}})</td><td>Number of DP replicas. <code>0</code> means "compute it" (<a href="#parallel-config">ParallelConfig</a>).</td><td><code>ParallelConfig</code></td></tr>
+    <tr><td><code>context_parallel_size</code><br><code>int</code>, <code>1</code> ({{cite deepinfer/engine/arg_utils.py:29}})</td><td>Ranks per engine for {{term context-parallelism}}.</td><td><code>ParallelConfig</code></td></tr>
+    <tr><td><code>expert_parallel_size</code><br><code>int</code>, <code>1</code> ({{cite deepinfer/engine/arg_utils.py:30}})<br>LLM: <code>1</code> ({{cite deepinfer/entrypoints/llm.py:59}})</td><td>Ranks that share the experts ({{term expert-parallelism}}).</td><td><code>ParallelConfig</code></td></tr>
+    <tr><td><code>engram_parallel_size</code><br><code>int</code>, <code>0</code> ({{cite deepinfer/engine/arg_utils.py:31}})</td><td>Ranks of one Engram group. <code>0</code> means "compute it".</td><td><code>ParallelConfig</code></td></tr>
+    <tr><td><code>engine_rank</code><br><code>int</code>, <code>0</code> ({{cite deepinfer/engine/arg_utils.py:32}})</td><td>The {{term engine-rank}} of this process.</td><td><code>ParallelConfig</code></td></tr>
+    <tr><td><code>engine_group_rank</code><br><code>int</code>, <code>0</code> ({{cite deepinfer/engine/arg_utils.py:33}})</td><td>Offset of the rendezvous port, for independent worlds on one host.</td><td><code>ParallelConfig</code></td></tr>
+    <tr><td><code>gpu_memory_utilization</code><br><code>float</code>, <code>0.90</code> ({{cite deepinfer/engine/arg_utils.py:34}})<br>LLM: <code>0.9</code> ({{cite deepinfer/entrypoints/llm.py:63}})</td><td>{{term gpu-memory-utilization}}: the share of device memory for weights, activations and KV cache.</td><td><code>CacheConfig</code></td></tr>
+    <tr><td><code>max_num_batched_tokens</code><br><code>int | None</code>, <code>None</code> ({{cite deepinfer/engine/arg_utils.py:35}})</td><td>Token budget of one step. <code>None</code> means "compute it".</td><td><code>ModelConfig</code>, <code>SchedulerConfig</code></td></tr>
+    <tr><td><code>max_num_seqs</code><br><code>int</code>, <code>256</code> ({{cite deepinfer/engine/arg_utils.py:36}})</td><td>Maximum sequences that run at the same time.</td><td><code>ModelConfig</code>, <code>SchedulerConfig</code></td></tr>
+    <tr><td><code>disable_log_stats</code><br><code>bool</code>, <code>False</code> ({{cite deepinfer/engine/arg_utils.py:37}})<br>LLM: <code>True</code> ({{cite deepinfer/entrypoints/llm.py:67}})</td><td>Turn off the statistics log. The engine gets <code>log_stats = not disable_log_stats</code> ({{cite deepinfer/engine/llm_engine.py:466}}).</td><td><code>LLMEngine</code></td></tr>
+    <tr><td><code>revision</code><br><code>str | None</code>, <code>None</code> ({{cite deepinfer/engine/arg_utils.py:38}})</td><td>Model version for the tokenizer loader.</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>tokenizer_revision</code><br><code>str | None</code>, <code>None</code> ({{cite deepinfer/engine/arg_utils.py:39}})</td><td>Tokenizer version for the tokenizer loader.</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>stop_preempted_request</code><br><code>bool</code>, <code>True</code> ({{cite deepinfer/engine/arg_utils.py:40}})<br>LLM: <code>False</code> ({{cite deepinfer/entrypoints/llm.py:68}})</td><td>On {{term preemption}}: <code>True</code> stops the request, <code>False</code> computes it again.</td><td><code>SchedulerConfig</code></td></tr>
+    <tr><td><code>engine_type</code><br><code>EngineType</code>, <code>NORMAL</code> ({{cite deepinfer/engine/arg_utils.py:41}})</td><td><code>NORMAL</code> does prefill and decode. <code>PROMPT</code> and <code>COMPLETION</code> are for a split deployment ({{cite deepinfer/engine/engine_type.py:11-13}}).</td><td><code>ModelConfig</code>, <code>ParallelConfig</code> and <code>LLMEngine</code>; the engine later writes its value into <code>SchedulerConfig</code> ({{cite deepinfer/engine/arg_utils.py:78}}, {{cite deepinfer/engine/arg_utils.py:105}}, {{cite deepinfer/engine/llm_engine.py:252}})</td></tr>
+    <tr><td><code>chunked_prefill</code><br><code>bool</code>, <code>False</code> ({{cite deepinfer/engine/arg_utils.py:42}})</td><td>Allow a long prompt to run in several prefill steps ({{term chunked-prefill}}). The examples set <code>True</code> ({{cite examples/_config.py:120}}).</td><td><code>SchedulerConfig</code></td></tr>
+    <tr><td><code>ignore_len</code><br><code>int</code>, <code>128 &lt;&lt; 20</code> ({{cite deepinfer/engine/arg_utils.py:43}})</td><td>Translated comment: <em>"accept requests of all lengths by default"</em>. Nothing reads it.</td><td><code>ModelConfig</code></td></tr>
+    <tr><td><code>tokens_per_block</code><br><code>int</code>, <code>-1</code> ({{cite deepinfer/engine/arg_utils.py:44}})</td><td>Optional check value. If it is not <code>-1</code>, it must equal the block size that the model gives (128).</td><td>only the check</td></tr>
+    <tr><td><code>lookahead_tokens</code><br><code>int</code>, <code>0</code> ({{cite deepinfer/engine/arg_utils.py:45}})</td><td>Passed to the C++ scheduler. The offline example sets <code>min(1, nextn)</code> ({{cite examples/offline_inference.py:56}}).</td><td><code>CacheConfig</code></td></tr>
+    <tr><td><code>offline_inference</code><br><code>bool</code>, <code>False</code> ({{cite deepinfer/engine/arg_utils.py:46}})<br>LLM: <code>True</code> ({{cite deepinfer/entrypoints/llm.py:79}})</td><td>Stored as <code>LLMEngine.offline_inference</code> ({{cite deepinfer/engine/llm_engine.py:195}}). Nothing reads it.</td><td><code>LLMEngine</code></td></tr>
+  </tbody>
+</table>
+<p><strong><code>LLM</code>-only arguments.</strong> <code>decode_sequence</code> (default <code>True</code>) is not an engine setting. <code>LLM</code> keeps it and uses it to decode the output text ({{cite deepinfer/entrypoints/llm.py:64}}, {{cite deepinfer/entrypoints/llm.py:82}}). All other <code>LLM</code> keyword arguments go to <code>EngineArgs</code> through <code>**kwargs</code>. An unknown name raises <code>TypeError</code> from the dataclass constructor. <code>LLM</code> also sets <code>TOKENIZERS_PARALLELISM=false</code> if it is not set ({{cite deepinfer/entrypoints/llm.py:69}}).</p>
+<p><strong>Side effects of <code>__post_init__</code>.</strong> It sets <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> to <code>1</code> for NORMAL and COMPLETION engines, and <code>DEEPINFER_USE_MULTIMODAL_POOL</code> to <code>1</code> except for COMPLETION. It sets each one only if the variable is not set, and then calls <code>environ.rearm</code> ({{cite deepinfer/engine/arg_utils.py:51-60}}, {{cite deepinfer/engine/engine_type.py:15-17}}). So ZOS is on when <code>ModelConfig</code> computes <code>runtime_max_model_len</code>.</p>
+
+<h2 id="model-config">ModelConfig</h2>
+<p>Constructor: {{cite deepinfer/config.py:43-80}}. The constructor also loads the model <code>config.json</code> (the last row).</p>
+<table>
+  <thead><tr><th>Field, type, default</th><th>Meaning</th><th>Set at, read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>model</code><br><code>str</code></td><td>Checkpoint folder.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:59}}<br><strong>Read:</strong> <code>load_model_config</code> ({{cite deepinfer/config.py:90}}), <code>get_model</code> ({{cite deepinfer/model_executor/model_loader.py:72}}), the multimodal processor ({{cite deepinfer/ve/multimodal_processor.py:76}}), the decode-curve cache key ({{cite deepinfer/worker/model_runner.py:571}})</td></tr>
+    <tr><td><code>tokenizer</code><br><code>str</code></td><td>Tokenizer folder.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:60}}<br><strong>Read:</strong> <code>get_hf_tokenizer</code> ({{cite deepinfer/engine/llm_engine.py:200-201}})</td></tr>
+    <tr><td><code>trust_remote_code</code><br><code>bool</code></td><td>See EngineArgs.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:61}}<br><strong>Read:</strong> {{cite deepinfer/engine/llm_engine.py:202}}</td></tr>
+    <tr><td><code>load_format</code><br><code>str</code></td><td><code>"auto"</code> or <code>"dummy"</code>, lower case after the check.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:62-63}}, {{cite deepinfer/config.py:119}}<br><strong>Read:</strong> <code>"dummy"</code> skips the checkpoint ({{cite deepinfer/engine/llm_engine.py:241}})</td></tr>
+    <tr><td><code>seed</code><br><code>int</code></td><td>Base seed.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:64}}<br><strong>Read:</strong> <code>set_random_seed(seed + global_rank)</code> ({{cite deepinfer/worker/base.py:170-172}})</td></tr>
+    <tr><td><code>revision</code>, <code>tokenizer_revision</code><br><code>str | None</code>, <code>None</code></td><td>Versions for the tokenizer loader.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:65-66}}<br><strong>Read:</strong> {{cite deepinfer/engine/llm_engine.py:203-204}}</td></tr>
+    <tr><td><code>max_num_seqs</code><br><code>int</code></td><td>See EngineArgs.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:68}}<br><strong>Read:</strong> state-buffer size ({{cite deepinfer/worker/base.py:242}}, {{cite deepinfer/worker/base.py:271}}), statistics ({{cite deepinfer/engine/stats_logger.py:370}}); copy in <code>model_cfg.gpt</code></td></tr>
+    <tr><td><code>max_model_len</code><br><code>int</code>, <code>4096</code> if <code>None</code></td><td>Maximum sequence length.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:69}}<br><strong>Read:</strong> goes to <code>SchedulerConfig</code> ({{cite deepinfer/engine/arg_utils.py:110}}); error text ({{cite deepinfer/engine/llm_engine.py:449}})</td></tr>
+    <tr><td><code>runtime_max_model_len</code><br><code>int</code>, derived</td><td>{{term runtime-max-model-len}} (<a href="#derived">formula</a>).</td><td><strong>Set:</strong> {{cite deepinfer/config.py:70}}<br><strong>Read:</strong> KV cache check ({{cite deepinfer/engine/llm_engine.py:446}}), block-table width ({{cite deepinfer/worker/model_runner.py:115}}), memory profile ({{cite deepinfer/worker/model_runner.py:411}}); the <code>model_cfg.gpt</code> copy: attention buffers ({{cite deepinfer/model_executor/models/v4_modules/attn.py:77}}, {{cite deepinfer/model_executor/models/v4_modules/index_attn.py:95}})</td></tr>
+    <tr><td><code>max_num_batched_tokens</code><br><code>int</code>, derived</td><td>Token budget of one step.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:71}}<br><strong>Read:</strong> statistics ({{cite deepinfer/engine/stats_logger.py:361}}); the <code>model_cfg.gpt</code> copy: prefill buffer size ({{cite deepinfer/model_executor/model_loader.py:120}})</td></tr>
+    <tr><td><code>ignore_len</code><br><code>int</code>, <code>-1</code> (EngineArgs passes <code>128 &lt;&lt; 20</code>)</td><td>Not used.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:73}}<br><strong>Read:</strong> nothing</td></tr>
+    <tr><td><code>served_model_name</code><br><code>str</code>, <code>"deepinfer-model"</code></td><td>Not used.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:74}}<br><strong>Read:</strong> nothing</td></tr>
+    <tr><td><code>dtype</code><br><code>torch.dtype</code>, always <code>torch.bfloat16</code></td><td>Default dtype while the model is built.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:75}}<br><strong>Read:</strong> {{cite deepinfer/model_executor/model_loader.py:70}}</td></tr>
+    <tr><td><code>use_compressed_tokenizer</code><br><code>bool</code>, <code>False</code></td><td>Engram models: also make compressed token ids.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:76}}; set later from the Engram config ({{cite deepinfer/engine/arg_utils.py:88-91}})<br><strong>Read:</strong> {{cite deepinfer/engine/llm_engine.py:564}}, {{cite deepinfer/worker/base.py:306}}, {{cite deepinfer/worker/model_runner.py:468}}</td></tr>
+    <tr><td><code>engram_tokenizer</code><br><code>str</code>, the tokenizer path</td><td>The <code>tokenizer.json</code> of the compressed tokenizer.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:77}}; set later ({{cite deepinfer/engine/arg_utils.py:91}})<br><strong>Read:</strong> {{cite deepinfer/worker/base.py:309}}</td></tr>
+    <tr><td><code>engine_type</code><br><code>EngineType</code>, <code>NORMAL</code></td><td>Engine kind.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:78}}<br><strong>Read:</strong> only the <code>model_cfg.gpt</code> copy, for example {{cite deepinfer/model_executor/models/deepseek.py:356}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:172}}</td></tr>
+    <tr><td><code>model_cfg</code><br><code>AttrDict</code></td><td>The parsed <code>config.json</code>: <code>architecture</code>, <code>gpt</code> (all model sizes), <code>vl_aligner</code> and more.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:89-94}}, through {{cite deepinfer/model_config_loader.py:8-23}}<br><strong>Read:</strong> {{cite deepinfer/engine/arg_utils.py:83}}, {{cite deepinfer/engine/llm_engine.py:207}}, {{cite deepinfer/model_executor/model_loader.py:73}}, {{cite deepinfer/worker/model_runner.py:84}}</td></tr>
+    <tr><td><code>architecture</code><br><code>str</code></td><td>The one name in <code>architectures</code> of <code>config.json</code>.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:91}}<br><strong>Read:</strong> model class lookup ({{cite deepinfer/model_executor/model_loader.py:37-44}})</td></tr>
+  </tbody>
+</table>
+<p><code>get_vocab_size()</code> returns <code>model_cfg.gpt.vocab_size</code>, a value from the checkpoint, not from the repository ({{cite deepinfer/config.py:121-122}}).</p>
+<p><strong>Fields copied into the model config.</strong> <code>_load_model_cfg</code> writes <code>max_num_seqs</code>, <code>max_num_batched_tokens</code>, <code>runtime_max_model_len</code> and <code>engine_type</code> into <code>model_cfg.gpt</code> ({{cite deepinfer/config.py:82-94}}). The model layers get only <code>model_cfg.gpt</code>, so they read these copies.</p>
+<p><strong>Copies for CP followers.</strong> A CP follower gets <code>ModelConfig</code> as a spawn argument, so Python pickles it. <code>__getstate__</code> leaves out <code>model_cfg</code> and keeps the four copied values. <code>__setstate__</code> loads <code>config.json</code> again in the new process and writes the four values back:</p>
+<x-code file="deepinfer/config.py" lines="96-113" highlight="100,104,110,112-113">
+  <x-tr line="97-98">model_cfg cannot be pickled. So pass only the necessary runtime scalars; the worker process loads model_cfg again in __setstate__ and then fills them back in.</x-tr>
+</x-code>
+
+<h2 id="cache-config">CacheConfig</h2>
+<p>Constructor: {{cite deepinfer/config.py:125-143}}. Four fields are <code>None</code> at first. Two later start-up steps fill them in the same object, which the engine and the driver Worker share.</p>
+<table>
+  <thead><tr><th>Field, type, default</th><th>Meaning</th><th>Set at, read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>block_size</code><br><code>int</code>; always 128 in this release</td><td>Tokens per KV {{term kv-block | block}}, before compression.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:132}}, from <code>resolved_tokens_per_block</code> ({{cite deepinfer/engine/arg_utils.py:84}}, {{cite deepinfer/model_executor/model_metadata_utils.py:133-135}})<br><strong>Read:</strong> C++ scheduler ({{cite deepinfer/engine/llm_engine.py:309}}), KV cache check ({{cite deepinfer/engine/llm_engine.py:445}}), ModelRunner ({{cite deepinfer/worker/base.py:95}}), memory profile ({{cite deepinfer/worker/base.py:222}}, {{cite deepinfer/worker/base.py:238}}), <code>CacheEngine</code> ({{cite deepinfer/worker/cache_engine.py:919}})</td></tr>
+    <tr><td><code>gpu_memory_utilization</code><br><code>float</code></td><td>Share of total device memory.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:133}}<br><strong>Read:</strong> {{cite deepinfer/worker/base.py:235}}</td></tr>
+    <tr><td><code>lookahead_tokens</code><br><code>int</code>, <code>0</code></td><td>Passed to the C++ scheduler. A prefill check there needs <code>cache.num_tokens</code> to be 0 or at least this value ({{cite csrc/engine/scheduler.hpp:454-457}}).</td><td><strong>Set:</strong> {{cite deepinfer/config.py:143}}<br><strong>Read:</strong> {{cite deepinfer/engine/llm_engine.py:316}}</td></tr>
+    <tr><td><code>num_gpu_blocks</code><br><code>int | None</code>, <code>None</code></td><td>Number of KV blocks.</td><td><strong>Set:</strong> set by the memory profile: the mean over all ranks, rounded down to even ({{cite deepinfer/worker/base.py:264-267}})<br><strong>Read:</strong> {{cite deepinfer/engine/llm_engine.py:438}}, KV <code>BlockManager</code> ({{cite deepinfer/engine/llm_engine.py:265}}), {{cite deepinfer/worker/cache_engine.py:882}}, {{cite deepinfer/engine/stats_logger.py:410}}</td></tr>
+    <tr><td><code>num_state_seqs</code><br><code>int | None</code>, <code>None</code></td><td>Number of {{term state-slot | state slots}}.</td><td><strong>Set:</strong> {{cite deepinfer/worker/cache_engine.py:950}}<br><strong>Read:</strong> state <code>BlockManager</code> ({{cite deepinfer/engine/llm_engine.py:266}}), {{cite deepinfer/engine/stats_logger.py:413}}</td></tr>
+    <tr><td><code>bytes_of_state_per_seqs</code><br><code>int | None</code>, <code>None</code></td><td>Bytes of one state slot.</td><td><strong>Set:</strong> {{cite deepinfer/worker/cache_engine.py:949}}<br><strong>Read:</strong> The state manager exists only if it is above 0 ({{cite deepinfer/engine/llm_engine.py:266}})</td></tr>
+    <tr><td><code>bytes_per_block</code><br><code>int | None</code>, <code>None</code></td><td>Bytes of one KV block row (all layers).</td><td><strong>Set:</strong> {{cite deepinfer/worker/cache_engine.py:951}}<br><strong>Read:</strong> only a log line ({{cite deepinfer/engine/llm_engine.py:262-264}})</td></tr>
+  </tbody>
+</table>
+<x-note title="The profile run writes the same fields first">
+<p>The memory profile makes a temporary <code>CacheEngine</code>, so the last three fields get values before the real allocation. Translated comment: <em>"allocate_gpu_cache also writes bytes_per_block / num_state_seqs / bytes_of_state_per_seqs of cache_config; the values are the same as the later real allocation writes (only num_gpu_blocks differs)"</em> ({{cite deepinfer/worker/model_runner.py:502-505}}).</p>
+</x-note>
+
+<h2 id="parallel-config">ParallelConfig</h2>
+<p>Constructor: {{cite deepinfer/config.py:150-174}}. There is no tensor-parallel size: the "model parallel" size is the CP size.</p>
+<table>
+  <thead><tr><th>Field, type, default</th><th>Meaning</th><th>Set at, read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>data_parallel_size</code><br><code>int</code>; <code>0</code> becomes <code>max(1, ep // cp)</code></td><td>Number of DP replicas (engines).</td><td><strong>Set:</strong> {{cite deepinfer/config.py:161-163}}<br><strong>Read:</strong> process groups ({{cite deepinfer/worker/base.py:322}}), decode-curve cache key ({{cite deepinfer/worker/decode_perf_cache.py:46}})</td></tr>
+    <tr><td><code>context_parallel_size</code><br><code>int</code></td><td>Ranks per engine.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:164}}<br><strong>Read:</strong> follower spawn ({{cite deepinfer/engine/llm_engine.py:370}}), global rank ({{cite deepinfer/worker/base.py:79}}), process groups ({{cite deepinfer/worker/base.py:323}})</td></tr>
+    <tr><td><code>expert_parallel_size</code><br><code>int</code></td><td>Size of one EP group.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:165}}<br><strong>Read:</strong> {{cite deepinfer/worker/base.py:324}}</td></tr>
+    <tr><td><code>engine_rank</code><br><code>int</code></td><td>Index of this engine.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:166}}<br><strong>Read:</strong> global rank <code>engine_rank × cp_size + cp_rank</code> ({{cite deepinfer/worker/base.py:79}}, {{cite deepinfer/worker/base.py:329}})</td></tr>
+    <tr><td><code>data_parallel_rank</code><br><code>int</code>, derived: <code>engine_rank % data_parallel_size</code></td><td>Index inside the DP group.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:167}}<br><strong>Read:</strong> multimodal processor ({{cite deepinfer/engine/llm_engine.py:217}}), {{cite deepinfer/worker/base.py:77}}</td></tr>
+    <tr><td><code>engine_group_rank</code><br><code>int</code></td><td>Port offset of the rendezvous address.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:168}}<br><strong>Read:</strong> {{cite deepinfer/utils.py:222-230}}</td></tr>
+    <tr><td><code>engine_type</code><br><code>EngineType</code>, <code>NORMAL</code></td><td>Engine kind.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:169}}<br><strong>Read:</strong> CUDA graphs on or off ({{cite deepinfer/worker/model_runner.py:73}}), draft pool ({{cite deepinfer/worker/model_runner.py:98}}), profile kind ({{cite deepinfer/worker/model_runner.py:448}})</td></tr>
+    <tr><td><code>model_parallel_size</code><br><code>int</code>, derived: <code>= context_parallel_size</code></td><td>Ranks that work on one batch.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:171}}<br><strong>Read:</strong> {{term mfu | MFU}} per device ({{cite deepinfer/engine/stats_logger.py:209}})</td></tr>
+    <tr><td><code>engram_parallel_size</code><br><code>int</code>; <code>0</code> becomes <code>model_parallel_size × data_parallel_size</code></td><td>Size of one Engram group.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:172}}<br><strong>Read:</strong> {{cite deepinfer/worker/base.py:325}}</td></tr>
+    <tr><td><code>world_size</code><br><code>int</code>, derived: <code>max(mp × dp, engram_parallel_size)</code></td><td>Number of ranks in the world group.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:173}}<br><strong>Read:</strong> <code>init_process_group</code> ({{cite deepinfer/worker/base.py:334-340}})</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example.</strong> <code>examples/offline_inference.py --ep 4 --cp 2</code> gives <code>dp_size = max(4 // 2, 1) = 2</code> ({{cite examples/offline_inference.py:24-28}}). Then <code>model_parallel_size = 2</code>, <code>engram_parallel_size = 2 × 2 = 4</code>, <code>world_size = max(4, 4) = 4</code>. Engine 1 has <code>data_parallel_rank = 1 % 2 = 1</code>, and its ranks are 2 and 3.</p>
+
+<h2 id="scheduler-config">SchedulerConfig</h2>
+<p>Constructor: {{cite deepinfer/config.py:185-206}}. The C++ <code>Scheduler</code> reads the fields by name from the Python object, once, in its constructor.</p>
+<table>
+  <thead><tr><th>Field, type, default</th><th>Meaning</th><th>Set at, read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>max_num_batched_tokens</code><br><code>int</code>, derived if <code>None</code></td><td>Token budget of one step.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:196}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:96}}, output builder ({{cite deepinfer/engine/llm_engine.py:745}}), memory profile ({{cite deepinfer/worker/model_runner.py:447}})</td></tr>
+    <tr><td><code>max_num_seqs</code><br><code>int</code></td><td>Maximum running sequences.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:197}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:97}}, CUDA graph sizes ({{cite deepinfer/worker/model_runner.py:77}}), DFlash graphs ({{cite deepinfer/worker/model_runner.py:89}}), draft pool ({{cite deepinfer/worker/model_runner.py:99}}), memory profile ({{cite deepinfer/worker/model_runner.py:446}})</td></tr>
+    <tr><td><code>max_model_len</code><br><code>int</code></td><td>From <code>ModelConfig</code> (already 4096 if it was <code>None</code>).</td><td><strong>Set:</strong> {{cite deepinfer/config.py:198}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:94}}; prompt limit ({{cite csrc/engine/scheduler.hpp:112}})</td></tr>
+    <tr><td><code>runtime_max_model_len</code><br><code>int</code>, derived</td><td>Same formula as in <code>ModelConfig</code>.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:199}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:95}}</td></tr>
+    <tr><td><code>stop_preempted_request</code><br><code>bool</code>, <code>False</code> here, but EngineArgs passes <code>True</code> by default</td><td>Stop or recompute a preempted request.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:200}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:98}}</td></tr>
+    <tr><td><code>chunked_prefill</code><br><code>bool</code>, <code>False</code></td><td>Allow prompt chunks.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:201}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:99}}</td></tr>
+    <tr><td><code>prefill_attempt_interval</code><br><code>int</code>, <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> (70)</td><td>Decode steps between ALL {{term attempt-point | attempt points}}.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:193}}, {{cite deepinfer/config.py:203}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:105}}</td></tr>
+    <tr><td><code>prefill_any_attempt_interval</code><br><code>int</code>, <code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code> (100)</td><td>Decode steps between ANY attempt points.</td><td><strong>Set:</strong> {{cite deepinfer/config.py:194}}, {{cite deepinfer/config.py:205}}<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:107}}</td></tr>
+    <tr><td><code>engine_type</code><br><code>int</code>, no default</td><td><code>EngineType.value</code>: 0, 1 or 2.</td><td><strong>Set:</strong> set by the engine after the KV cache ({{cite deepinfer/engine/llm_engine.py:252}})<br><strong>Read:</strong> {{cite csrc/engine/scheduler.hpp:100}}</td></tr>
+    <tr><td><code>driver_gpu_id</code><br><code>int</code>, no default</td><td>First visible device id.</td><td><strong>Set:</strong> set by the engine ({{cite deepinfer/engine/llm_engine.py:253}})<br><strong>Read:</strong> nothing</td></tr>
+  </tbody>
+</table>
+<x-warning title="The prefill intervals are read at import time">
+<p>The default values of <code>prefill_attempt_interval</code> and <code>prefill_any_attempt_interval</code> are function default arguments ({{cite deepinfer/config.py:193-194}}). Python computes them once, when it imports <code>deepinfer.config</code>. <code>create_engine_configs</code> does not pass them ({{cite deepinfer/engine/arg_utils.py:107-113}}). So set the two variables before you import <code>deepinfer</code>. See {{link reference/env-vars#import-time-table | the import-time table}}.</p>
+</x-warning>
+
+<h2 id="derived">Derived values</h2>
+<p><strong><code>runtime_max_model_len</code></strong> ({{cite deepinfer/config.py:11-16}}):</p>
+<pre><code class="language-python">nextn              = DEEPINFER_USE_NEXTN_DECODE                 # default 5
+scheduler_overhead = nextn + (nextn + 1 if ZOS on else 0)
+draft_overhead     = nextn
+runtime_max_model_len = max_model_len + scheduler_overhead + draft_overhead</code></pre>
+<p><strong><code>max_num_batched_tokens</code></strong> ({{cite deepinfer/config.py:219-228}}):</p>
+<pre><code class="language-python">max_num_decoding_tokens = max_num_seqs * (1 + nextn)
+if max_num_batched_tokens is given:
+    assert max_num_batched_tokens >= max_num_decoding_tokens
+    use it
+else:
+    max(max_model_len, 4096, max_num_decoding_tokens)</code></pre>
+<table>
+  <thead><tr><th>Value</th><th>EngineArgs defaults</th><th><code>examples/offline_inference.py</code></th></tr></thead>
+  <tbody>
+    <tr><td><code>max_model_len</code></td><td><code>None</code> → 4096 ({{cite deepinfer/config.py:69}})</td><td>32768 ({{cite examples/offline_inference.py:53}})</td></tr>
+    <tr><td><code>max_num_seqs</code></td><td>256</td><td>4 ({{cite examples/offline_inference.py:54}})</td></tr>
+    <tr><td><code>max_num_decoding_tokens</code></td><td>256 × 6 = 1536</td><td>4 × 6 = 24</td></tr>
+    <tr><td><code>max_num_batched_tokens</code></td><td><code>None</code> → max(4096, 4096, 1536) = 4096</td><td>32768, given; 32768 ≥ 24 passes ({{cite examples/offline_inference.py:52}})</td></tr>
+    <tr><td><code>runtime_max_model_len</code> (ZOS on)</td><td>4096 + (5 + 6) + 5 = 4112</td><td>32768 + (5 + 6) + 5 = 32784</td></tr>
+    <tr><td><code>runtime_max_model_len</code> (ZOS off)</td><td>4096 + 5 + 5 = 4106</td><td>32768 + 5 + 5 = 32778</td></tr>
+  </tbody>
+</table>
+<x-note title="Both objects compute the same values">
+<p><code>ModelConfig</code> and <code>SchedulerConfig</code> each call the two helper functions ({{cite deepinfer/config.py:70-71}}, {{cite deepinfer/config.py:196}}, {{cite deepinfer/config.py:199}}). They get the same input, because <code>SchedulerConfig</code> gets <code>model_config.max_model_len</code> ({{cite deepinfer/engine/arg_utils.py:110}}). Both read the environment variables at that moment.</p>
+</x-note>
+
+<h2 id="checks">Checks and their errors</h2>
+<table>
+  <thead><tr><th>Check</th><th>Error</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>load_format</code> (lower case) is <code>"auto"</code> or <code>"dummy"</code></td><td><code>AssertionError</code>, no message</td><td>{{cite deepinfer/config.py:115-119}}</td></tr>
+    <tr><td><code>config.json</code> has <code>vl_aligner</code> (only multimodal checkpoints)</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_config_loader.py:22}}</td></tr>
+    <tr><td>A given <code>max_num_batched_tokens</code> ≥ <code>max_num_seqs × (1 + nextn)</code></td><td><code>AssertionError</code>, no message</td><td>{{cite deepinfer/config.py:224-226}}</td></tr>
+    <tr><td><code>tokens_per_block</code> is <code>-1</code> or equals 128</td><td><code>AssertionError</code> with both values</td><td>{{cite deepinfer/engine/arg_utils.py:85-86}}</td></tr>
+    <tr><td><code>gpu_memory_utilization</code> ≤ 1.0</td><td><code>ValueError("GPU memory utilization must be less than 1.0. ...")</code></td><td>{{cite deepinfer/config.py:145-147}}</td></tr>
+    <tr><td><code>expert_parallel_size &gt; 0</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/config.py:177}}</td></tr>
+    <tr><td><code>(mp × dp) % ep == 0</code>: the EP groups fill the ranks exactly</td><td><code>AssertionError</code></td><td>{{cite deepinfer/config.py:178}}</td></tr>
+    <tr><td><code>engram_parallel_size &gt; 0</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/config.py:179}}</td></tr>
+    <tr><td><code>world_size</code> divides by <code>mp × dp</code> and by <code>engram_parallel_size</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/config.py:180-181}}</td></tr>
+    <tr><td><code>0 ≤ engine_rank &lt; world_size // mp</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/config.py:182}}</td></tr>
+    <tr><td>Without chunked prefill: <code>max_num_batched_tokens ≥ max_model_len</code></td><td><code>ValueError</code>: "max_num_batched_tokens (...) is smaller than max_model_len (...)"</td><td>{{cite deepinfer/config.py:209-212}}</td></tr>
+    <tr><td>Both prefill intervals ≥ 1</td><td><code>ValueError</code></td><td>{{cite deepinfer/config.py:213-216}}; C++ checks again ({{cite csrc/engine/scheduler.hpp:106}}, {{cite csrc/engine/scheduler.hpp:108}})</td></tr>
+    <tr><td>A COMPLETION engine needs <code>stop_preempted_request=True</code></td><td><code>RuntimeError</code> from <code>TORCH_CHECK</code></td><td>{{cite csrc/engine/scheduler.hpp:101-104}}</td></tr>
+  </tbody>
+</table>
+<p>Some checks are <code>assert</code> statements. Python removes them when it runs with <code>-O</code>.</p>
+
+<h2 id="docs-vs-code">Where the docstrings and the code disagree</h2>
+<ul>
+  <li><strong><code>max_model_len</code>.</strong> The docstring says: "If None, will be derived from the model" ({{cite deepinfer/config.py:39-40}}). The code uses 4096 and does not read the model ({{cite deepinfer/config.py:69}}). The checkpoint value <code>max_position_embeddings</code> is parsed, but <code>ModelConfig</code> does not use it ({{cite deepinfer/hugging_face/config.py:277}}).</li>
+  <li><strong><code>gpu_memory_utilization</code>.</strong> The error text says "must be less than 1.0", but the test is <code>&gt; 1.0</code>, so 1.0 passes ({{cite deepinfer/config.py:146-147}}). The <code>LLM</code> docstring says "between 0 and 1" ({{cite deepinfer/entrypoints/llm.py:44-48}}). No check refuses 0 or a negative value; then the memory profile finds no room, and start-up stops with "No available memory for the cache blocks" ({{cite deepinfer/engine/llm_engine.py:441-444}}).</li>
+  <li><strong><code>stop_preempted_request</code>.</strong> Three defaults exist: <code>SchedulerConfig</code> <code>False</code> ({{cite deepinfer/config.py:191}}), <code>EngineArgs</code> <code>True</code> ({{cite deepinfer/engine/arg_utils.py:40}}), <code>LLM</code> <code>False</code> ({{cite deepinfer/entrypoints/llm.py:68}}). The <code>EngineArgs</code> value always reaches <code>SchedulerConfig</code> ({{cite deepinfer/engine/arg_utils.py:111}}).</li>
+</ul>
+
+<h2 id="unused">Fields that nothing reads</h2>
+<p>A search of <code>deepinfer/</code>, <code>csrc/</code> and <code>examples/</code> finds no reader for these fields. They are stored and then not used in this release.</p>
+<ul>
+  <li><code>EngineArgs.offline_inference</code>: stored in <code>LLMEngine.offline_inference</code> only ({{cite deepinfer/engine/llm_engine.py:195}}).</li>
+  <li><code>ModelConfig.ignore_len</code> ({{cite deepinfer/config.py:73}}) and <code>ModelConfig.served_model_name</code> ({{cite deepinfer/config.py:74}}).</li>
+  <li><code>SchedulerConfig.driver_gpu_id</code>: the C++ constructor does not read it ({{cite deepinfer/engine/llm_engine.py:253}}, {{cite csrc/engine/scheduler.hpp:94-108}}).</li>
+  <li><code>CacheConfig.bytes_per_block</code> appears only in a log line ({{cite deepinfer/engine/llm_engine.py:262-264}}).</li>
+</ul>

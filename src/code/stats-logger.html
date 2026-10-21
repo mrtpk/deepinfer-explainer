@@ -1,0 +1,209 @@
+---
+title: engine/stats_logger.py: step statistics, MFU and moe_lb
+nav_title: engine/stats_logger.py
+level: Intermediate
+prerequisites: code/llm-engine
+related: code/llm-engine, code/eplb, concepts/eplb, concepts/cuda-graphs, concepts/speculative-decoding, reference/env-vars, tours/startup
+summary: StatsLogger collects one StepStats record per engine step into sliding windows, and every N steps writes one [stats] log line with throughput, MFU, draft accept rates, moe_lb and cache usage. timer.py gives the CPU and device timers; profile_server.py gives an HTTP endpoint for torch.profiler traces.
+---
+<h2>Purpose</h2>
+<p><code>StatsLogger</code> turns per-step numbers into a periodic log line, so that you can see the speed and the health of a running engine.</p>
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/engine/stats_logger.py</code>, 477 lines. Also on this page: <code>deepinfer/timer.py</code> (295 lines) and <code>deepinfer/engine/profile_server.py</code> (320 lines).</td></tr>
+    <tr><th>Main class</th><td><code>StatsLogger</code> ({{cite deepinfer/engine/stats_logger.py:129}}), with the records <code>StepStats</code> ({{cite deepinfer/engine/stats_logger.py:33}}), <code>Aggregates</code> ({{cite deepinfer/engine/stats_logger.py:53}}) and <code>Window</code> ({{cite deepinfer/engine/stats_logger.py:92}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process. <code>log_step</code> runs in the main thread; a daemon thread writes the lines.</td></tr>
+    <tr><th>Called by</th><td><code>LLMEngine</code>: it makes the logger at the end of start-up ({{cite deepinfer/engine/llm_engine.py:298-305}}) and calls <code>log_step</code> from <code>post_process</code> ({{cite deepinfer/engine/llm_engine.py:1004-1008}}).</td></tr>
+    <tr><th>Calls</th><td>The C++ scheduler for counts, the timers of <code>timer.py</code>, and <code>NCCLMemoryStatsLogger</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The FLOP counts (C++ <code>FlopsEstimator</code>) and the expert token counts (EPLB). The logger only sums what it gets.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b11_stats_flow" alt="Panel 1: every step, log_step appends records to six windows and reads running, pending and cache usage; every N steps (N = 10 in the example) it trims the windows, aggregates TPS, MFU, accept rates and moe_lb, builds the stats line and puts it on a queue; a daemon log thread takes it, sleeps rank mod 8 times 5 ms and logs each line. Panel 2: three formulas with examples: completion TPS 240 tokens in 0.1 s is 2400 tokens per second; MFU 900 TFLOP per second over 4500 is 0.2; moe_lb sum of maxima 270 over sum of means 200 is 1.35." caption="Figure: what the logger does in every step and every N steps, and three of its formulas with invented numbers. Click to zoom." />
+<p>Read panel 1 from left to right. Blue work happens in every step, green work only in a logging step, and the amber thread does the slow logging call. Panel 2 shows three formulas from the code with small invented numbers.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>LLMEngine.__init__</code></strong> passes itself, three configs and the device peak: <code>tflops_limit = get_bf16_tflops_limit() × 2</code>, an FP8-equivalent peak ({{cite deepinfer/engine/llm_engine.py:298-305}}).</li>
+  <li><strong><code>_process_model_outputs</code></strong> makes a <code>StepStats</code> record and returns a function that calls <code>log_step</code>, only when statistics are on ({{cite deepinfer/engine/llm_engine.py:763-785}}). <code>post_process</code> calls it and only logs an error if it fails ({{cite deepinfer/engine/llm_engine.py:1004-1008}}).</li>
+  <li><strong><code>step()</code></strong> calls <code>log_nccl_memory()</code> in every step with statistics on ({{cite deepinfer/engine/llm_engine.py:954-955}}).</li>
+  <li><strong><code>close()</code></strong> stops the log thread ({{cite deepinfer/engine/llm_engine.py:355-356}}).</li>
+</ul>
+<p>Statistics are on when <code>disable_log_stats</code> is false. <code>LLM</code> turns them off by default; the example scripts turn them on ({{cite deepinfer/entrypoints/llm.py:67}}, {{cite examples/_config.py:122}}).</p>
+<h3>What it calls</h3>
+<ul>
+  <li>Scheduler counters: free blocks, running and chunked prompt counts, preempted and aborted counts ({{cite deepinfer/engine/stats_logger.py:410-423}}).</li>
+  <li><code>cpu_timer</code> and the two device timers, through <code>get_timers()</code> ({{cite deepinfer/timer.py:293-295}}).</li>
+  <li>A daemon thread <code>stats_log_worker</code> with a <code>queue.SimpleQueue</code> ({{cite deepinfer/engine/stats_logger.py:185-187}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>StepStats</code></td><td>{{cite deepinfer/engine/stats_logger.py:33}}</td><td>The input of one step: batch, lengths, FLOPs, first-token latencies, draft counts, load balance.</td></tr>
+    <tr><td><code>Aggregates</code></td><td>{{cite deepinfer/engine/stats_logger.py:53}}</td><td>The computed values of one log line.</td></tr>
+    <tr><td><code>Window</code></td><td>{{cite deepinfer/engine/stats_logger.py:92}}</td><td>A list of <code>(time, payload, step)</code>; <code>trim</code> keeps the entries that are at most <code>max_age</code> steps old.</td></tr>
+    <tr><td><code>_log_worker</code></td><td>{{cite deepinfer/engine/stats_logger.py:116}}</td><td>The thread function: take messages, sleep a little, log.</td></tr>
+    <tr><td><code>_throughput</code></td><td>{{cite deepinfer/engine/stats_logger.py:195}}</td><td>Tokens per second over a window.</td></tr>
+    <tr><td><code>_mfu</code></td><td>{{cite deepinfer/engine/stats_logger.py:203}}</td><td>{{term mfu | Model FLOPs utilization}} over the window.</td></tr>
+    <tr><td><code>_nextn_stats</code></td><td>{{cite deepinfer/engine/stats_logger.py:211}}</td><td>Accept rate per draft position, average verified length, confidence error.</td></tr>
+    <tr><td><code>_moe_lb_ratio</code></td><td>{{cite deepinfer/engine/stats_logger.py:238}}</td><td>The {{term moe-lb}} value.</td></tr>
+    <tr><td><code>_record</code>, <code>_should_log</code>, <code>_collect</code></td><td>{{cite deepinfer/engine/stats_logger.py:355-426}}</td><td>The three parts of one call.</td></tr>
+    <tr><td><code>log_step</code></td><td>{{cite deepinfer/engine/stats_logger.py:438}}</td><td>The entry point, once per step.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+<h3><code>log_step</code>: once per step</h3>
+<x-code file="deepinfer/engine/stats_logger.py" lines="437-477" highlight="449,452-458,459,462-467,470-474" />
+<ol>
+  <li>Line 449: <code>_record</code> appends the step to the {{term stats-window | windows}}. A prefill step goes into the prompt window; a decode step into three windows for generated tokens, verified tokens and confidence errors. Every step goes into the FLOP window, and into the <code>moe_lb</code> window when it has a value ({{cite deepinfer/engine/stats_logger.py:359-377}}).</li>
+  <li>Line 452: a log line is due at step 0 and then every <code>DEEPINFER_LOGGING_INTERVAL_STEP</code> steps. A PROMPT engine logs five times as often ({{cite deepinfer/engine/stats_logger.py:381-390}}).</li>
+  <li>Lines 453-458: on a logging step, each window keeps only the entries that are at most <code>interval</code> steps old (so <code>interval + 1</code> steps). The <code>moe_lb</code> window keeps at least <code>DEEPINFER_MOE_LB_STAT_INTERVAL</code> steps (default 128), because a new value comes only that often.</li>
+  <li>Line 459: <code>_collect</code> computes the values. Cheap values are computed in every step; the expensive ones only on a logging step.</li>
+  <li>Lines 462-467: the message goes to the queue, not to the logger. The main thread never waits for log I/O ({{cite deepinfer/engine/stats_logger.py:342-344}}).</li>
+  <li>Lines 470-474: on a logging step, all timers are cleared, so each line shows the time since the last line.</li>
+</ol>
+<x-note title="With the interval at 0, the windows stay empty">
+<p><code>DEEPINFER_LOGGING_INTERVAL_STEP=0</code> turns the line off. The condition on line 453 is then true in every step, so every window except the <code>moe_lb</code> window is trimmed to age 0 in every step (line 456). The benchmark script uses this to turn the log off in parts of its run ({{cite examples/README.md:49}}).</p>
+</x-note>
+
+<h3>Throughput and MFU</h3>
+<x-code file="deepinfer/engine/stats_logger.py" lines="194-209" highlight="199,201,208-209">
+  <x-tr line="200">Convention: the first entry is only the start of the window (its value is not counted); the denominator goes to now, including the empty time after the last sample, so the value decays when the window stops getting entries (compare _mfu).</x-tr>
+  <x-tr line="207">Convention: the first entry is only the start of the interval (its value is not counted); the denominator is the time between the first and the last sample, not up to now (compare _throughput; _tflops gets an entry in every step, so in practice the last time stamp is now).</x-tr>
+</x-code>
+<p>MFU divides by <code>model_parallel_size</code>, which is the CP size ({{cite deepinfer/config.py:171}}). The code does not say why. The peak <code>tflops_limit</code> is two times the BF16 peak of <code>deep_cluster</code>: 2 × 2250 on x86_64 SM100, 2 × 2500 on ARM, 2 × 432 on Ascend ({{cite deep_cluster/hardware/device.py:151-156}}).</p>
+
+<h3>Draft accept rates</h3>
+<x-code file="deepinfer/engine/stats_logger.py" lines="211-236" highlight="213,224-226,230-232,236" />
+<p>The sampler reports two lists per decode step: <code>num_generated_tokens</code> and <code>num_verified_tokens</code>. Item 0 is the request count; item <code>i</code> is the count for draft position <code>i</code> ({{cite deepinfer/sequence.py:242-246}}, {{cite deepinfer/model_executor/layers/sampler.py:294-295}}). So <code>nextn_rates[i-1]</code> is the accept rate of draft <code>i</code> among the drafts that were verified. <code>avg_verified_len</code> is the mean number of drafts sent per request; it is lower than 5 only with DSpark.</p>
+
+<h3><code>moe_lb</code>: sum of maxima over sum of means</h3>
+<x-code file="deepinfer/engine/stats_logger.py" lines="238-241">
+  <x-tr line="240">No data: assume perfect balance.</x-tr>
+</x-code>
+<p>Each payload is <code>(mean, max)</code>. The EPLB code makes it every <code>DEEPINFER_MOE_LB_STAT_INTERVAL</code> steps: it gathers the token counts of every EP rank, takes the mean and the maximum over ranks for each step and MoE layer, and sums each over all steps and layers ({{cite deepinfer/model_executor/eplb/__init__.py:180-193}}). The logger then divides the sum of maxima by the sum of means. 1.0 is perfect balance.</p>
+<x-warning title="Not the same as the doc's wording">
+<p>The deployment Q&amp;A calls <code>moe_lb</code> "slowest rank / mean" ({{cite doc/inference_deployment_qa.md:99}}). The code takes the maximum per step and layer first, then sums. So the busiest rank can change from layer to layer, and the result is never smaller than the ratio of the total of the busiest rank to the mean. The page {{link concepts/eplb}} explains the counting.</p>
+</x-warning>
+
+<h3>The log line</h3>
+<p><code>_build_log_messages</code> makes one <code>[stats]</code> line and up to two timer lines, <code>[cpu]</code> and <code>[cuda]</code> ({{cite deepinfer/engine/stats_logger.py:272-340}}). A shortened example from a decode step (invented values):</p>
+<pre><code class="language-none">RANK 3, GPU 3, step 120, [stats] (is_prompt False | cur_SPS 98.512 | avg_SPS 97.004 | cur_TPS 1182.1
+ | prompt_TPS 0.0 | completion_TPS 1150.3 | avg_nextn_accept_rate 62.00% | nextn_accept_rate [87.50%,
+ 75.00%, 60.00%, 50.00%, 37.50%] | verified_tokens 200 | accepted_tokens 124 | avg_verified_len 5.00
+ | avg_confidence_error 0.0000 | moe_lb 1.0900 | running 4 | pending 1 | chunked 0
+ | num_batched_tokens 24[100.00%] | KV_cache_usage 3.41% | state_cache_usage 100.00% | ...
+ | TTFT (max 0.0 ms, mean 0.0 ms) | ... | MFU 0.012)
+RANK 3, GPU 3, step 120, [cpu] (schedule cur0.4ms/mean0.4ms/max0.6ms/10calls/4.0% | ...)</code></pre>
+
+<h2>Deep dive</h2>
+<x-deepdive title="Data flow: StepStats fields, types and sources">
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Source</th><th>Used for</th></tr></thead>
+  <tbody>
+    <tr><td><code>prompt_run</code></td><td>bool</td><td><code>SchedulerOutputs</code></td><td>prompt or decode windows</td></tr>
+    <tr><td><code>num_seqs</code>, <code>num_batched_tokens</code></td><td>int</td><td><code>SchedulerOutputs</code></td><td>batch use, prompt TPS</td></tr>
+    <tr><td><code>sum_seqlen_qxk</code>, <code>max_seqlen_k</code>, <code>min_seqlen_k</code></td><td>int</td><td><code>SchedulerOutputs</code></td><td>printed as they are</td></tr>
+    <tr><td><code>attn_tflops</code>, <code>total_tflops</code></td><td>float</td><td>C++ <code>FlopsEstimator</code></td><td>MFU</td></tr>
+    <tr><td><code>first_token_latencies</code></td><td><code>np.ndarray</code> float64</td><td><code>process_outputs</code> ({{cite csrc/engine/scheduler.hpp:1008-1010}})</td><td>TTFT max and mean</td></tr>
+    <tr><td><code>num_cached_tokens_gpu</code></td><td>int</td><td><code>SchedulerOutputs</code></td><td>prefill caching rate</td></tr>
+    <tr><td><code>num_generated_tokens</code>, <code>num_verified_tokens</code></td><td><code>list[int]</code>, length <code>nextn + 1</code></td><td>sampler</td><td>accept rates</td></tr>
+    <tr><td><code>batch_confidence_error</code></td><td>float</td><td>sampler: <code>Σ|accept_prob − confidence|</code> ({{cite deepinfer/sequence.py:248-249}})</td><td>average confidence error</td></tr>
+    <tr><td><code>moe_load_balance_ratio</code></td><td><code>(float, float)</code> or <code>None</code></td><td>EPLB, every 128 steps</td><td><code>moe_lb</code></td></tr>
+  </tbody>
+</table>
+<p>The record is built in <code>_process_model_outputs</code> ({{cite deepinfer/engine/llm_engine.py:765-780}}). With ZOS, this runs one step late, so a log line at step N describes steps up to N−1.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one window, all formulas">
+<p>Invented numbers: one DP rank, <code>--cp 1</code>, x86_64 SM100 (<code>tflops_limit = 4500</code>), interval 10. Steps 110 to 120 are decode steps, 10 ms apart, each with 4 sequences and 24 query tokens.</p>
+<ol>
+  <li><strong>completion_TPS.</strong> The generated-token window has 11 entries. Each counts <code>sum(gen_tokens)</code>: for example 4 + 3 + 3 + 2 + 2 + 1 = 15 tokens (4 sampled tokens and 11 accepted drafts). The first entry only marks the start. <code>10 × 15 / 0.1 s = 1500</code> tokens per second.</li>
+  <li><strong>MFU.</strong> Each step reports 0.9 TFLOP. <code>(11 × 0.9 − 0.9) / 0.1 s / 1 / 4500 = 0.02</code>.</li>
+  <li><strong>Accept rate of draft 1.</strong> 4 drafts verified per step at position 1, and 3 accepted. All 11 entries count here: <code>33 / 44 = 75 %</code>.</li>
+  <li><strong>avg_verified_len.</strong> <code>sum(verified[1:]) / sum(num_seqs) = 11 × 20 / 44 = 5.0</code> with fixed 5 drafts.</li>
+  <li><strong>KV_cache_usage.</strong> <code>(num_gpu_blocks − 1 − free) / (num_gpu_blocks − 1)</code>; block 0 is not counted ({{cite deepinfer/engine/stats_logger.py:410-411}}).</li>
+  <li><strong>cur_SPS.</strong> With ZOS, <code>1 / last_step_interval</code>, the time between two <code>step()</code> calls ({{cite deepinfer/engine/stats_logger.py:405-406}}): <code>1 / 0.010 = 100</code>.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Threads, timing and a small sleep">
+<p>The log thread sleeps <code>(rank % 8) × 5 ms</code> before it writes, but only when no backlog waits in the queue ({{cite deepinfer/engine/stats_logger.py:116-126}}). So the 8 ranks of one host do not all write at the same moment. <code>close()</code> puts <code>None</code> on the queue and joins the thread, so queued lines are written before the engine stops ({{cite deepinfer/engine/stats_logger.py:346-349}}).</p>
+<p>The CPU split <code>prefill/decode</code> comes from two extra timer names. <code>_record</code> adds the time since the last step to <code>engine_step:prefill</code> or <code>engine_step:decode</code>, but not for empty steps ({{cite deepinfer/engine/stats_logger.py:362-372}}).</p>
+</x-deepdive>
+
+<x-deepdive title="timer.py: three timers">
+<table>
+  <thead><tr><th>Timer</th><th>Class</th><th>How it measures</th><th>Example users</th></tr></thead>
+  <tbody>
+    <tr><td><code>cpu_timer</code></td><td><code>CPUTimer</code> ({{cite deepinfer/timer.py:48-66}})</td><td><code>time.perf_counter()</code> around a block; also a <code>torch.profiler.record_function</code> label <code>deepinfer:&lt;name&gt;</code></td><td><code>schedule</code>, <code>multi_modal_fetch</code>, <code>bubble</code> ({{cite deepinfer/engine/llm_engine.py:881-991}})</td></tr>
+    <tr><td><code>cuda_timer</code></td><td><code>CUDATimer</code> ({{cite deepinfer/timer.py:223-290}})</td><td>a pair of <code>torch.cuda.Event</code> per call; <code>flush_out</code> reads the finished pairs</td><td><code>device_forward</code>, <code>device_sample</code> ({{cite deepinfer/worker/model_runner.py:323}}, {{cite deepinfer/worker/model_runner.py:358}})</td></tr>
+    <tr><td><code>cuda_graph_timer</code></td><td><code>CUDAGraphTimer</code> ({{cite deepinfer/timer.py:78-220}})</td><td>event-record nodes inside a captured graph, with two event sets that swap before each replay; GPU only</td><td>probes in a few chosen decode layers, for example <code>attn-part-&lt;layer&gt;</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:128-132}})</td></tr>
+  </tbody>
+</table>
+<p>All three keep <code>times</code>, <code>called</code>, <code>max_time</code> and <code>latest_times</code> per name ({{cite deepinfer/timer.py:19-30}}). A name with <code>-part-</code> is added to the name before it. A <code>scale</code> multiplies a measured time; for example, the MoE probe of one layer is scaled by the number of MoE layers ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:588-592}}). So the <code>[cuda]</code> line shows an estimate for all layers, from one measured layer. The {{term graph-timer}} is explained on {{link concepts/cuda-graphs}}.</p>
+</x-deepdive>
+
+<x-deepdive title="profile_server.py: torch.profiler traces over HTTP">
+<p>With <code>DEEPINFER_PROFILE_HTTP_ENABLE=1</code>, the engine starts a small HTTP server in a daemon thread ({{cite deepinfer/engine/llm_engine.py:235-239}}). It listens on port <code>DEEPINFER_PROFILE_HTTP_PORT_BASE + driver_gpu_id</code>, default <code>6070 + gpu</code> ({{cite deepinfer/engine/profile_server.py:117}}).</p>
+<ol>
+  <li>A client sends <code>POST /profile</code> (or <code>GET</code>) with <code>num_steps</code> (1 to 50, default 20) and an optional <code>output_dir</code> ({{cite deepinfer/engine/profile_server.py:167-205}}).</li>
+  <li>The engine thread picks the request up at the start of the next <code>step()</code> and starts <code>torch.profiler</code> ({{cite deepinfer/engine/profile_server.py:256-295}}, {{cite deepinfer/engine/llm_engine.py:878-879}}).</li>
+  <li>After <code>num_steps</code> steps it stops the profiler. A worker thread writes the {{term profiler-trace}} to <code>profile-&lt;ip&gt;-gpu&lt;id&gt;-rank&lt;rank&gt;-&lt;time&gt;.json</code> ({{cite deepinfer/engine/profile_server.py:311-320}}, {{cite deepinfer/engine/profile_server.py:224-226}}).</li>
+  <li>The HTTP reply holds the file path. A second request during a run gets 409; a request that the engine does not pick up in 30 s gets 503 ({{cite deepinfer/engine/profile_server.py:216-252}}, {{cite deepinfer/engine/profile_server.py:277-278}}).</li>
+</ol>
+<p>Only the driver device is traced, because the profiler works in one process; CP followers are not in the trace (Translated, {{cite deepinfer/engine/profile_server.py:7-8}}). A comment gives a measured size of about 4.9 MB per step (Translated, {{cite deepinfer/engine/profile_server.py:45}}). Missing <code>fastapi</code> or <code>uvicorn</code>, or a busy port, only turns the endpoint off with an error log ({{cite deepinfer/engine/profile_server.py:140-152}}).</p>
+<pre><code class="language-bash">DEEPINFER_PROFILE_HTTP_ENABLE=1 python3 examples/offline_inference.py
+curl -XPOST "http://&lt;host-ip&gt;:6073/profile?num_steps=5"    # device 3</code></pre>
+</x-deepdive>
+
+<x-deepdive title="Error paths and environment variables">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>An exception in <code>log_step</code></td><td>traceback and an error log; the step goes on</td><td>{{cite deepinfer/engine/llm_engine.py:1004-1008}}</td></tr>
+    <tr><td>An exception in the log thread</td><td>traceback; the thread goes on</td><td>{{cite deepinfer/engine/stats_logger.py:125-126}}</td></tr>
+    <tr><td>Unknown device for the peak</td><td><code>RuntimeError("unknown GPU type")</code> at start-up</td><td>{{cite deep_cluster/hardware/device.py:151-156}}</td></tr>
+    <tr><td><code>DEEPINFER_MOE_LB_STAT_INTERVAL</code> ≤ 0</td><td><code>ValueError</code></td><td>{{cite deepinfer/model_executor/eplb/__init__.py:125-127}}</td></tr>
+  </tbody>
+</table>
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_LOGGING_INTERVAL_STEP</code></td><td>100 ({{cite deepinfer/environ.py:182}})</td><td>{{cite deepinfer/engine/stats_logger.py:384}}</td><td>Steps between lines; ≤ 0 turns them off.</td></tr>
+    <tr><td><code>DEEPINFER_MOE_LB_STAT_INTERVAL</code></td><td>128 ({{cite deepinfer/environ.py:118}})</td><td>{{cite deepinfer/engine/stats_logger.py:456}}</td><td>Minimum age of the <code>moe_lb</code> window.</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5</td><td>{{cite deepinfer/engine/stats_logger.py:213}}</td><td>Length of the accept-rate lists.</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>1 for NORMAL</td><td>{{cite deepinfer/engine/stats_logger.py:405}}</td><td>How <code>cur_SPS</code> measures a step.</td></tr>
+    <tr><td><code>DEEPINFER_NCCL_MEMORY_SAMPLE_INTERVAL_STEPS</code></td><td>1000 ({{cite deepinfer/environ.py:183}})</td><td><code>NCCLMemoryStatsLogger</code></td><td>How often NCCL memory is sampled.</td></tr>
+    <tr><td><code>DEEPINFER_PROFILE_HTTP_ENABLE</code>, <code>_PORT_BASE</code>, <code>DEEPINFER_TORCH_PROFILER_DIR</code></td><td>off, 6070, <code>/tmp</code> ({{cite deepinfer/environ.py:202-204}})</td><td>{{cite deepinfer/engine/llm_engine.py:237}}, {{cite deepinfer/engine/profile_server.py:117}}, {{cite deepinfer/engine/profile_server.py:208}}</td><td>The profiling endpoint.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/eplb}}: where the expert token counts for <code>moe_lb</code> come from.</li>
+  <li>{{link concepts/speculative-decoding}} and {{link concepts/dspark}}: what the accept rates and the verified length mean.</li>
+  <li>{{link concepts/cuda-graphs}}: the graph timer behind the <code>[cuda]</code> line.</li>
+  <li>{{link code/llm-engine}}: where the engine builds <code>StepStats</code>.</li>
+  <li>{{link reference/env-vars}}: the logging and profiling variables.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">You use <code>LLM(...)</code> and see no <code>[stats]</code> lines. Why?
+    <x-a><p><code>LLM.__init__</code> sets <code>disable_log_stats=True</code> unless you pass it ({{cite deepinfer/entrypoints/llm.py:67}}). Then <code>_process_model_outputs</code> returns an empty function ({{cite deepinfer/engine/llm_engine.py:782-783}}). Pass <code>disable_log_stats=False</code>, as <code>create_llm</code> does ({{cite examples/_config.py:122}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Two windows give moe_lb payloads (mean, max) = (100, 120) and (100, 150). What does the log show? What would "slowest rank / mean" of each payload give?
+    <x-a><p>The code: <code>(120 + 150) / (100 + 100) = 1.35</code> ({{cite deepinfer/engine/stats_logger.py:238-241}}). Per payload: 1.2 and 1.5, with a mean of 1.35 here only because both means are equal. With different means, the two methods give different numbers; the code weights each payload by its mean.</p></x-a>
+  </x-q>
+  <x-q level="medium">A decode run stops getting new steps. Why does completion_TPS go down, but MFU stays the same, in the next log line?
+    <x-a><p><code>_throughput</code> divides by <code>now − t_first</code>, so empty time after the last sample counts. <code>_mfu</code> divides by <code>t_last − t_first</code> ({{cite deepinfer/engine/stats_logger.py:199-209}}). The translated comments state this difference.</p></x-a>
+  </x-q>
+  <x-q level="hard">On x86_64 SM100 with <code>--cp 2</code>, the FLOP window has 11 entries of 18 TFLOP each, 0.1 s from first to last. What MFU does the logger print?
+    <x-a><p><code>(11 × 18 − 18) / 0.1 = 1800</code> TFLOP/s. Divide by <code>model_parallel_size = 2</code> and by <code>tflops_limit = 2 × 2250 = 4500</code>: <code>1800 / 2 / 4500 = 0.2</code> ({{cite deepinfer/engine/stats_logger.py:208-209}}, {{cite deepinfer/engine/llm_engine.py:304}}, {{cite deep_cluster/hardware/device.py:155}}).</p></x-a>
+  </x-q>
+</x-quiz>

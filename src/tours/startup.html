@@ -1,0 +1,494 @@
+---
+title: Tour: Start-up
+nav_title: Start-up
+level: Intermediate
+prerequisites: tours/life-of-a-request, learn/kv-cache, learn/parallelism
+related: code/config, reference/config-classes, code/llm-engine, code/worker-base, code/model-runner, code/cache-engine, code/cuda-graph-runner, concepts/cuda-graphs, concepts/paged-kv-cache, concepts/eplb, concepts/hardware-discovery, reference/env-vars, tours/life-of-a-request
+summary: Follow one engine from python3 examples/offline_inference.py to the first step in 14 stops: launcher, environment, configs, tokenizer, workers, process groups, weights, EPLB, memory profile, KV cache and CUDA graphs.
+---
+<x-sentence>We follow one engine process from the launcher script to the moment when <code>LLM(...)</code> returns and the engine can run its first step.</x-sentence>
+
+<h2>The idea</h2>
+<p>The tour {{link tours/life-of-a-request}} starts after the engine is ready. This tour covers the part before it. The call <code>LLM(model=...)</code> does a lot of work. It starts processes, connects the devices and loads the weights. Then it measures the free memory, makes the {{term kv-cache}} and records {{term cuda-graph | CUDA graphs}}. Only after all that can <code>generate()</code> run.</p>
+<p>The order of this work is strict. The KV cache gets the memory that the weights and a test run leave free, so it comes after them. The CUDA graphs record kernels that read the KV cache, so they come after the cache. The device settings must be in the environment before Python imports <code>torch</code>, so they come first of all.</p>
+<p>The tour uses the settings of <code>examples/offline_inference.py</code> with its defaults: <code>--ep 8 --cp 1</code> on one host with 8 devices ({{cite examples/offline_inference.py:13-15}}). So there are 8 {{term data-parallelism | data-parallel}} (DP) ranks, and each one builds a full engine with <code>max_num_seqs=4</code>, <code>max_model_len=32768</code> and <code>gpu_memory_utilization=0.85</code> ({{cite examples/offline_inference.py:45-57}}). Where the library defaults give other numbers, the deep dives say so.</p>
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Where (file and function)</th><th>Runs in</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The launcher starts one process per DP rank</td><td><code>examples/offline_inference.py</code>, <code>_launch.run_dp</code></td><td>launcher</td></tr>
+    <tr><td>2</td><td>Environment and devices, then <code>import deepinfer</code></td><td><code>examples/_config.py</code>: <code>setup_common_env</code>, <code>create_llm</code>; <code>deepinfer/__init__.py</code></td><td>each DP process</td></tr>
+    <tr><td>3</td><td><code>LLM.__init__</code> makes <code>EngineArgs</code></td><td><code>entrypoints/llm.py</code>, <code>engine/arg_utils.py</code></td><td>engine</td></tr>
+    <tr><td>4</td><td><code>EngineArgs</code> makes four config objects</td><td><code>create_engine_configs</code>, <code>deepinfer/config.py</code></td><td>engine</td></tr>
+    <tr><td>5</td><td>HF config, tokenizer and the multimodal worker</td><td><code>hugging_face/config.py</code>, <code>LLMEngine.__init__</code></td><td>engine</td></tr>
+    <tr><td>6</td><td>Workers: CP followers, then the driver</td><td><code>LLMEngine._init_workers</code></td><td>engine</td></tr>
+    <tr><td>7</td><td>Device setup: NUMA, device, CPU cores, seed</td><td><code>WorkerBase.init_model</code>, <code>_bind_numa</code>, <code>deep_cluster.topology</code></td><td>every rank</td></tr>
+    <tr><td>8</td><td>Process groups</td><td><code>WorkerBase.init_dist</code>, <code>parallel_state.py</code></td><td>every rank</td></tr>
+    <tr><td>9</td><td>Model build and weight loading</td><td><code>DeepseekForCausalLM.load_model</code>, <code>V41Builder</code></td><td>every rank</td></tr>
+    <tr><td>10</td><td>Runtime model: DFlash, EPLB, userbuffer</td><td><code>DeepseekForCausalLM.__init__</code></td><td>every rank</td></tr>
+    <tr><td>11</td><td>Profile run and KV cache size</td><td><code>profile_num_available_blocks</code>, <code>LLMEngine._init_cache</code></td><td>every rank</td></tr>
+    <tr><td>12</td><td>KV cache allocation</td><td><code>CacheEngine.allocate_gpu_cache</code></td><td>every rank</td></tr>
+    <tr><td>13</td><td>CUDA graph capture</td><td><code>WorkerBase.warm_up_model</code>, <code>CudaGraphRunner.capture</code></td><td>every rank</td></tr>
+    <tr><td>14</td><td>Ready: block managers, scheduler, statistics</td><td><code>LLMEngine.__init__</code> (end)</td><td>engine</td></tr>
+  </tbody>
+</table>
+<p><strong>An everyday comparison.</strong> Think of a restaurant before it opens. The owner picks the staff and gives each cook a station (stops 1 to 8). The cooks bring in the food and set up the kitchen (stops 9 and 10). Then the owner measures the free space in the cold room and fills it with shelves (stops 11 and 12). The cooks practise each dish one time, so that later they can repeat it fast (stop 13). The comparison stops being true in one place. Here all 8 "restaurants" (DP ranks) must open at the same time, because they share one set of experts.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b11_startup_map" alt="Panel 1: a launcher process spawns 8 DP rank processes. Each DP rank process has a main thread with LLM, LLMEngine, the driver Worker and the C++ scheduler, and it starts helpers: CP followers (0 here), one forked multimodal worker, a stats log thread and an optional profile HTTP thread. Panel 2: 14 numbered cards in code order. Cards 1-2 run in the launcher and before the import, cards 3-6 and 14 run once in the engine process, cards 7-13 run on every rank." caption="Figure: the processes of start-up and the 14 stops in code order. The colour of a card shows where the stop runs. Click to zoom." />
+<p>Read panel 1 from left to right and panel 2 from top to bottom. Amber stops run before Python imports <code>deepinfer</code>. Blue stops run one time in the engine process. Green stops run in every {{term rank}}: in this example only the {{term driver-worker | driver}}, but with <code>--cp 2</code> also in a {{term cp-follower | CP follower}} process.</p>
+
+<x-stop n="1" title="The launcher starts one process per DP rank">
+<p>We are in <code>examples/offline_inference.py</code>. The script reads the parallel sizes from the command line. <code>dp_size</code> is <code>ep // cp</code>, so 8 ({{cite examples/offline_inference.py:24-29}}). The last line calls <code>launch_dp(main, dp_size)</code> ({{cite examples/offline_inference.py:112-113}}).</p>
+<x-code file="examples/_launch.py" lines="15-50" highlight="17-18,35-44,46-48,50">
+  <x-tr line="16">Set the single-host defaults of RANK/WORLD_SIZE, then start child processes with run_dp; when dp_size is None, use all GPUs of this node.</x-tr>
+  <x-tr line="27-30">Give main_fn to each global data-parallel rank that this node owns, by RANK/WORLD_SIZE. With dp_size == 1, run main_fn(dp_size, 0) in the current process.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 17-18: <code>RANK</code> is the index of this host and <code>WORLD_SIZE</code> the number of hosts. The defaults are one host.</li>
+  <li>Lines 35-44: with more than one DP rank, the launcher starts one process per rank of this host with the {{term spawn}} start method. Each process runs <code>main(dp_size, dp_rank)</code>.</li>
+  <li>Lines 46-48: it waits for all processes. A process with a non-zero exit code gives <code>RuntimeError</code>.</li>
+  <li>Line 50: with one DP rank there is no child process.</li>
+</ol>
+<p>The module docstring says that this file does not use <code>deepinfer</code> (Translated, {{cite examples/_launch.py:1-5}}). So the launcher process never imports <code>torch</code> or touches a device. Each child is a new Python interpreter and sets its own devices (stop 2).</p>
+<p><strong>What the data looks like now</strong> (in the process of DP rank 3):</p>
+<pre><code class="language-python">os.environ["RANK"], os.environ["WORLD_SIZE"]   # "0", "1"   (one host)
+dp_size, dp_rank                                # 8, 3
+"deepinfer" in sys.modules                      # False</code></pre>
+<x-deepdive title="Stop 1 in detail: hosts, ranks and spawn">
+<p><strong>More than one host.</strong> <code>run_dp</code> starts the ranks with <code>dp_rank // (dp_size // num_nodes) == node_rank</code> ({{cite examples/_launch.py:39-40}}). With 16 ranks on 2 hosts, host 0 starts ranks 0-7 and host 1 starts ranks 8-15. <code>dp_size</code> must be a multiple of the host count (line 33).</p>
+<p><strong>What spawn gives.</strong> The code does not say why it uses spawn. A spawned child gets a copy of the environment of the parent but no copy of its memory. The child imports <code>torch</code> only after it sets the visible devices (stop 2).</p>
+<p><strong>Who else starts processes.</strong> The engine starts more processes later: CP followers with spawn (stop 6) and a multimodal worker with fork (stop 5). The launcher does not know about them.</p>
+<p><strong>The world size.</strong> <code>world_size = dp_size * cp_size</code> and it must be a multiple of <code>ep_size</code> ({{cite examples/offline_inference.py:28-29}}). With <code>--ep 8 --cp 2</code> the script makes 4 DP ranks with 2 devices each.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="2" title="Environment and devices, then import deepinfer">
+<p>Each DP process runs <code>main</code>. It first writes {{term environment-variable | environment variables}} and only then imports <code>deepinfer</code>. Many settings are read only once, at the first read or at import. And the visible devices must be known before <code>torch</code> starts CUDA.</p>
+<x-code file="examples/_config.py" lines="55-83" highlight="58-61,62-63,75-76,79-80">
+  <x-tr line="56">Set CUDA_VISIBLE_DEVICES for the current engine rank; the first device number comes from the environment variable DEVICE_OFFSET.</x-tr>
+  <x-tr line="73">Set the inference environment variables that the scripts and tests/models share; parameters control the differences between callers.</x-tr>
+  <x-tr line="78">Only a lower bound: the engine rounds up so that num_physical_experts is divisible by ep_size.</x-tr>
+</x-code>
+<p><code>main</code> calls <code>setup_common_env</code> ({{cite examples/offline_inference.py:35-43}}), then <code>create_llm</code>. <code>create_llm</code> sets the visible devices and then imports <code>torch</code> and <code>deepinfer</code> inside the function:</p>
+<x-code file="examples/_config.py" lines="104-113" highlight="106,108,110">
+  <x-tr line="104-113">(no Chinese in these lines)</x-tr>
+</x-code>
+<p>The import of <code>deepinfer</code> runs <code>deepinfer/__init__.py</code>. That file must not import <code>torch</code>. Translated: <em>"Never import torch or initialize a device in this file in any form: it causes failures in child processes"</em> ({{cite deepinfer/__init__.py:1}}). It reads one variable and sets four others:</p>
+<x-code file="deepinfer/__init__.py" lines="28-44" highlight="30-32,39">
+  <x-tr line="28-29">Build outputs are stored per platform (deepinfer/_so/&lt;tag&gt;/). With the folder on the package search path, import still finds the copy of this platform, so NVIDIA and Ascend builds of one CPU architecture can share one code tree.</x-tr>
+  <x-tr line="37-38">Imported dependencies may call torch.cuda.is_available. If CUDA starts before CUDA_VISIBLE_DEVICES is set, the setting has no effect, so use the NVML-based check.</x-tr>
+</x-code>
+<p><strong>What the data looks like now</strong> (DP rank 3, before <code>LLM(...)</code> runs):</p>
+<pre><code class="language-python">os.environ["CUDA_VISIBLE_DEVICES"]          # "3"   (local_engine_rank 3, cp_size 1)
+os.environ["DEEPINFER_USE_NEXTN_DECODE"]    # "5"   (setdefault)
+os.environ["DEEPINFER_SAMPLER_FORCE_TOPK"]  # "4096"
+os.environ["DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS"]       # "32"  (EPLB on in this example)
+os.environ["DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL"]  # "30"
+os.environ["DEEPINFER_BATCH_INVARIANT"]     # "1" on NVIDIA (setdefault)
+os.environ["DEEPINFER_LOGGING_INTERVAL_STEP"]  # "10"
+os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"]    # "1"  (set by deepinfer/__init__.py)</code></pre>
+<x-deepdive title="Stop 2 in detail: the device formula, deep_cluster, and the import-time reads">
+<p><strong>The device formula.</strong> <code>local_engine_rank = engine_rank * cp_size % device_count // cp_size</code>. The process gets <code>cp_size</code> devices from <code>DEVICE_OFFSET + local_engine_rank * cp_size</code> ({{cite examples/_config.py:57-61}}). Examples on a host with 8 devices:</p>
+<table>
+  <thead><tr><th>Settings</th><th>engine_rank</th><th>CUDA_VISIBLE_DEVICES</th></tr></thead>
+  <tbody>
+    <tr><td><code>--ep 8 --cp 1</code></td><td>3</td><td><code>"3"</code></td></tr>
+    <tr><td><code>--ep 8 --cp 2</code></td><td>3</td><td><code>3*2 % 8 // 2 = 3</code>, so <code>"6,7"</code></td></tr>
+    <tr><td><code>--ep 16 --cp 1</code>, host 1</td><td>11</td><td><code>11 % 8 = 3</code>, so <code>"3"</code></td></tr>
+  </tbody>
+</table>
+<p><strong>deep_cluster before deepinfer.</strong> <code>_config.py</code> imports <code>deep_cluster.hardware</code> at the top ({{cite examples/_config.py:26}}). That package reads the hardware from the file system and does not start CUDA. <code>accelerator_kind()</code> returns <code>"ascend"</code>, <code>"nvidia"</code> or <code>"cpu"</code> ({{cite deep_cluster/hardware/device.py:18-23}}), and <code>get_actual_num_gpus()</code> counts the physical devices ({{cite deep_cluster/hardware/device.py:139-140}}). On Ascend, the script copies the device list to <code>ASCEND_RT_VISIBLE_DEVICES</code> ({{cite examples/_config.py:62-63}}). The docstring of <code>create_llm</code> gives the reason. Translated: <em>"On Ascend NPU, import torch initializes the ACL environment, and then the ASCEND_RT_VISIBLE_DEVICES setting fails"</em> ({{cite examples/_config.py:102}}). The page {{link concepts/hardware-discovery}} explains the package.</p>
+<p><strong>Reads at import time.</strong> <code>deepinfer/__init__.py</code> reads <code>DEEPINFER_ACCELERATOR</code> (default <code>"nvidia"</code>) for the folder of the compiled extension ({{cite deepinfer/__init__.py:15}}, {{cite deepinfer/environ.py:101}}). Later imports read more variables at {{term import-time}}: for example, <code>SchedulerConfig</code> uses <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code> as a default argument ({{cite deepinfer/config.py:193-194}}). The table {{link reference/env-vars#import-time-table | Variables read at import time}} lists all of them. A change after the import has no effect on those values.</p>
+<p><strong>The other settings.</strong> <code>DEEPINFER_EXPERT_COUNT_WINDOW_SIZE=3</code> is always set ({{cite examples/_config.py:80}}). With EPLB on (the default of this script), the script also asks for 32 extra experts and a rearrangement every 30 steps ({{cite examples/_config.py:77-83}}, {{cite examples/offline_inference.py:35-41}}). The library default for extra experts is 0 ({{cite deepinfer/environ.py:114}}).</p>
+<p><strong>The model path.</strong> <code>resolve_model_path</code> takes a local folder with <code>config.json</code>, or downloads the {{term hf-checkpoint}} <code>deepseek-ai/DeepSeek-V4.1-Flash-1017</code> into the Hugging Face cache. <code>DEEPINFER_HF_MODEL_DIR</code> points the default name at a local copy ({{cite examples/_config.py:32-52}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="3" title="LLM.__init__ makes EngineArgs">
+<p>We are in <code>deepinfer/entrypoints/llm.py</code>. <code>create_llm</code> calls <code>LLM(model=..., expert_parallel_size=8, context_parallel_size=1, engine_rank=3, ...)</code> ({{cite examples/_config.py:113-125}}). <code>LLM.__init__</code> puts all arguments into one {{term engine-args}} object:</p>
+<x-code file="deepinfer/entrypoints/llm.py" lines="54-85" highlight="67-69,79,84" />
+<ol>
+  <li>Lines 67-68: two defaults that differ from <code>EngineArgs</code>. Statistics are off unless the caller turns them on, and a preempted request is computed again, not stopped. <code>create_llm</code> passes <code>disable_log_stats=False</code>, so the example logs statistics ({{cite examples/_config.py:122}}).</li>
+  <li>Line 79: <code>offline_inference=True</code> is always set.</li>
+  <li>Line 84: everything else happens inside <code>LLMEngine.from_engine_args</code>. When it returns, the engine is ready (stop 14).</li>
+</ol>
+<p>The dataclass runs <code>__post_init__</code> at once. It sets two environment variables, if the user did not set them, and makes the cached value fresh with <code>rearm</code>:</p>
+<x-code file="deepinfer/engine/arg_utils.py" lines="48-60" highlight="51-55" />
+<p>The NORMAL engine type has <code>default_zero_overhead_scheduling = True</code> ({{cite deepinfer/engine/engine_type.py:15-17}}). So {{term zos | zero-overhead scheduling}} (ZOS) is on, although <code>environ.py</code> has the default off ({{cite deepinfer/environ.py:179}}).</p>
+<p><strong>What the data looks like now</strong>:</p>
+<pre><code class="language-python">EngineArgs(model="/…/DeepSeek-V4.1-Flash-1017", tokenizer=&lt;same path&gt;, trust_remote_code=True,
+           data_parallel_size=8, context_parallel_size=1, expert_parallel_size=8, engine_rank=3,
+           max_num_seqs=4, max_model_len=32768, max_num_batched_tokens=32768,
+           gpu_memory_utilization=0.85, chunked_prefill=True, stop_preempted_request=False,
+           disable_log_stats=False, lookahead_tokens=1, offline_inference=True,
+           engine_type=EngineType.NORMAL, tokens_per_block=-1, seed=0)
+os.environ["DEEPINFER_ZERO_OVERHEAD_SCHEDULING"]  # "1"
+os.environ["DEEPINFER_USE_MULTIMODAL_POOL"]       # "1"</code></pre>
+<x-deepdive title="Stop 3 in detail: two sets of defaults">
+<p><code>LLM</code> and <code>EngineArgs</code> do not have the same defaults. The table lists the differences and one value that <code>LLM</code> sets again. The page {{link reference/config-classes}} lists every field.</p>
+<table>
+  <thead><tr><th>Field</th><th><code>EngineArgs</code> default</th><th>With <code>LLM(...)</code></th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>disable_log_stats</code></td><td><code>False</code></td><td><code>True</code></td><td>{{cite deepinfer/engine/arg_utils.py:37}}, {{cite deepinfer/entrypoints/llm.py:67}}</td></tr>
+    <tr><td><code>stop_preempted_request</code></td><td><code>True</code></td><td><code>False</code></td><td>{{cite deepinfer/engine/arg_utils.py:40}}, {{cite deepinfer/entrypoints/llm.py:68}}</td></tr>
+    <tr><td><code>offline_inference</code></td><td><code>False</code></td><td><code>True</code> (always)</td><td>{{cite deepinfer/engine/arg_utils.py:46}}, {{cite deepinfer/entrypoints/llm.py:79}}</td></tr>
+    <tr><td><code>gpu_memory_utilization</code></td><td><code>0.90</code></td><td><code>0.9</code> (the same value; the parameter is explicit in <code>LLM</code>)</td><td>{{cite deepinfer/engine/arg_utils.py:34}}, {{cite deepinfer/entrypoints/llm.py:63}}</td></tr>
+  </tbody>
+</table>
+<p><code>TOKENIZERS_PARALLELISM</code> becomes <code>"false"</code> if it is not set ({{cite deepinfer/entrypoints/llm.py:69}}). The Hugging Face tokenizer library reads it.</p>
+<p>The LLM docstring has a note for CUDA graphs. Translated: <em>"With cudagraph on, an 'illegal memory access' error can mean that cudagraph ran out of memory. Try a lower gpu_memory_utilization."</em> ({{cite deepinfer/entrypoints/llm.py:50-51}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="4" title="EngineArgs makes four config objects">
+<p><code>from_engine_args</code> calls <code>create_engine_configs()</code> and gives the four results to <code>LLMEngine.__init__</code> ({{cite deepinfer/engine/llm_engine.py:460-469}}). These are the {{term engine-configs}}: <code>ModelConfig</code>, <code>CacheConfig</code>, <code>ParallelConfig</code> and <code>SchedulerConfig</code>.</p>
+<x-code file="deepinfer/engine/arg_utils.py" lines="62-97" highlight="65,83-86,89-91,93-97">
+  <x-tr line="80">Before the KV store is made, derive the block size from the model config.</x-tr>
+</x-code>
+<ol>
+  <li>Line 65: <code>ModelConfig</code> reads the checkpoint <code>config.json</code> at once (stop 5).</li>
+  <li>Lines 83-86: the block size comes from <code>ModelMetadata</code>. It is always 128 tokens ({{cite deepinfer/model_executor/model_metadata_utils.py:133-135}}). A <code>tokens_per_block</code> other than -1 must match it.</li>
+  <li>Lines 89-91: an Engram model can need a compressed tokenizer.</li>
+  <li>Lines 93-97 and the rest: <code>CacheConfig</code>, <code>ParallelConfig</code> and <code>SchedulerConfig</code> (lines 98-113).</li>
+</ol>
+<p>The configs compute some values. The most important one is the {{term runtime-max-model-len}}, the upper limit of every position at run time:</p>
+<x-code file="deepinfer/config.py" lines="11-16" />
+<p>With <code>nextn = 5</code> and ZOS on: <code>32768 + (5 + 6) + 5 = 32784</code>. The KV cache check (stop 11), the block-table width and the profile run use this value, not 32768.</p>
+<p><strong>What the data looks like now</strong> (DP rank 3):</p>
+<pre><code class="language-python">ModelConfig:     max_model_len 32768, runtime_max_model_len 32784, max_num_batched_tokens 32768,
+                 dtype torch.bfloat16, architecture "DeepseekV41ForCausalLM", model_cfg = {gpt: …}
+CacheConfig:     block_size 128, gpu_memory_utilization 0.85, lookahead_tokens 1,
+                 num_gpu_blocks None, num_state_seqs None, bytes_per_block None   # set later
+ParallelConfig:  data_parallel_size 8, context_parallel_size 1, expert_parallel_size 8,
+                 engine_rank 3, data_parallel_rank 3, model_parallel_size 1,
+                 engram_parallel_size 8, world_size 8
+SchedulerConfig: max_num_seqs 4, max_num_batched_tokens 32768, chunked_prefill True,
+                 prefill_attempt_interval 70, prefill_any_attempt_interval 100</code></pre>
+<x-deepdive title="Stop 4 in detail: derived values and checks">
+<table>
+  <thead><tr><th>Value</th><th>Rule</th><th>Example</th><th>Library defaults</th></tr></thead>
+  <tbody>
+    <tr><td><code>max_model_len</code></td><td>the argument, or 4096 if <code>None</code> ({{cite deepinfer/config.py:69}})</td><td>32768</td><td>4096</td></tr>
+    <tr><td><code>runtime_max_model_len</code></td><td><code>max_model_len + nextn + (nextn + 1 if ZOS) + nextn</code></td><td>32784</td><td>4112</td></tr>
+    <tr><td><code>max_num_batched_tokens</code></td><td>the argument (must be ≥ <code>max_num_seqs × (1 + nextn)</code>), else <code>max(max_model_len, 4096, max_num_seqs × (1 + nextn))</code> ({{cite deepinfer/config.py:219-228}})</td><td>32768</td><td><code>max(4096, 4096, 1536) = 4096</code></td></tr>
+    <tr><td><code>data_parallel_size</code></td><td>0 means <code>max(1, ep // cp)</code> ({{cite deepinfer/config.py:161-162}})</td><td>8 (given)</td><td>1</td></tr>
+    <tr><td><code>data_parallel_rank</code></td><td><code>engine_rank % data_parallel_size</code> ({{cite deepinfer/config.py:167}})</td><td>3</td><td>0</td></tr>
+    <tr><td><code>model_parallel_size</code></td><td>equal to the CP size ({{cite deepinfer/config.py:171}})</td><td>1</td><td>1</td></tr>
+    <tr><td><code>engram_parallel_size</code></td><td>the argument, or <code>model_parallel_size × dp</code> ({{cite deepinfer/config.py:172}})</td><td>8</td><td>1</td></tr>
+    <tr><td><code>world_size</code></td><td><code>max(model_parallel_size × dp, engram_parallel_size)</code> ({{cite deepinfer/config.py:173}})</td><td>8</td><td>1</td></tr>
+  </tbody>
+</table>
+<p><strong>Checks.</strong> An unknown <code>load_format</code> fails an assert ({{cite deepinfer/config.py:115-119}}). <code>gpu_memory_utilization</code> above 1.0 raises <code>ValueError</code> ({{cite deepinfer/config.py:145-147}}). Six asserts check the parallel sizes, for example that <code>cp × dp</code> is a multiple of <code>ep</code> ({{cite deepinfer/config.py:176-182}}). Without chunked prefill, <code>max_num_batched_tokens &lt; max_model_len</code> raises <code>ValueError</code> ({{cite deepinfer/config.py:208-212}}). The page {{link code/config}} reads all checks.</p>
+<p><strong>The model config is also in the C++ view.</strong> <code>ModelConfig._load_model_cfg</code> copies four runtime values into <code>model_cfg.gpt</code>: <code>max_num_seqs</code>, <code>max_num_batched_tokens</code>, <code>runtime_max_model_len</code> and <code>engine_type</code> ({{cite deepinfer/config.py:82-94}}). The model code reads them from there.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="5" title="HF config, tokenizer and the multimodal worker">
+<p>The first thing that <code>ModelConfig</code> does is read the checkpoint. <code>load_model_config</code> parses <code>config.json</code> and asserts that the model has a vision part (<code>vl_aligner</code>) ({{cite deepinfer/model_config_loader.py:8-23}}). The parser accepts only one model type and one number format:</p>
+<x-code file="deepinfer/hugging_face/config.py" lines="237-262" highlight="242-249,251,254-262" />
+<p>So the repository supports exactly one architecture, <code>DeepseekV41ForCausalLM</code>, which maps to the class <code>DeepseekVLForCausalLM</code> ({{cite deepinfer/model_executor/models/__init__.py:15-17}}). All model sizes (layers, hidden size, experts, vocabulary) come from <code>config.json</code>, not from the repository ({{cite deepinfer/hugging_face/config.py:271-311}}).</p>
+<p>Then <code>LLMEngine.__init__</code> starts. It logs the config, reads the first visible device, loads the {{term tokenizer}} and makes the multimodal processor:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="188-221" highlight="188,200-205,209-213" />
+<ol>
+  <li>Line 188: <code>CUDA_VISIBLE_DEVICES</code> must exist, else <code>KeyError</code>. The driver device id is the first entry: 3 for our process.</li>
+  <li>Lines 200-205: the tokenizer comes from the same folder. With the release policy, BOS must be id 0 and EOS id 1 ({{cite deepinfer/hugging_face/tokenizer.py:33-39}}).</li>
+  <li>Lines 209-213: the model class has <code>multi_modal_mapper</code>, so the engine binds this process to the {{term numa-node}} of device 0 and makes a <code>MultimodalProcessor</code>. Its constructor forks one worker process for image pre-processing ({{cite deepinfer/ve/multimodal_processor.py:57}}, {{cite deepinfer/ve/multimodal_processor.py:93-103}}).</li>
+</ol>
+<p><strong>What the data looks like now</strong>:</p>
+<pre><code class="language-python">model_cfg.architecture        # "DeepseekV41ForCausalLM"
+model_cfg.gpt.vocab_size      # from config.json (129280 inferred, see tours/life-of-a-request stop 3)
+model_cfg.gpt.n_prefill_layer # index of the first layer with compress ratio 1
+self.tokenizer.eos_token_id   # 1
+self.multi_modal_processor.workers   # [ForkProcessWithCrashHeader, name "multi-modal-worker-0"]</code></pre>
+<x-deepdive title="Stop 5 in detail: what the HF parser checks">
+<p><strong>Required values.</strong> The checkpoint must use SwiGLU (<code>hidden_act = "silu"</code>), no attention bias, zero dropout, one KV head and BF16 parameters ({{cite deepinfer/hugging_face/config.py:51-59}}). The quantization must be FP8 with FP4 experts, dynamic activations, blocks of 32 × 32 and UE8M0 scales (lines 254-262). Any other value raises <code>ValueError</code> with the expected value.</p>
+<p><strong>Values that the parser derives.</strong> <code>kv_lora_rank = head_dim - qk_rope_head_dim</code> ({{cite deepinfer/hugging_face/config.py:288-289}}). <code>window_size = (sliding_window, 0)</code> (line 284). <code>use_fp4_sparse_kv</code> defaults to <code>True</code> (line 303). <code>attn_module_list</code> has one entry per layer, one <code>None</code> for the LM head and one per DFlash layer ({{cite deepinfer/hugging_face/config.py:146-155}}).</p>
+<p><strong>The fork happens early.</strong> The multimodal worker is forked before <code>_init_workers</code> (stop 6). With <code>DEEPINFER_USE_MULTIMODAL_POOL=1</code> (set in stop 3), the processor logs the size of a pinned host pool: <code>DEEPINFER_MULTIMODAL_POOL_SIZE_GB</code> (default 8) per rank ({{cite deepinfer/ve/multimodal_processor.py:49-56}}, {{cite deepinfer/environ.py:208}}). Before the fork, <code>get_multi_modal_pool()</code> makes this pool and pins it, on GPU with <code>cudaHostRegister</code> ({{cite deepinfer/ve/multimodal_processor.py:99-100}}, {{cite deepinfer/shared_memory.py:360-363}}, {{cite deepinfer/shared_memory.py:116-119}}, {{cite deepinfer/platform.py:65-68}}). So the engine process calls the CUDA runtime already here, before stop 7.</p>
+<p><strong>NUMA binding here.</strong> <code>_bind_numa(local_rank=0)</code> runs only when the engine makes a multimodal processor. The same function runs again for every Worker in stop 7.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="6" title="Workers: CP followers, then the driver">
+<p>Next, <code>_init_workers</code> makes the Worker objects. A Worker owns one device. The engine process always holds the driver Worker. Extra processes exist only for context parallelism:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="377-413" highlight="377,384,389-395,402-411" />
+<ol>
+  <li>Lines 377-395: one {{term spawn | spawned}} process per CP rank 1 to <code>cp_size − 1</code>. Each one runs <code>_spawn_worker</code>, which makes a Worker with <code>is_driver_worker=False</code> ({{cite deepinfer/engine/llm_engine.py:122-127}}). With <code>--cp 1</code> the loop is empty.</li>
+  <li>Line 384: a follower uses local device <code>cp_rank % ngpus</code> of this process's visible devices.</li>
+  <li>Lines 402-411: the driver Worker runs in this process, with <code>local_rank = 0</code> and <code>cp_rank = 0</code>. It gets two callbacks into the engine.</li>
+</ol>
+<p>The Worker constructor does stops 7 and 8 at once. A follower then never returns from its constructor: it waits in a loop for method calls from the driver ({{cite deepinfer/worker/base.py:120-133}}).</p>
+<p><strong>What the data looks like now</strong> (with <code>--cp 2</code>, for comparison):</p>
+<pre><code class="language-python"># engine process of DP rank 1, CUDA_VISIBLE_DEVICES = "2,3"
+worker-cp1   SpawnProcess, local_rank 1 (device "3"), cp_rank 1, global rank 1*2+1 = 3
+driver       Worker in this process, local_rank 0 (device "2"), cp_rank 0, global rank 2</code></pre>
+<x-deepdive title="Stop 6 in detail: the order of construction and the rendezvous address">
+<p><strong>Order.</strong> The followers start first, and then the driver Worker is built. All of them meet in <code>init_dist</code> (stop 8), so this order does not matter for correctness. A follower that starts late only makes the others wait.</p>
+<p><strong>The init method.</strong> All ranks of all DP processes meet at one TCP address. <code>get_distributed_init_method</code> returns <code>tcp://MASTER_ADDR:(MASTER_PORT − 50 + engine_group_rank)</code>, with defaults <code>localhost</code> and 23333 ({{cite deepinfer/utils.py:222-230}}). So the example uses <code>tcp://localhost:23283</code>. The comment says that two independent jobs on one host must use different <code>MASTER_PORT</code> values.</p>
+<p><strong>Follower extras.</strong> <code>_spawn_worker</code> first calls <code>expose_all_gpus_to_cuda_driver()</code>. On NVIDIA with <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> on, it shows all devices to the CUDA driver for one <code>cuInit</code> call, then restores the old list ({{cite deepinfer/worker/runtime_config.py:13-26}}). A follower also asks the kernel for <code>SIGKILL</code> when its parent dies ({{cite deepinfer/worker/base.py:130}}).</p>
+<p><strong>The profiling server.</strong> Right after <code>_init_workers</code>, the engine starts the HTTP profiling server if <code>DEEPINFER_PROFILE_HTTP_ENABLE=1</code> ({{cite deepinfer/engine/llm_engine.py:235-239}}). The page {{link code/stats-logger}} describes it.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="7" title="Device setup: NUMA, device, CPU cores, seed">
+<p>We are in <code>WorkerBase.__init__</code> in <code>deepinfer/worker/base.py</code>. It makes the <code>ModelRunner</code> (no model yet), turns off automatic garbage collection, sets some torch options, and calls <code>init_model</code>:</p>
+<x-code file="deepinfer/worker/base.py" lines="174-194" highlight="177,183,185-188,191,194" />
+<ol>
+  <li>Line 177: the PyTorch allocator uses expandable segments.</li>
+  <li>Line 183: <code>configure_worker_environment</code> sets NCCL and JIT-cache variables for this process ({{cite deepinfer/worker/runtime_config.py:29-51}}).</li>
+  <li>Line 185: {{term numa-node | NUMA}} binding for the device (below).</li>
+  <li>Lines 186-187: the device is <code>cuda:{local_rank}</code>, so <code>cuda:0</code> for the driver. The process sees only its own devices, so <code>cuda:0</code> is physical device 3.</li>
+  <li>Line 188: kernel-library settings, for example deterministic algorithms with <code>DEEPINFER_BATCH_INVARIANT=1</code> ({{cite deepinfer/worker/runtime_config.py:54-69}}).</li>
+  <li>Line 191: {{term cpu-affinity}} to a fixed range of physical cores.</li>
+  <li>Line 194: the random seed is <code>seed + global_rank</code> ({{cite deepinfer/worker/base.py:170-172}}).</li>
+</ol>
+<p>The NUMA binding uses <code>deep_cluster.topology</code>. An exception gives only a warning. A return value of -1 from <code>bind_numa</code> is ignored ({{cite deep_cluster/topology/bind.py:82-92}}):</p>
+<x-code file="deepinfer/worker/base.py" lines="347-357" highlight="355,357">
+  <x-tr line="357">NUMA binding failed; memory placement falls back to first-touch, which can make host-to-device copies slower.</x-tr>
+</x-code>
+<x-code file="deep_cluster/topology/bind.py" lines="79-93" highlight="85,90" />
+<p><strong>What the data looks like now</strong> (DP rank 3 on a host with 8 devices and 64 physical cores, an example):</p>
+<pre><code class="language-python">which_numa(0)                 # NUMA node of physical device 3, read from sysfs
+os.sched_getaffinity(0)       # after bind_cpu: {24, 25, ..., 31}   (64 // 8 = 8 cores per device)
+torch.cuda.current_device()   # 0  (physical device 3)
+torch.initial_seed()          # 0 + 3</code></pre>
+<x-deepdive title="Stop 7 in detail: two bindings and their order">
+<ol>
+  <li><strong>NUMA.</strong> <code>which_numa(local_rank)</code> maps the visible device to its physical id and reads its NUMA node ({{cite deep_cluster/topology/bind.py:42-61}}). <code>bind_numa</code> loads <code>libnuma.so.1</code> with <code>ctypes</code>. It sets the CPU affinity to the cores of that node and the memory policy to <code>MPOL_BIND</code> on that node (lines 79-93).</li>
+  <li><strong>CPU cores.</strong> <code>bind_cpu(gpu_id)</code> then sets the affinity again, to <code>phy_cpus // ngpus</code> cores from <code>gpu_id × that number</code> ({{cite deepinfer/utils.py:143-151}}). The second call replaces the CPU set of the first one. The memory policy of the first call stays.</li>
+</ol>
+<p>The argument of <code>bind_cpu</code> is the physical device id from <code>CUDA_VISIBLE_DEVICES</code> ({{cite deepinfer/worker/base.py:125-127}}), so DP rank 3 gets cores 24 to 31 in the example. The page {{link concepts/hardware-discovery}} explains sysfs and NUMA. If <code>libnuma.so.1</code> is missing, <code>bind_numa</code> raises <code>OSError</code> ({{cite deep_cluster/topology/bind.py:25-30}}), and <code>_bind_numa</code> turns it into the warning above.</p>
+<p><strong>Other settings in this phase.</strong> <code>gc.disable()</code> stops automatic garbage collection; the worker runs <code>gc.collect()</code> every <code>DEEPINFER_GC_INTERVAL_STEP</code> steps instead ({{cite deepinfer/worker/base.py:102-106}}, {{cite deepinfer/worker/base.py:153-157}}). <code>torch.set_num_threads(8)</code> limits the CPU threads of PyTorch (line 178).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="8" title="Process groups">
+<p>Now the ranks of all 8 DP processes must find each other. <code>init_dist</code> makes the world group with a {{term rendezvous}}, and then the smaller groups:</p>
+<x-code file="deepinfer/worker/base.py" lines="315-344" highlight="329,334-340,343" />
+<ol>
+  <li>Line 329: the global rank is <code>engine_rank × cp_size + cp_rank</code>: 3 for our process.</li>
+  <li>Lines 334-340: the default {{term process-group}} uses the {{term gloo}} backend on the CPU. Its timeout is <code>DEEPINFER_GLOO_TIMEOUT</code>, default 14400 s ({{cite deepinfer/environ.py:110}}).</li>
+  <li>Line 343: the named groups for DP, CP, EP and Engram, on the device backend.</li>
+</ol>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="85-126" highlight="92-94,97-99,102-106,123-124,126" />
+<p>Each group has a device copy with the backend of the platform ({{term nccl}} or {{term hccl}}). The DP, CP and EP-in-DP groups also have a Gloo copy for CPU tensors. The last line runs one small all-reduce on every device group:</p>
+<x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="173-187" highlight="187">
+  <x-tr line="174-176">After the default process group became CPU (gloo), the NCCL/HCCL subgroups lost their eager or split initialization and are all lazy: a collective must run once before the communicator really exists. A single-rank group cannot be skipped either: Engram DeepEP reuses the communicator made here through backend._comm_ptr(), and a null pointer gives a segmentation fault.</x-tr>
+</x-code>
+<p><strong>What the data looks like now</strong> (8 ranks, dp 8, cp 1, ep 8):</p>
+<pre><code class="language-python">PG.world   ranks [0..7]          PG.dp      [0..7]       PG.cpu_dp_group  [0..7] (gloo)
+PG.ep      = PG.world (ep 8)     PG.cp      [3]          PG.enp           [0..7]
+PG.ep_in_dp [0..7]               PG.local   [3]          PG.mq            None (cp 1)
+PG.rank    3</code></pre>
+<x-deepdive title="Stop 8 in detail: group layout with numbers">
+<p>The ranks are numbered <code>dp_index × cp_size + cp_rank</code>. <code>einops.rearrange</code> cuts the list into groups ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:80-118}}). With 4 ranks, <code>--ep 4 --cp 2</code> (2 DP ranks):</p>
+<table>
+  <thead><tr><th>Group</th><th>Rule</th><th>Groups</th></tr></thead>
+  <tbody>
+    <tr><td>DP</td><td><code>(replica dp cp) -&gt; (replica cp) dp</code></td><td>[0, 2], [1, 3]</td></tr>
+    <tr><td>CP</td><td><code>(dp cp) -&gt; dp cp</code></td><td>[0, 1], [2, 3]</td></tr>
+    <tr><td>EP</td><td>contiguous blocks of <code>ep_size</code>; the world group if <code>ep_size</code> = world</td><td>[0, 1, 2, 3]</td></tr>
+    <tr><td>Engram (enp)</td><td>contiguous blocks of <code>enp_size</code></td><td>[0, 1, 2, 3]</td></tr>
+  </tbody>
+</table>
+<p>There is no tensor-parallel group and no pipeline-parallel group. With <code>cp_size &gt; 1</code>, the CP group also gets a shared-memory message queue with 10 slots of 1 MiB each. The driver sends method calls to the followers through it ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:122-124}}, {{cite deepinfer/worker/base.py:290-302}}).</p>
+<p><strong>Why this is a barrier.</strong> <code>init_process_group</code> waits until all <code>world_size</code> ranks connect. <code>dist.new_group</code> is a collective call, so every rank creates every group in the same order ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:26-37}}). If one DP process fails before this stop, the others wait until the Gloo timeout.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="9" title="Model build and weight loading">
+<p>Back in <code>LLMEngine.__init__</code>, the engine calls <code>_run_workers("load_model")</code> ({{cite deepinfer/engine/llm_engine.py:241}}). The Worker calls <code>ModelRunner.load_model</code>, then <code>get_model</code>, then the class method <code>load_model</code> of the model class ({{cite deepinfer/worker/base.py:203-209}}, {{cite deepinfer/model_executor/model_loader.py:65-80}}). The VL class first reads the image processor settings, then calls the base class ({{cite deepinfer/model_executor/models/deepseek_vl.py:237-245}}):</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="452-470" highlight="457,466-467" />
+<ol>
+  <li>Line 457: <code>finalize_model_config</code> adds values that need the process groups, for example the number of extra experts (stop 10) ({{cite deepinfer/model_executor/model_loader.py:109-125}}).</li>
+  <li>Line 466: <code>prepare_hf_coverage</code> reads the safetensors index and plans which file holds each parameter.</li>
+  <li>Line 467: the builder makes the whole model on the {{term meta-device}}: shapes only, no memory.</li>
+</ol>
+<x-code file="deepinfer/model_executor/models/v4_modules/builder.py" lines="102-127" highlight="102,105-107,114-125" />
+<p>The module list is: one embedding, one block per decoder layer, the main head, and one DFlash block per draft layer. Then the loader puts each parameter on the device and reads the weights:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="509-521" highlight="510,514" />
+<p><strong>What the data looks like now</strong>:</p>
+<pre><code class="language-python">stage_modules  # [MultimodalEmbedding, MoeDecoderBlockHC x num_hidden_layers,
+               #  MainPredictHeadHC, DFlashNextPredictHeadHC x num_nextn_predict_layers]
+model          # DeepseekVLForCausalLM, eval(), requires_grad False, every parameter on cuda
+# log: "Memory allocated: builder=… GiB, deepinfer=… GiB."</code></pre>
+<x-deepdive title="Stop 9 in detail: materialize, tie and load">
+<ol>
+  <li><strong>Materialize.</strong> For each meta parameter, the loader makes a real tensor ({{cite deepinfer/model_executor/models/deepseek.py:473-498}}). Engram tables can stay on the CPU unless <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> is on (line 473). Expert weights are packed FP4 (line 478).</li>
+  <li><strong>Tied weights.</strong> A parameter with an alias shares the storage of its source, so the DFlash layers do not get a second vocabulary matrix (lines 479-485).</li>
+  <li><strong>Dummy weights.</strong> With <code>load_format="dummy"</code> the engine passes <code>skip_load=True</code> ({{cite deepinfer/engine/llm_engine.py:241}}). The loader then fills zeros and calls <code>init_dummy_weight</code> (lines 488-494).</li>
+  <li><strong>Load.</strong> <code>load_hf_checkpoint</code> raises <code>RuntimeError</code> if the checkpoint does not cover a parameter, checks the shapes, and loads the files under a watchdog ({{cite deepinfer/model_executor/model_loader.py:136-153}}). If the load takes more than 30 minutes, the watchdog calls <code>os.abort()</code> ({{cite deepinfer/model_executor/model_loader.py:47-62}}).</li>
+  <li><strong>Final checks.</strong> <code>get_model</code> asserts that every parameter and every scale tensor is on the device, and returns the model in eval mode with gradients off ({{cite deepinfer/model_executor/model_loader.py:76-80}}).</li>
+</ol>
+<p>The page {{link concepts/weight-loading}} explains the coverage plan and the file reads.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="10" title="Runtime model: DFlash, EPLB and the userbuffer">
+<p><code>from_model_cfg</code> wraps the built parameters in the runtime class. Its constructor makes the parts that run in each step:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="298-321" highlight="300-302,310-317,321" />
+<ol>
+  <li>Lines 300-302: with <code>DEEPINFER_USE_NEXTN_DECODE &gt; 0</code>, the {{term dflash}} module that proposes draft tokens.</li>
+  <li>Lines 310-317: the list holds every decoder layer and every DFlash layer that has an MoE block ({{cite deepinfer/model_executor/models/mtp/dflash.py:389-392}}). <code>_init_eplb</code> groups them by layout and makes one {{term eplb}} load balancer per group ({{cite deepinfer/model_executor/models/deepseek.py:324-365}}).</li>
+  <li>Line 321: the {{term userbuffer}} for communication is allocated.</li>
+</ol>
+<p>The number of {{term redundant-expert | extra experts}} was fixed in stop 9 by <code>finalize_model_config</code>. The rule rounds the request up, so that the physical expert count divides by the EP size:</p>
+<x-code file="deepinfer/model_executor/eplb/__init__.py" lines="21-28">
+  <x-tr line="26">Take the number of redundant experts that is at least the lower bound and makes num_physical_experts divisible by ep_size.</x-tr>
+</x-code>
+<p><strong>What the data looks like now</strong> (the expert count is an invented example; the real one is in <code>config.json</code>):</p>
+<pre><code class="language-python"># n_routed_experts = 250 (example), DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS = 32, ep_size = 8
+padding = -(250 + 32) % 8          # 6
+n_redundant_experts = 32 + 6       # 38  -> 288 physical experts, 36 per rank
+# log: "EPLB initialized with N homogeneous layout group(s)"</code></pre>
+<x-deepdive title="Stop 10 in detail: the layout groups and the warning">
+<p><strong>Rounding warning.</strong> If the rounded value differs from the request, the loader writes a warning (in Chinese) with both numbers. The backbone and the DFlash layers are rounded separately, because DFlash can override the MoE config ({{cite deepinfer/model_executor/model_loader.py:83-106}}).</p>
+<p><strong>Layout groups.</strong> Two MoE layers share a load balancer only if their layouts are equal ({{cite deepinfer/model_executor/models/deepseek.py:331-342}}). A layout is the four expert counts, the EP group, and the weight shapes and dtypes. The backbone layers form one group. The DFlash layers form another group if their MoE config is different.</p>
+<p><strong>What is not decided yet.</strong> EPLB does not move experts at start-up. The example sets an interval of 30 steps ({{cite examples/_config.py:81-83}}). The first rearrangement comes earlier, after <code>max(1, 30 // 4) = 7</code> counted steps ({{cite deepinfer/model_executor/eplb/__init__.py:121-123}}). Because the script also sets <code>DEEPINFER_REARRANGE_AFTER_PREFILL_IN_NORMAL_ENGINE=1</code>, the first decode step after a prefill step also rearranges (lines 156-159). The page {{link concepts/eplb}} explains the policy. The memory profile in stop 11 turns on a simulated imbalance, so that the measured peak covers an unbalanced expert load.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="11" title="Profile run and KV cache size">
+<p>The model is on the device. Now the engine must decide how many KV {{term kv-block | blocks}} fit in the memory that is left. <code>_init_cache</code> runs a {{term memory-profiling | memory profile}} on every rank ({{cite deepinfer/engine/llm_engine.py:437}}):</p>
+<x-code file="deepinfer/worker/base.py" lines="217-246" highlight="225,228,234-235,241-245">
+  <x-tr line="241">Subtract the state cache, which has a fixed reserved size.</x-tr>
+  <x-tr line="243">State store and copy buffer, so reserve two times the size.</x-tr>
+</x-code>
+<ol>
+  <li>Line 225: <code>profile_run</code> runs one prefill step with a large test batch (deep dive).</li>
+  <li>Lines 228-234: the peak is the largest PyTorch allocation of the run, plus the memory that other libraries hold.</li>
+  <li>Line 235: the budget is <code>total × gpu_memory_utilization − peak</code>.</li>
+  <li>Lines 241-245: the budget loses two copies of the state buffer. The rest, divided by the size of one block row, is the block count.</li>
+</ol>
+<p>Each rank measures a different number. All ranks must use the same number, so they take the mean:</p>
+<x-code file="deepinfer/worker/base.py" lines="264-268" />
+<x-diagram name="b11_kv_budget" alt="Panel 1: a bar of an 80 GiB device: 50 GiB peak of the profile run, 1 GiB for two copies of the state buffer, 17 GiB of KV blocks, and 12 GiB unused because of gpu_memory_utilization 0.85; 17 GiB divided by a 2 MiB block row gives 8,704 blocks. Panel 2: eight ranks measure 8,704 four times and 8,600, 8,600, 8,600, 8,601; the all-reduce sum is 69,217, divided by 8 is 8,652, rounded to even 8,652; the engine checks int(128 × 8,652 × 0.8) = 885,964 ≥ 32,784." caption="Figure: the memory budget of one rank and the mean over ranks. All GiB values are invented examples. Click to zoom." />
+<p>Then the engine checks that the cache can hold one sequence of full length, with 20 % to spare:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="437-451" highlight="441,445-446" />
+<p><strong>What the data looks like now</strong> (the example values of the figure):</p>
+<pre><code class="language-python">cache_config.num_gpu_blocks   # 8652 on every rank   (written by worker/base.py:267)
+# minimum for the check: ceil(32784 / (128 * 0.8)) = 321 blocks</code></pre>
+<x-deepdive title="Stop 11 in detail: the profile batch, the temporary cache and the imbalance">
+<p><strong>The test batch.</strong> <code>profile_run</code> splits <code>max_num_batched_tokens</code> evenly over <code>max_num_seqs</code> prefill sequences. The first sequence gets the longest possible context, <code>runtime_max_model_len</code> ({{cite deepinfer/worker/model_runner.py:405-414}}). For the example: <code>seqlen_q = [8192, 8192, 8192, 8192]</code> and <code>seqlen_k = [32784, 8192, 8192, 8192]</code>. The token ids are random, and the sampling settings ask for <code>top_logprobs=20</code> ({{cite deepinfer/worker/model_runner.py:473-485}}).</p>
+<p><strong>A temporary cache.</strong> The run needs a real KV cache for the attention kernels. It makes a small one with exactly the blocks of the test batch. That is <code>⌈32784 / 128⌉ + 3 × 64 = 449</code> blocks and <code>int(4 × 1.2) + 1 = 5</code> state slots:</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="498-512" highlight="505-507,510,512">
+  <x-tr line="498-503">Run the profile with a small real KV cache, so that it counts the memory of the cache read and write kernels. The allocation uses cuMemAlloc, is not in the PyTorch statistics and is freed when this function returns, so it does not change the count in profile_num_available_blocks. The cache is set to zero because the full gather of chunked prefill reads parts that no step wrote; zero makes the values finite. NOTE allocate_gpu_cache also writes bytes_per_block, num_state_seqs and bytes_of_state_per_seqs into cache_config, with the same values as the later real allocation (only num_gpu_blocks differs).</x-tr>
+</x-code>
+<p><strong>Simulated imbalance.</strong> Lines 510 and 512 set <code>DEEPINFER_FORCE_IMBALANCE_RATIO</code> to 1.8 for the run and to 0.0 after it. So the profile measures the memory of an unbalanced expert load. A value that you export for this variable has no effect after start-up.</p>
+<p><strong>The library defaults.</strong> With <code>max_num_seqs=256</code> and <code>max_model_len=None</code>: <code>max_num_batched_tokens = 4096</code>, so <code>seqlen_q</code> is 16 for each of 256 sequences, and the first <code>seqlen_k</code> is 4112.</p>
+<p><strong>Why the mean.</strong> The docstring of <code>_init_cache</code> says "the minimum number of blocks across all workers" ({{cite deepinfer/engine/llm_engine.py:426-428}}). The code takes the mean (line 266 above). A rank that measured fewer blocks than the mean gets more blocks than it measured. The extra blocks use memory outside the budget of that rank, for example a part of the 15 % that <code>gpu_memory_utilization = 0.85</code> keeps free. The code does not check this.</p>
+<p><strong>The 2 × state reserve.</strong> The second copy is for <code>copy_state</code>, a buffer of the KV-saving hooks. In this release <code>copy_state</code> stays <code>None</code> ({{cite deepinfer/engine/llm_engine.py:284-285}}), but the memory is still reserved.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="12" title="KV cache allocation">
+<p>With the block count fixed, every rank makes its {{term cache-engine}} ({{cite deepinfer/worker/base.py:270-272}}). It allocates two raw byte buffers with <code>cuda_utils.alloc_tensor</code>, which calls <code>cuMemAlloc</code> directly and does not use the PyTorch allocator ({{cite deepinfer/worker/cache_engine.py:910-916}}, {{cite csrc/cuda_utils.cpp:77-79}}):</p>
+<x-code file="deepinfer/worker/cache_engine.py" lines="936-958" highlight="937-938,948-951,956">
+  <x-tr line="936">Shape comment: [num_gpu_blocks, num_layers, block_size, kv, num_heads, head_size].</x-tr>
+</x-code>
+<ol>
+  <li>Lines 937-938: {{term gpu-blocks}} has one row per block. One row holds the compressed KV entries of all layers for 128 tokens.</li>
+  <li>Lines 948-951: the cache engine writes three sizes back into the shared <code>CacheConfig</code>. The engine reads them in stop 14.</li>
+  <li>Line 956: {{term gpu-states}} has one row per {{term state-slot}}: the sliding-window ring and the compression state of one sequence.</li>
+</ol>
+<p><strong>What the data looks like now</strong> (example values):</p>
+<pre><code class="language-python">gpu_blocks   uint8 [8652, 2097152]       # 2 MiB per row (example), about 16.9 GiB
+gpu_states   uint8 [5, bytes_per_slot]   # int(4 * 1.2) + 1 = 5 slots; slot 0 is never used
+cache_config.bytes_per_block, num_state_seqs, bytes_of_state_per_seqs   # now set
+self.gpu_cache  # GPUCacheInterface: per-layer views ca_cache, ica_cache, swa_cache, ca_state, …</code></pre>
+<x-deepdive title="Stop 12 in detail: what decides the row sizes">
+<p><strong>Block row.</strong> <code>get_cache_block_size</code> returns the bytes of one block over all layers ({{cite deepinfer/worker/cache_engine.py:968-978}}). Each layer stores one entry per group of <code>compress_ratio</code> tokens. An entry is 288 bytes in FP4 or 528 bytes in FP8 ({{cite deepinfer/worker/cache_engine.py:211-213}}). The page {{link code/cache-engine}} computes every offset.</p>
+<p><strong>State slots.</strong> The state shape is <code>(get_num_state_slots(max_num_seqs), bytes per slot)</code> ({{cite deepinfer/worker/cache_engine.py:646-651}}), and <code>get_num_state_slots</code> is <code>int(max_num_seqs × DEEPINFER_NUM_STATE_SLOTS_RATIO) + 1</code> ({{cite deepinfer/worker/cache_engine.py:201-202}}). With the defaults (256 sequences, ratio 1.2) that is 308 slots. The sliding-window ring has <code>window + DEEPINFER_MAX_BACKTRACKING_TOKENS</code> rows ({{cite deepinfer/worker/cache_engine.py:88-93}}).</p>
+<p><strong>Memory outside PyTorch.</strong> Because <code>alloc_tensor</code> bypasses the PyTorch caching allocator, <code>torch.cuda.memory_allocated()</code> does not count the KV cache. Tools that read the PyTorch statistics show less memory than the device really uses. The page {{link concepts/paged-kv-cache}} explains how the blocks are given out.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="13" title="CUDA graph capture">
+<p>The last Worker call of start-up is <code>warm_up_model</code> ({{cite deepinfer/engine/llm_engine.py:457}}). A {{term cuda-graph}} records all kernel launches of one decode forward pass for one fixed batch size. Later decode steps replay a recording instead of launching kernels one by one. The page {{link concepts/cuda-graphs}} explains the idea.</p>
+<x-code file="deepinfer/worker/base.py" lines="274-288" highlight="276,279-281,282-285,288" />
+<ol>
+  <li>Line 279: capture one graph per size of the main model.</li>
+  <li>Lines 280-281: with DSpark on, measure the time of each graph size. The scheduler uses this curve ({{cite deepinfer/engine/llm_engine.py:268}}).</li>
+  <li>Lines 282-285: capture the DFlash graphs, which share the memory pool of the main graphs.</li>
+  <li>Line 288: reset the seed, so that start-up does not change the random state of the first step.</li>
+</ol>
+<p>The list of sizes comes from one function. Sizes double up to the interval (default 8), then grow by the interval up to the largest size:</p>
+<x-code file="deepinfer/worker/cuda_graph_runner.py" lines="41-51" />
+<p>The largest size is <code>max_num_seqs × (1 + nextn)</code> tokens ({{cite deepinfer/worker/model_runner.py:73-79}}).</p>
+<p><strong>What the data looks like now</strong>:</p>
+<pre><code class="language-python"># example: max_num_seqs 4 -> max 24 tokens
+cuda_graph_runner.batch_sizes         # [1, 2, 4, 8, 16, 24]                 6 graphs
+dflash_cuda_graph_runner.batch_sizes  # [1, 2, 4]                            3 graphs
+# EngineArgs default: max_num_seqs 256 -> max 1536 tokens
+cuda_graph_runner.batch_sizes         # [1, 2, 4, 8, 16, …, 1520, 1528, 1536]  195 graphs
+dflash_cuda_graph_runner.batch_sizes  # [1, 2, 4, 8, 16, …, 248, 256]          35 graphs
+# log: "All graph capturing finished in …s."</code></pre>
+<x-deepdive title="Stop 13 in detail: counting the graphs, and when there are none">
+<p><strong>Count with the defaults.</strong> <code>build_graph_batch_sizes(1536, 8)</code> gives 1, 2 and 4 (below the interval), then <code>range(8, 1536, 8)</code> with 191 values, then 1536. That is <code>3 + 191 + 1 = 195</code> graphs. The DFlash runner counts sequences, not tokens: <code>build_graph_batch_sizes(256, DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL = 8)</code> gives <code>3 + 31 + 1 = 35</code> ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:32-37}}, {{cite deepinfer/environ.py:155-157}}).</p>
+<p><strong>Capture order.</strong> The runner captures the largest size first, and all graphs share one memory pool and one set of input buffers ({{cite deepinfer/worker/cuda_graph_runner.py:93-140}}). Each graph runs once as a warm-up before its capture. So capture time grows with the number of sizes: a larger <code>DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL</code> means fewer graphs, but more padding rows in each decode step.</p>
+<p><strong>No graphs.</strong> <code>use_cuda_graph</code> is false with <code>DEEPINFER_ENFORCE_EAGER=1</code> or for a PROMPT engine ({{cite deepinfer/worker/model_runner.py:73}}). Then <code>warm_up_model</code> only resets the seed. The DFlash graphs need the main graphs, <code>nextn &gt; 0</code>, a <code>dflash_cfg</code> and no <code>DEEPINFER_DFLASH_ENFORCE_EAGER</code> ({{cite deepinfer/worker/model_runner.py:80-85}}).</p>
+<p><strong>Memory.</strong> The capture happens after the KV cache allocation. So the graph memory must fit in the memory that the budget left free. That is the 15 % that <code>gpu_memory_utilization</code> keeps, plus the activation memory of the profile run (a deduction from {{cite deepinfer/worker/base.py:228-245}}). The LLM docstring warns that an out-of-memory in a CUDA graph can show as "illegal memory access" ({{cite deepinfer/entrypoints/llm.py:50-51}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="14" title="Ready: block managers, scheduler and statistics">
+<p>All Worker calls are done. The engine now makes its own C++ objects from the numbers of stops 11 and 12:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="262-275" highlight="265-267,271-273" />
+<ol>
+  <li>Line 265: one {{term block-manager}} for the KV blocks: 8652 entries in the example.</li>
+  <li>Line 266: a second manager for the state slots: 5 entries.</li>
+  <li>Line 267: the C++ {{term scheduler}} gets 14 arguments ({{cite deepinfer/engine/llm_engine.py:307-327}}). It reads its limits from <code>SchedulerConfig</code> ({{cite csrc/engine/scheduler.hpp:94-108}}).</li>
+  <li>Lines 271-273: the object pool for <code>SequenceMetadata</code> and the deferred-release helper.</li>
+</ol>
+<p>The last object is the statistics logger. It needs the peak speed of the device:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="297-305" highlight="304" />
+<x-code file="deep_cluster/hardware/device.py" lines="151-156" />
+<x-warning title="Start-up fails at the end on an unknown device">
+<p><code>get_bf16_tflops_limit()</code> knows only Ascend and NVIDIA devices with compute capability 10.x. Any other device raises <code>RuntimeError("unknown GPU type")</code>. The engine calls it always, also with statistics off. So on such a device, start-up fails after the weights, the KV cache and the graphs are ready. The README lists the supported hardware: NVIDIA SM100 GPUs and Huawei Ascend 950 NPUs ({{cite README.md:33-36}}).</p>
+</x-warning>
+<p>Then <code>LLM.__init__</code> makes the request counter and returns ({{cite deepinfer/entrypoints/llm.py:84-85}}). The script calls <code>generate()</code>, and the tour {{link tours/life-of-a-request}} starts.</p>
+<p><strong>What the data looks like now</strong>:</p>
+<pre><code class="language-python">engine.block_manager            # BlockManager(8652): free list 1..8651 (block 0 is never used)
+engine.state_manager            # BlockManager(5): slots 1..4
+engine.scheduler                # waiting, prompted, running: all empty; decode_step 0
+engine.stats_logger             # tflops_limit = 2 * 2250 (x86_64 SM100) or 2 * 432 (Ascend)
+engine.generate_step            # 0</code></pre>
+<x-deepdive title="Stop 14 in detail: what the first step finds">
+<p><strong>The first step.</strong> <code>step()</code> number 1 has <code>decode_step = 0</code>, an ALL attempt point. With the vision model class, the first requests are not schedulable yet, so the first prefill comes at step 71 at the earliest. The tour {{link tours/life-of-a-request}} (stop 5, deep dive) derives this.</p>
+<p><strong>The statistics peak.</strong> The engine passes two times the BF16 peak as an FP8-equivalent peak ({{cite deepinfer/engine/llm_engine.py:304}}). On x86_64 with SM100 that is <code>2 × 2250 = 4500</code> TFLOPS; on ARM <code>2 × 2500</code>; on Ascend <code>2 × 432</code> ({{cite deep_cluster/hardware/device.py:151-156}}). The page {{link code/stats-logger}} shows how {{term mfu}} uses it.</p>
+<p><strong>Threads that now run.</strong> The statistics log thread starts in the <code>StatsLogger</code> constructor ({{cite deepinfer/engine/stats_logger.py:185-187}}). The multimodal worker process (stop 5) waits for its first image. The CP followers (stop 6) wait for the first method call.</p>
+<p><strong>Time.</strong> The log has one line per phase: "load_model done.", "init_cache done.", "warm_up_model done." and "init all done." ({{cite deepinfer/engine/llm_engine.py:242-246}}, {{cite deepinfer/engine/llm_engine.py:458}}, {{cite deepinfer/engine/llm_engine.py:290}}). Weight loading has its own phase log with <code>log_load_phase</code> ({{cite deepinfer/model_executor/models/deepseek.py:470-517}}).</p>
+</x-deepdive>
+</x-stop>
+
+<h2>What can go wrong</h2>
+<x-warning title="Set the devices before you import torch or deepinfer">
+<p>If your script imports <code>torch</code> or <code>deepinfer</code> before it sets <code>CUDA_VISIBLE_DEVICES</code> (or <code>ASCEND_RT_VISIBLE_DEVICES</code>), the setting can have no effect. Follow the order of <code>create_llm</code> ({{cite examples/_config.py:104-110}}).</p>
+</x-warning>
+<ul>
+  <li><strong><code>KeyError: 'CUDA_VISIBLE_DEVICES'</code>.</strong> The engine and the Worker read this variable without a default ({{cite deepinfer/engine/llm_engine.py:188}}, {{cite deepinfer/worker/base.py:127}}). Set it, also on Ascend.</li>
+  <li><strong>The ranks hang in stop 8.</strong> One DP process failed or did not start, or two jobs use the same <code>MASTER_PORT</code> ({{cite deepinfer/utils.py:222-230}}). The others wait up to <code>DEEPINFER_GLOO_TIMEOUT</code> (4 hours by default).</li>
+  <li><strong><code>ValueError: Unsupported HF ...</code></strong> The checkpoint is not a DeepSeek V4.1 checkpoint in the expected format ({{cite deepinfer/hugging_face/config.py:241-262}}).</li>
+  <li><strong>"No available memory for the cache blocks"</strong> or <strong>"runtime max seq len ... is larger than ..."</strong>. The weights and the test batch leave too little memory. Raise <code>gpu_memory_utilization</code>, or lower <code>max_model_len</code>, <code>max_num_seqs</code> or <code>max_num_batched_tokens</code> ({{cite deepinfer/engine/llm_engine.py:441-451}}).</li>
+  <li><strong>Out of memory or "illegal memory access" in stop 13.</strong> The graphs did not fit in the memory that is left. Lower <code>gpu_memory_utilization</code> ({{cite deepinfer/entrypoints/llm.py:50-51}}).</li>
+  <li><strong><code>RuntimeError: unknown GPU type</code></strong> at the very end: the device is not SM100 and not Ascend ({{cite deep_cluster/hardware/device.py:151-156}}).</li>
+  <li><strong>A NUMA warning in the log.</strong> <code>libnuma.so.1</code> is missing or the binding failed. Start-up continues, but host-to-device copies can be slower ({{cite deepinfer/worker/base.py:356-357}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Start-up decides the numbers that limit every later step. These are the number of blocks, the batch sizes that have a graph, and the ranks that talk to each other. When a step does something unexpected, read the start-up log first. It shows the block count, the graph sizes and the group layout.</p>
+
+<x-quiz>
+  <x-q level="easy">Why does <code>examples/_config.py</code> import <code>deepinfer</code> inside <code>create_llm</code> and not at the top of the file?
+    <x-a><p>The visible devices must be set before <code>torch</code> starts CUDA (or ACL on Ascend). <code>create_llm</code> first calls <code>setup_cuda_visible_devices</code>, then imports <code>torch</code> and <code>deepinfer</code> ({{cite examples/_config.py:104-110}}). The module docstring states the rule ({{cite examples/_config.py:1-7}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">With the example settings (<code>--ep 8 --cp 1</code>), how many processes does <code>_init_workers</code> start in each DP process?
+    <x-a><p>None. The loop runs for <code>cp_rank</code> 1 to <code>cp_size − 1</code>, and <code>cp_size</code> is 1 ({{cite deepinfer/engine/llm_engine.py:377}}). The driver Worker runs in the engine process. (The engine does fork one multimodal worker earlier, in stop 5.)</p></x-a>
+  </x-q>
+  <x-q level="medium">You keep the <code>EngineArgs</code> defaults: <code>max_num_seqs=256</code>, <code>DEEPINFER_USE_NEXTN_DECODE=5</code>, <code>DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL=8</code>. How many main-model CUDA graphs does start-up capture, and what is the largest size?
+    <x-a><p>The largest size is <code>256 × (1 + 5) = 1536</code> tokens ({{cite deepinfer/worker/model_runner.py:76-79}}). <code>build_graph_batch_sizes</code> gives 1, 2, 4, then 8 to 1528 in steps of 8 (191 values), then 1536: 195 graphs ({{cite deepinfer/worker/cuda_graph_runner.py:41-51}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Four ranks measure 1000, 1000, 1000 and 990 blocks. Which block count does each rank use? Is the docstring of <code>_init_cache</code> right?
+    <x-a><p>The sum is 3990. <code>3990 // 4 = 997</code>, and <code>997 // 2 × 2 = 996</code> ({{cite deepinfer/worker/base.py:264-266}}). Every rank uses 996 blocks, so the rank that measured 990 gets 6 blocks more than it measured. The docstring says "minimum" ({{cite deepinfer/engine/llm_engine.py:426-428}}), which would be 990. The code takes the mean, rounded down to an even number. See stop 11, deep dive.</p></x-a>
+  </x-q>
+  <x-q level="hard">You export <code>DEEPINFER_FORCE_IMBALANCE_RATIO=1.5</code> before you start the engine. What value does the model use in the profile run, and what value after start-up?
+    <x-a><p>1.8 in the profile run and 0.0 after it. <code>profile_run</code> assigns <code>envs.DEEPINFER_FORCE_IMBALANCE_RATIO = 1.8</code> before the test run and <code>0.0</code> after it ({{cite deepinfer/worker/model_runner.py:510-512}}). The assignment replaces the cached value in the class <code>envs</code>, so your exported 1.5 never takes effect.</p></x-a>
+  </x-q>
+</x-quiz>
