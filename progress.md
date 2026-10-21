@@ -24,7 +24,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B5a Attention I | done | done (43 defects fixed) | yes |
 | B5b Attention II | done | running | — |
 | B6a Layer + mHC | done | running | — |
-| B6b Engram + VL | done | running | — |
+| B6b Engram + VL | done | done (36 defects fixed) | yes |
 | B7 MoE + EP | done | done (40 defects fixed) | yes |
 | B8 Scale | running | — | — |
 | B9 Decoding | done | done (25 defects fixed) | yes |

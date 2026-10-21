@@ -1,0 +1,200 @@
+---
+title: v4_modules/engram.py and engram_metadata.py: the Engram runtime
+nav_title: v4_modules/engram.py
+level: Advanced
+prerequisites: concepts/engram, concepts/model-map
+related: concepts/engram, code/deepseek, code/userbuffer, code/decoder-layer, code/v4-hc, code/parallel-state, concepts/zero-overhead-scheduling
+summary: engram.py maps token ids to compressed ids, holds the sharded n-gram tables in a DeepEP EngramBuffer, and gates the fetched rows into the mHC trunk. engram_metadata.py builds the compressed vocabulary, the prime table sizes and the hash multipliers.
+---
+<h2>Purpose</h2>
+<p>These two files give a decoder layer its {{term engram | Engram}} lookup: <code>engram_metadata.py</code> computes the static layout once, and <code>engram.py</code> stores the tables and applies the rows in every forward step.</p>
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/model_executor/models/v4_modules/engram.py</code> (219 lines) and <code>engram_metadata.py</code> (116 lines), Python. The parameter containers are in <code>engram_parameters.py</code> (64 lines).</td></tr>
+    <tr><th>Main classes</th><td><code>CompressedTokenizer</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:35}}), <code>NgramEmbedding</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:69}}), <code>Engram</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:107}}), <code>EngramRuntime</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:164}}); <code>CompressedVocabulary</code>, <code>EngramLayout</code>, <code>NgramHashMapping</code> ({{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:16}}, {{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:59}}, {{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:98}}).</td></tr>
+    <tr><th>Runs in</th><td>Every rank process. <code>CompressedTokenizer</code> is a class-level singleton, used by the engine (same process as the driver Worker) and by the input preparation.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekModel</code> (hash, fetch, runtime), <code>DeepseekDecoderLayer</code> (one <code>Engram</code> per Engram layer), <code>Worker.init_engram</code>, <code>LLMEngine.add_request</code>, the ZOS input preparation.</td></tr>
+    <tr><th>Calls</th><td><code>tile_kernels.engram</code> (<code>fused_weight</code>, <code>engram_gate_fwd</code>, <code>make_offsets</code>), DeepEP <code>EngramBuffer</code> through <code>userbuffer</code>, the C++ function <code>encode_compressed</code>, the HF <code>tokenizers</code> library, <code>sympy.nextprime</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The hash kernel (<code>engram_hash</code> is called in <code>deepseek.py</code>), the n-gram row preparation (C++ and <code>gather_engram_tokens_zos</code>), the cross-rank fetch (inside DeepEP).</td></tr>
+  </tbody>
+</table>
+<p>The module docstring: "Engram runtime: hash n-grams, gather the sharded tables and gate the fused projection" ({{cite deepinfer/model_executor/models/v4_modules/engram.py:1}}).</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_engram" alt="Panel 1: compressed ids, the n-gram row [17, 42, 7], and four hashes. Panel 2: the four global rows on enp ranks 0, 2, 4 and 6. Panel 3: Engram.forward between the mHC post of the previous sub-layer and the attention pre mix and norm." caption="Figure: the Engram data flow with toy numbers. This module owns box A of panel 1, the storage of panel 2 and the middle box of panel 3. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Start-up.</strong> <code>Worker.init_engram</code> calls <code>CompressedTokenizer.initialize</code> and gives the table to C++ ({{cite deepinfer/worker/base.py:304-312}}). <code>load_model</code> calls <code>EngramRuntime.preallocate</code> before the checkpoint load ({{cite deepinfer/model_executor/models/deepseek.py:502-506}}). <code>allocate_userbuffer</code> calls <code>engram_runtime.initialize()</code> ({{cite deepinfer/model_executor/models/deepseek.py:438-440}}).</li>
+  <li><strong>Model build.</strong> <code>DeepseekModel.__init__</code> makes <code>NgramHashMapping</code> and <code>EngramRuntime</code> ({{cite deepinfer/model_executor/models/deepseek.py:83-90}}, {{cite deepinfer/model_executor/models/deepseek.py:112-114}}). Each Engram layer makes its <code>Engram</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:80-83}}).</li>
+  <li><strong>Every request.</strong> <code>LLMEngine.add_request</code> calls <code>CompressedTokenizer.encode</code> ({{cite deepinfer/engine/llm_engine.py:564-567}}).</li>
+  <li><strong>Every forward.</strong> <code>DeepseekModel.forward</code> calls <code>fetch</code> ({{cite deepinfer/model_executor/models/deepseek.py:188}}). The layer calls <code>Engram.forward</code> from its mHC hook ({{cite deepinfer/model_executor/models/decoder_layer.py:114-116}}).</li>
+  <li><strong>ZOS decode.</strong> The input preparation reads <code>CompressedTokenizer.lookup_table_gpu</code> and <code>IMAGE_SENTINEL</code> ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:255-272}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>encode_compressed</code> from <code>deepinfer._C.engine</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:18}}); its C++ body is {{cite csrc/engine/pybind_sequence.cpp:40-46}}.</li>
+  <li><code>userbuffer.allocate_engram</code> and the <code>EngramBuffer</code> methods <code>write</code> and <code>fetch</code> ({{cite deepinfer/model_executor/models/v4_modules/engram.py:181-189}}, {{cite deepinfer/model_executor/models/v4_modules/engram.py:210}}, {{cite deepinfer/model_executor/models/v4_modules/engram.py:215-218}}).</li>
+  <li><code>dist.all_gather_into_tensor</code> on the {{term enp-group | enp group}} for the FP8 scales ({{cite deepinfer/model_executor/models/v4_modules/engram.py:96-101}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_pack_ue8m0_to_int</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:27}}</td><td>Packs float32 power-of-two scales into the exponent byte, 4 per <code>int32</code> (NVIDIA) or 2 per <code>int16</code> (Ascend).</td></tr>
+    <tr><td><code>CompressedTokenizer.initialize</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:46}}</td><td>Builds the lookup table in three forms and the compressed pad id.</td></tr>
+    <tr><td><code>CompressedTokenizer.encode</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:63}}</td><td>Raw ids → compressed ids; ids outside the table → <code>-1</code>.</td></tr>
+    <tr><td><code>NgramEmbedding</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:69}}</td><td>This rank's shard of one layer's table, plus its scales, until the buffer takes them.</td></tr>
+    <tr><td><code>Engram.forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:139}}</td><td>Projects the fetched rows and gates them into the trunk, in place.</td></tr>
+    <tr><td><code>EngramRuntime.allocate</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:171}}</td><td>Sizes and makes the one <code>EngramBuffer</code> for all Engram layers.</td></tr>
+    <tr><td><code>EngramRuntime.initialize</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:195}}</td><td>Writes all shards into the buffer, then drops the source tensors.</td></tr>
+    <tr><td><code>EngramRuntime.fetch</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:214}}</td><td>Starts the row fetch for a batch; returns <code>{layer_id: hook}</code>.</td></tr>
+    <tr><td><code>CompressedVocabulary</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:16}}</td><td>Normalizes every token text and gives equal texts one id.</td></tr>
+    <tr><td><code>EngramLayout.from_cfg</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:68}}</td><td>Checks the config and gives each (layer, n-gram size, head) a distinct prime size.</td></tr>
+    <tr><td><code>NgramHashMapping</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:98}}</td><td>Per-layer odd int64 multipliers, the sizes and the offsets for the hash kernel.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>CompressedTokenizer</code>: one class, three copies of the table</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/engram.py" lines="35-66" highlight="42-43,48-53,66" />
+<ol>
+  <li>Line 42: before <code>initialize</code>, the pad id is the raw <code>DEEPINFER_ENGRAM_PAD_TOKEN</code> (default 2). Line 53 replaces it with the compressed id.</li>
+  <li>Line 43: <code>IMAGE_SENTINEL = -1</code> marks every id outside the table, which includes the image ids.</li>
+  <li>Lines 49-52: a Python list (for the C++ scheduler and the C++ prepare code), a NumPy <code>int32</code> array (for <code>encode</code>) and a device <code>int32</code> tensor (for the ZOS kernel).</li>
+  <li>Line 66: the C++ loop runs without the GIL.</li>
+</ol>
+<x-warning title="Class state, not instance state"><p><code>CompressedTokenizer</code> keeps its table in class attributes. The engine and the driver Worker share one process, so <code>add_request</code> sees the table that <code>Worker.init_engram</code> built ({{cite deepinfer/worker/base.py:309}}). <code>release()</code> resets it ({{cite deepinfer/model_executor/models/v4_modules/engram.py:56-60}}).</p></x-warning>
+
+<h3><code>NgramEmbedding.__init__</code>: the local shard</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/engram.py" lines="72-94" highlight="79-83,86-89,93-94" />
+<ol>
+  <li>Lines 79-83: the group is <code>PG.engram_parallel_group()</code>. The parameter container must have been built for the same group size and rank.</li>
+  <li>Lines 86-89: <code>weight</code> is this rank's <code>[num_per_part, head_dim]</code> part. <code>sf</code> exists for an FP8 table.</li>
+  <li>Line 93: entries per token = the number of sub-tables = (n-gram sizes) × heads.</li>
+  <li>Line 94: the buffer must hold the rows for the largest batch: the decode token limit for a COMPLETION engine, else the prefill token limit.</li>
+</ol>
+
+<h3><code>Engram</code>: build and forward</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/engram.py" lines="122-161" highlight="127-131,134-137,149,151-160" />
+<ol>
+  <li>Lines 127-131: <code>fused_kv_projection</code> maps <code>sum(n_embed_per_ngram)</code> inputs to <code>hidden × (hc_mult + 1)</code> outputs. The weight is the loaded one.</li>
+  <li>Lines 133-137: the two gate weights, each <code>[hc_mult, hidden]</code>, are fused once at start-up. Translated comment: <em>"weight_hidden / weight_embed stay constant during inference, so fuse them once up front"</em>.</li>
+  <li>Line 149: <code>embed_hook()</code> returns the fetched rows of this layer. The projection output is unflattened to <code>[T, hc_mult + 1, hidden]</code>.</li>
+  <li>Lines 151-160: <code>engram_gate_fwd</code> gets the trunk <code>[T, hc_mult, hidden]</code>, <code>kv</code>, the fused weight, the RMS-norm <code>eps</code> and <code>clamp_value = 1e-6</code> ({{cite deepinfer/model_executor/models/v4_modules/engram_parameters.py:55-56}}). It writes in place and gets the image mask.</li>
+</ol>
+
+<h3><code>EngramRuntime</code>: one buffer for all Engram layers</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/engram.py" lines="170-219" highlight="174-180,187,197-203,208-212,215-219" />
+<ol>
+  <li>Lines 174-180: for FP8, <code>head_dim</code> must be a multiple of 32; each 32 values have one scale; the scales are packed per <code>fp8_sf_type</code>.</li>
+  <li>Line 187: the table dtype is <code>float8_e4m3fn</code> or <code>bfloat16</code>.</li>
+  <li>Lines 191-193: <code>preallocate</code> makes the buffer before the checkpoint load, with temporary <code>NgramEmbedding</code> objects. <code>__init__</code> then reuses <code>userbuffer.engram</code> (line 168).</li>
+  <li>Lines 197-203: on GPU, a CPU shard gets a "CUDA-tagged" view of the same memory, because the DeepEP write expects one.</li>
+  <li>Lines 208-212: write all shards (and the all-gathered scales), then release the per-layer tensors.</li>
+  <li>Lines 215-219: one <code>fetch</code> for all layers. The buffer returns one hook per layer, in layer order.</li>
+</ol>
+
+<h3><code>engram_metadata.py</code>: layout and hash inputs</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/engram_metadata.py" lines="68-95" highlight="70-76,78-94" />
+<ol>
+  <li>Lines 70-76: at least 2-grams; all n-gram sizes have the same head count and head width.</li>
+  <li>Lines 78-94: for each layer, n-gram size and head, take the next prime above <code>vocab_size − 1</code> that no earlier sub-table uses. The comment says the primes are unique across all layers and heads, in config order.</li>
+</ol>
+<x-code file="deepinfer/model_executor/models/v4_modules/engram_metadata.py" lines="101-116" highlight="104-106,109,112-113,116" />
+<ol>
+  <li>Lines 104-106: the hash range uses the compressed vocabulary size when compression is on.</li>
+  <li>Line 109: <code>bound = (int64 max // vocab_size) // 2</code>, so a multiplier times an id stays inside <code>int64</code>.</li>
+  <li>Lines 112-113: one NumPy generator per layer, seeded with <code>seed + 10007 × layer_id</code>; <code>max_ngram_size</code> odd multipliers (<code>2k + 1</code>). The comment warns that a change to the generator or the bound changes the table ids, so the values must match training.</li>
+  <li>Line 116: the offsets come from <code>tile_kernels.torch.engram.make_offsets</code>.</li>
+</ol>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data: types and shapes">
+<table>
+  <thead><tr><th>Value</th><th>Shape and dtype</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>lookup_table_np</code> / <code>lookup_table_gpu</code></td><td><code>int32 [tokenizer vocab]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:51-52}}</td></tr>
+    <tr><td><code>ngram_token_ids</code></td><td><code>int32 [total_q, max_ngram_size]</code></td><td>{{cite deepinfer/model_executor/input_metadata/input_metadata.py:40-42}}</td></tr>
+    <tr><td><code>ngram_multipliers</code></td><td><code>int64 [num_engram_layers, max_ngram_size]</code>, odd</td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:114}}</td></tr>
+    <tr><td><code>ngram_vocab_sizes</code></td><td><code>int32 [num_engram_layers, max_ngram_size − 1, n_heads]</code>, primes</td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:115}}</td></tr>
+    <tr><td>shard <code>weight</code></td><td><code>[num_per_part, head_dim]</code>, made as <code>bfloat16</code>, loaded as FP8 when <code>fp8_embed</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_parameters.py:33-34}}, {{cite deepinfer/hugging_face/weights.py:352}}</td></tr>
+    <tr><td>hidden states (trunk)</td><td><code>[total_q, hc_mult, hidden]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:145-148}}</td></tr>
+    <tr><td><code>kv</code></td><td><code>[total_q, hc_mult + 1, hidden]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:149}}</td></tr>
+    <tr><td><code>weight_hidden</code>, <code>weight_embed</code></td><td><code>[hc_mult, hidden]</code> each</td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_parameters.py:63-64}}</td></tr>
+  </tbody>
+</table>
+<p>The shape of the <code>hashes</code> tensor and of the fetched rows is not in this repo: both come from external kernels.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: sizes for a toy config">
+<p>Toy config (not from a checkpoint): <code>engram_vocab_size = 1000</code>, 2 heads, <code>max_ngram_size = 3</code>, <code>engram_head_dim = 64</code>, hidden 4096, <code>hc_mult = 4</code>, enp 8.</p>
+<ul>
+  <li>Sub-tables per layer: 2 n-gram sizes × 2 heads = 4. <code>num_entries_per_token = 4</code>.</li>
+  <li>Primes for the first layer: 1009, 1013, 1019, 1021; sum 4062. Padded to 4096 (<code>lcm(256, 8) = 256</code>); 512 rows per rank ({{cite deepinfer/model_executor/models/v4_modules/engram_parameters.py:26-31}}).</li>
+  <li>One shard in FP8: 512 × 64 = 32768 bytes, plus 2 one-byte scales per row (64 / 32). Line 177 asserts <code>groups % itemsize == 0</code>. On Ascend (<code>int16</code>, itemsize 2) the 2 scales fill one pack. On NVIDIA (<code>int32</code>, itemsize 4) the assert fails. So on NVIDIA an FP8 table needs a <code>head_dim</code> that is a multiple of 128 ({{cite deepinfer/model_executor/models/v4_modules/engram.py:174-178}}).</li>
+  <li><code>fused_kv_projection</code>: 2 × 2 × 64 = 256 inputs → 4096 × 5 = 20480 outputs.</li>
+  <li>Multipliers: <code>bound = (2^63 − 1) // V // 2</code> for the compressed vocabulary size <code>V</code>.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and devices">
+<ul>
+  <li>All of this runs in the rank process. There is no Engram thread.</li>
+  <li><code>fetch</code> starts the transfer early (once per forward, before the layer loop). Each layer calls its hook later ({{cite deepinfer/model_executor/models/deepseek.py:177-188}}, {{cite deepinfer/model_executor/models/v4_modules/engram.py:149}}). How DeepEP overlaps the transfer is not in this repo.</li>
+  <li>The shard is on the CPU unless <code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code> is on ({{cite deepinfer/model_executor/models/deepseek.py:473-477}}). The buffer reads host storage over RDMA (<code>use_cpu_rdma_storage</code>, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:148}}).</li>
+  <li>The single-rank enp group must still have a NCCL/HCCL communicator, because DeepEP reuses it. The translated comment says a null pointer would cause a segmentation fault ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:176}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Case</th><th>Result</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>encode</code> before <code>initialize</code></td><td><code>AssertionError</code> "CompressedTokenizer is not initialized"</td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:65}}</td></tr>
+    <tr><td>Container built for another enp size or rank</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:82-83}}</td></tr>
+    <tr><td>Scales not powers of two (UE8M0)</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:29-31}}</td></tr>
+    <tr><td><code>head_dim</code> not a multiple of 32, or the scale groups do not fill a pack</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram.py:175-177}}</td></tr>
+    <tr><td><code>allocate_engram</code> called twice</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/parallel_utils/userbuffer.py:137}}</td></tr>
+    <tr><td>PAD token not at id 2</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:26-27}}</td></tr>
+    <tr><td><code>max_ngram_size</code> below 2, no layer ids, list lengths differ, unequal heads or head widths</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:70-76}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_ENGRAM_PAD_TOKEN</code></td><td>2</td><td>{{cite deepinfer/environ.py:146}}; used at {{cite deepinfer/model_executor/models/v4_modules/engram.py:42}}, {{cite deepinfer/model_executor/models/v4_modules/engram.py:53}}</td><td>Raw id whose compressed id pads the n-gram rows.</td></tr>
+    <tr><td><code>DEEPINFER_ENGRAM_FORCE_GPU_STORAGE</code></td><td>off; on when <code>DEEPINFER_ACCELERATOR=ascend</code></td><td>{{cite deepinfer/environ.py:147}}; used at {{cite deepinfer/model_executor/models/deepseek.py:473}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:148}}</td><td>Shards in device memory, not host memory.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/engram}}: the idea, the toy example and the n-gram rows in decode.</li>
+  <li>{{link concepts/mhc-residual}}: the trunk that Engram changes.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why the ZOS decode needs the device lookup table.</li>
+  <li>{{link code/userbuffer}}: <code>allocate_engram</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">How many <code>EngramBuffer</code> objects does one process make for a model with 3 Engram layers?
+    <x-a><p>One. <code>allocate</code> passes the row counts of all layers as a list, and <code>allocate_engram</code> asserts that it runs only once ({{cite deepinfer/model_executor/models/v4_modules/engram.py:181-189}}, {{cite deepinfer/model_executor/parallel_utils/userbuffer.py:137}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>CompressedTokenizer</code> keep a device copy of the table, when <code>add_request</code> already compresses the prompt on the CPU?
+    <x-a><p>Under ZOS the newest sampled and draft tokens of a running sequence are only on the device. <code>gather_engram_tokens_zos</code> must compress them there, with <code>lookup_table_gpu</code> ({{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:255-272}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What makes the hash multipliers the same on every rank and in every run?
+    <x-a><p>Each layer uses <code>np.random.default_rng(seed + 10007 × layer_id)</code> with <code>seed = 0</code> by default ({{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:101}}, {{cite deepinfer/model_executor/models/v4_modules/engram_metadata.py:111-113}}). The comment warns that a change to the generator or the bound changes the table ids.</p></x-a>
+  </x-q>
+  <x-q level="hard">In the toy example of the deep dive, why does <code>head_dim = 64</code> fail on NVIDIA but not on Ascend?
+    <x-a><p>FP8 tables have one scale per 32 values, so 64 values give 2 scale groups. The scales are packed into <code>fp8_sf_type</code>: <code>int32</code> (4 per pack) on NVIDIA and <code>int16</code> (2 per pack) on Ascend ({{cite deepinfer/platform.py:63}}, {{cite deepinfer/platform.py:138}}). Line 177 asserts <code>groups % itemsize == 0</code>: <code>2 % 4 ≠ 0</code> fails, <code>2 % 2 = 0</code> passes ({{cite deepinfer/model_executor/models/v4_modules/engram.py:175-178}}).</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,179 @@
+---
+title: vision_encoder/vit.py, vl_aligner.py, mlp_projector.py: the vision encoder
+nav_title: vision_encoder/vit.py
+level: Advanced
+prerequisites: concepts/vision-encoder, learn/transformer, learn/attention
+related: concepts/vision-encoder, code/deepseek-vl, code/ve, concepts/hardware-platforms, code/npu-ops
+summary: vit.py is the fixed 32-block ViT of V4.1. vl_aligner.py turns raw RGB bytes into patches, runs the ViT, joins blocks of patches, runs the MLP projector of mlp_projector.py, and writes the result into the image-token rows of the prefill embeddings.
+---
+<h2>Purpose</h2>
+<p>These three files are the {{term vision-encoder | vision encoder}}: they turn the raw pixels of the images in a prefill batch into one vector per image token and write those vectors into the input embeddings.</p>
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/model_executor/models/vision_encoder/vit.py</code> (230 lines), <code>vl_aligner.py</code> (141 lines), <code>mlp_projector.py</code> (23 lines). Comments are mostly in Chinese.</td></tr>
+    <tr><th>Main classes</th><td><code>VisionTransformer</code> ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:168}}), <code>VisionLanguageInstructTuner</code> ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:10}}), <code>MlpProjector</code> ({{cite deepinfer/model_executor/models/vision_encoder/mlp_projector.py:10}}).</td></tr>
+    <tr><th>Runs in</th><td>The rank process, on the device, inside the prefill forward. One device per rank; the ViT weights are not split.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekVLForCausalLM.get_input_embeddings</code>; the parameter container <code>HFModelParameters</code> builds the ViT and the projector.</td></tr>
+    <tr><th>Calls</th><td><code>flash_attn</code> (<code>_flash_attn_fwd</code>), DeepGEMM GEMMs, <code>tile_kernels</code> (SwiGLU, rotary), TileLang kernels in <code>image_embed_ops.py</code> and <code>norm</code>.</td></tr>
+    <tr><th>Not in this file</th><td>Image decode and resize (worker process, <code>ve/processor</code>), the token layout, the chunk slicing.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_vit" alt="Panel 1: patch embedding, 32 blocks and fc_norm with shapes for 1610 patches. Panel 2: the patch grid, batch_downsample to [192, 9216], and the projector to [192, H]." caption="Figure: the shapes inside these files for one 640 × 480 image. The ratio 3 is an example value. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>HFModelParameters.__init__</code> makes <code>VisionTransformer(**cfg.vision.params)</code> and <code>MlpProjector(cfg.mlp_projector.params)</code> on the device, because the ViT builds its RoPE table in the constructor ({{cite deepinfer/model_executor/models/v4_modules/containers.py:50-54}}).</li>
+  <li><code>DeepseekVLForCausalLM.__init__</code> makes the tuner from these modules and the three special-token vectors of the embedding module ({{cite deepinfer/model_executor/models/deepseek_vl.py:35-39}}).</li>
+  <li><code>get_input_embeddings</code> calls the tuner when the batch has image bytes ({{cite deepinfer/model_executor/models/deepseek_vl.py:202-218}}).</li>
+  <li><code>examples/_ve_helper.py</code> loads only these weights for tests and timing ({{cite examples/_ve_helper.py:1-5}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>image_embed_ops.rgb_pad_to_patches</code>, <code>batch_downsample</code> and <code>replace_input_embeds</code> ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:5}}, {{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:116}}).</li>
+  <li><code>_flash_attn_fwd</code> from <code>flash_attn.cute</code>, <code>deep_gemm.bf16_gemm_nt</code> or <code>cublaslt_gemm_nt</code>, <code>tile_kernels</code> SwiGLU and rotary ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:10-20}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>constants</td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:23-34}}</td><td>Patch 14, width 1024, 32 blocks, 16 heads, MLP ratio 2.7, multiple of 128, RoPE table size 4096, norm eps 1e-6.</td></tr>
+    <tr><td><code>_linear</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:37}}</td><td>BF16 GEMM: <code>addmm</code> with bias, else DeepGEMM.</td></tr>
+    <tr><td><code>_norm</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:54}}</td><td>RMSNorm with a fused residual add.</td></tr>
+    <tr><td><code>PatchEmbedFlatten</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:69}}</td><td>One linear layer from 3 × 14 × 14 = 588 values to 1024.</td></tr>
+    <tr><td><code>Attention</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:90}}</td><td>QKV, 2-D RoPE, variable-length non-causal attention, output projection.</td></tr>
+    <tr><td><code>SwiGLU</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:126}}</td><td>Gate-up linear (1024 → 5632), SwiGLU, down linear (2816 → 1024).</td></tr>
+    <tr><td><code>Block</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:139}}</td><td>Pre-norm block that can hand its residual to the next norm.</td></tr>
+    <tr><td><code>VisionTransformer.forward</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:206}}</td><td>Patches → 32 blocks → final norm.</td></tr>
+    <tr><td><code>VisionLanguageInstructTuner.forward</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:96}}</td><td>Bytes → patches → encode → merge into the embeddings.</td></tr>
+    <tr><td><code>_encode_images</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:47}}</td><td>ViT, downsample, projector.</td></tr>
+    <tr><td><code>_merge_image_embeds</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:79}}</td><td>Writes image vectors and special vectors into the rows, by token type.</td></tr>
+    <tr><td><code>MlpProjector</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/mlp_projector.py:10}}</td><td><code>Linear → GELU → Linear</code> for depth 2.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>Attention.forward</code></h3>
+<x-code file="deepinfer/model_executor/models/vision_encoder/vit.py" lines="99-123" highlight="105,107-122">
+  <x-tr line="106">The flash-attn versions and builds return different numbers of outputs (2-3 or 5); take only the first.</x-tr>
+</x-code>
+<ol>
+  <li>Line 100: one GEMM for Q, K and V (1024 → 3072, with bias).</li>
+  <li>Line 105: rotary embedding on Q and K, in place.</li>
+  <li>Lines 107-122: <code>cu_seqlens</code> holds the patch ranges of the images. With <code>causal=False</code> and no window, every patch attends to every patch of the same image and to no patch of another image.</li>
+</ol>
+<x-note title="On Ascend"><p><code>npu_ops</code> replaces this <code>_flash_attn_fwd</code> with a wrapper around <code>torch_npu.npu_fusion_attention</code> ({{cite deepinfer/npu_ops/vit_attn.py:8-31}}). That call needs the segment ends as a host list, so <code>VisionTransformer.forward</code> passes <code>vit_attn_cu_seqlens</code> when it is set ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:224-225}}).</p></x-note>
+
+<h3><code>Block.forward</code>: a lazy residual</h3>
+<x-code file="deepinfer/model_executor/models/vision_encoder/vit.py" lines="149-165" highlight="159,161,163-165">
+  <x-tr line="157">Returns (x, residual); a non-None residual means the next block's norm kernel adds it.</x-tr>
+  <x-tr line="158">Both norms bypass RMSNorm.forward: the fused residual add returns two values, which the single-value nn.Module forward cannot.</x-tr>
+</x-code>
+<p>A block normally does not add the residual itself. It gives the residual to the next RMSNorm kernel, which adds it and normalizes in one pass (<code>_norm</code>, {{cite deepinfer/model_executor/models/vision_encoder/vit.py:54-58}}). Every <code>recomputing_every_layer</code>-th block and the last block add it themselves (line 164) ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:187-190}}). The HF loader sets <code>recomputing_every_layer = 2</code> ({{cite deepinfer/hugging_face/config.py:221-224}}). The comment says the BF16 add order changes the result bit by bit, so these points are fixed.</p>
+
+<h3><code>VisionTransformer.forward</code></h3>
+<x-code file="deepinfer/model_executor/models/vision_encoder/vit.py" lines="196-230" highlight="196-198,203,220-221,223,227-230" />
+<ol>
+  <li>Lines 196-198: the RoPE table holds cos and sin for positions 0 to 4095, 16 frequencies each (<code>1024 / 16 / 2 = 32</code> dims, step 2).</li>
+  <li>Line 203: each patch has <code>(row, column)</code>. The gather gives <code>[n, 64]</code> in the order cos_row, cos_col, sin_row, sin_col. So half of each 64-wide head encodes the row and half the column.</li>
+  <li>Lines 220-221: the input must be <code>[n, 3, 14, 14]</code>.</li>
+  <li>Lines 227-230: 32 blocks, then the final RMSNorm. The output is <code>[n, 1024]</code>.</li>
+</ol>
+
+<h3><code>VisionLanguageInstructTuner.forward</code></h3>
+<x-code file="deepinfer/model_executor/models/vision_encoder/vl_aligner.py" lines="112-141" highlight="118-129,130-138,139">
+  <x-tr line="112">Pad the raw RGB bytes from the worker into image patches (centre pad + normalize), encode them, and merge them into input_embeds.</x-tr>
+  <x-tr line="114">This runs in the forward section: no filtering and no CUDA synchronization.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 118-129: <code>rgb_pad_to_patches</code> reads each image's <code>HWC uint8</code> bytes, centres the image in its patch grid, fills the border with the pad colour, normalizes with <code>(x / 255 − mean) / std</code>, and writes <code>bf16 [total_patches, 3, 14, 14]</code> ({{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:55-78}}; formula in the reference code, {{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:440-452}}).</li>
+  <li>Lines 130-138: <code>_encode_images</code> runs the ViT, <code>batch_downsample</code> and the projector ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:61-77}}).</li>
+  <li>Line 139: <code>replace_input_embeds</code> gets <code>mm_token_type</code> in place of ids. The i-th row of type <code>IMAGE</code> gets the i-th image vector. Rows of type <code>IMAGE_NEW_LINE</code>, <code>IMAGE_START</code> and <code>IMAGE_END</code> get the learned vectors <code>image_newline</code>, <code>image_start</code> and <code>image_end</code> ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:34-45}}, {{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:19-40}}).</li>
+</ol>
+
+<h3><code>MlpProjector</code></h3>
+<x-code file="deepinfer/model_executor/models/vision_encoder/mlp_projector.py" lines="10-23" highlight="14,17,18-22" />
+<p>Line 14 accepts only <code>downsample_mlp_gelu</code>. The first layer takes <code>input_dim × r × r</code> values, the width after <code>batch_downsample</code> joins an <code>r × r</code> block of patch vectors (line 16 comment). The HF loader sets <code>input_dim</code> to the ViT width, <code>hidden_size</code> to the LLM hidden size, and <code>depth = 2</code> ({{cite deepinfer/hugging_face/config.py:225-233}}). With depth 2 the loop on line 18 does nothing, so the result is <code>Linear(1024·r², H) → GELU → Linear(H, H)</code>.</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data: shapes and dtypes for one prefill batch">
+<p>Example: one 640 × 480 image, ratio <code>r = 3</code> (example value), LLM hidden size <code>H</code> (from <code>config.json</code>).</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Shape</th><th>Dtype</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>images_raw</code></td><td><code>[w × h × 3]</code>, real resized size ≤ 644 × 490</td><td><code>uint8</code></td><td>worker</td></tr>
+    <tr><td><code>cu_raw_bytes</code></td><td><code>[num_images + 1]</code></td><td><code>int64</code></td><td>prepare</td></tr>
+    <tr><td><code>images_valid_spatial_crop</code></td><td><code>[num_images, 2]</code> = <code>[[46, 35]]</code></td><td><code>int32</code></td><td>prepare</td></tr>
+    <tr><td><code>cu_seqlens_vit</code></td><td><code>[num_images + 1]</code> = <code>[0, 1610]</code></td><td><code>int32</code></td><td>prepare</td></tr>
+    <tr><td>patches</td><td><code>[1610, 3, 14, 14]</code></td><td><code>bf16</code></td><td><code>rgb_pad_to_patches</code></td></tr>
+    <tr><td>after patch embed</td><td><code>[1610, 1024]</code></td><td><code>bf16</code></td><td>line 76</td></tr>
+    <tr><td>Q, K, V</td><td><code>[1610, 16, 64]</code> each</td><td><code>bf16</code></td><td>lines 100-104</td></tr>
+    <tr><td>SwiGLU gate-up</td><td><code>[1610, 5632]</code> → <code>[1610, 2816]</code></td><td><code>bf16</code></td><td>lines 134-135</td></tr>
+    <tr><td>ViT output</td><td><code>[1610, 1024]</code></td><td><code>bf16</code></td><td>line 230</td></tr>
+    <tr><td><code>batch_downsample</code> output</td><td><code>[192, 9216]</code></td><td><code>bf16</code></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:537-541}}</td></tr>
+    <tr><td>projector output</td><td><code>[192, H]</code></td><td><code>bf16</code></td><td>mlp_projector.py</td></tr>
+    <tr><td>input embeddings</td><td><code>[total_q, H]</code>, written in place</td><td><code>bf16</code></td><td>line 139</td></tr>
+  </tbody>
+</table>
+<p>The MLP width: <code>int(1024 × 2.7) = 2764</code>, rounded up to a multiple of 128 gives 2816 ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:129}}).</p>
+<p>The downsample pads the patch grid to a multiple of <code>r</code> with zeros: 35 × 46 → 36 × 48, which gives 12 × 16 = 192 blocks ({{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:513-515}}, reference code {{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:573-580}}).</p>
+</x-deepdive>
+
+<x-deepdive title="GEMM choice in _linear">
+<x-code file="deepinfer/model_executor/models/vision_encoder/vit.py" lines="37-51" highlight="39-40,42-47,49-50" />
+<ul>
+  <li>With a bias (QKV and the attention output projection), the code uses <code>torch.addmm</code>. The patch embedding does not use <code>_linear</code>; it calls <code>F.linear</code> ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:76}}).</li>
+  <li>Without a bias (the two SwiGLU linears), on SM100 GPUs or Ascend, with BF16 inputs, it uses <code>deep_gemm.bf16_gemm_nt</code>. The output row stride is padded to 16 bytes.</li>
+  <li>Else it uses <code>deep_gemm.cublaslt_gemm_nt</code>.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Edge cases and error paths">
+<table>
+  <thead><tr><th>Case</th><th>Result</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Patch shape is not <code>[n, 3, 14, 14]</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:220}}</td></tr>
+    <tr><td>Config without <code>image_pixel_mean</code> (and the others)</td><td><code>KeyError</code> when the tuner is built</td><td>{{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:25-27}}</td></tr>
+    <tr><td>Projector type other than <code>downsample_mlp_gelu</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/mlp_projector.py:14}}</td></tr>
+    <tr><td>No image patches in the batch (all images cached)</td><td>No <code>cu_seqlens_vit</code>; the tuner does not run</td><td>{{cite deepinfer/ve/prepare_tensor_input_vl.py:125-130}}</td></tr>
+    <tr><td>Empty downsample on Ascend</td><td>Not launched; the comment says a zero-trip kernel hangs the vector core</td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:518-522}}</td></tr>
+  </tbody>
+</table>
+<p>The <code>cfg.vision</code> keys other than <code>recomputing_every_layer</code> do nothing: the structure is fixed by the constants ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:171-175}}). The processor reads <code>patch_size</code> from <code>config.json</code> ({{cite deepinfer/hugging_face/processor.py:28}}), but the tuner uses the ViT constant ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:28-29}}). The code does not check that the two values agree.</p>
+</x-deepdive>
+
+<x-deepdive title="Batch invariance test">
+<p><code>tests/models/test_ve_batch_invariant.py</code> runs only the image encoding. For each image size it compares the vectors of an image alone with the vectors of the same image in a batch of equal images and in a batch of mixed sizes. It requires <code>torch.equal</code>, so bit-identical results ({{cite tests/models/test_ve_batch_invariant.py:1-13}}). The fixed residual points of <code>Block</code> serve this goal.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<p>These files read no environment variable. The platform (<code>accelerator_kind</code>, <code>is_sm_major_10</code>) picks the GEMM ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:42}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/vision-encoder}}: the whole image path.</li>
+  <li>{{link code/deepseek-vl}}: the model class that calls the tuner.</li>
+  <li>{{link concepts/hardware-platforms}}: the NPU replacement of the ViT attention.</li>
+  <li>{{link learn/attention}}: attention basics.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">How many transformer blocks does the ViT have, and where does this number come from?
+    <x-a><p>32, from the constant <code>DEPTH</code> in <code>vit.py</code>. The config does not change it ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:29}}, {{cite deepinfer/model_executor/models/vision_encoder/vit.py:174}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Can a patch of image 1 attend to a patch of image 2 in the same batch?
+    <x-a><p>No. The attention gets <code>cu_seqlens</code> with the patch range of each image, so each image is its own sequence ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:107-117}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">An image takes 206 prompt positions but only 192 image vectors. Which vectors fill the other 14 rows?
+    <x-a><p>The learned vectors <code>image_start</code> (1 row), <code>image_end</code> (1 row) and <code>image_newline</code> (12 rows), chosen by <code>mm_token_type</code> ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:34-45}}, {{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:86-93}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>r = 3</code>, what is the input width of the first projector layer, and why?
+    <x-a><p><code>1024 × 3 × 3 = 9216</code>. <code>batch_downsample</code> in mode <code>downsample_mlp_gelu</code> joins the 9 patch vectors of each 3 × 3 block along the channel axis ({{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:537-541}}), and the first linear layer takes <code>input_dim × r × r</code> ({{cite deepinfer/model_executor/models/vision_encoder/mlp_projector.py:17}}).</p></x-a>
+  </x-q>
+</x-quiz>

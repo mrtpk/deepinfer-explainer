@@ -1,0 +1,197 @@
+---
+title: deepinfer/ve/: the multimodal worker, the image processor and the schema
+nav_title: ve/ (images)
+level: Intermediate
+prerequisites: concepts/vision-encoder, code/llm-engine
+related: concepts/vision-encoder, code/deepseek-vl, code/vit, code/llm-engine, concepts/scheduler, code/shared-memory, tours/life-of-a-request
+summary: The ve/ folder expands image placeholders into image tokens, runs a forked worker process that decodes and resizes images, plans the token layout of each image, moves the result through a shared pinned pool, and cuts the image data to each prefill chunk.
+---
+<h2>Purpose</h2>
+<p><code>deepinfer/ve/</code> does all image work on the CPU: it plans how many tokens each image takes, prepares the pixels in a separate process, and gives each prefill chunk the image data that it needs.</p>
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>multimodal_processor.py</code> (326 lines), <code>prepare_tensor_input_vl.py</code> (163), <code>schema.py</code> (77), <code>processor/image_processor.py</code> (318), <code>processor/common.py</code> (52), <code>processor/mm_processor.py</code> (30), <code>processor/text_processor.py</code> (13). <code>__init__.py</code> files are empty.</td></tr>
+    <tr><th>Main class</th><td><code>MultimodalProcessor</code> ({{cite deepinfer/ve/multimodal_processor.py:29}}). Also <code>ImageProcessorAnyRes</code> ({{cite deepinfer/ve/processor/image_processor.py:245}}), <code>MMProcessor</code> ({{cite deepinfer/ve/processor/mm_processor.py:10}}), <code>prepare_input_metadata_vl</code> ({{cite deepinfer/ve/prepare_tensor_input_vl.py:78}}).</td></tr>
+    <tr><th>Runs in</th><td>The rank process (placeholder expansion, <code>fetch</code>, chunk slicing) and one forked worker process per engine (decode, resize, layout).</td></tr>
+    <tr><th>Called by</th><td><code>LLMEngine</code> (<code>overwrite_prompt</code>, <code>add</code>, <code>fetch</code>, <code>abort</code>, <code>stop</code>), <code>ModelMetadata.prepare_inputmetadata_dict</code> (chunk slicing), <code>DeepseekVLForCausalLM</code> (processors).</td></tr>
+    <tr><th>Calls</th><td>PIL, <code>torch.multiprocessing</code> queues, <code>SharedTorchMemoryPool</code>, the C++ <code>Scheduler.set_schedulable</code>, <code>deep_cluster.topology</code> for NUMA and CPU binding.</td></tr>
+    <tr><th>Not in this file</th><td>Any device work: the ViT, the patch padding and the merge are in <code>vision_encoder/</code> and <code>image_embed_ops.py</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_vl_path" alt="Panel 1: the engine's add_request expands the placeholder and queues the dict; the forked worker runs multi_modal_mapper and puts tensors in the shared pool; fetch() in a later step calls set_schedulable. Panel 2: the prefill steps, with the scheduler and the chunk slicing first. Panel 3: token counts for a 640 x 480 image." caption="Figure: the image path. This folder owns panel 1, the slicing in step 1 of panel 2, and the geometry of panel 3. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>LLMEngine.__init__</code> makes the processor when the model class has <code>multi_modal_mapper</code> and the engine is not <code>COMPLETION</code>, and gives it the scheduler ({{cite deepinfer/engine/llm_engine.py:209-221}}, {{cite deepinfer/engine/llm_engine.py:269-270}}).</li>
+  <li><code>add_request</code> calls <code>overwrite_prompt</code> ({{cite deepinfer/engine/llm_engine.py:547-551}}); <code>_enqueue</code> calls <code>add</code> ({{cite deepinfer/engine/llm_engine.py:624-625}}).</li>
+  <li><code>step</code> calls <code>fetch</code> and <code>fetch_to_abort_requests</code> after <code>schedule()</code> ({{cite deepinfer/engine/llm_engine.py:939-945}}). After a prefill, <code>_process_model_outputs</code> calls <code>abort</code> to drop the processor's reference to the dict ({{cite deepinfer/engine/llm_engine.py:734-735}}).</li>
+  <li><code>prepare_inputmetadata_dict</code> calls <code>prepare_input_metadata_vl</code> for prefill batches ({{cite deepinfer/model_executor/model_metadata_utils.py:182-187}}).</li>
+  <li><code>DeferredRelease</code> calls <code>free_deferred_pool_handles</code> in <code>pre_sampler_sync</code> ({{cite deepinfer/engine/llm_engine.py:118-119}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>build_mm_processor</code> and <code>load_processor_config</code> for the geometry settings from <code>config.json</code> ({{cite deepinfer/ve/multimodal_processor.py:76-81}}).</li>
+  <li><code>model_class.multi_modal_mapper</code> in the worker ({{cite deepinfer/ve/multimodal_processor.py:87}}).</li>
+  <li><code>self.scheduler.set_schedulable(id)</code> ({{cite deepinfer/ve/multimodal_processor.py:303}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>MultimodalProcessor._resolve_processor</code></td><td>{{cite deepinfer/ve/multimodal_processor.py:59}}</td><td>Finds the image placeholder id, builds the processors, sets the two image ids.</td></tr>
+    <tr><td><code>_start_workers</code></td><td>{{cite deepinfer/ve/multimodal_processor.py:93}}</td><td>Forks the worker processes (one by default) and makes the two queues.</td></tr>
+    <tr><td><code>overwrite_prompt</code></td><td>{{cite deepinfer/ve/multimodal_processor.py:105}}</td><td>Placeholder → <code>IMAGE</code> + <code>IMAGE_PAD × (n − 1)</code>; builds the segment list.</td></tr>
+    <tr><td><code>_processor</code></td><td>{{cite deepinfer/ve/multimodal_processor.py:164}}</td><td>Worker loop: bind CPUs, run the mapper, copy tensors into the pool.</td></tr>
+    <tr><td><code>add</code>, <code>fetch</code>, <code>abort</code>, <code>stop</code></td><td>{{cite deepinfer/ve/multimodal_processor.py:248}}, {{cite deepinfer/ve/multimodal_processor.py:281}}, {{cite deepinfer/ve/multimodal_processor.py:312}}, {{cite deepinfer/ve/multimodal_processor.py:317}}</td><td>Engine side of the queues; hang detection in <code>fetch</code>.</td></tr>
+    <tr><td><code>compute_image_layout</code></td><td>{{cite deepinfer/ve/processor/image_processor.py:155}}</td><td>Image size → patch grid, LLM grid, token count.</td></tr>
+    <tr><td><code>load_image_anyres</code></td><td>{{cite deepinfer/ve/processor/image_processor.py:194}}</td><td>Layout tensors for one image size; cached for up to 10000 sizes.</td></tr>
+    <tr><td><code>ImageProcessorAnyRes.process</code></td><td>{{cite deepinfer/ve/processor/image_processor.py:282}}</td><td>Layout tensors plus a lazy loader that decodes and resizes.</td></tr>
+    <tr><td><code>MMProcessor.convert_segments_to_tensor_dict</code></td><td>{{cite deepinfer/ve/processor/mm_processor.py:23}}</td><td>Runs each segment's processor and joins the results.</td></tr>
+    <tr><td><code>_chunk_mm_metadata</code></td><td>{{cite deepinfer/ve/prepare_tensor_input_vl.py:32}}</td><td>Cuts one sequence's image data to one chunk.</td></tr>
+    <tr><td><code>prepare_input_metadata_vl</code></td><td>{{cite deepinfer/ve/prepare_tensor_input_vl.py:78}}</td><td>Batches the slices and builds <code>cu_seqlens_vit</code>.</td></tr>
+    <tr><td><code>MM_METADATA_KEYS</code>, pool helpers</td><td>{{cite deepinfer/ve/schema.py:29}}</td><td>The key contract and the lifetime of pool blocks.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>overwrite_prompt</code></h3>
+<x-code file="deepinfer/ve/multimodal_processor.py" lines="113-162" highlight="118-124,145-148,158-162">
+  <x-tr line="121-122">"Found N image_token_id but only M images; the extra image_token_id stay plain tokens!"</x-tr>
+  <x-tr line="134-135">Inference does not use the text token content (the engine has input_ids): TextLengthInput carries only the length.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 118-124: extra placeholders stay as text, with an error log.</li>
+  <li>Line 145: the token count comes from the declared size, without a decode.</li>
+  <li>Lines 146-148: the first token is <code>vocab_size + 2</code>, the others <code>vocab_size + 1</code>. The span <code>(start, count)</code> goes into <code>image_spans</code>.</li>
+  <li>Lines 158-162: the dict gets <code>segment_input</code> and loses <code>image_sizes</code> and <code>image_bytes</code> (the bytes now live in the segments). The function always returns a new array.</li>
+</ol>
+
+<h3><code>_processor</code>: the worker loop</h3>
+<x-code file="deepinfer/ve/multimodal_processor.py" lines="172-196" highlight="176-178,184-190,192">
+  <x-tr line="173">Bind to the NUMA node of this engine's GPU (index 0 of the visible list). Every VE deployment uses one device per process.</x-tr>
+  <x-tr line="195">"multimodal processor NUMA/CPU binding failed; continue without binding"</x-tr>
+</x-code>
+<p>Before the loop, the worker binds to the NUMA node of the engine's first visible device. With 2-way SMT, it uses the sibling hyperthreads of that device's cores, to stay off the main process's cores. It uses 2 torch threads. A binding failure only logs a warning. On NPU, it first resets <code>SIGTERM</code> to the default, because torch_npu's fork path ignores the signal ({{cite deepinfer/ve/multimodal_processor.py:165-171}}). The loop itself is in {{link concepts/vision-encoder}} (step 3).</p>
+
+<h3><code>fetch</code></h3>
+<x-code file="deepinfer/ve/multimodal_processor.py" lines="281-305" highlight="287-289,290-295,296-299,303,305" />
+<ol>
+  <li>Lines 287-289: any result, also a failure, proves that the worker is alive and resets the hang clock.</li>
+  <li>Lines 290-292: a failure goes to <code>to_abort_ids</code>; the engine aborts it in the same step.</li>
+  <li>Lines 293-295: a result for an aborted request frees its pool blocks.</li>
+  <li>Lines 296-299: with the pool, each handle becomes a tensor view of the shared pool. The <code>"handle"</code> key stays in the dict and marks pool ownership.</li>
+  <li>Lines 301-303: the original dict object, which the C++ sequence also holds, is updated in place. Then the sequence becomes schedulable.</li>
+</ol>
+
+<h3><code>compute_image_layout</code></h3>
+<x-code file="deepinfer/ve/processor/image_processor.py" lines="155-188" highlight="166-167,170-173,178-179,180-188">
+  <x-tr line="165">Clamp the width of a very wide image to height × max_wh_ratio; that image is then stretched, not fitted with the same aspect ratio.</x-tr>
+  <x-tr line="175-177">Resize to a multiple of patch_size within max_n_token, with the same aspect ratio, and count the LLM tokens. Any-resolution images still add image_newline: the ViT features have 2-D information, but the LLM still uses 1-D RoPE.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 166-167: a very wide image is clamped to <code>max_wh_ratio</code>.</li>
+  <li>Lines 170-173: a small image is scaled up to <code>min_pixels</code>.</li>
+  <li>Lines 178-179: round both sides up to a multiple of the patch size.</li>
+  <li>Lines 180-188: <code>safe_resize</code> keeps that size if the token count fits, else <code>solve_resize_ratio</code> solves <code>h × (w + 1) = max_n_token − 2</code> with the aspect ratio ({{cite deepinfer/ve/processor/image_processor.py:95-127}}).</li>
+</ol>
+
+<h3><code>_chunk_mm_metadata</code></h3>
+<x-code file="deepinfer/ve/prepare_tensor_input_vl.py" lines="32-74" highlight="36-37,43-47,50-52,55-56,63-67,69-73" />
+<ol>
+  <li>Lines 36-37: cut the per-token keys to the chunk.</li>
+  <li>Lines 43-47: binary search for the first image that ends after the chunk start and the first image that starts at or after the chunk end.</li>
+  <li>Lines 50-52: no overlap: all image keys become <code>None</code>.</li>
+  <li>Lines 55-73: cut the per-image keys, the raw bytes and the patch positions to the overlapping images, and shift the running sums to start at 0.</li>
+</ol>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data: keys of the metadata dict (schema.py)">
+<x-code file="deepinfer/ve/schema.py" lines="9-29" />
+<table>
+  <thead><tr><th>Group</th><th>Keys</th><th>Indexed by</th><th>In <code>InputMetadata</code>?</th></tr></thead>
+  <tbody>
+    <tr><td><code>MM_TOKEN_KEYS</code></td><td><code>mm_token_type</code>, <code>images_seq_mask</code></td><td>token</td><td>yes</td></tr>
+    <tr><td><code>MM_IMAGE_SPAN_KEYS</code></td><td><code>image_starts</code>, <code>image_lens</code></td><td>image</td><td>no: popped after slicing</td></tr>
+    <tr><td><code>MM_IMAGE_KEYS</code></td><td><code>images_raw</code>, <code>images_input_size</code>, <code>cu_raw_bytes</code>, <code>images_global_attn_pos_id</code>, <code>images_spatial_crop</code>, <code>cu_image_patch_lens</code></td><td>byte, image or patch</td><td>partly: some keys are rebuilt for the batch</td></tr>
+  </tbody>
+</table>
+<p>After batching, <code>prepare_input_metadata_vl</code> adds <code>cu_seqlens_vit</code> (<code>int32 [num_valid_images + 1]</code>), <code>max_seqlen_vit</code>, <code>num_downsampled_patch</code>, <code>vit_attn_cu_seqlens</code> (NPU only), <code>image_raw_sizes</code>, <code>cu_raw_bytes</code> (rebuilt for the whole batch, <code>int64</code>) and <code>total_image_patches</code> ({{cite deepinfer/ve/prepare_tensor_input_vl.py:123-163}}). Zero-crop rows (cached images) are removed before the ViT ({{cite deepinfer/ve/prepare_tensor_input_vl.py:99-111}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, queues and the shared pool">
+<ul>
+  <li><strong>Processes.</strong> The engine passes no <code>num_workers</code>, so the default of 1 applies: one worker process per engine (per DP rank) ({{cite deepinfer/ve/multimodal_processor.py:36}}, {{cite deepinfer/engine/llm_engine.py:213-219}}). The worker is a daemon <code>ForkProcessWithCrashHeader</code> ({{cite deepinfer/ve/multimodal_processor.py:99-101}}).</li>
+  <li><strong>Queues.</strong> <code>input_queue</code> has no limit. <code>output_queue</code> holds at most <code>DEEPINFER_MULTI_MODAL_BUFFER_SIZE</code> results; a full queue blocks the worker, which gives back-pressure.</li>
+  <li><strong>Pool.</strong> With <code>DEEPINFER_USE_MULTIMODAL_POOL</code>, the worker copies each non-empty tensor into a <code>SharedTorchMemoryPool</code> block and sends <code>(handle, shape, dtype)</code> ({{cite deepinfer/ve/multimodal_processor.py:202-211}}). The pool is one <code>multiprocessing.shared_memory</code> block, pinned for fast copies to the device ({{cite deepinfer/shared_memory.py:80-84}}, {{cite deepinfer/shared_memory.py:114-120}}).</li>
+  <li><strong>Pool lifetime.</strong> When a prefill covers all tokens of a sequence, <code>defer_expiring_pool_handles</code> takes the blocks and records an event after the host-to-device copy is queued. <code>free_deferred_pool_handles</code> waits for that event and frees the blocks in <code>pre_sampler_sync</code> of the same step ({{cite deepinfer/ve/schema.py:53-77}}).</li>
+  <li><strong>Shutdown.</strong> <code>stop</code> terminates the workers, joins them when the pool is on, and closes the pool ({{cite deepinfer/ve/multimodal_processor.py:317-326}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: a two-image prompt in two chunks">
+<p>Prompt: 40 text tokens, image A (206 tokens), 10 text tokens, image B (206 tokens), 30 text tokens. Total 492. Image spans: A = (40, 206), B = (256, 206). Assume a token budget of 300 and chunked prefill on.</p>
+<ol>
+  <li>Chunk 1 would be tokens 0-299. Position 300 is inside B (B covers 256-461), so the scheduler must move the end. This is the first sequence of the batch, so it tries to grow to 462. 462 tokens exceed the budget, so it shrinks to the start of B: chunk 1 is tokens 0-255 ({{cite csrc/engine/scheduler.hpp:487-493}}).</li>
+  <li><code>_chunk_mm_metadata(0, 256)</code>: <code>ends = [246, 462]</code>, <code>bisect_right(ends, 0) = 0</code>; <code>starts = [40, 256]</code>, <code>bisect_left(starts, 256) = 1</code>. So only image A is in chunk 1.</li>
+  <li>Chunk 2 starts at 256, the first token of B, which is an <code>IMAGE</code> id. Its 236 tokens fit the budget. <code>bisect_right(ends, 256) = 1</code>, <code>bisect_left(starts, 492) = 2</code>: only image B.</li>
+</ol>
+<p>So each image goes to the ViT exactly once, in the chunk that holds all its tokens. The slicing code also handles the theoretical case that a chunk cuts an image, but the scheduler rule prevents it.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Case</th><th>Result</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>No known image token in the tokenizer</td><td><code>AssertionError</code> at start-up</td><td>{{cite deepinfer/ve/multimodal_processor.py:69-71}}</td></tr>
+    <tr><td><code>config.json</code> and tokenizer disagree on the image token id</td><td><code>AssertionError</code></td><td>{{cite deepinfer/ve/multimodal_processor.py:83-86}}</td></tr>
+    <tr><td>More placeholders than images</td><td>Error log; extra placeholders stay text</td><td>{{cite deepinfer/ve/multimodal_processor.py:119-124}}</td></tr>
+    <tr><td>Mapper exception in the worker</td><td>Log, free pool blocks, send <code>None</code>; the engine aborts the request</td><td>{{cite deepinfer/ve/multimodal_processor.py:213-217}}</td></tr>
+    <tr><td>No result for <code>DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT</code> seconds while requests wait</td><td><code>os.abort()</code> of the engine process</td><td>{{cite deepinfer/ve/multimodal_processor.py:264-275}}</td></tr>
+    <tr><td>Declared size differs from the real image</td><td>Printed warning; resized to the planned size</td><td>{{cite deepinfer/ve/processor/image_processor.py:295-299}}</td></tr>
+    <tr><td>Extreme aspect ratio (for example 1 × 100000)</td><td><code>ImageOps.contain</code> raises; the code stretches instead</td><td>{{cite deepinfer/ve/processor/image_processor.py:274-279}}</td></tr>
+    <tr><td>SMT other than off or 2-way</td><td><code>AssertionError</code> inside the binding block, caught: warning, no binding</td><td>{{cite deepinfer/ve/multimodal_processor.py:184}}, {{cite deepinfer/ve/multimodal_processor.py:194-195}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_MULTIMODAL_POOL</code></td><td>off; <code>EngineArgs</code> sets <code>"1"</code> for every engine type except <code>COMPLETION</code> (with <code>setdefault</code>, so an exported value wins)</td><td>{{cite deepinfer/environ.py:207}}, {{cite deepinfer/engine/arg_utils.py:56-60}}</td><td>Tensors go through the shared pool.</td></tr>
+    <tr><td><code>DEEPINFER_MULTIMODAL_POOL_SIZE_GB</code></td><td>8</td><td>{{cite deepinfer/environ.py:208}}</td><td>Pool size per rank.</td></tr>
+    <tr><td><code>DEEPINFER_MULTI_MODAL_BUFFER_SIZE</code></td><td>512</td><td>{{cite deepinfer/environ.py:209}}</td><td>Size of <code>output_queue</code>.</td></tr>
+    <tr><td><code>DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT</code></td><td>1800.0</td><td>{{cite deepinfer/environ.py:210}}</td><td>Hang limit in seconds; 0 or less turns it off.</td></tr>
+    <tr><td><code>CUDA_VISIBLE_DEVICES</code></td><td>must be set</td><td>{{cite deepinfer/ve/multimodal_processor.py:176}}</td><td>Else the binding block fails and logs a warning.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/vision-encoder}}: the whole image path and the token geometry.</li>
+  <li>{{link concepts/scheduler}}: chunked prefill and the <code>schedulable</code> flag.</li>
+  <li>{{link code/deepseek-vl}}: <code>multi_modal_mapper</code>, which the worker runs.</li>
+  <li>{{link tours/life-of-a-request}}: what the wait for the worker means for the first prefill step.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which process decodes the JPEG bytes of an image?
+    <x-a><p>The forked multimodal worker. The image processor returns a lazy <code>ImageTensorLoader</code>, and the mapper calls <code>load()</code> in the worker ({{cite deepinfer/ve/processor/image_processor.py:292-302}}, {{cite deepinfer/model_executor/models/deepseek_vl.py:81-89}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What does <code>TextLengthInput</code> carry, and why not the text tokens?
+    <x-a><p>Only a length. The engine already has the ids; the processor only needs to make <code>mm_token_type</code> zeros of that length ({{cite deepinfer/ve/processor/common.py:24-27}}, {{cite deepinfer/ve/processor/text_processor.py:10-13}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">When are the pool blocks of a request freed in the normal case?
+    <x-a><p>In the step whose prefill covers all tokens of the sequence. <code>defer_expiring_pool_handles</code> takes them during preparation, and <code>free_deferred_pool_handles</code> frees them in <code>pre_sampler_sync</code> after the copy event ({{cite deepinfer/ve/schema.py:53-77}}, {{cite deepinfer/engine/llm_engine.py:118-119}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the worked example, why does chunk 1 end at token 255 and not at 299?
+    <x-a><p>Position 300 is inside image B. The first sequence of a batch may grow to the image end (462), but that exceeds the budget of 300, so <code>_adjust_chunk_size</code> shrinks the chunk to the start of B at 256 ({{cite csrc/engine/scheduler.hpp:235-260}}, {{cite csrc/engine/scheduler.hpp:487-493}}).</p></x-a>
+  </x-q>
+</x-quiz>

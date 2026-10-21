@@ -1,0 +1,172 @@
+---
+title: Vision encoder (VL)
+nav_title: Vision encoder (VL)
+level: Intermediate
+prerequisites: learn/tokens, learn/prefill-decode, concepts/model-map, concepts/scheduler
+related: code/ve, code/deepseek-vl, code/vit, concepts/engram, concepts/hardware-platforms, tours/life-of-a-request, code/llm-engine
+summary: DeepInfer reads images in the prefill of the same engine. A worker process prepares each image, the scheduler keeps whole images in one chunk, and a ViT plus a projector turn the pixels into vectors at the image-token positions of the prompt.
+---
+<x-sentence>A worker process prepares each image. In the prefill, a ViT and a projector turn its pixels into vectors at the image tokens of the prompt.</x-sentence>
+
+<h2>The idea</h2>
+<p>A language model reads only vectors, one per token. To read an image, the model needs vectors for the image too. A {{term vision-encoder | vision encoder}} makes them. DeepInfer's vision encoder is a {{term vit | ViT}}: it cuts the image into {{term image-patch | patches}} of 14 × 14 pixels and runs 32 transformer blocks over the patches. A {{term vl-projector | projector}} then joins small blocks of patch vectors and maps them to the hidden size of the language model.</p>
+<p>The prompt needs room for these vectors. So the engine replaces each image placeholder in the prompt with many {{term image-token | image tokens}}, one position per image vector plus a few marker positions. In the {{term prefill}}, the model puts the image vectors into exactly these positions. After that, the image is part of the {{term kv-cache | KV cache}} like any text, and {{term decode}} never looks at the pixels again.</p>
+<p>Image work is slow on the CPU. So a separate process, the {{term multimodal-processor | MultimodalProcessor}} worker, decodes and resizes the image while the engine continues. A request can run only after the worker has answered.</p>
+<p><strong>An everyday comparison.</strong> Think of a translator who reads a letter with a photo in it. An assistant first scans the photo and writes a short description card. The translator leaves a gap of the right size in the text and puts the card into the gap. The comparison stops here. The "card" is a list of numbers that the model learned to read, not words. Also, the gap size depends only on the image size.</p>
+<x-note title="One machine, not E/P/D"><p>In this release the vision encoder runs inside the prefill forward of each engine. The docs describe separate vision-encoder, prefill and decode instances ({{cite doc/inference_deployment_qa.md:31}}, {{cite doc/inference_deployment_qa.md:61-63}}). The README lists "VE/Prefill/Decode disaggregation" as not included in this release ({{cite README.md:38-41}}). See {{link concepts/hardware-platforms#is-it-afd | Is it AFD?}}.</p></x-note>
+
+<h2>The picture</h2>
+<x-diagram name="b6b_vl_path" alt="Panel 1: three boxes. The engine's add_request expands the placeholder into V+2 and 205 times V+1, adds the sequence with schedulable False, and queues the dict. A forked worker process runs multi_modal_mapper, decodes and resizes the image, and puts the tensors into the shared pool. In a later step, fetch() after schedule() copies the result back and calls set_schedulable. Panel 2: six steps of a prefill: the scheduler keeps the image in one chunk; the ids are embedded; rgb_pad_to_patches makes 1610 patches; the ViT gives [1610, 1024]; downsample and projector give [192, hidden]; replace_input_embeds puts the 192 vectors into the IMAGE rows and learned vectors into START, NEW_LINE and END rows. Panel 3: a 640x480 image gives 46 x 35 patches, a 16 x 12 grid, and 206 prompt positions." caption="Figure: the image path for one 640 × 480 image. Panel 1 runs at admission, panel 2 in the prefill step, panel 3 shows the token counts. The downsample ratio 3 is an example value. Click to zoom." />
+<p>Read the three panels from top to bottom. Blue and violet show the two processes. Teal is the vision encoder itself, and pink is the merge into the prompt. The numbers in panel 3 come from the geometry code with the example values in the header.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the request brings image bytes and sizes</h3>
+<p>The caller passes one dict per prompt to <code>LLM.generate(..., multi_modal_data=...)</code> ({{cite deepinfer/entrypoints/llm.py:96}}, {{cite deepinfer/entrypoints/llm.py:135-141}}). The image is not part of <code>SamplingParams</code>. The example scripts build the dict from <code>examples/images/</code>:</p>
+<x-code file="examples/_prompts.py" lines="53-62" highlight="58-61" />
+<p>The prompt text contains one placeholder token per image, <code>&lt;image&gt;</code> or <code>&lt;｜deepseek_image｜&gt;</code> ({{cite deepinfer/multimodal_tokens.py:14}}). At start-up, the processor finds its id in the tokenizer and asserts that <code>config.json</code> has the same <code>image_token_id</code> ({{cite deepinfer/ve/multimodal_processor.py:68-86}}). A text-only prompt still gets a dict with empty image lists, because the engine has a <code>MultimodalProcessor</code> ({{cite deepinfer/entrypoints/llm.py:158-159}}).</p>
+
+<h3>Step 2: each placeholder becomes many image tokens</h3>
+<x-code file="deepinfer/ve/multimodal_processor.py" lines="132-152" highlight="145-148" />
+<p><code>add_request</code> calls <code>overwrite_prompt</code> before it makes the sequence ({{cite deepinfer/engine/llm_engine.py:547-551}}). For each placeholder, line 145 computes the token count from the image size alone, with no image decode. The first new id is <code>vocab_size + 2</code> (<code>IMAGE</code>) and all others are <code>vocab_size + 1</code> (<code>IMAGE_PAD</code>) ({{cite deepinfer/ve/multimodal_processor.py:89-91}}, {{cite deepinfer/multimodal_tokens.py:17-28}}). The id range check then allows the 5 ids above <code>vocab_size</code> ({{cite deepinfer/engine/llm_engine.py:581}}).</p>
+
+<h3>Step 3: the worker process prepares the image</h3>
+<p>The engine forks one worker process at start-up ({{cite deepinfer/ve/multimodal_processor.py:93-103}}, {{cite deepinfer/engine/llm_engine.py:213-219}}). <code>_enqueue</code> adds the sequence to the scheduler and puts the dict on the input queue ({{cite deepinfer/engine/llm_engine.py:620-625}}). The sequence starts with <code>schedulable = False</code>, because it has a multimodal dict ({{cite csrc/engine/pybind_sequence.cpp:35}}).</p>
+<x-code file="deepinfer/ve/multimodal_processor.py" lines="197-217" highlight="201-211,217">
+  <x-tr line="198">When output_queue is full, the put below blocks. This is the same back-pressure as the old "stop taking new input at the backlog limit".</x-tr>
+</x-code>
+<p>Line 201 runs <code>DeepseekVLForCausalLM.multi_modal_mapper</code>. It decodes and resizes the image and makes the token types and patch positions (see {{link code/deepseek-vl}}). With the {{term multimodal-pool | multimodal pool}} on, lines 205-211 copy every non-empty tensor into shared memory and send only handles. If you do not set the variable, <code>EngineArgs</code> turns the pool on for every engine type except <code>COMPLETION</code> ({{cite deepinfer/engine/arg_utils.py:56-60}}).</p>
+
+<h3>Step 4: fetch() makes the request schedulable</h3>
+<x-code file="deepinfer/ve/multimodal_processor.py" lines="281-305" highlight="290-292,296-303" />
+<p><code>step()</code> calls <code>fetch()</code> after <code>schedule()</code> ({{cite deepinfer/engine/llm_engine.py:939-945}}). So a request can join a prefill at the earliest in the next step. A failed image gives <code>None</code> (line 290); the engine aborts that request.</p>
+<x-warning title="Every request waits for the worker"><p>The only registered architecture is <code>DeepseekVLForCausalLM</code> ({{cite deepinfer/model_executor/models/__init__.py:15-17}}). So every NORMAL engine has a <code>MultimodalProcessor</code>, and every request, also a text-only one, waits for one round trip through the worker process. The {{link tours/life-of-a-request}} tour shows what this means for the first prefill step.</p></x-warning>
+
+<h3>Step 5: the scheduler keeps each image in one chunk</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="232-260" highlight="241,244-246,249-254">
+  <x-tr line="232">Adjust the chunk size: multimodal input must not be cut in the middle of an image.</x-tr>
+  <x-tr line="243">Grow forward: skip all IMAGE_PAD (stop at the next MM_TOKEN_IMAGE or a non-image token).</x-tr>
+  <x-tr line="248">Shrink back: skip all IMAGE_PAD and the MM_TOKEN_IMAGE (the whole image moves to the next chunk).</x-tr>
+</x-code>
+<p>With {{term chunked-prefill}}, a chunk can end anywhere. If it ends inside an image, the code moves the end. For the first sequence of the batch, it grows the chunk to the image end if the token budget allows. Else it shrinks the chunk to the image start ({{cite csrc/engine/scheduler.hpp:487-493}}). This is why the first id of an image is different (<code>IMAGE</code>, not <code>IMAGE_PAD</code>): two images that touch can still be cut between them.</p>
+<p>Then <code>prepare_input_metadata_vl</code> cuts the image data of each sequence to the token range of the chunk ({{cite deepinfer/ve/prepare_tensor_input_vl.py:77-138}}). It runs only for prefill batches ({{cite deepinfer/model_executor/model_metadata_utils.py:182-187}}).</p>
+
+<h3>Step 6: the prefill forward puts the image vectors into the prompt</h3>
+<x-code file="deepinfer/model_executor/models/deepseek_vl.py" lines="226-234" />
+<p>In every prefill, also a text-only one, the VL class computes the input embeddings itself. Decode uses the normal embedding of <code>DeepseekModel</code>. <code>get_input_embeddings</code> embeds the ids and, when the batch has image bytes, calls the vision-language tuner ({{cite deepinfer/model_executor/models/deepseek_vl.py:194-224}}):</p>
+<x-code file="deepinfer/model_executor/models/vision_encoder/vl_aligner.py" lines="118-141" />
+<ol>
+  <li><code>rgb_pad_to_patches</code> turns the raw RGB bytes into normalized <code>bf16</code> patches on the device.</li>
+  <li><code>_encode_images</code> runs the ViT, joins blocks of patch vectors (<code>batch_downsample</code>) and runs the projector ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:47-77}}).</li>
+  <li><code>_merge_image_embeds</code> writes the i-th image vector into the i-th position of type <code>IMAGE</code>. Positions of type <code>IMAGE_START</code>, <code>IMAGE_NEW_LINE</code> and <code>IMAGE_END</code> get three learned vectors ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:31-45}}, {{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:79-94}}).</li>
+</ol>
+<p>The batch also gets <code>images_seq_mask</code>, true at every image position ({{cite deepinfer/model_executor/models/deepseek_vl.py:179}}). The MoE gate then uses a separate correction bias for image tokens ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:373-390}}), and {{link concepts/engram | Engram}} uses the mask too ({{cite deepinfer/model_executor/models/deepseek.py:180-186}}).</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Worked example: how many tokens does one image take?">
+<p>The geometry code is in <code>ve/processor/image_processor.py</code>. Its inputs come from <code>config.json</code>: <code>patch_size</code>, <code>downsample_ratio</code>, <code>max_image_tokens</code>, <code>min_pixels</code>, <code>max_wh_ratio</code> ({{cite deepinfer/hugging_face/processor.py:25-36}}). The repo does not contain these values. The example below uses patch 14 (the ViT constant, {{cite deepinfer/model_executor/models/vision_encoder/vit.py:27}}) and ratio 3, the values that a code comment names ({{cite deepinfer/ve/prepare_tensor_input_vl.py:155}}). It assumes <code>max_image_tokens ≥ 206</code>, <code>min_pixels ≤ 307200</code>, and <code>max_wh_ratio</code> null or at least 4/3 ({{cite deepinfer/ve/processor/image_processor.py:166-173}}).</p>
+<ol>
+  <li>Round each side up to a multiple of 14: 640 → 644, 480 → 490 ({{cite deepinfer/ve/processor/image_processor.py:178-179}}).</li>
+  <li>Patch grid: <code>n_vit_w = 644 / 14 = 46</code>, <code>n_vit_h = 490 / 14 = 35</code>, so 1610 patches ({{cite deepinfer/ve/processor/image_processor.py:87-92}}).</li>
+  <li>LLM grid: <code>n_llm_w = ceil(46 / 3) = 16</code>, <code>n_llm_h = ceil(35 / 3) = 12</code>, so 192 image vectors.</li>
+  <li>Token count: <code>n_llm_h × (n_llm_w + 1) + 2 = 12 × 17 + 2 = 206</code>. Each row of the grid ends with a <code>NEW_LINE</code> token, and <code>START</code> and <code>END</code> frame the image ({{cite deepinfer/ve/processor/image_processor.py:76-78}}).</li>
+  <li>If the count is above <code>max_image_tokens</code>, <code>solve_resize_ratio</code> computes a smaller size with about the same aspect ratio in one pass. Then an assert checks that the new count fits ({{cite deepinfer/ve/processor/image_processor.py:95-127}}, {{cite deepinfer/ve/processor/image_processor.py:140-152}}).</li>
+</ol>
+<p>The comment explains the <code>NEW_LINE</code> tokens: the ViT features have 2-D information, but the LLM uses 1-D RoPE ({{cite deepinfer/ve/processor/image_processor.py:175-177}}).</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Shape and dtype</th><th>Made by</th></tr></thead>
+  <tbody>
+    <tr><td>prompt ids for the image</td><td>206 × <code>int32</code>: <code>[V+2, V+1 × 205]</code></td><td><code>overwrite_prompt</code></td></tr>
+    <tr><td><code>mm_token_type</code></td><td><code>int32 [206]</code>: <code>[3, (2 × 16, 5) × 12, 4]</code></td><td>{{cite deepinfer/ve/processor/image_processor.py:232-235}}</td></tr>
+    <tr><td><code>images_spatial_crop</code></td><td><code>int64 [1, 2]</code> = <code>[[46, 35]]</code></td><td>{{cite deepinfer/ve/processor/image_processor.py:224}}</td></tr>
+    <tr><td><code>images_global_attn_pos_id</code></td><td><code>int64 [1610, 2]</code> (row, column)</td><td>{{cite deepinfer/ve/processor/image_processor.py:226-229}}</td></tr>
+    <tr><td><code>images_raw</code></td><td><code>uint8</code>, at most 644 × 490 × 3 bytes (HWC)</td><td>{{cite deepinfer/ve/processor/image_processor.py:57-63}}</td></tr>
+    <tr><td>patches for the ViT</td><td><code>bf16 [1610, 3, 14, 14]</code></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:43-97}}</td></tr>
+    <tr><td>ViT output</td><td><code>[1610, 1024]</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/vit.py:214}}</td></tr>
+    <tr><td>after downsample</td><td><code>[192, 9216]</code></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:492-503}}</td></tr>
+    <tr><td>after projector</td><td><code>[192, hidden]</code></td><td>{{cite deepinfer/model_executor/models/vision_encoder/mlp_projector.py:17-23}}</td></tr>
+  </tbody>
+</table>
+<p>The CPU resize keeps the aspect ratio (<code>ImageOps.contain</code>), so the real image can be smaller than 644 × 490. The device kernel centres it in the grid and fills the border with the pad colour ({{cite deepinfer/ve/processor/image_processor.py:270-280}}, {{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:55-60}}). The normalization constants are mean 0.5 and std 0.5 for each channel ({{cite deepinfer/hugging_face/processor.py:34-35}}), so the pad colour is <code>int(0.5 × 255) = 127</code> ({{cite deepinfer/model_executor/models/deepseek_vl.py:258-260}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Inside the ViT and the projector">
+<x-diagram name="b6b_vit" alt="Panel 1: patch embedding (Linear 588 to 1024), 32 blocks with RMSNorm, attention (qkv 1024 to 3072, 16 heads of 64) and SwiGLU (1024 to 2 x 2816 to 1024), then fc_norm, output [1610, 1024]. Panel 2: the 35 x 46 patch grid is padded to 36 x 48, cut into 3 x 3 blocks (192), concatenated to [192, 9216], then Linear, GELU, Linear to [192, H]." caption="Figure: shapes inside the vision encoder for the example image. Click to zoom." />
+<ul>
+  <li>Constants in <code>vit.py</code> fix the ViT structure: patch 14, width 1024, 32 blocks and 16 heads. The MLP ratio is 2.7, rounded up to a multiple of 128 ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:26-32}}). The comment says it is the only vision encoder in use for V4.1.</li>
+  <li>Attention is not causal. <code>cu_seqlens_vit</code> splits the batch so that patches see only patches of the same image ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:107-122}}).</li>
+  <li>Positions use a 2-D RoPE table. Each patch gathers the cos and sin of its row and of its column ({{cite deepinfer/model_executor/models/vision_encoder/vit.py:196-203}}).</li>
+  <li>On Ascend, an import hook replaces <code>_flash_attn_fwd</code> with a function that calls <code>npu_fusion_attention</code> ({{cite deepinfer/npu_ops/__init__.py:3-12}}, {{cite deepinfer/npu_ops/vit_attn.py:9-20}}). That kernel needs the segment ends as a host list. That is why the batch also carries <code>vit_attn_cu_seqlens</code> on NPU ({{cite deepinfer/ve/prepare_tensor_input_vl.py:131-133}}). See {{link concepts/hardware-platforms}}.</li>
+  <li>The projector type must be <code>downsample_mlp_gelu</code> ({{cite deepinfer/model_executor/models/vision_encoder/mlp_projector.py:14}}). The HF loader sets depth 2 ({{cite deepinfer/hugging_face/config.py:225-233}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Chunks, cached prefixes and the image slices">
+<p><code>_chunk_mm_metadata</code> works on one sequence and one chunk <code>[seqlen_k − seqlen_q, seqlen_k)</code> ({{cite deepinfer/ve/prepare_tensor_input_vl.py:17-18}}, {{cite deepinfer/ve/prepare_tensor_input_vl.py:31-74}}):</p>
+<ol>
+  <li>Slice the per-token tensors <code>mm_token_type</code> and <code>images_seq_mask</code> to the chunk.</li>
+  <li>Find the images that overlap the chunk with two binary searches over the image start and end positions.</li>
+  <li>No overlap: set every image key to <code>None</code>. The chunk is then text-only for the vision encoder.</li>
+  <li>Else slice the per-image tensors, the raw bytes (with <code>cu_raw_bytes</code>) and the patch positions (with <code>cu_image_patch_lens</code>).</li>
+</ol>
+<p>Because the scheduler never ends a chunk inside an image, an overlapping image is always inside the chunk. A chunk end that falls on the first token of an image is allowed; that image then goes to the next chunk.</p>
+<p><strong>Cached images.</strong> The mapper can replace a prefix of images that the KV cache already holds with plain text of the same length ({{cite deepinfer/model_executor/models/deepseek_vl.py:41-72}}). It reads <code>_num_cached_tokens</code> from the dict. In this release, <code>_enqueue</code> calls <code>add(request_id, multi_modal_data)</code> without <code>num_cached_tokens</code>, so the value is always 0 ({{cite deepinfer/engine/llm_engine.py:625}}, {{cite deepinfer/ve/multimodal_processor.py:248-255}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Memory and lifetime of the image data">
+<ul>
+  <li>The pool is <code>DEEPINFER_MULTIMODAL_POOL_SIZE_GB</code> (default 8) of shared host memory per rank, pinned for fast copies to the device ({{cite deepinfer/environ.py:207-210}}, {{cite deepinfer/shared_memory.py:360-363}}). The log line says how much memory all ranks of the node keep ({{cite deepinfer/ve/multimodal_processor.py:49-56}}).</li>
+  <li>When a prefill has read all tokens of a sequence, <code>defer_expiring_pool_handles</code> takes the pool blocks and records an event. The engine frees them in <code>pre_sampler_sync</code> of the same step, after the event ({{cite deepinfer/ve/schema.py:48-77}}, {{cite deepinfer/engine/llm_engine.py:118-119}}, {{cite deepinfer/engine/llm_engine.py:830-831}}).</li>
+  <li>An aborted request frees its blocks at once ({{cite deepinfer/engine/llm_engine.py:651-655}}, {{cite deepinfer/ve/schema.py:32-45}}).</li>
+  <li>The output queue holds at most <code>DEEPINFER_MULTI_MODAL_BUFFER_SIZE</code> (default 512) results. A full queue blocks the worker ({{cite deepinfer/ve/multimodal_processor.py:96}}).</li>
+</ul>
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_MULTIMODAL_POOL</code></td><td>off in <code>environ.py</code>; if it is not set, <code>EngineArgs</code> sets it to 1 unless the engine is <code>COMPLETION</code></td><td>{{cite deepinfer/environ.py:207}}, {{cite deepinfer/engine/arg_utils.py:56-60}}</td><td>Tensors go through the shared pool, not the queue.</td></tr>
+    <tr><td><code>DEEPINFER_MULTIMODAL_POOL_SIZE_GB</code></td><td>8</td><td>{{cite deepinfer/environ.py:208}}</td><td>Pool size per rank.</td></tr>
+    <tr><td><code>DEEPINFER_MULTI_MODAL_BUFFER_SIZE</code></td><td>512</td><td>{{cite deepinfer/environ.py:209}}</td><td>Size of the output queue.</td></tr>
+    <tr><td><code>DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT</code></td><td>1800.0 s</td><td>{{cite deepinfer/environ.py:210}}</td><td>No progress for this long: <code>os.abort()</code>. 0 or less turns the check off.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Examples and the VL regression test">
+<p><code>examples/images/</code> holds two pictures, <code>carrots.jpeg</code> and <code>ribs.jpeg</code>. The offline samples are two text-only prompts, one with one image, one with three images, and one 4-shot prompt with five images ({{cite examples/README.md:27-29}}, {{cite examples/_prompts.py:67-99}}). The README asks you to measure the PPL baselines again on NVIDIA and Ascend after a change to the images or questions.</p>
+<p>The tests that cover the vision path:</p>
+<ul>
+  <li><code>tests/models/test_offline_inference.py</code>: the offline regression with these five samples, compared to the PPL baselines in <code>offline_decode_ppl.json</code> ({{cite tests/models/test_offline_inference.py:19}}).</li>
+  <li><code>tests/models/test_ve_batch_invariant.py</code>: runs only the image encoding and checks that each image gives bit-identical vectors in any batch ({{cite tests/models/test_ve_batch_invariant.py:1-13}}).</li>
+  <li><code>tests/engine/test_mm_overwrite_prompt.py</code> and <code>tests/ve/test_chunk_mm_metadata.py</code>: the placeholder expansion and the chunk slicing.</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>More placeholders than images.</strong> The engine logs an error and keeps the extra placeholders as plain tokens ({{cite deepinfer/ve/multimodal_processor.py:118-124}}).</li>
+  <li><strong>Wrong <code>image_sizes</code>.</strong> The token count comes from the declared size. If the real image has another size, the worker prints a warning and resizes it to the planned size ({{cite deepinfer/ve/processor/image_processor.py:292-299}}).</li>
+  <li><strong>A broken image.</strong> The mapper raises in the worker, the worker sends <code>None</code>, and the engine aborts the request with an error log ({{cite deepinfer/ve/multimodal_processor.py:213-217}}, {{cite deepinfer/engine/llm_engine.py:942-945}}). With <code>image_bytes=None</code>, the request starts as <code>FINISHED_VE_FAILED</code> ({{cite deepinfer/engine/llm_engine.py:548-549}}, {{cite deepinfer/engine/llm_engine.py:603-604}}).</li>
+  <li><strong>A hung worker.</strong> After <code>DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT</code> seconds with no result, the engine process calls <code>os.abort()</code> ({{cite deepinfer/ve/multimodal_processor.py:264-275}}).</li>
+  <li><strong>A tokenizer without a known image token.</strong> Start-up fails with <code>AssertionError</code> ({{cite deepinfer/ve/multimodal_processor.py:70-71}}).</li>
+  <li><strong>An image longer than the token budget.</strong> The scheduler never cuts an image. If an image starts at the chunk start and has more tokens than <code>max_num_batched_tokens</code>, the shrink step gives a chunk of 0 tokens. With no other sequence in the batch, the <code>TORCH_CHECK</code> fails ({{cite csrc/engine/scheduler.hpp:488-501}}). This case needs chunked prefill: without it, <code>max_num_batched_tokens</code> must be at least <code>max_model_len</code> ({{cite deepinfer/config.py:209-212}}). This site derived this case from the code and did not run it. <code>max_image_tokens</code> limits the size of one image.</li>
+</ul>
+<p><strong>Why it matters.</strong> The image path changes the timing of every request, not only of image requests. Also, an image always enters the KV cache in one chunk, so chunks can be shorter than the token budget.</p>
+
+<x-quiz>
+  <x-q level="easy">Does the decode step run the ViT?
+    <x-a><p>No. <code>DeepseekVLForCausalLM.forward</code> calls <code>get_input_embeddings</code> only when <code>is_prompt</code> is true ({{cite deepinfer/model_executor/models/deepseek_vl.py:232-233}}). After the prefill, the image is in the KV cache.</p></x-a>
+  </x-q>
+  <x-q level="easy">Is E/P/D (separate vision-encoder machines) part of this release?
+    <x-a><p>No. The README lists "VE/Prefill/Decode disaggregation" under "not included in this release" ({{cite README.md:38-41}}). The vision encoder runs inside each engine's prefill.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why is the first id of an image <code>vocab_size + 2</code> and the rest <code>vocab_size + 1</code>?
+    <x-a><p>The scheduler must find image boundaries in the id list. A chunk boundary can be just before an <code>IMAGE</code> id, but not just before an <code>IMAGE_PAD</code> id that follows one ({{cite csrc/engine/scheduler.hpp:214-230}}). The different first id marks where one image ends and the next one starts. The comment says the first token must be <code>IMAGE</code> to support chunked prefill ({{cite deepinfer/ve/multimodal_processor.py:89}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With patch 14 and downsample ratio 3, how many prompt positions does a 640 × 480 image take, and how many of them get ViT vectors?
+    <x-a><p>The grid is 46 × 35 patches. Rounded up by 3, the LLM grid is 16 × 12 = 192 vectors. The positions are <code>12 × (16 + 1) + 2 = 206</code>: 192 <code>IMAGE</code>, 12 <code>NEW_LINE</code>, one <code>START</code> and one <code>END</code> ({{cite deepinfer/ve/processor/image_processor.py:76-92}}, {{cite deepinfer/ve/processor/image_processor.py:232-235}}). Only the 192 <code>IMAGE</code> positions get ViT vectors; the 14 others get learned vectors.</p></x-a>
+  </x-q>
+  <x-q level="hard">A text-only request arrives at an idle engine. Why can it not run its prefill in the same step in which it was added?
+    <x-a><p>It has a multimodal dict with empty image lists (not <code>None</code>), so it starts with <code>schedulable = False</code> ({{cite deepinfer/entrypoints/llm.py:158-159}}, {{cite csrc/engine/pybind_sequence.cpp:35}}). Only <code>fetch()</code> sets it, and <code>fetch()</code> runs after <code>schedule()</code> in each step ({{cite deepinfer/engine/llm_engine.py:885}}, {{cite deepinfer/engine/llm_engine.py:939-941}}). So the earliest prefill is in a later step, after the worker has answered.</p></x-a>
+  </x-q>
+</x-quiz>

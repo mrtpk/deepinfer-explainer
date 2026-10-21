@@ -1,0 +1,160 @@
+---
+title: models/deepseek_vl.py: the vision-language model class
+nav_title: deepseek_vl.py
+level: Advanced
+prerequisites: concepts/vision-encoder, code/deepseek
+related: concepts/vision-encoder, code/vit, code/ve, code/deepseek, concepts/model-map, code/llm-engine
+summary: DeepseekVLForCausalLM is the only registered model class. It adds the vision encoder to DeepseekForCausalLM, prepares image metadata in the multimodal worker process (multi_modal_mapper), and computes the input embeddings of every prefill.
+---
+<h2>Purpose</h2>
+<p><code>DeepseekVLForCausalLM</code> extends the text model with images: it owns the vision encoder, it turns the image part of a request into tensors, and it merges the image vectors into the prefill embeddings.</p>
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/deepseek_vl.py</code>, 267 lines of Python. Many comments are in Chinese.</td></tr>
+    <tr><th>Main class</th><td><code>DeepseekVLForCausalLM(DeepseekForCausalLM)</code> ({{cite deepinfer/model_executor/models/deepseek_vl.py:26}}).</td></tr>
+    <tr><th>Runs in</th><td>Two processes. <code>multi_modal_mapper</code> is a class method that runs in the forked multimodal worker process. Everything else runs in the rank process; the forward runs on the device.</td></tr>
+    <tr><th>Called by</th><td>The model loader (<code>load_model</code>), the model runner (<code>forward</code>), <code>MultimodalProcessor</code> (<code>multi_modal_mapper</code>).</td></tr>
+    <tr><th>Calls</th><td><code>VisionLanguageInstructTuner</code> (vision encoder), <code>MMProcessor</code> and the image helpers of <code>ve/processor</code>, <code>DeepseekForCausalLM</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The ViT and projector (<code>vision_encoder/</code>), the placeholder expansion and the worker loop (<code>ve/multimodal_processor.py</code>), the chunk slicing (<code>ve/prepare_tensor_input_vl.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The registry maps the only supported architecture to this class ({{cite deepinfer/model_executor/models/__init__.py:15-17}}). So every engine uses it, also for text-only work.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_vl_path" alt="Panel 1: add_request, the worker process that runs multi_modal_mapper, and fetch() with set_schedulable. Panel 2: the six steps of a prefill with an image, from the scheduler to replace_input_embeds. Panel 3: token counts for a 640 x 480 image." caption="Figure: the image path. This class owns the violet box of panel 1 (<code>multi_modal_mapper</code>) and steps 2 to 6 of panel 2. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Loading.</strong> <code>get_model</code> calls <code>model_class.load_model</code> ({{cite deepinfer/model_executor/model_loader.py:65-79}}). This class reads the image processor config first, then calls the parent ({{cite deepinfer/model_executor/models/deepseek_vl.py:236-245}}). The parent calls <code>cls.from_model_cfg</code> so that it builds the VL class ({{cite deepinfer/model_executor/models/deepseek.py:444-445}}, {{cite deepinfer/model_executor/models/deepseek.py:514}}).</li>
+  <li><strong>The worker process.</strong> <code>MultimodalProcessor</code> binds <code>multi_modal_mapper</code> to its <code>MMProcessor</code> with <code>functools.partial</code> ({{cite deepinfer/ve/multimodal_processor.py:87}}) and calls it for each request ({{cite deepinfer/ve/multimodal_processor.py:201}}).</li>
+  <li><strong>The engine.</strong> <code>LLMEngine</code> makes a <code>MultimodalProcessor</code> because this class has <code>multi_modal_mapper</code> and the engine type is not <code>COMPLETION</code> ({{cite deepinfer/engine/llm_engine.py:209-213}}).</li>
+  <li><strong>Every step.</strong> The model runner calls <code>forward</code> with the input metadata.</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>VisionLanguageInstructTuner</code> from <code>vision_encoder/vl_aligner.py</code> ({{cite deepinfer/model_executor/models/deepseek_vl.py:35-39}}).</li>
+  <li><code>MMProcessor.convert_segments_to_tensor_dict</code>, <code>ImageTensorLoader.load</code> and <code>pack_resized_images</code> from <code>ve/processor</code> ({{cite deepinfer/model_executor/models/deepseek_vl.py:17-19}}).</li>
+  <li><code>DeepseekForCausalLM.forward</code> with the computed hidden states ({{cite deepinfer/model_executor/models/deepseek_vl.py:234}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>__init__</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:27}}</td><td>Builds the text model, then the vision-language tuner from the loaded vision parameters.</td></tr>
+    <tr><td><code>_split_cached_prefix</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:42}}</td><td>Replaces the segments that the KV cache already holds with one text segment of the same length.</td></tr>
+    <tr><td><code>_load_image_raw_bytes</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:75}}</td><td>Decodes and resizes the images (threads for more than one) and packs the RGB bytes.</td></tr>
+    <tr><td><code>_cu_patch_lens_from_crop</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:95}}</td><td>Running sum of patches per image; 0 for cached images.</td></tr>
+    <tr><td><code>multi_modal_mapper</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:105}}</td><td>Class method, worker process: the request dict → the metadata dict of <code>MM_METADATA_KEYS</code>.</td></tr>
+    <tr><td><code>_special_image_token_mask</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:189}}</td><td>True for ids in <code>[vocab_size, vocab_size + 5)</code>.</td></tr>
+    <tr><td><code>get_input_embeddings</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:194}}</td><td>Embeds the ids, runs the vision encoder, and sets <code>images_seq_mask</code>.</td></tr>
+    <tr><td><code>forward</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:226}}</td><td>In a prefill, computes the embeddings; then the parent forward.</td></tr>
+    <tr><td><code>load_model</code>, <code>derive_image_transform_cfg</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:237}}, {{cite deepinfer/model_executor/models/deepseek_vl.py:248}}</td><td>Write the pixel mean, std and pad colour into the config.</td></tr>
+    <tr><td><code>from_model_cfg</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:263}}</td><td>Puts the vision and aligner params into the GPT config, then builds the class.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>multi_modal_mapper</code> (worker process)</h3>
+<x-warning title="This method runs in another process"><p>The worker is forked at start-up ({{cite deepinfer/ve/multimodal_processor.py:93-103}}). <code>multi_modal_mapper</code> must not touch the device or engine state. It gets a dict through a queue and returns a dict.</p></x-warning>
+<x-code file="deepinfer/model_executor/models/deepseek_vl.py" lines="110-130" highlight="110-111,117-119,130">
+  <x-tr line="111">A ve_failed request (image_bytes=None) does not go through overwrite_prompt; pass it on unchanged.</x-tr>
+  <x-tr line="116">Read the cache information that multi_modal_processor.add() computed, and try to cut off the cached prefix.</x-tr>
+  <x-tr line="129">The tokens themselves stay in the engine; the processor only makes the modality tensors (mm_token_type and image keys).</x-tr>
+</x-code>
+<ol>
+  <li>Lines 110-111: no <code>segment_input</code> means that the engine did not expand the prompt. The dict goes back as it is.</li>
+  <li>Lines 117-119: the cached counts come from <code>MultimodalProcessor.add</code>. In this release the engine passes no cache length, so <code>num_cached_images</code> is 0 ({{cite deepinfer/engine/llm_engine.py:625}}).</li>
+  <li>Line 130: each segment goes to its processor. Text segments give <code>mm_token_type</code> zeros; image segments give the layout tensors and a lazy image loader ({{cite deepinfer/ve/processor/text_processor.py:10-13}}, {{cite deepinfer/ve/processor/image_processor.py:282-306}}).</li>
+</ol>
+<x-code file="deepinfer/model_executor/models/deepseek_vl.py" lines="149-187" highlight="149-150,163-164,170-171,177-179,184-186" />
+<ol>
+  <li>Line 149: <code>_load_image_raw_bytes</code> runs the lazy loaders: decode, then the CPU resize. With more than one image it uses a thread pool ({{cite deepinfer/model_executor/models/deepseek_vl.py:81-89}}).</li>
+  <li>Lines 159-164: <code>cu_raw_bytes</code> is the running sum of <code>width × height × 3</code> in <code>int64</code>. The comment says the byte offsets do not have the <code>int32</code> limit of the token counts.</li>
+  <li>Lines 170-171: <code>image_starts</code> and <code>image_lens</code> are the token spans of the images. The chunk slicer uses them, then drops them.</li>
+  <li>Line 179: <code>images_seq_mask</code> is true where <code>mm_token_type ≥ IMAGE</code>: <code>IMAGE</code>, <code>IMAGE_START</code>, <code>IMAGE_END</code>, <code>IMAGE_NEW_LINE</code> and <code>IMAGE_PAD</code> ({{cite deepinfer/multimodal_tokens.py:31-41}}).</li>
+  <li>Lines 184-186: the key set must equal <code>MM_METADATA_KEYS</code> of <code>ve/schema.py</code>, else <code>AssertionError</code>.</li>
+</ol>
+
+<h3><code>get_input_embeddings</code> and <code>forward</code></h3>
+<x-code file="deepinfer/model_executor/models/deepseek_vl.py" lines="194-234" highlight="200,202-218,221-222,232-233">
+  <x-tr line="199">Invalid ids (negative, and the special image tokens at or above vocab_size) are set to zero by the gather kernel, so no mask is needed first.</x-tr>
+  <x-tr line="203">The ViT is loaded with the LLM; in this process, first pad the raw RGB bytes into patches, then encode.</x-tr>
+  <x-tr line="219-220">When no sequence of the batch has multi_modal_data (text only / profile run), the mapper makes no images_seq_mask. Build it from input_ids, so that the MoE gate and Engram take the same masked path as a batch with images.</x-tr>
+</x-code>
+<ol>
+  <li>Line 200: the normal embedding. The comment says that the gather kernel gives zero rows for ids at or above <code>vocab_size</code>; the kernel itself is in TileLang.</li>
+  <li>Lines 202-218: only when the batch has image bytes, the tuner runs the vision encoder and writes the image vectors in place. A chunk without images has <code>images_raw = None</code>.</li>
+  <li>Lines 221-222: the mask always exists after this method.</li>
+  <li>Lines 232-233: the VL class computes the embeddings in every prefill, also text-only. So the embedding line of <code>DeepseekModel.forward</code> runs only in decode ({{cite deepinfer/model_executor/models/deepseek.py:161-162}}).</li>
+</ol>
+
+<h3><code>load_model</code> and <code>derive_image_transform_cfg</code></h3>
+<x-code file="deepinfer/model_executor/models/deepseek_vl.py" lines="247-260" highlight="251-257,258-260" />
+<p>The device kernel <code>rgb_pad_to_patches</code> uses one mean, one std and one pad value for all three channels, so the method asserts equal channels and a nonzero std. It also asserts that the processor dtype is <code>bfloat16</code>. The HF processor config sets mean and std to 0.5 ({{cite deepinfer/hugging_face/processor.py:34-35}}). So the pad colour is <code>int(0.5 × 255) = 127</code>. The comment says <code>int()</code> truncates, to match the processor.</p>
+<p>The tuner reads these keys with <code>cfg["..."]</code> and no default. A comment explains: a default would let the ViT silently get pixels in <code>[0, 1]</code> that are not normalized, so a missing value must raise <code>KeyError</code> ({{cite deepinfer/model_executor/models/vision_encoder/vl_aligner.py:22-27}}).</p>
+
+<h2>Deep dive</h2>
+
+<x-deepdive title="Data: the metadata dict of one request">
+<p>Example: a prompt of 10 text tokens, one 640 × 480 image (206 tokens, see {{link concepts/vision-encoder}}), and 5 text tokens. Total 221 positions. Downsample ratio 3 is an example value.</p>
+<table>
+  <thead><tr><th>Key</th><th>Value</th><th>Kind</th></tr></thead>
+  <tbody>
+    <tr><td><code>image_starts</code>, <code>image_lens</code></td><td><code>int32 [1]</code>: <code>[10]</code>, <code>[206]</code></td><td>per image, chunk slicing only</td></tr>
+    <tr><td><code>mm_token_type</code></td><td><code>int32 [221]</code>: 10 × 0, the image layout, 5 × 0</td><td>per token</td></tr>
+    <tr><td><code>images_seq_mask</code></td><td><code>bool [221]</code>: true at positions 10-215</td><td>per token</td></tr>
+    <tr><td><code>images_spatial_crop</code></td><td><code>int64 [1, 2]</code>: <code>[[46, 35]]</code></td><td>per image</td></tr>
+    <tr><td><code>cu_image_patch_lens</code></td><td><code>int64 [2]</code>: <code>[0, 1610]</code></td><td>per image + 1</td></tr>
+    <tr><td><code>images_global_attn_pos_id</code></td><td><code>int64 [1610, 2]</code></td><td>per patch</td></tr>
+    <tr><td><code>images_raw</code></td><td><code>uint8 [w × h × 3]</code>, real resized size</td><td>bytes</td></tr>
+    <tr><td><code>images_input_size</code></td><td><code>int64 [1, 2]</code>: real <code>(w, h)</code></td><td>per image</td></tr>
+    <tr><td><code>cu_raw_bytes</code></td><td><code>int64 [2]</code>: <code>[0, w × h × 3]</code></td><td>per image + 1</td></tr>
+  </tbody>
+</table>
+<p>With the pool on, the worker replaces each tensor by a pool handle before the queue ({{cite deepinfer/ve/multimodal_processor.py:202-211}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Cached image prefixes (not active in this release)">
+<p>The mapper can skip images that the KV cache already holds. <code>MultimodalProcessor.add</code> counts the images that lie fully inside the cached token prefix and drops their bytes ({{cite deepinfer/ve/multimodal_processor.py:219-246}}). The mapper then replaces the cached segments with one <code>TextLengthInput</code> of the same length ({{cite deepinfer/model_executor/models/deepseek_vl.py:62-72}}). It adds zero rows in <code>images_spatial_crop</code> and <code>images_input_size</code> for the cached images, so that the per-image indices stay aligned ({{cite deepinfer/model_executor/models/deepseek_vl.py:133-158}}).</p>
+<p>The only caller in the package, <code>_enqueue</code>, does not pass <code>num_cached_tokens</code> ({{cite deepinfer/engine/llm_engine.py:625}}). So in this release the cached count is always 0. A test calls only the first part, <code>_compute_and_strip_cached_images</code>, directly ({{cite tests/engine/test_mm_overwrite_prompt.py:128-137}}). No test in the repo calls <code>_split_cached_prefix</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Case</th><th>Result</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Cached image count does not match the replaced segments</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:124-126}}</td></tr>
+    <tr><td>Metadata keys differ from <code>MM_METADATA_KEYS</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:184-186}}</td></tr>
+    <tr><td>Different mean or std per channel, std 0, or a processor dtype other than bf16</td><td><code>AssertionError</code> at load</td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:251-257}}</td></tr>
+    <tr><td><code>input_ids</code> and <code>mm_token_type</code> have different shapes</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/deepseek_vl.py:197-198}}</td></tr>
+    <tr><td>Any exception inside the mapper</td><td>The worker logs it and returns <code>None</code>; the engine aborts the request</td><td>{{cite deepinfer/ve/multimodal_processor.py:213-217}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<p>This file reads no environment variable. The image path depends on <code>DEEPINFER_USE_MULTIMODAL_POOL</code> and the other variables of {{link code/ve}}.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/vision-encoder}}: the whole image path, with a worked example.</li>
+  <li>{{link code/vit}}: the ViT, the aligner and the projector.</li>
+  <li>{{link code/ve}}: the worker process, the processors and the chunk slicing.</li>
+  <li>{{link code/deepseek}}: the parent class.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">In which process does <code>multi_modal_mapper</code> run?
+    <x-a><p>In the forked multimodal worker process, not in the rank process ({{cite deepinfer/ve/multimodal_processor.py:197-201}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A batch has only text prompts. Why does <code>images_seq_mask</code> still exist after <code>get_input_embeddings</code>?
+    <x-a><p>Lines 221-222 build it from the ids when the mapper made none. The comment says this keeps the MoE gate and Engram on the same masked path as a batch with images ({{cite deepinfer/model_executor/models/deepseek_vl.py:219-222}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>derive_image_transform_cfg</code> reject a mean of <code>(0.48, 0.46, 0.41)</code>?
+    <x-a><p>The device kernel <code>rgb_pad_to_patches</code> takes one scalar mean, one std and one pad value for all channels ({{cite deepinfer/model_executor/layers/tilelang_ops/image_embed_ops.py:51-53}}). So the method asserts equal channel values ({{cite deepinfer/model_executor/models/deepseek_vl.py:251-253}}).</p></x-a>
+  </x-q>
+</x-quiz>
