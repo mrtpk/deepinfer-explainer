@@ -1,0 +1,214 @@
+---
+title: Request and sequence lifecycle
+nav_title: Request and sequence lifecycle
+level: Intermediate
+prerequisites: learn/prefill-decode, learn/kv-cache, concepts/engine-step-loop
+related: concepts/scheduler, concepts/paged-kv-cache, concepts/speculative-decoding, concepts/structured-outputs, concepts/vision-encoder, code/sequence-hpp, code/sequence, code/scheduler-hpp, code/outputs-hpp, tours/life-of-a-request
+summary: Each request becomes a C++ Sequence. It waits until it is schedulable, runs one or more prefill steps and many decode steps, and ends with one of seven finish reasons. Preemption stops it or sends it back to the queue for a recompute.
+---
+<x-sentence>Each request becomes a C++ <code>Sequence</code>. It waits, runs its prefill and many decode steps, and ends with a finish reason such as <code>"stop"</code> or <code>"length"</code>.</x-sentence>
+
+<h2>The idea</h2>
+<p>A user sends a <em>request</em>: a prompt and its {{term sampling-params | sampling settings}}. Inside the engine, the request becomes a {{term sequence}}. The sequence is a C++ object. It holds the token ids, the settings, the KV {{term block-table | block table}}, the draft tokens, and a status.</p>
+<p>The status tells where the sequence is in its life ({{cite csrc/engine/sequence.hpp:30-41}}):</p>
+<ul>
+  <li><code>WAITING</code>: in the waiting queue. The sequence waits for its {{term prefill}}, or for the next chunk of it.</li>
+  <li><code>RUNNING</code>: the prompt is in the KV cache. Each {{term decode}} step adds one or more tokens.</li>
+  <li><code>FINISHED_*</code>: seven final values. Each one has a {{term finish-reason | finish reason}}, for example <code>"stop"</code> for the end-of-sequence token or <code>"length"</code> for the token limit.</li>
+</ul>
+<p>Two more things can happen on the way. A sequence can wait at the start, until the image worker marks it {{term schedulable}}. And when the KV cache is full, the scheduler can {{term preemption | preempt}} it. The sequence then stops, or it goes back to the queue and computes its KV cache again ({{term recompute}}).</p>
+<p><strong>An everyday comparison.</strong> Think of a passenger at an airport. Check-in makes a boarding pass (the sequence). The passenger waits at the gate until the gate opens (schedulable, attempt point). Boarding is the prefill; the flight is the decode. The trip ends with a reason: arrived, cancelled, or bumped. A bumped passenger can get a seat on a later flight at the front of the line. The comparison stops being true here. A recomputed sequence keeps every token that it already made, but it must read all of them again in a new prefill.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3a_lifecycle" alt="Panel 1: add_request makes a Sequence with status WAITING; an arrow goes to the WAITING box (Scheduler.waiting), which loops back to its own front after a prefill chunk; the last chunk goes to RUNNING; a dashed recompute arrow goes from RUNNING back to WAITING. The image worker sets schedulable. Arrows go down to a FINISHED box that lists six rows: STOPPED stop, LENGTH_CAPPED length, PREEMPTED insufficient_system_resource, IGNORED prompt_length_exceeded, ABORTED abort, SO_FAILED and VE_FAILED. Panel 2: six boxes for the field groups request, input, generation, cache, mtp and schedule." caption="Figure: the statuses of one Sequence and what moves it between them (panel 1), and the groups of fields that it keeps (panel 2). Click to zoom." />
+<p>Read panel 1 from left to right. Amber arrows belong to the waiting queue, the dashed pink arrow is a recompute, and solid pink arrows end the sequence. The table in the finished box gives the reason string that the user sees in <code>RequestOutput.finish_reason</code>.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the engine makes the Sequence</h3>
+<p><code>LLMEngine.add_request</code> checks the prompt and makes the C++ object ({{cite deepinfer/engine/llm_engine.py:580-604}}). The binding fills a <code>SequenceInit</code> from the flat Python arguments:</p>
+<x-code file="csrc/engine/pybind_sequence.cpp" lines="25-38" highlight="35" />
+<p>Line 35 is important. A sequence with multimodal data starts as not schedulable. The offline <code>LLM</code> gives every request a multimodal dict when the engine has an image processor, also for text-only prompts ({{cite deepinfer/entrypoints/llm.py:158-159}}). The constructor then copies the sampling values and the stop values out of the Python object once ({{cite csrc/engine/sequence.hpp:276-283}}).</p>
+<p>Two error cases give a sequence a final status before it enters a queue. Image bytes set to <code>None</code> give <code>FINISHED_VE_FAILED</code> ({{cite deepinfer/engine/llm_engine.py:603-604}}). An aborted grammar build gives <code>FINISHED_SO_FAILED</code> ({{cite deepinfer/engine/llm_engine.py:621-622}}).</p>
+
+<h3>Step 2: the sequence enters the waiting queue</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="135-142" highlight="136,138-139,141" />
+<p><code>add_sequence</code> sets the arrival time in milliseconds (the Python value is replaced). For a NORMAL engine it also reserves memory for <code>max_tokens</code> more token ids. It also reserves room in the block table for all blocks that the sequence can need ({{cite csrc/engine/scheduler.hpp:190-192}}). Then the sequence goes to the end of <code>waiting</code>. With an image processor, the engine also sends the multimodal dict to the image worker ({{cite deepinfer/engine/llm_engine.py:624-625}}).</p>
+
+<h3>Step 3: the image worker makes it schedulable</h3>
+<p>The image worker runs in other processes. In every engine step, <code>fetch()</code> collects its results:</p>
+<x-code file="deepinfer/ve/multimodal_processor.py" lines="281-305" highlight="290-291,303" />
+<x-code file="csrc/engine/scheduler.hpp" lines="1054-1059" />
+<p>A failed result (<code>None</code>) goes to a list; the engine then aborts that request ({{cite deepinfer/engine/llm_engine.py:942-945}}). A sequence that is not schedulable stops the prefill loop when it is at the front of the queue ({{cite csrc/engine/scheduler.hpp:369-371}}).</p>
+
+<h3>Step 4: the prefill makes it RUNNING</h3>
+<p>At an {{term attempt-point}}, the scheduler takes the sequence from the front of <code>waiting</code>. The first chunk takes the KV blocks and one {{term state-slot}} for the whole prompt. Only the last chunk changes the status:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="518-526" />
+<p>After the step, <code>process_outputs</code> moves the cache counter forward by the chunk length. Then it decides:</p>
+<ul>
+  <li>The whole prompt is in the cache: the sequence goes into <code>running</code>, and the sampled token becomes its first output token ({{cite csrc/engine/scheduler.hpp:937-953}}, {{cite csrc/engine/scheduler.hpp:969-990}}).</li>
+  <li>More prompt is left: the sequence goes back to the <em>front</em> of <code>waiting</code>, with no output ({{cite csrc/engine/scheduler.hpp:1011-1020}}).</li>
+</ul>
+
+<h3>Step 5: decode steps add tokens</h3>
+<p>In each decode step, a running sequence sends its last token plus its draft tokens. After the step, the accepted drafts and the new sampled token are appended one by one. The stop check runs after each token:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="1035-1052" />
+<p>So there are three stop conditions: the EOS token (unless <code>ignore_eos</code>), a length above <code>max_model_len</code>, and <code>max_tokens</code> output tokens. The EOS id is the tokenizer EOS that the engine gives to the scheduler ({{cite deepinfer/engine/llm_engine.py:312}}). <code>SamplingParams</code> has no stop strings and no list of stop ids ({{cite deepinfer/sampling_params.py:47-62}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="982-990" highlight="986-989" caption="A stop in the middle of the accepted drafts drops the rest of them." />
+
+<h3>Step 6: preemption: stop or recompute</h3>
+<p>If a decode step finds no free block, the scheduler preempts the running sequence with the most output tokens ({{link concepts/scheduler}}). <code>_preempt</code> has two policies:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="770-788" highlight="771,778,783,785-787" />
+<ul>
+  <li><strong>Stop.</strong> Status <code>FINISHED_PREEMPTED</code>, reason <code>"insufficient_system_resource"</code>. This is the <code>EngineArgs</code> default ({{cite deepinfer/engine/arg_utils.py:40}}). A sequence with a structured-output status other than 0 always stops, because the code cannot recompute the grammar state ({{cite csrc/engine/scheduler.hpp:770-771}}).</li>
+  <li><strong>Recompute.</strong> The sequence keeps all its tokens, prompt and output. It loses its blocks, gets status <code>WAITING</code>, and goes to the front of the queue. Its next prefill reads the prompt <em>and</em> the outputs so far. The offline <code>LLM</code> uses this policy ({{cite deepinfer/entrypoints/llm.py:68}}).</li>
+</ul>
+<p><code>reset_for_recompute</code> resets the cache counters, the in-flight counters and the draft state ({{cite csrc/engine/sequence.hpp:307-311}}).</p>
+
+<h3>Step 7: a finished sequence leaves the engine</h3>
+<p>A sequence that finishes in a decode step stays in <code>running</code> until the next decode schedule. Then <code>free_finished_seqs</code> takes it out. It also gives back the draft-info slot, if <code>process_outputs</code> did not give it back already ({{cite csrc/engine/scheduler.hpp:992-994}}):</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="752-763" />
+<p>The finished list goes out with that step. In <code>pre_sampler_sync</code>, the engine calls <code>finalize_seq</code> for each one, which frees the KV blocks and the state slot ({{cite deepinfer/engine/llm_engine.py:844-846}}, {{cite deepinfer/engine/llm_engine.py:804-806}}, {{cite csrc/engine/scheduler.hpp:738-745}}).</p>
+
+<h3>Step 8: the user sees RequestOutput objects</h3>
+<p>For every new token, <code>build_request_outputs</code> makes one {{term request-output | RequestOutput}}:</p>
+<x-code file="csrc/engine/outputs.hpp" lines="18-43" />
+<p><code>finish_reason</code> comes from the status ({{cite csrc/engine/sequence.hpp:45-64}}). It is an empty string while the sequence runs. Only the last output of a finished request has <code>finished=True</code> ({{cite csrc/engine/outputs.hpp:247-251}}). An ignored sequence (too long, aborted in the queue, failed, or preempted with stop) gets one output with its last token id and its reason ({{cite csrc/engine/outputs.hpp:297-304}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Every status: who sets it, and what the user gets">
+<table>
+  <thead><tr><th>Status</th><th>Reason string</th><th>Set by</th><th>Queue at that time</th><th>Output</th></tr></thead>
+  <tbody>
+    <tr><td><code>WAITING</code></td><td>-</td><td>default ({{cite csrc/engine/sequence.hpp:236}}); recompute ({{cite csrc/engine/scheduler.hpp:786}})</td><td><code>waiting</code></td><td>-</td></tr>
+    <tr><td><code>RUNNING</code></td><td>-</td><td>last prefill chunk ({{cite csrc/engine/scheduler.hpp:524}})</td><td><code>running</code> after the step</td><td>one per token</td></tr>
+    <tr><td><code>SWAPPED</code></td><td>-</td><td>no code sets it</td><td>-</td><td>-</td></tr>
+    <tr><td><code>FINISHED_STOPPED</code></td><td><code>"stop"</code></td><td>EOS in <code>_check_stop</code> ({{cite csrc/engine/scheduler.hpp:1038-1041}})</td><td><code>running</code></td><td>last token output, <code>finished=True</code></td></tr>
+    <tr><td><code>FINISHED_LENGTH_CAPPED</code></td><td><code>"length"</code></td><td><code>_check_stop</code> ({{cite csrc/engine/scheduler.hpp:1043-1051}}); a fork longer than <code>max_model_len</code> ({{cite csrc/engine/scheduler.hpp:1103-1105}})</td><td><code>running</code></td><td>last token output</td></tr>
+    <tr><td><code>FINISHED_ABORTED</code></td><td><code>"abort"</code></td><td><code>abort_sequence</code> ({{cite csrc/engine/scheduler.hpp:144-163}})</td><td><code>waiting</code> or <code>running</code></td><td>from <code>waiting</code>: one ignored output; from <code>running</code>: none (see below)</td></tr>
+    <tr><td><code>FINISHED_IGNORED</code></td><td><code>"prompt_length_exceeded"</code></td><td>prefill checks ({{cite csrc/engine/scheduler.hpp:377-396}})</td><td>leaves <code>waiting</code></td><td>one ignored output</td></tr>
+    <tr><td><code>FINISHED_PREEMPTED</code></td><td><code>"insufficient_system_resource"</code></td><td><code>_preempt</code> ({{cite csrc/engine/scheduler.hpp:778}})</td><td>leaves <code>running</code></td><td>one ignored output</td></tr>
+    <tr><td><code>FINISHED_SO_FAILED</code></td><td><code>"xgrammar runtime errors or timeout"</code></td><td>grammar build aborted ({{cite deepinfer/engine/llm_engine.py:621-622}}); SO state -1 ({{cite csrc/engine/scheduler.hpp:976-980}}); bad SO state at the last chunk ({{cite deepinfer/engine/llm_engine.py:913-928}})</td><td>any</td><td>state -1: a last output (the sequence gets token 0); build failure: one ignored output; bad state at the last chunk: none (the step skips finished sequences)</td></tr>
+    <tr><td><code>FINISHED_VE_FAILED</code></td><td><code>"ve_error"</code></td><td><code>add_request</code>, image bytes <code>None</code> ({{cite deepinfer/engine/llm_engine.py:548-549}}, {{cite deepinfer/engine/llm_engine.py:603-604}})</td><td><code>waiting</code></td><td>one ignored output</td></tr>
+  </tbody>
+</table>
+<p><code>is_finished</code> is a comparison: every status from <code>FINISHED_STOPPED</code> on counts as finished ({{cite csrc/engine/sequence.hpp:43}}). Translated, the comment on the preempted reason says: <em>"if the KV cache is about to overflow, stop the task with the most KV cache"</em> ({{cite csrc/engine/sequence.hpp:56}}). The code picks by output length, not by total KV use ({{cite csrc/engine/scheduler.hpp:624-625}}).</p>
+<p><strong>An abort of a running sequence makes no output.</strong> <code>abort_sequence</code> only sets the status. The in-flight step skips the sequence because it is finished ({{cite csrc/engine/scheduler.hpp:905-915}}). The next decode schedule puts it into <code>finished_seqs</code>, and <code>build_request_outputs</code> makes outputs only for scheduled and ignored sequences ({{cite csrc/engine/outputs.hpp:194-304}}). So the caller does not get an output with <code>"abort"</code> for it. A sequence aborted in <code>waiting</code> leaves as an ignored sequence and gets one. This site derived this from the code and did not run it.</p>
+</x-deepdive>
+
+<x-deepdive title="One request through every state, with numbers">
+<p>Settings: block size 128, token budget 256 with chunked prefill, ZOS on, <code>nextn = 5</code>, an engine with an image processor. The request has a 300-token text prompt and <code>max_tokens = 4</code>. In the decode step, the sampler accepts 2 of the 5 drafts. Values from this site's reading of the code, not from a run.</p>
+<table>
+  <thead><tr><th>When</th><th>status</th><th>len</th><th><code>cache.num_tokens</code></th><th>blocks</th><th>What happened</th></tr></thead>
+  <tbody>
+    <tr><td><code>add_request</code></td><td>WAITING</td><td>300</td><td>0</td><td>0</td><td><code>schedulable = False</code> (multimodal dict)</td></tr>
+    <tr><td>a later <code>fetch()</code></td><td>WAITING</td><td>300</td><td>0</td><td>0</td><td><code>set_schedulable</code> → <code>True</code></td></tr>
+    <tr><td>prefill step 1</td><td>WAITING</td><td>300</td><td>256</td><td>3</td><td>chunk of 256; <code>ceil(300/128) = 3</code> blocks and 1 state slot; <code>chunked_rest_len = 44</code>; back to the front of <code>waiting</code></td></tr>
+    <tr><td>prefill step 2</td><td>RUNNING</td><td>301</td><td>300</td><td>3</td><td>last chunk of 44; MTP slot; first token t1; 5 placeholder drafts</td></tr>
+    <tr><td>decode D1 scheduled</td><td>RUNNING</td><td>301</td><td>300</td><td>3</td><td><code>seqlen_q = 1 + 5 = 6</code>, <code>seqlen_k = 300 + 0 + 6 = 306</code>; blocks needed <code>ceil((301 + 0 + 5)/128) = 3</code>; 6 tokens in flight</td></tr>
+    <tr><td>decode D2 scheduled</td><td>RUNNING</td><td>301</td><td>300</td><td>3</td><td>D1 is not processed yet (ZOS): 6 tokens still in flight, so <code>seqlen_k = 300 + 6 + 6 = 312</code> before the device correction</td></tr>
+    <tr><td>D1 processed (in the D2 call)</td><td>FINISHED_LENGTH_CAPPED</td><td>304</td><td>303</td><td>3</td><td>first <code>300 → 306</code>; d1, d2 and the sample are appended (outputs 2, 3, 4); output 4 = <code>max_tokens</code>; then <code>num_tokens = 300 + 3</code></td></tr>
+    <tr><td>D3 call: schedule</td><td>(finished)</td><td>304</td><td>303</td><td>3</td><td>leaves <code>running</code> (into <code>finished_seqs</code>); D3 is an empty decode step</td></tr>
+    <tr><td>D3 call: D2 processed</td><td>(finished)</td><td>304</td><td>303</td><td>3</td><td>skipped: the sequence is finished</td></tr>
+    <tr><td>D3 call: <code>pre_sampler_sync</code></td><td>(finished)</td><td>304</td><td>303</td><td>0</td><td><code>finalize_seq</code> frees 3 blocks and the state slot</td></tr>
+  </tbody>
+</table>
+<p>Sources: chunk ({{cite csrc/engine/scheduler.hpp:470-475}}), allocation ({{cite csrc/engine/block_manager.hpp:207-214}}), counters ({{cite csrc/engine/sequence.hpp:216-221}}), in-flight tokens ({{cite csrc/engine/sequence.hpp:244-256}}), <code>seqlen_k</code> ({{cite csrc/engine/scheduler.hpp:697}}), commit ({{cite csrc/engine/scheduler.hpp:997-1000}}).</p>
+<p>The user gets 4 outputs: t1 after prefill step 2, then d1, d2 and the sample in the D2 call. The last one has <code>finished=True</code> and <code>finish_reason="length"</code>. It also carries <code>draft_tok = 6</code> and <code>accept_tok = 3</code> ({{cite csrc/engine/outputs.hpp:215-216}}, {{cite csrc/engine/outputs.hpp:288-291}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Recompute: what the sequence keeps and what it loses">
+<table>
+  <thead><tr><th>Part</th><th>After <code>_preempt</code> with recompute</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td>token ids (prompt + output), <code>prompt_len</code></td><td>kept</td><td>not touched</td></tr>
+    <tr><td>sampling and stop settings</td><td>kept</td><td>not touched</td></tr>
+    <tr><td>KV blocks, state slot, MTP info slot</td><td>given back</td><td>{{cite csrc/engine/scheduler.hpp:738-745}}</td></tr>
+    <tr><td><code>cache.num_tokens</code>, <code>previous_num_tokens</code>, <code>swa_valid_start</code></td><td>0</td><td>{{cite csrc/engine/sequence.hpp:223-227}}</td></tr>
+    <tr><td>in-flight counters</td><td>0</td><td>{{cite csrc/engine/sequence.hpp:258-261}}</td></tr>
+    <tr><td>draft tokens, accept rates, <code>confidence_raw</code>, <code>process_cnt</code>, <code>schedule_cnt</code></td><td>cleared</td><td>{{cite csrc/engine/sequence.hpp:134-142}}</td></tr>
+    <tr><td><code>accepted_tokens</code>, <code>prev_confidence_raw</code></td><td>kept (comment: needed by the grammar matcher and by metrics)</td><td>{{cite csrc/engine/sequence.hpp:133}}</td></tr>
+    <tr><td>status, place</td><td><code>WAITING</code>, front of <code>waiting</code></td><td>{{cite csrc/engine/scheduler.hpp:785-786}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Cost.</strong> The new prefill reads <code>len - 0</code> tokens: the whole prompt and all outputs ({{cite csrc/engine/scheduler.hpp:372}}). A sequence with a 20000-token prompt and 900 outputs reads 20900 tokens again. Its first new output comes from that prefill, so the output list continues without a gap.</p>
+<p><strong>Preempted while in flight.</strong> With ZOS, the scheduler can preempt a sequence whose previous decode step is still on the device. When that step is processed later, the sequence has status <code>WAITING</code>. <code>process_outputs</code> and <code>process_MTPInfo</code> skip it, so the old tokens do not move the counters ({{cite csrc/engine/scheduler.hpp:917-925}}, {{cite csrc/engine/scheduler.hpp:1214-1219}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="917-925">
+<x-tr line="917-919">ZOS async: a seq that _preempt preempted for recompute while this step was still in flight (only in decode steps; in-flight seqs of a prompt step are not in running, so they cannot be preempted). _preempt already reset its counters and put it at the head of waiting. The output of this step is void: skip all bookkeeping, to avoid a second enqueue and a wrong advance of cache.num_tokens.</x-tr>
+</x-code>
+</x-deepdive>
+
+<x-deepdive title="Stop conditions in detail">
+<ol>
+  <li><strong>EOS.</strong> <code>token_id == eos_token_id</code> and not <code>ignore_eos</code> gives <code>"stop"</code> ({{cite csrc/engine/scheduler.hpp:1038-1041}}). <code>eos_token_id</code> is the tokenizer EOS, given to the scheduler at start-up ({{cite deepinfer/engine/llm_engine.py:312}}). In the default "release" mode, the tokenizer loader accepts only a tokenizer whose EOS has id 1 ({{cite deepinfer/hugging_face/tokenizer.py:38}}, {{cite deepinfer/hugging_face/tokenizer.py:121}}).</li>
+  <li><strong>Model length.</strong> More than <code>max_model_len</code> tokens in the sequence (prompt + output) gives <code>"length"</code> ({{cite csrc/engine/scheduler.hpp:1043-1046}}).</li>
+  <li><strong>Output length.</strong> <code>get_output_len() == max_tokens</code> gives <code>"length"</code> ({{cite csrc/engine/scheduler.hpp:1048-1051}}). <code>max_tokens</code> defaults to 16, and <code>0</code> becomes <code>1</code> ({{cite deepinfer/sampling_params.py:53}}, {{cite deepinfer/sampling_params.py:69-71}}).</li>
+</ol>
+<p><strong>Where the EOS id is also used.</strong> <code>add_request</code> writes the same id into <code>SamplingParams.eos_id</code> ({{cite deepinfer/engine/llm_engine.py:527}}). The sampler uses it in two places: to forbid EOS as the first token when <code>first_n_token_no_eos == 1</code> ({{cite csrc/engine/prepare_sample.cpp:20-22}}, {{cite csrc/engine/prepare_sample.cpp:192-195}}), and as the stop token during draft verification ({{cite csrc/engine/prepare_sample.cpp:217-218}}).</p>
+<p><strong>No stop strings.</strong> <code>SamplingParams.__init__</code> has no <code>stop</code> or <code>stop_token_ids</code> argument ({{cite deepinfer/sampling_params.py:47-62}}). To stop on other text, a caller must check the outputs and call <code>abort_request</code>.</p>
+<p><strong>Order.</strong> The checks run after every appended token, in the order EOS, model length, output length. With 2 accepted drafts, the sequence gets up to 3 tokens. If the first draft is EOS, the loop stops there, and the other 2 tokens are not appended ({{cite csrc/engine/scheduler.hpp:982-990}}). The output objects follow: <code>pushed_tokens_before_finish</code> limits them to the appended tokens ({{cite csrc/engine/outputs.hpp:232-234}}).</p>
+<p><strong>Grammar failure.</strong> If the structured-output state is <code>-1</code>, the sequence gets <code>FINISHED_SO_FAILED</code> and one token with id 0 ({{cite csrc/engine/scheduler.hpp:976-980}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The fields that the life of a sequence changes">
+<p>The full table of fields is on the page {{link code/sequence-hpp}}. These are the fields that change between the statuses:</p>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Changed by</th></tr></thead>
+  <tbody>
+    <tr><td><code>schedule.status</code></td><td><code>SequenceStatus</code></td><td>prefill, <code>_check_stop</code>, <code>_preempt</code>, abort</td></tr>
+    <tr><td><code>schedule.schedulable</code></td><td><code>bool</code></td><td>binding (start), <code>set_schedulable</code></td></tr>
+    <tr><td><code>schedule.chunked_rest_len</code></td><td><code>int</code></td><td>each prefill chunk ({{cite csrc/engine/scheduler.hpp:533-540}})</td></tr>
+    <tr><td><code>schedule.total_inflight_tokens</code>, <code>last_inflight_tokens</code></td><td><code>int</code></td><td><code>start_inflight_step</code> in <code>schedule()</code>, <code>finish_inflight_step</code> in <code>process_outputs</code> ({{cite csrc/engine/sequence.hpp:244-256}})</td></tr>
+    <tr><td><code>input.tokens.token_ids</code></td><td><code>std::vector&lt;int&gt;</code></td><td><code>append_token_id</code> after each step</td></tr>
+    <tr><td><code>cache.num_tokens</code></td><td><code>int</code></td><td><code>advance_optimistically</code>, <code>commit_processed_tokens</code> ({{cite csrc/engine/sequence.hpp:216-221}})</td></tr>
+    <tr><td><code>cache.block_table</code></td><td><code>std::vector&lt;int&gt;</code></td><td><code>allocate_seq</code>, <code>_append_slot</code>, <code>free_seq_nolock</code></td></tr>
+    <tr><td><code>cache.state_id</code></td><td><code>int</code>, <code>-1</code> = none</td><td><code>allocate_seq</code> ({{cite csrc/engine/block_manager.hpp:210-213}})</td></tr>
+    <tr><td><code>mtp.info_slot</code></td><td><code>int</code>, <code>0</code> = none</td><td>RUNNING (alloc), finish or preempt (release)</td></tr>
+    <tr><td><code>mtp.draft_tokens</code></td><td><code>std::vector&lt;int&gt;</code></td><td><code>process_MTPInfo</code> after each step ({{cite csrc/engine/scheduler.hpp:1234-1238}})</td></tr>
+  </tbody>
+</table>
+<p><strong>Python names.</strong> <code>deepinfer/sequence.py</code> re-exports the C++ classes ({{cite deepinfer/sequence.py:14-20}}). Python sees flat property names, for example <code>seq.status</code>, <code>seq.num_cached_tokens</code>, <code>seq.schedulable</code> and <code>seq.last_next_n_token</code> (the drafts) ({{cite csrc/engine/pybind_sequence.cpp:109-137}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Abort and failure paths">
+<ul>
+  <li><strong><code>abort_request(ids)</code></strong> calls <code>abort_sequence</code>, which scans <code>running</code> and <code>waiting</code> ({{cite csrc/engine/scheduler.hpp:158-161}}). It does not scan <code>prompted</code>. The engine also removes the request from the image worker and frees its shared-memory handles ({{cite deepinfer/engine/llm_engine.py:651-656}}). It returns the count and the total length of the aborted sequences.</li>
+  <li><strong>Aborted in <code>waiting</code>.</strong> The next prefill moves it to <code>ignored_seqs</code> ({{cite csrc/engine/scheduler.hpp:363-367}}). If no prefill runs on this rank, the decode branch removes it ({{cite csrc/engine/scheduler.hpp:569-577}}).</li>
+  <li><strong>Image failure.</strong> <code>fetch()</code> collects failed ids; <code>step()</code> aborts them with an error log ({{cite deepinfer/engine/llm_engine.py:942-945}}).</li>
+  <li><strong>Image worker hang.</strong> If the worker gives no result for <code>DEEPINFER_MULTI_MODAL_WORKER_TIMEOUT</code> seconds (default 1800) while requests wait, the engine calls <code>os.abort()</code> ({{cite deepinfer/ve/multimodal_processor.py:264-275}}, {{cite deepinfer/environ.py:210}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Text-only requests also wait for the image worker">
+<p>In this release, the engine always has an image processor, so the offline API gives every request a multimodal dict ({{cite deepinfer/entrypoints/llm.py:158-159}}). Every sequence starts as not schedulable, and it waits for one round trip through the image worker ({{cite csrc/engine/pybind_sequence.cpp:35}}).</p>
+</x-warning>
+<ul>
+  <li><strong>Short outputs.</strong> The default <code>max_tokens</code> is 16 ({{cite deepinfer/sampling_params.py:53}}). <code>generate()</code> with no <code>sampling_params</code> uses this default.</li>
+  <li><strong>No stop strings.</strong> A stop word in the prompt template does not end the request. Only EOS and the two length limits do.</li>
+  <li><strong>Preempted requests that stop.</strong> With <code>EngineArgs</code> defaults, a preempted request ends with <code>"insufficient_system_resource"</code>. A request with a structured-output status other than 0 ends this way with any setting ({{cite csrc/engine/scheduler.hpp:770-780}}).</li>
+  <li><strong>Recompute cost.</strong> A recomputed sequence reads all its tokens again. Many preemptions of long sequences can cost more device time than they save.</li>
+  <li><strong>Prompt too long.</strong> The request ends at its first prefill attempt with <code>"prompt_length_exceeded"</code> ({{cite csrc/engine/scheduler.hpp:377-385}}).</li>
+  <li><strong>No final output after an abort.</strong> A running sequence that is aborted gets no output with <code>"abort"</code> (deep dive "Every status").</li>
+</ul>
+<p><strong>Why it matters.</strong> The status and the finish reason are the only things that tell a user why a request ended. To read the logs, the metrics and the outputs, you must know which code path sets each value.</p>
+
+<x-quiz>
+  <x-q level="easy">Which three conditions end a running request normally?
+    <x-a><p>The EOS token (unless <code>ignore_eos</code>), a length above <code>max_model_len</code>, and <code>max_tokens</code> output tokens. <code>_check_stop</code> tests them after each appended token ({{cite csrc/engine/scheduler.hpp:1035-1052}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What does a preempted sequence keep when the offline <code>LLM</code> recomputes it?
+    <x-a><p>All its token ids, prompt and output, and its settings. It loses its KV blocks, its state slot and its draft state, and goes to the front of <code>waiting</code> ({{cite csrc/engine/scheduler.hpp:782-787}}, {{cite csrc/engine/sequence.hpp:307-311}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request has a 300-token prompt, and the budget of the step is 256 with chunked prefill. What is its status after the first prefill step, and where is it?
+    <x-a><p><code>WAITING</code>, at the front of <code>waiting</code>. Only the last chunk sets <code>RUNNING</code> ({{cite csrc/engine/scheduler.hpp:522-526}}). After the step, <code>process_outputs</code> sees 256 &lt; 300 cached tokens and puts it back at the front ({{cite csrc/engine/scheduler.hpp:1011-1020}}). It already holds 3 blocks for the whole prompt.</p></x-a>
+  </x-q>
+  <x-q level="medium">A decode step accepts 3 drafts, and the second accepted draft is the EOS token. How many tokens are appended, and what is the finish reason?
+    <x-a><p>Two: the first draft and the EOS draft. <code>_check_stop</code> sets <code>FINISHED_STOPPED</code> after the EOS token, and the loop breaks ({{cite csrc/engine/scheduler.hpp:982-990}}). The reason is <code>"stop"</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">The user aborts a request while it is in <code>running</code>, with ZOS on. Does the user get a <code>RequestOutput</code> with <code>finish_reason == "abort"</code>?
+    <x-a><p>No. The abort only sets the status ({{cite csrc/engine/scheduler.hpp:152}}). The in-flight step skips finished sequences ({{cite csrc/engine/scheduler.hpp:905-915}}). The next decode schedule moves the sequence to <code>finished_seqs</code>, and <code>build_request_outputs</code> makes outputs only for scheduled and ignored sequences ({{cite csrc/engine/outputs.hpp:194-304}}). A request aborted in <code>waiting</code> does get one, as an ignored sequence. See the deep dive "Every status".</p></x-a>
+  </x-q>
+</x-quiz>

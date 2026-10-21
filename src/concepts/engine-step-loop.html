@@ -1,0 +1,211 @@
+---
+title: Offline API and the step loop
+nav_title: Offline API and the step loop
+level: Intermediate
+prerequisites: learn/prefill-decode, learn/kv-cache
+related: concepts/request-lifecycle, concepts/scheduler, concepts/zero-overhead-scheduling, concepts/dp-step-votes, code/entrypoints-llm, code/llm-engine, code/worker, tours/life-of-a-request, tours/engine-step
+summary: LLM.generate() adds all requests, then calls LLMEngine.step() until no request is left. Each step schedules one batch, runs the model once, and returns handles to the new outputs. With ZOS, a decode step returns the tokens of the step before it.
+---
+<x-sentence><code>LLM.generate()</code> adds all requests, then calls <code>LLMEngine.step()</code> again and again. Each step runs one batch and returns the outputs that are ready.</x-sentence>
+
+<h2>The idea</h2>
+<p>An {{term llm}} makes one {{term token}} at a time for each request. DeepInfer serves many requests together, so it works in rounds. One round is an {{term engine-step | engine step}}. In each step, the engine selects a batch of requests and runs the model once for the whole batch. Then it adds new tokens to each request in the batch.</p>
+<p>The offline API is the class <code>LLM</code> in <code>deepinfer/entrypoints/llm.py</code>. It has one main method, <code>generate()</code>, which does three things:</p>
+<ol>
+  <li>It adds every prompt to the engine as a request.</li>
+  <li>It calls <code>step()</code> while a request is not finished. It copies the outputs of each step.</li>
+  <li>When all requests are finished, it calls <code>flush_inflight_reqs()</code> once, sorts the results, and returns them.</li>
+</ol>
+<p>One step has fixed phases. The C++ {{term scheduler}} selects the batch. The Worker runs the model on the device and samples the next tokens. The engine then updates each sequence and makes one {{term request-output | RequestOutput}} for each new token. With {{term zos | zero-overhead scheduling (ZOS)}}, the engine updates the sequences of a decode step during the <em>next</em> step. So the CPU work overlaps with the device work.</p>
+<p><strong>An everyday comparison.</strong> Think of a ferry that crosses a river again and again. On each trip it takes all cars that are ready. A car must make many trips to reach its goal, because each trip moves it only a short distance (one or a few tokens). The comparison stops being true in two places. A real ferry unloads at the end of the same trip. With ZOS, DeepInfer reports the result of a decode trip during the next trip. Also, all ferries of a fleet (the data-parallel ranks) must make the same number of trips, also when one of them is empty.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3a_step_loop" alt="Panel 1: LLM.generate adds requests, then a loop: has_unfinished_requests (an all-reduce MAX over DP ranks); yes goes to LLMEngine.step, then clone each output, then back to the test; no goes to flush_inflight_reqs and then return results. Panel 2: one step has three parts: LLMEngine schedules on the CPU; the Worker runs forward N, post-processes N-1, samples N and calls pre_sampler_sync; the post-process callback runs process_MTPInfo, process_outputs and build_request_outputs. Panel 3: seven rows for two requests A (max_tokens 3) and B (max_tokens 4): step 1 prefill returns A1, B1; step 2 returns nothing; step 3 returns A2, B2; step 4 returns A3 and B3; step 5 returns B4; step 6 is an empty decode; the flush returns nothing." caption="Figure: the offline step loop (panel 1), the parts of one step (panel 2), and what each call returns for two short requests with ZOS on (panel 3). Click to zoom." />
+<p>Read panel 1 as a loop: test, step, copy, test again. Panel 2 shows that the Worker calls back into the engine twice in one step. Panel 3 is the most important one. A prefill step returns its tokens at once, but a decode step returns the tokens of the step before it.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: generate() adds all requests first</h3>
+<x-code file="deepinfer/entrypoints/llm.py" lines="129-142" highlight="135,142" />
+<p>Each <code>_add_request</code> call tokenizes the prompt (if the caller gave text), gives the request the next counter value as its id, and calls <code>LLMEngine.add_request</code> ({{cite deepinfer/entrypoints/llm.py:151-166}}). The engine makes a C++ {{term sequence}} and puts it into the waiting queue of the scheduler ({{cite deepinfer/engine/llm_engine.py:620-630}}). No model work happens yet. The page {{link concepts/request-lifecycle}} follows one sequence from here to its end.</p>
+
+<h3>Step 2: the loop in _run_engine()</h3>
+<x-code file="deepinfer/entrypoints/llm.py" lines="168-195" highlight="176-186,187" />
+<ol>
+  <li>Line 177: the loop asks the engine if any request is unfinished.</li>
+  <li>Line 178: if yes, it runs one step. If no, it calls <code>flush_inflight_reqs()</code> instead.</li>
+  <li>Lines 179-182: each step returns an array of handles. The loop copies each output with <code>RequestOutput.clone</code> before the next step. The engine gives the original objects back to their pool one step later.</li>
+  <li>Lines 185-186: the loop ends after the flush.</li>
+  <li>Lines 187-190: the results are sorted by request id as an integer, so they come back in prompt order. With <code>decode_sequence=True</code> (the default), each list of outputs becomes a string ({{cite deepinfer/entrypoints/llm.py:64}}).</li>
+</ol>
+
+<h3>Step 3: is any request unfinished?</h3>
+<x-code file="deepinfer/engine/llm_engine.py" lines="665-679" highlight="673-674,675-678" />
+<p>The local answer is true if a scheduler queue (<code>waiting</code>, <code>running</code> or <code>prompted</code>) holds a sequence ({{cite csrc/engine/scheduler.hpp:165-167}}). It is also true if a {{term structured-output}} grammar is still in the build queue. With more than one data-parallel rank, the engine takes the maximum over all ranks. So all ranks keep calling <code>step()</code> until the last rank is done. A rank with no work then runs a {{term placeholder-step | placeholder step}}.</p>
+
+<h3>Step 4: one call of step()</h3>
+<p><code>LLMEngine.step()</code> is short. It schedules, does some checks, and hands the batch to the Worker:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="881-887" />
+<x-code file="deepinfer/engine/llm_engine.py" lines="939-959" highlight="941,945,952,957,959">
+<x-tr line="944">Multimodal processing failed (usually a damaged image or video); about to abort N requests.</x-tr>
+</x-code>
+<p>The phases, in order:</p>
+<ol>
+  <li><strong>Schedule</strong> (lines 885-887). The C++ scheduler picks a prefill batch or a decode batch. It returns one {{term sequence-metadata | SequenceMetadata}} per sequence and a {{term scheduler-outputs | SchedulerOutputs}} object. The page {{link concepts/scheduler}} explains the rules.</li>
+  <li><strong>Clone or zero</strong> (lines 889-905). Only for forked sequences. The offline API never forks.</li>
+  <li><strong>Checks</strong> (lines 907-928). An empty hook, and a check of the structured-output state at the last prefill chunk.</li>
+  <li><strong>Multimodal fetch</strong> (lines 939-945). The engine collects the results of the image worker. In the engine, a request becomes schedulable only here. A failed request is aborted.</li>
+  <li><strong>Execute</strong> (line 952). The engine calls the Worker. The Worker runs the device work and calls back into the engine (next step).</li>
+  <li><strong>Return</strong> (line 959). The handles of the outputs that are ready now.</li>
+</ol>
+
+<h3>Step 5: the Worker part of the step</h3>
+<p>The Worker method <code>execute_model_step</code> has four parts. Its docstring lists them:</p>
+<x-code file="deepinfer/worker/worker.py" lines="96-103" />
+<x-code file="deepinfer/worker/worker.py" lines="182-189" highlight="183-185,186-187">
+<x-tr line="182">Prompt steps, or a configuration with ZOS off: post-process now. A ZOS decode step waits until the next step (to overlap with the forward pass).</x-tr>
+</x-code>
+<p>The post-process calls back into the engine. <code>LLMEngine.post_process</code> runs three C++ functions ({{cite deepinfer/engine/llm_engine.py:717-761}}). <code>process_MTPInfo</code> stores the new draft tokens. <code>scheduler.process_outputs</code> appends the tokens to each sequence and checks the stop conditions. <code>build_request_outputs</code> makes the output objects. The second callback, <code>pre_sampler_sync</code>, runs while the device samples. It gives back the buffers of the previous step and frees finished sequences ({{cite deepinfer/engine/llm_engine.py:830-846}}).</p>
+
+<h3>Step 6: what step() returns</h3>
+<p><code>step()</code> returns a NumPy array of <code>uint64</code> values. Each value is the address of a <code>RequestOutput</code> object in the {{term request-output-pool | RequestOutputPool}}. The docstring gives the rule:</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="860-871" highlight="867-870" />
+<p>One request can get several outputs in one step, one per accepted token. A step can also return no output at all. Panel 3 of the figure shows steps with no output. Its footnote mentions the case with accepted drafts.</p>
+
+<h3>Step 7: the end of the loop and the flush</h3>
+<x-code file="deepinfer/engine/llm_engine.py" lines="977-982" />
+<x-code file="deepinfer/worker/worker.py" lines="274-283" />
+<p>With ZOS, the Worker keeps the last decode step in <code>prev_step_state</code>. No later step post-processes it, so the flush does it. In the offline loop, the kept step at that time has no real sequence, so the flush returns no output (deep dive below). A custom loop must still call it: if the loop stops earlier, the flush returns the last tokens.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="One step, phase by phase (ZOS on and off)">
+<p>The table lists everything that one call of <code>step()</code> does, in order. "N" is this step, "N−1" the step before it.</p>
+<table>
+  <thead><tr><th>#</th><th>Phase</th><th>Where</th><th>ZOS on</th><th>ZOS off</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>timers, profiler hook</td><td>{{cite deepinfer/engine/llm_engine.py:872-879}}</td><td colspan="2">same</td></tr>
+    <tr><td>2</td><td><code>Scheduler.schedule(pool)</code></td><td>{{cite deepinfer/engine/llm_engine.py:885-887}}</td><td>plans N before N−1 is post-processed; sequences carry in-flight tokens</td><td>N−1 is already post-processed</td></tr>
+    <tr><td>3</td><td>clone / zero states and blocks, if asked</td><td>{{cite deepinfer/engine/llm_engine.py:889-905}}</td><td colspan="2">same (only forked sequences)</td></tr>
+    <tr><td>4</td><td><code>post_schedule</code> hook (empty), SO check at the last prefill chunk</td><td>{{cite deepinfer/engine/llm_engine.py:907-928}}</td><td colspan="2">same</td></tr>
+    <tr><td>5</td><td>KV state copy (unused: <code>copy_state</code> is <code>None</code>)</td><td>{{cite deepinfer/engine/llm_engine.py:930-937}}</td><td colspan="2">same</td></tr>
+    <tr><td>6</td><td>multimodal <code>fetch()</code>, abort failed requests</td><td>{{cite deepinfer/engine/llm_engine.py:939-945}}</td><td colspan="2">same</td></tr>
+    <tr><td>7</td><td>Worker: correct <code>seqlen_q</code>/<code>seqlen_k</code> with the results of N−1</td><td>{{cite deepinfer/worker/worker.py:116-118}}</td><td>on the device, if N and N−1 share sequences</td><td>nothing to correct</td></tr>
+    <tr><td>8</td><td>Worker: forward pass of N</td><td>{{cite deepinfer/worker/worker.py:121-127}}</td><td colspan="2">same; a placeholder sequence if the batch is empty</td></tr>
+    <tr><td>9</td><td>Worker: post-process N−1 → <code>LLMEngine.post_process</code></td><td>{{cite deepinfer/worker/worker.py:143-144}}</td><td>the decode step N−1, if kept</td><td>nothing kept</td></tr>
+    <tr><td>10</td><td>Worker: sample N</td><td>{{cite deepinfer/worker/worker.py:146-159}}</td><td colspan="2">same</td></tr>
+    <tr><td>11</td><td><code>pre_sampler_sync</code>: release old buffers, SO pump, free finished sequences</td><td>{{cite deepinfer/worker/worker.py:162-165}}, {{cite deepinfer/engine/llm_engine.py:830-846}}</td><td colspan="2">same</td></tr>
+    <tr><td>12</td><td>Worker: post-process N now, or keep it</td><td>{{cite deepinfer/worker/worker.py:182-187}}</td><td>prefill: now; decode: keep</td><td>always now</td></tr>
+    <tr><td>13</td><td>keep the output handles for release, return them</td><td>{{cite deepinfer/engine/llm_engine.py:974-975}}, {{cite deepinfer/engine/llm_engine.py:957-959}}</td><td colspan="2">same</td></tr>
+  </tbody>
+</table>
+<p><strong>The default.</strong> <code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code> is <code>0</code> in <code>environ.py</code>, but <code>EngineArgs</code> sets it to <code>1</code> for NORMAL and COMPLETION engines, if you did not set it ({{cite deepinfer/environ.py:179}}, {{cite deepinfer/engine/arg_utils.py:51-55}}). So the offline API runs with ZOS on. The page {{link concepts/zero-overhead-scheduling}} explains the overlap.</p>
+</x-deepdive>
+
+<x-deepdive title="What each call returns: the worked example, line by line">
+<p>Two requests, A with <code>max_tokens=3</code> and B with <code>max_tokens=4</code>, are schedulable and start in the same prefill step. ZOS is on. To keep the numbers simple, every decode step accepts no draft, so each step adds one token per request. This site derived the table from the code and did not run it.</p>
+<table>
+  <thead><tr><th>Call</th><th>Scheduled</th><th>Post-processed in this call</th><th>Returns</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td>step 1</td><td>prefill A, B</td><td>step 1 (prefill: at once)</td><td>A1, B1</td><td>{{cite deepinfer/worker/worker.py:183-185}}</td></tr>
+    <tr><td>step 2</td><td>decode A, B</td><td>nothing (no kept step)</td><td>none</td><td>{{cite deepinfer/worker/worker.py:259-260}}</td></tr>
+    <tr><td>step 3</td><td>decode A, B</td><td>step 2</td><td>A2, B2</td><td>{{cite deepinfer/worker/worker.py:143-144}}</td></tr>
+    <tr><td>step 4</td><td>decode A, B</td><td>step 3: A reaches 3 tokens, <code>"length"</code></td><td>A3 (finished), B3</td><td>{{cite csrc/engine/scheduler.hpp:1048-1051}}</td></tr>
+    <tr><td>step 5</td><td>decode B (A leaves <code>running</code>)</td><td>step 4: A is finished, so its token is dropped; B reaches 4</td><td>B4 (finished)</td><td>{{cite csrc/engine/scheduler.hpp:752-763}}, {{cite csrc/engine/scheduler.hpp:905-915}}</td></tr>
+    <tr><td>step 6</td><td>empty decode (B leaves <code>running</code>)</td><td>step 5: B is finished, token dropped</td><td>none</td><td>{{cite deepinfer/worker/worker.py:125-127}}</td></tr>
+    <tr><td>flush</td><td>-</td><td>step 6 (placeholder: no sampler output)</td><td>none</td><td>{{cite deepinfer/engine/llm_engine.py:987}}</td></tr>
+  </tbody>
+</table>
+<ol>
+  <li><strong>Why step 2 returns nothing.</strong> A prefill step sets <code>prev_step_state = None</code> ({{cite deepinfer/worker/worker.py:185}}). The first decode step after it has nothing to post-process.</li>
+  <li><strong>Why A still runs in step 4.</strong> The scheduler of step 4 runs before the post-process of step 3. At that moment A has 2 output tokens.</li>
+  <li><strong>Why step 6 happens.</strong> Before step 6, B is finished but is still in <code>running</code>, so <code>has_unfinished_requests()</code> is true. The decode schedule of step 6 removes B, and <code>pre_sampler_sync</code> frees its blocks ({{cite deepinfer/engine/llm_engine.py:844-846}}).</li>
+  <li><strong>Cost.</strong> With ZOS, each request does one forward pass whose token is dropped: the step that ran while its last token was still in flight.</li>
+</ol>
+<p>With ZOS off, each step post-processes itself. Then step 2 returns A2, B2, step 3 returns A3 and B3, and A leaves <code>running</code> one step earlier.</p>
+<p>With accepted drafts, one decode step appends several tokens. <code>build_request_outputs</code> makes one object for each accepted draft and one for the sampled token ({{cite csrc/engine/outputs.hpp:219-285}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Termination: what counts as unfinished">
+<table>
+  <thead><tr><th>Counted</th><th>Where</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>sequences in <code>waiting</code></td><td>{{cite csrc/engine/scheduler.hpp:167}}</td><td>also those that wait for the image worker, and chunked prompts</td></tr>
+    <tr><td>sequences in <code>running</code></td><td>{{cite csrc/engine/scheduler.hpp:167}}</td><td>also finished ones, until the next decode schedule removes them</td></tr>
+    <tr><td>sequences in <code>prompted</code></td><td>{{cite csrc/engine/scheduler.hpp:167}}</td><td>only forked sequences use it</td></tr>
+    <tr><td>grammar builds that are not done</td><td>{{cite deepinfer/engine/llm_engine.py:344-345}}, {{cite deepinfer/engine/llm_engine.py:674}}</td><td>the sequence is not in a queue yet</td></tr>
+  </tbody>
+</table>
+<p><strong>The all-reduce.</strong> With <code>dp_group.size() &gt; 1</code>, the answer becomes an <code>int64</code> tensor, and an all-reduce MAX combines all ranks ({{cite deepinfer/engine/llm_engine.py:675-678}}). With ZOS the group is the CPU (Gloo) group, else the device group (lines 667-672). Every rank calls this function once per loop, so every rank calls <code>step()</code> the same number of times. This matters because the scheduler of each rank votes with all-reduce calls inside <code>schedule()</code> ({{cite csrc/engine/scheduler.hpp:315-332}}).</p>
+<p><strong>The progress bar.</strong> With <code>use_tqdm=True</code>, the total is <code>get_num_unfinished_requests()</code> at the start ({{cite deepinfer/entrypoints/llm.py:170-172}}). It is a local count: the sum of the three queues plus pending grammar builds ({{cite deepinfer/engine/llm_engine.py:658-663}}). The bar moves when an output has <code>finished=True</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Buffers that live for one step">
+<p>Three kinds of objects that a step makes are valid only until the next step. <code>DeferredRelease</code> collects them and gives them back in the next <code>pre_sampler_sync</code>, while the device samples ({{cite deepinfer/engine/llm_engine.py:67-121}}).</p>
+<x-code file="deepinfer/engine/llm_engine.py" lines="67-71">
+<x-tr line="68">Release the resources that a step made one step later, so that the caller has finished reading them.</x-tr>
+<x-tr line="70">Collect the resources to release. Release them at the next pre_sampler_sync, overlapped with GPU computation.</x-tr>
+</x-code>
+<table>
+  <thead><tr><th>Object</th><th>Pool</th><th>Collected at</th><th>Given back at</th></tr></thead>
+  <tbody>
+    <tr><td>output handles (<code>uint64</code>)</td><td><code>RequestOutputPool</code>, 10000 objects ({{cite csrc/engine/outputs.hpp:51}})</td><td>{{cite deepinfer/engine/llm_engine.py:974}}, {{cite deepinfer/engine/llm_engine.py:980}}</td><td>next <code>pre_sampler_sync</code></td></tr>
+    <tr><td><code>SequenceMetadata</code> list</td><td><code>SequenceMetadataPool</code></td><td>end of <code>post_process</code> ({{cite deepinfer/engine/llm_engine.py:1013}})</td><td>next <code>pre_sampler_sync</code></td></tr>
+    <tr><td>state and block ids from a clone</td><td>block managers</td><td>{{cite deepinfer/engine/llm_engine.py:905}}</td><td>same step's <code>pre_sampler_sync</code>, after a CUDA event</td></tr>
+  </tbody>
+</table>
+<p><strong>Copying an output.</strong> <code>RequestOutput.clone(ptr)</code> copies the C++ object into a new object that Python owns ({{cite csrc/engine/pybind_output.cpp:17-18}}). The fields include <code>request_id</code>, <code>token_id</code>, <code>finished</code>, <code>finish_reason</code>, <code>token_logprobs</code>, <code>top_logprobs</code>, <code>num_output_tokens</code>, <code>draft_tok</code> and <code>accept_tok</code> ({{cite csrc/engine/outputs.hpp:18-43}}).</p>
+<p><strong>Pool size.</strong> The pool has 10000 objects. If no object is free, <code>allocate</code> fails with <code>"RequestOutputPool exhausted"</code> ({{cite csrc/engine/outputs.hpp:64-70}}). One decode step makes at most <code>max_num_seqs × (1 + nextn)</code> outputs, for example 256 × 6 = 1536.</p>
+</x-deepdive>
+
+<x-deepdive title="Placeholder steps: steps with no sequence">
+<p>A step can have no scheduled sequence. This happens when the decode branch finds no running sequence, or when another data-parallel rank runs a prefill step and this rank has no prompt. <code>step()</code> still calls the Worker, with <code>is_placeholder = scheduler_outputs.is_empty()</code> ({{cite deepinfer/engine/llm_engine.py:972}}).</p>
+<x-code file="deepinfer/worker/model_runner.py" lines="386-403" caption="The placeholder: one token (id 0), block table [0], greedy sampling. Block 0 is never given to a real sequence." />
+<p>The Worker runs the forward pass and the sampler on this one sequence ({{cite deepinfer/worker/worker.py:125-127}}). The post-process gets no sampler output ({{cite deepinfer/engine/llm_engine.py:987}}), so it makes no <code>RequestOutput</code>. The forward pass still runs the collective operations of the model, such as the MoE dispatch and combine. That keeps every rank in the same order of collective calls.</p>
+<p><strong>Empty steps at the start.</strong> In this release, every request of a NORMAL engine waits for the multimodal worker before its first prefill. The first prefill then waits for an attempt point, so the first steps of a run are placeholder steps ({{link tours/life-of-a-request}}, stop 5).</p>
+</x-deepdive>
+
+<x-deepdive title="Settings that change the loop">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Effect on the loop</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>on for NORMAL engines ({{cite deepinfer/engine/arg_utils.py:51-55}})</td><td>Decode outputs come one step late; the flush gets the last ones; the DP tests run on the CPU group.</td></tr>
+    <tr><td><code>LLM(decode_sequence=...)</code></td><td><code>True</code> ({{cite deepinfer/entrypoints/llm.py:64}})</td><td><code>generate()</code> returns strings, not <code>RequestOutput</code> lists ({{cite deepinfer/entrypoints/llm.py:189-190}}).</td></tr>
+    <tr><td><code>LLM</code> keyword defaults</td><td><code>disable_log_stats=True</code>, <code>stop_preempted_request=False</code> ({{cite deepinfer/entrypoints/llm.py:67-68}})</td><td>No statistics log lines; preempted requests are recomputed, not stopped.</td></tr>
+    <tr><td><code>use_tqdm</code></td><td><code>True</code></td><td>A progress bar over the number of requests.</td></tr>
+    <tr><td>data-parallel size</td><td>from the launcher</td><td>Each rank is a separate process with its own <code>LLM</code> and loop ({{cite examples/_launch.py:35-44}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Copy outputs before the next step">
+<p>A handle from <code>step()</code> points into the output pool. The engine gives the object back to the pool in the next step ({{cite deepinfer/engine/llm_engine.py:830-831}}). Call <code>RequestOutput.clone(handle)</code> before the next step, as <code>LLM</code> does ({{cite deepinfer/entrypoints/llm.py:181}}).</p>
+</x-warning>
+<ul>
+  <li><strong>A custom loop without the flush.</strong> With ZOS, the outputs of the last kept decode step come only from <code>flush_inflight_reqs()</code> ({{cite deepinfer/worker/worker.py:274-283}}).</li>
+  <li><strong>A loop on one data-parallel rank only.</strong> The scheduler votes with all-reduce calls in every step. If one rank stops calling <code>step()</code>, the other ranks wait in the vote. Use <code>has_unfinished_requests()</code>, which combines all ranks.</li>
+  <li><strong>Lost token ids.</strong> With <code>decode_sequence=True</code> (the default), <code>generate()</code> returns only text ({{cite deepinfer/entrypoints/llm.py:189-190}}). The examples set <code>decode_sequence=False</code> to keep the objects ({{cite examples/_config.py:121}}).</li>
+  <li><strong>A slow start.</strong> The first steps of a run can be empty, because requests wait for the multimodal worker and for an attempt point.</li>
+  <li><strong>A request that is never added.</strong> <code>add_request</code> returns <code>None</code> for a token id outside the vocabulary and writes only an info log line ({{cite deepinfer/engine/llm_engine.py:582-589}}). <code>generate()</code> then has no output for that prompt, and the result list is shorter than the prompt list.</li>
+</ul>
+<p><strong>Why it matters.</strong> The step loop is the heartbeat of the engine. A driver of your own (a server or a benchmark) must keep three rules. Copy the outputs before the next step. Flush at the end. Keep all data-parallel ranks in the same number of steps.</p>
+
+<x-quiz>
+  <x-q level="easy">What does <code>LLMEngine.step()</code> return?
+    <x-a><p>A NumPy array of <code>uint64</code> handles. Each handle is the address of a <code>RequestOutput</code> object in the <code>RequestOutputPool</code>. The objects are valid until the next step ({{cite deepinfer/engine/llm_engine.py:860-871}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">When does <code>_run_engine</code> call <code>flush_inflight_reqs()</code>?
+    <x-a><p>Once, when <code>has_unfinished_requests()</code> returns false. Then it copies the outputs and leaves the loop ({{cite deepinfer/entrypoints/llm.py:177-186}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">ZOS is on. A prefill step is followed by a decode step. What does the decode step return, and why?
+    <x-a><p>Nothing. A prefill step post-processes at once and sets <code>prev_step_state</code> to <code>None</code> ({{cite deepinfer/worker/worker.py:183-185}}). The decode step keeps its own state for the next call, and has no kept step to post-process ({{cite deepinfer/worker/worker.py:186-187}}, {{cite deepinfer/worker/worker.py:259-260}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Two data-parallel ranks run. Rank 0 has no request left, rank 1 has one. What does rank 0 do in the next loop?
+    <x-a><p>It calls <code>step()</code>. <code>has_unfinished_requests()</code> takes the MAX over the DP group, so it is true on both ranks ({{cite deepinfer/engine/llm_engine.py:675-678}}). Rank 0 schedules an empty batch and runs a placeholder step ({{cite deepinfer/worker/worker.py:125-127}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With ZOS on, request A has <code>max_tokens=3</code> and starts in a prefill step alone. No draft is accepted. How many calls of <code>step()</code> run, and in which one does A's last output come back?
+    <x-a><p>Prefill (returns A1), decode (returns nothing), decode (returns A2), decode (returns A3, finished). In the fourth call the post-process of the third step finds the 3rd token. A is still in <code>running</code>, so a fifth call runs. Its schedule removes A, and its post-process drops A's 4th token, so it returns nothing. Then the loop flushes. So 5 calls of <code>step()</code> and one flush; A's last output comes back in call 4. See the deep dive "What each call returns".</p></x-a>
+  </x-q>
+</x-quiz>

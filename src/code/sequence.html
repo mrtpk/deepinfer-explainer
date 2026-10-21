@@ -1,0 +1,206 @@
+---
+title: sequence.py: sampler output classes and C++ re-exports
+nav_title: sequence.py
+level: Intermediate
+prerequisites: concepts/request-lifecycle, concepts/engine-step-loop
+related: code/sequence-hpp, code/sampler, code/llm-engine, code/worker, code/model-runner, code/dflash, concepts/sampler, concepts/speculative-decoding, concepts/zero-overhead-scheduling
+summary: deepinfer/sequence.py re-exports the C++ Sequence classes and defines the dataclasses that carry the results of the sampler (tokens, log-probabilities, draft tokens and their confidence) from the device to the engine.
+---
+<h2>Purpose</h2>
+<p><code>deepinfer/sequence.py</code> gives Python one import place for the C++ sequence classes, and defines <code>SamplerOutput</code>: the object that carries the sampler results of one step to the engine.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/sequence.py</code>, 281 lines of Python. The header says "Derived from vLLM; modified by DeepSeek." ({{cite deepinfer/sequence.py:2}}). Many docstrings are in Chinese.</td></tr>
+    <tr><th>Main class</th><td><code>SamplerOutput</code> ({{cite deepinfer/sequence.py:172}}). Also <code>SampledInfo</code>, <code>MTPPredictInfo</code>, <code>DeepInferTopkInfo</code> and the helper <code>_where_update</code>.</td></tr>
+    <tr><th>Runs in</th><td>The process of the driver Worker, which is also the engine process. The tensors start on the device and move to the CPU at the end of sampling.</td></tr>
+    <tr><th>Called by</th><td>The sampler and DFlash (they make the objects), the model runner and the Worker (they finish and keep them), and <code>LLMEngine._process_model_outputs</code> (it reads them).</td></tr>
+    <tr><th>Calls</th><td>Only PyTorch, and the import of <code>deepinfer._C.engine</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The <code>Sequence</code> class itself: it is C++ ({{link code/sequence-hpp}}). The sampling math: it is in <code>layers/sampler.py</code>.</td></tr>
+  </tbody>
+</table>
+<x-note title="The name is from vLLM">
+<p>In vLLM, <code>sequence.py</code> defines the sequence classes in Python. In DeepInfer those classes moved to C++. This file now only re-exports them and holds the sampler result types.</p>
+</x-note>
+
+<h2>Where it sits</h2>
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The sampler</strong> makes <code>SampledInfo</code>, <code>DeepInferTopkInfo</code> and <code>SamplerOutput</code> ({{cite deepinfer/model_executor/layers/sampler.py:555-560}}, {{cite deepinfer/model_executor/layers/sampler.py:626-630}}). A prefill step fills <code>sampled_token</code> only ({{cite deepinfer/model_executor/layers/sampler.py:198-203}}). A decode step fills the verified tokens, the drafts and the ZOS fields ({{cite deepinfer/model_executor/layers/sampler.py:277-291}}).</li>
+  <li><strong>DFlash</strong> makes <code>MTPPredictInfo</code> with the new drafts ({{cite deepinfer/model_executor/models/mtp/dflash.py:338}}). Its CUDA-graph runner uses <code>narrow</code> and <code>copy_</code> ({{cite deepinfer/worker/dflash_cuda_graph_runner.py:60-71}}, {{cite deepinfer/worker/dflash_cuda_graph_runner.py:91}}).</li>
+  <li><strong>The model</strong> adds a post function that fills <code>moe_load_balance_ratio</code> ({{cite deepinfer/model_executor/models/deepseek.py:403-409}}).</li>
+  <li><strong>The model runner</strong> runs the post functions after the step is on the CPU ({{cite deepinfer/worker/model_runner.py:369-378}}).</li>
+  <li><strong>The Worker</strong> reads the ZOS fields of the previous step to correct the next one ({{cite deepinfer/worker/worker.py:219-243}}).</li>
+  <li><strong>The engine</strong> reads the tokens, log-probabilities and drafts ({{cite deepinfer/engine/llm_engine.py:693-761}}).</li>
+  <li><strong>Imports of the C++ classes.</strong> <code>llm.py</code>, <code>llm_engine.py</code>, <code>worker.py</code>, <code>model_runner.py</code>, the CUDA-graph runners and <code>zos_status.py</code> import <code>Sequence</code>, <code>SequenceMetadata</code> or <code>SequenceData</code> from here.</li>
+</ul>
+<h3>What it calls</h3>
+<p>Only <code>torch</code> for tensor work, and <code>deepinfer._C.engine</code> for the re-exported names.</p>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>re-exports</td><td>{{cite deepinfer/sequence.py:14-20}}</td><td><code>PLACEHOLDER_REQUEST_ID</code>, <code>Sequence</code>, <code>SequenceData</code>, <code>SequenceMetadata</code>, <code>SequenceStatus</code> from C++.</td></tr>
+    <tr><td><code>PromptLogprobs</code></td><td>{{cite deepinfer/sequence.py:22}}</td><td>Type alias <code>list[float]</code>.</td></tr>
+    <tr><td><code>_where_update</code></td><td>{{cite deepinfer/sequence.py:25}}</td><td>Overwrite the rows of a tensor where a mask is true.</td></tr>
+    <tr><td><code>DeepInferTopkInfo</code></td><td>{{cite deepinfer/sequence.py:39}}</td><td>Top-k log-probabilities and token ids.</td></tr>
+    <tr><td><code>MTPPredictInfo</code></td><td>{{cite deepinfer/sequence.py:77}}</td><td>New draft tokens and their confidence values.</td></tr>
+    <tr><td><code>SampledInfo</code></td><td>{{cite deepinfer/sequence.py:114}}</td><td>Tokens and log-probabilities of one kind: sampled, or verified.</td></tr>
+    <tr><td><code>SamplerOutput</code></td><td>{{cite deepinfer/sequence.py:172}}</td><td>Everything the sampler returns for one step.</td></tr>
+    <tr><td><code>__all__</code></td><td>{{cite deepinfer/sequence.py:272-281}}</td><td>Eight public names. <code>SampledInfo</code> and <code>MTPPredictInfo</code> are not in it; users import them by name.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>Imports and re-exports</h3>
+<x-code file="deepinfer/sequence.py" lines="4-22" highlight="14-20,22" />
+<p>The C++ classes have no Python source. Their stubs are in <code>deepinfer/_C/engine.pyi</code>. A <code>Sequence</code> made in Python is the same object that the scheduler holds: the binding wraps a <code>std::shared_ptr&lt;Sequence&gt;</code> ({{cite csrc/engine/pybind_sequence.cpp:91}}).</p>
+
+<h3><code>_where_update</code> and <code>DeepInferTopkInfo</code></h3>
+<x-code file="deepinfer/sequence.py" lines="25-73" highlight="31-35,55-56,63-68">
+<x-tr line="30">Where is_final is True, overwrite current with candidate. If current is None, clone candidate.</x-tr>
+<x-tr line="42">shape [num_token, topk], dtype torch.float. logps first, then tokens, the same order as deep_select.</x-tr>
+<x-tr line="54">Make a DeepInferTopkInfo from the request count and topk. With topk = 0, all members are None.</x-tr>
+<x-tr line="64">Final step before the sampler returns: move the results to the CPU. NOTE: call this before the last sync of the sampler.</x-tr>
+<x-tr line="71">Where is_final is True, overwrite the current values with candidate.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 31-35: <code>None</code> means "no data". A <code>None</code> candidate keeps the current value.</li>
+  <li>Lines 55-61: with <code>topk = 0</code>, no tensors are made. Else <code>logps</code> is <code>float32 [req_cnt, topk]</code> (zeros) and <code>tokens</code> is <code>int32 [req_cnt, topk]</code> (not set).</li>
+  <li>Lines 63-68: <code>sampler_epilogue</code> starts the copies to the CPU with <code>non_blocking=True</code>. The values are valid only after the sampler's last sync.</li>
+</ol>
+
+<h3><code>MTPPredictInfo</code>: the new drafts</h3>
+<x-code file="deepinfer/sequence.py" lines="76-110" highlight="88-91,93-98,100-104,106-110">
+<x-tr line="78-85">Information of the MTP prediction. If the current step needs no MTP, every member is None; parts of the framework test this None to know if MTP exists. token_ids and confidence_rates move to the CPU for the scheduler. The logprobs and their indices go straight from the sampling path of the MTP module into the MTP info pool on the GPU; they are not part of the prediction result.</x-tr>
+<x-tr line="91">The accept rate of each draft token, predicted by the confidence head. shape [bs, nextn], values in [0, 1]. None if there is no confidence head.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 88-91: <code>token_ids [bs, nextn]</code>, and an optional <code>confidence_rates [bs, nextn]</code>.</li>
+  <li>Lines 93-98: <code>narrow(req_cnt)</code> drops the padding rows of a CUDA graph. It asserts <code>0 &lt; req_cnt &lt;= bs</code>.</li>
+  <li>Lines 100-104: <code>copy_</code> copies in place; both objects must agree on the confidence tensor.</li>
+  <li>Lines 106-110: the CPU copy is <code>int32</code> for the ids.</li>
+</ol>
+<p>The engine passes <code>token_ids</code> to <code>process_MTPInfo</code>, which stores them as the drafts of each sequence ({{cite deepinfer/engine/llm_engine.py:713-723}}, {{cite csrc/engine/scheduler.hpp:1235-1238}}).</p>
+
+<h3><code>SampledInfo</code>: one kind of tokens</h3>
+<x-code file="deepinfer/sequence.py" lines="113-151" highlight="117-128,130-139">
+<x-tr line="115">Information about returned tokens. One class can mean the sampled token (is_verified_token = False) or the verified tokens (is_verified_token = True).</x-tr>
+<x-tr line="120">Is it a verified token? This is different from the one token that each step samples. The number of verified tokens is not fixed; the upper limit is nextn.</x-tr>
+<x-tr line="122">The token sampled in this step.</x-tr>
+<x-tr line="125-126">The ids and logp of the top-k tokens that SamplingParams asks for. shape [bs*num_top] or [bs*nextn*num_top]; logically [bs, num_top] or [bs, nextn, num_top].</x-tr>
+<x-tr line="128">shape [bs] or [bs*nextn]. Only when DEEPINFER_COMPUTE_SUM_SMALLER_PROBS is on.</x-tr>
+<x-tr line="131">Final step before the sampler returns: move the results to the CPU. NOTE: call this before the last sync of the sampler.</x-tr>
+<x-tr line="142">Where is_final (a [bs] or [bs*nextn] bool tensor) is True, overwrite with candidate.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 117-128: one <code>SampledInfo</code> holds either the sampled token of each request (<code>[bs]</code>) or the verified draft tokens (flat, <code>[total_q]</code> in decode).</li>
+  <li>Lines 130-139: the CPU copy of <code>token_ids</code> becomes <code>int32</code>.</li>
+  <li>Lines 141-151 (<code>update</code>) and 153-168 (<code>from_reqcnt</code>): no code outside this file calls them in this release. A search for <code>from_reqcnt(</code> and for <code>.update(is_final</code> finds only this file.</li>
+</ol>
+
+<h3><code>SamplerOutput</code>: the result of one step</h3>
+<x-code file="deepinfer/sequence.py" lines="171-205" highlight="174-177,179-183,203-205" />
+<p>The properties give old flat names to the nested fields: <code>token_ids</code> is <code>sampled_token.token_ids</code>, and <code>accepted_token_ids</code> is <code>verified_tokens.token_ids</code>. <code>token_ids</code> and <code>token_logprobs</code> return an empty tensor instead of <code>None</code> (lines 181-183, 187-189). So the engine can read <code>output.token_ids.size(0)</code> also for a placeholder output ({{cite deepinfer/engine/llm_engine.py:693-695}}).</p>
+<x-code file="deepinfer/sequence.py" lines="223-269" highlight="226-228,230,242-246,254-255,259-269">
+<x-tr line="224">shape [total_q]. The last logprobs of each verify position. Only when DEEPINFER_COMPUTE_SUM_SMALLER_PROBS is on.</x-tr>
+<x-tr line="227-228">shape [req_cnt], CPU int32. Offset of the first token of each req in the [total_q] flat tensor. Lets later code index [total_q]-shaped tensors such as verified_tokens.</x-tr>
+<x-tr line="239">The accept rate of each draft token, predicted by the confidence head. shape [bs, nextn].</x-tr>
+<x-tr line="252">Log-probabilities of the prompt tokens. Only when SamplingParams.prompt_logprobs=True and the step is a prompt step.</x-tr>
+</x-code>
+<ol>
+  <li>Line 226: <code>first_token_positions</code> is the key to the flat layout. Request <code>i</code> owns positions <code>ftp[i] … ftp[i+1] − 1</code> of every <code>[total_q]</code> tensor.</li>
+  <li>Line 230: <code>predict_tokens</code> holds the drafts for the <em>next</em> step.</li>
+  <li>Lines 242-246: two statistics lists. The decode post function fills them as <code>[req_cnt] + counts</code> ({{cite deepinfer/model_executor/layers/sampler.py:293-296}}).</li>
+  <li>Lines 254-255: <code>so_status</code> per request: -1 (aborted), 0 (no grammar), 1 (just started), 2 (started).</li>
+  <li>Lines 259-269: four GPU tensors for ZOS. The next step reads them on the device to correct its <code>seqlen_q</code> and <code>seqlen_k</code> without a CPU sync ({{cite deepinfer/worker/worker.py:219-243}}).</li>
+</ol>
+<p><code>post_funcs</code> (line 177) is a list of functions that fill fields after the CPU copies are done. The model runner calls them once and clears the list ({{cite deepinfer/worker/model_runner.py:376-378}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Every field of SamplerOutput: shape, device, writer, reader">
+<p><code>bs</code> (or <code>req_cnt</code>) is the number of requests in the step. <code>total_q</code> is the number of query tokens in a decode step. <code>nextn</code> is the number of drafts.</p>
+<table>
+  <thead><tr><th>Field (property)</th><th>Shape, dtype</th><th>Device</th><th>Written in</th><th>Read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>sampled_token.token_ids</code> (<code>token_ids</code>)</td><td><code>int32 [bs]</code></td><td>CPU after the epilogue</td><td>prefill and decode</td><td><code>process_outputs</code>, <code>build_request_outputs</code></td></tr>
+    <tr><td><code>sampled_token.token_logprobs</code></td><td><code>float32 [bs]</code></td><td>CPU</td><td>prefill and decode</td><td><code>build_request_outputs</code></td></tr>
+    <tr><td><code>sampled_token.topk_tokens</code> (<code>top_logprobs</code>, <code>top_token_ids</code>)</td><td><code>[bs, topk]</code></td><td>CPU</td><td>if a request asks for top log-probabilities</td><td><code>build_request_outputs</code></td></tr>
+    <tr><td><code>verified_tokens.token_ids</code> (<code>accepted_token_ids</code>)</td><td><code>int32 [total_q]</code>, -1 = rejected</td><td>CPU</td><td>decode with drafts</td><td><code>process_outputs</code> ({{cite csrc/engine/scheduler.hpp:955-966}})</td></tr>
+    <tr><td><code>first_token_positions</code></td><td><code>int32 [bs]</code></td><td>CPU</td><td>decode with drafts</td><td>engine, <code>build_request_outputs</code></td></tr>
+    <tr><td><code>predict_tokens.token_ids</code> (<code>next_n_token_ids</code>)</td><td><code>int32 [bs, nextn]</code></td><td>CPU</td><td>decode with drafts</td><td><code>process_MTPInfo</code></td></tr>
+    <tr><td><code>predict_tokens.confidence_rates</code></td><td><code>float32 [bs, nextn]</code> or <code>None</code></td><td>CPU</td><td>with a confidence head</td><td><code>process_MTPInfo</code></td></tr>
+    <tr><td><code>prompt_logprobs</code></td><td>list per request</td><td>CPU</td><td>prefill post function</td><td><code>update_prompt_logprobs</code>, outputs</td></tr>
+    <tr><td><code>so_status</code></td><td><code>list[int]</code> or <code>None</code></td><td>CPU</td><td>sampler</td><td><code>process_outputs</code></td></tr>
+    <tr><td><code>num_generated_tokens</code>, <code>num_verified_tokens</code>, <code>batch_confidence_error</code></td><td>lists, float</td><td>CPU</td><td>decode post function</td><td><code>StepStats</code> ({{cite deepinfer/engine/llm_engine.py:776-778}})</td></tr>
+    <tr><td><code>moe_load_balance_ratio</code></td><td><code>(float, float)</code></td><td>CPU</td><td>model post function</td><td><code>StepStats</code></td></tr>
+    <tr><td><code>sampled_token_ids_gpu</code></td><td><code>int32 [bs]</code></td><td>device</td><td>decode</td><td>ZOS correction of the next step</td></tr>
+    <tr><td><code>predict_token_ids_gpu</code></td><td><code>int32 [bs, nextn]</code></td><td>device</td><td>decode with drafts</td><td>ZOS</td></tr>
+    <tr><td><code>num_accepted_tokens_gpu</code></td><td><code>[bs]</code>, values 0 … <code>nextn</code></td><td>device</td><td>decode</td><td><code>compute_seqlens_k_zos</code></td></tr>
+    <tr><td><code>confidence_rates_gpu</code></td><td><code>[bs, nextn]</code></td><td>device</td><td>decode with a confidence head</td><td><code>compute_seqlens_q_by_confidence_rates</code></td></tr>
+  </tbody>
+</table>
+<p>Writers: {{cite deepinfer/model_executor/layers/sampler.py:198-210}} (prefill) and {{cite deepinfer/model_executor/layers/sampler.py:256-298}} (decode). On a follower rank of context parallelism, the sampler returns an empty <code>SamplerOutput(post_funcs=[])</code> ({{cite deepinfer/model_executor/layers/sampler.py:145-161}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: a decode step with two requests">
+<p>Two requests, <code>nextn = 5</code>, both send 1 + 5 tokens, so <code>total_q = 12</code>. Request 0 gets 2 drafts accepted, request 1 gets 0. Illustrative values:</p>
+<pre><code class="language-python">out.first_token_positions          # tensor([0, 6], dtype=torch.int32), CPU
+out.accepted_token_ids             # shape [12]: [t1, t2, -1, -1, -1, *, -1, -1, -1, -1, -1, *]
+out.token_ids                      # shape [2]: [s0, s1]  (the new sampled token of each request)
+out.next_n_token_ids               # shape [2, 5]: new drafts for the next step
+out.next_n_token_confidence_rates  # shape [2, 5] or None
+out.num_accepted_tokens_gpu        # device, [2]: [2, 0]</code></pre>
+<p>The engine passes <code>accepted_token_ids</code> to C++ without a copy, because <code>first_token_positions</code> is set ({{cite deepinfer/engine/llm_engine.py:698-702}}). <code>process_outputs</code> walks the flat array with <code>seqlens_q</code>: request 0 appends <code>t1, t2, s0</code>; request 1 appends <code>s1</code>. The <code>*</code> slots are the main token positions and are not read ({{cite csrc/engine/scheduler.hpp:873-875}}). <code>build_request_outputs</code> uses <code>first_token_positions</code> to find each request's slice ({{cite csrc/engine/outputs.hpp:203-213}}).</p>
+<p><strong>A prefill step</strong> has only <code>sampled_token</code>. <code>next_n_token_ids</code> is <code>None</code>, so a NORMAL engine pads it with <code>vocab_size − 1</code> ids, shape <code>[bs, 5]</code> ({{cite deepinfer/engine/llm_engine.py:706-711}}).</p>
+</x-deepdive>
+
+<x-deepdive title="CPU copies, syncs and post functions">
+<ol>
+  <li>The sampler calls <code>sampler_epilogue()</code> on each <code>SampledInfo</code> and <code>MTPPredictInfo</code> ({{cite deepinfer/model_executor/layers/sampler.py:259-264}}). Each one starts <code>.to("cpu", non_blocking=True)</code>.</li>
+  <li>The Worker records <code>sample_end_evt</code> after sampling ({{cite deepinfer/worker/worker.py:167-168}}).</li>
+  <li>Before the post-process, the Worker waits for that event ({{cite deepinfer/worker/worker.py:262-263}}). Only now are the CPU tensors valid.</li>
+  <li>The model runner calls the post functions: the prefill one splits the prompt log-probabilities per request; the decode one turns the device counters into lists ({{cite deepinfer/model_executor/layers/sampler.py:205-210}}, {{cite deepinfer/model_executor/layers/sampler.py:293-298}}).</li>
+  <li>The engine reads the fields in <code>_process_model_outputs</code>.</li>
+</ol>
+<x-warning title="Read the CPU fields only after the sync">
+<p>A field that <code>sampler_epilogue</code> moved holds a CPU tensor at once, but its values arrive later. Code that reads it before <code>sample_end_evt.synchronize()</code> can read old memory. The comment says the same: <em>"call this before the last sync of the sampler"</em> (translated, {{cite deepinfer/sequence.py:64}}).</p>
+</x-warning>
+</x-deepdive>
+
+<x-deepdive title="Unused code in this release">
+<ul>
+  <li><code>SampledInfo.update</code>, <code>SampledInfo.from_reqcnt</code>, <code>DeepInferTopkInfo.update</code>, <code>DeepInferTopkInfo.from_reqcnt_topk</code> and <code>_where_update</code> call each other, but no other file calls them.</li>
+  <li><code>is_verified_token</code> is set to <code>True</code> for verified tokens ({{cite deepinfer/model_executor/layers/sampler.py:555-557}}), but no code reads it.</li>
+  <li><code>nextn</code> on <code>SampledInfo</code> is read only by <code>update</code> (line 145).</li>
+</ul>
+<p>These helpers look like the tools for a merge of two sampler passes by a mask, but the release does not use them. This site describes them, and does not guess their future use.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/sampler}}: how the sampler fills these objects.</li>
+  <li>{{link concepts/speculative-decoding}}: drafts, verification and the flat <code>[total_q]</code> layout.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why the GPU copies of the results exist.</li>
+  <li>{{link concepts/request-lifecycle}}: what the engine does with the tokens.</li>
+  <li>{{link code/sequence-hpp}}: the C++ classes that this file re-exports.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Where is the <code>Sequence</code> class defined, and why does <code>from deepinfer.sequence import Sequence</code> work?
+    <x-a><p>In C++, in <code>csrc/engine/sequence.hpp</code>. <code>sequence.py</code> imports it from <code>deepinfer._C.engine</code> and lists it in <code>__all__</code> ({{cite deepinfer/sequence.py:14-20}}, {{cite deepinfer/sequence.py:272-281}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>SamplerOutput.token_ids</code> return an empty tensor and not <code>None</code> when no token was sampled?
+    <x-a><p>The property makes an empty <code>IntTensor</code> on first access ({{cite deepinfer/sequence.py:179-183}}). The engine reads <code>output.token_ids.size(0)</code> for every step, also for a placeholder step whose output is a fresh <code>SamplerOutput()</code> ({{cite deepinfer/engine/llm_engine.py:693-695}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In a decode step, request 2 has <code>first_token_positions[2] = 12</code> and request 3 has <code>first_token_positions[3] = 18</code>. Which positions of <code>accepted_token_ids</code> belong to request 2, and which one is not read?
+    <x-a><p>Positions 12 to 17. Positions 12 to 16 are the 5 draft results; position 17 is the main token position, which <code>process_outputs</code> does not read ({{cite csrc/engine/scheduler.hpp:873-875}}, {{cite deepinfer/sequence.py:226-228}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Which four fields of <code>SamplerOutput</code> stay on the device, and which component reads them? Why are they not copied to the CPU?
+    <x-a><p><code>sampled_token_ids_gpu</code>, <code>predict_token_ids_gpu</code>, <code>num_accepted_tokens_gpu</code> and <code>confidence_rates_gpu</code> ({{cite deepinfer/sequence.py:259-269}}). With ZOS, the Worker of the <em>next</em> step reads them on the device to correct <code>seqlen_q</code> and <code>seqlen_k</code> before the CPU has the results ({{cite deepinfer/worker/worker.py:214-243}}). A CPU copy would need a sync and would stop the overlap. See the deep dive "Every field of SamplerOutput".</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,377 @@
+---
+title: The scheduler
+nav_title: The scheduler
+level: Intermediate
+prerequisites: learn/prefill-decode, learn/kv-cache, concepts/engine-step-loop
+related: concepts/request-lifecycle, concepts/paged-kv-cache, concepts/dp-step-votes, concepts/speculative-decoding, concepts/dspark, concepts/zero-overhead-scheduling, code/scheduler-hpp, code/block-manager-hpp, tours/life-of-a-request
+scripts: viz/scheduler_sim.js
+summary: In every engine step, the C++ scheduler runs either a prefill batch or a decode batch. It starts prefills only at attempt points, cuts long prompts into chunks, gives KV blocks, and preempts sequences when the blocks run out.
+---
+<x-sentence>In each engine step, the C++ {{term scheduler}} picks a {{term prefill}} batch or a {{term decode}} batch, never both, and gives each sequence its KV blocks.</x-sentence>
+
+<h2>The idea</h2>
+<p>The engine works in {{term engine-step | steps}}. Before each step, <code>LLMEngine.step()</code> asks the scheduler for a batch ({{cite deepinfer/engine/llm_engine.py:885-887}}). The scheduler answers three questions:</p>
+<ol>
+  <li>Is this step a prefill step or a decode step?</li>
+  <li>Which {{term sequence | sequences}} run, and how many query tokens does each one send?</li>
+  <li>Which {{term kv-block | KV blocks}} does each sequence get?</li>
+</ol>
+<p>DeepInfer never puts prefill and decode work into the same step. A prefill step reads new prompts and writes their KV cache. A decode step adds new tokens to the sequences that already run. While a prefill step runs, the running sequences make no progress. So the scheduler does not start a prefill in every step. It tries only at fixed points.</p>
+<p>The main rules are short:</p>
+<ul>
+  <li><strong>{{term attempt-point | Attempt points}}.</strong> A prefill can start only when the decode counter <code>decode_step</code> is a multiple of 70 (an ALL point) or of 100 (an ANY point). A prefill step sets the counter back to 0, which is again an attempt point.</li>
+  <li><strong>{{term token-budget | Token budget}}.</strong> One step has at most <code>max_num_batched_tokens</code> query tokens. With {{term chunked-prefill}}, the scheduler cuts a long prompt to fit.</li>
+  <li><strong>{{term cache-watermark | Watermark}}.</strong> A new prefill starts only if 90 % or less of the KV blocks are in use.</li>
+  <li><strong>Slots.</strong> At most <code>max_num_seqs</code> sequences hold a place in the running set.</li>
+  <li><strong>Decode order.</strong> A decode step serves the sequences with the fewest output tokens first. If no block is free, it {{term preemption | preempts}} the sequence with the most output tokens.</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of a bus on a loop route. Most of the time the bus drives, and every passenger moves on (decode). At fixed stops, the bus stops to let new passengers in (prefill). While it stops, the passengers inside do not move. If the bus is full, the driver asks one passenger to leave. The comparison stops being true here. That passenger keeps a record of the trip so far, but must ride the whole route again from the start (recompute).</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3a_sched_decide" alt="Panel 1: six numbered cards from top to bottom. 1: is decode_step an attempt point (ALL every 70, ANY every 100)? 2: does this rank want a prefill (cache usage 0.9 or less and a schedulable request at the front)? 3: vote 1, an all-reduce MIN over the DP group. 4: _schedule_prefill. 5: vote 2, did any rank schedule? 6: prefill step. A no from cards 1, 3 and 5 goes to a decode step box on the right. Panel 2: a time axis of decode_step from 0 to 210 with ALL points at 0, 70, 140, 210 and ANY points at 100 and 200." caption="Figure: how one step becomes a prefill step or a decode step (panel 1), and where the attempt points are with the default intervals (panel 2). Click to zoom." />
+<p>Read panel 1 from top to bottom. Each "no" goes to the decode box on the right. Only a "yes" in all three tests makes a prefill step. Panel 2 shows why prefill steps come in groups: a prefill step sets <code>decode_step</code> to 0, and 0 is an ALL point.</p>
+<x-diagram name="b3a_sched_batches" alt="Panel 1: a token-budget bar of 32768 tokens filled by A (41 tokens), B (20000) and a 12727-token chunk of C; D and E are not looked at. Panel 2: the next prefill step holds the last 2273 tokens of C and D (300); E waits because four sequences hold slots. Panel 3: a table of four running sequences sorted by output length: B 900, A 300, D 120, C 40. B is preempted first; C, D, A are served in that order." caption="Figure: a worked example with the settings of the offline example. A chunk ends a prefill batch. In decode, the loop serves from the end of the sorted list and preempts from the front. Click to zoom." />
+<p>Blue segments are whole prompts. Amber segments are chunks. In panel 3, green rows run in the step and the pink row loses its blocks.</p>
+
+<h3 id="try-it">Try it: a scheduler simulator</h3>
+<p>Each click on <em>Next step</em> runs one engine step with the rules of <code>scheduler.hpp</code>, on a tiny cache: 16 blocks of 4 tokens. Watch the step type, the token budget, the chunks and the blocks. Change the settings to see their effect.</p>
+<x-viz id="scheduler-sim" title="Scheduler simulator: one click, one engine step" caption="Keyboard: Tab to a button or a list, then press Enter, Space or the arrow keys. The same 5 requests start each time; Reset starts again with the selected settings.">
+<p>This simulator needs JavaScript. Without it, read the worked example in the deep dive <em>Worked example with real sizes</em>.</p>
+</x-viz>
+<x-simplified>
+<p>The simulator is a small model, not the real engine. It keeps these rules from the code:</p>
+<ul>
+  <li>attempt points and the counter reset ({{cite csrc/engine/scheduler.hpp:308-322}}, {{cite csrc/engine/scheduler.hpp:676-681}});</li>
+  <li>the 90 % watermark, the prefill limits and the chunks ({{cite csrc/engine/scheduler.hpp:360-546}});</li>
+  <li>the decode order and preemption ({{cite csrc/engine/scheduler.hpp:622-645}});</li>
+  <li>the late release of the blocks of finished sequences.</li>
+</ul>
+<p>It leaves out these parts:</p>
+<ul>
+  <li>Real blocks hold 128 tokens, and a real cache has thousands of blocks.</li>
+  <li>A real decode step sends 1 + 5 draft tokens per sequence and reserves blocks for them. The toy sends 1 token.</li>
+  <li>The toy runs with ZOS off and one data-parallel rank, so the two votes always agree with the local answer.</li>
+  <li>Every toy request is schedulable at once. In this release, each request first waits for the multimodal worker ({{link concepts/request-lifecycle}}).</li>
+  <li>The toy has no EOS token. Every request runs until it has <code>max_tokens</code> output tokens.</li>
+  <li>When two sequences have the same output length, the toy takes the lower request number first. <code>std::sort</code> in the code does not fix this order.</li>
+  <li>With chunked prefill off, the toy accepts a budget below <code>max_model_len</code>. The real <code>SchedulerConfig</code> refuses that combination ({{cite deepinfer/config.py:209-212}}).</li>
+</ul>
+</x-simplified>
+
+<h2>In the code</h2>
+
+<h3>Step 1: one call per engine step</h3>
+<p>Python calls <code>Scheduler.schedule(pool)</code> once per step. It runs <code>_schedule()</code>, then turns the result into one {{term sequence-metadata | SequenceMetadata}} per sequence ({{cite csrc/engine/scheduler.hpp:667-736}}). <code>_schedule()</code> first releases the Python lock and takes the locks of both block managers:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="275-294" highlight="276-277,282-284,289-294">
+<x-tr line="279-281">The SchedulerOutputs of the previous step borrows the storage of these three vectors (see the pybind properties clone_states/clone_blocks/zero_states). Python must use them before the next schedule; here they are cleared and used again.</x-tr>
+<x-tr line="290">A PROMPT engine only does prefill. It returns an (empty) prefill result, also if no request was scheduled.</x-tr>
+<x-tr line="293">A COMPLETION engine only does decode.</x-tr>
+</x-code>
+<p>The offline <code>LLM</code> makes a NORMAL engine, because that is the <code>EngineArgs</code> default ({{cite deepinfer/engine/arg_utils.py:41}}). The rest of this page is about the NORMAL case.</p>
+
+<h3>Step 2: prefill step or decode step</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="305-341" highlight="308-309,313,315-319,324-326,332">
+<x-tr line="305-306">A prompt step sets decode_step to 0 (see schedule()). So the step right after a prefill has decode_step == 0 and is again an ALL point: to prefill again, every rank must have work.</x-tr>
+<x-tr line="307">decode_step is the same on every rank, so the number and the meaning of the votes match in the group, and the all-reduce does not hang.</x-tr>
+<x-tr line="316">ANY: the prefill starts if any rank wants it.</x-tr>
+<x-tr line="318">ALL: the prefill starts only if all ranks want it.</x-tr>
+<x-tr line="328-331">Second vote: confirm that some rank really scheduled a prefill. "want" only looked at the waiting queue, but _schedule_prefill can still come back empty (slots full, not enough KV blocks). If the whole group comes back empty, the step must be a decode step. A forced empty prompt step would set decode_step to 0; the next step would vote and come back empty again, and with running full and waiting not empty this is an endless loop.</x-tr>
+<x-tr line="339">Some rank in the group does a prompt step: this rank runs an empty prompt step with it, to keep the step type the same.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 308-311: no attempt point, so this is a decode step. No vote runs.</li>
+  <li>Line 313: this rank <em>wants</em> a prefill if the cache usage is 0.9 or less and the first waiting sequence is {{term schedulable}}. The watermark is the constant <code>GPU_CACHE_PREFILL_WATERMARK = 0.9f</code> ({{cite csrc/engine/scheduler.hpp:80}}).</li>
+  <li>Lines 315-319: the first vote. Both cases use an all-reduce MIN. At an ANY point each rank sends 0 if it wants, so the MIN is 0 if one rank wants. At an ALL point each rank sends 1 if it wants, so the MIN is 1 only if all ranks want.</li>
+  <li>Lines 324-326: only a rank that wants a prefill runs <code>_schedule_prefill</code>.</li>
+  <li>Line 332: the second vote. If no rank got a batch, the step becomes a decode step.</li>
+  <li>Line 340: a rank with no batch runs an empty prefill step, so that all ranks run the same kind of step.</li>
+</ol>
+<p>The defaults are <code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL = 70</code> and <code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL = 100</code> ({{cite deepinfer/environ.py:174-178}}). The page {{link concepts/dp-step-votes}} explains why all data-parallel ranks must run the same kind of step.</p>
+
+<h3>Step 3: the prefill batch</h3>
+<p><code>_schedule_prefill</code> looks at the waiting queue from the front. It stops at the first sequence that cannot start, so a later, smaller request cannot pass it.</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="360-397" highlight="363-367,369-371,377-385,386-388,389-396">
+<x-tr line="362">A sequence that was already dead before it entered the queue does not run a prefill. It goes into ignored_seqs and returns with its finish_reason.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 363-367: a sequence that is aborted, or failed in the image or grammar step, leaves the queue as an ignored sequence.</li>
+  <li>Lines 369-371: a sequence that is not schedulable stops the loop.</li>
+  <li>Lines 374-385: a new sequence (no block table yet) longer than <code>prompt_limit</code> ends as <code>FINISHED_IGNORED</code>. <code>prompt_limit</code> is <code>max_model_len</code> with chunked prefill, else <code>min(max_model_len, max_num_batched_tokens)</code> ({{cite csrc/engine/scheduler.hpp:112}}).</li>
+  <li>Lines 386-396: the block check. <code>LATER</code> (not enough free blocks now) stops the loop. <code>NEVER</code> (more blocks than the whole cache) ends the sequence as <code>FINISHED_IGNORED</code>.</li>
+</ol>
+<p>Lines 398-438 handle a forked sequence, whose <code>branch_id</code> starts with <code>_</code>. Only <code>Scheduler.fork_seq</code> makes such sequences ({{cite csrc/engine/pybind_scheduler.cpp:123-124}}). No file in the <code>deepinfer</code> package calls it. Only <code>examples/benchmark.py</code> uses it, to copy one cached prompt to a whole batch ({{cite examples/benchmark.py:331-352}}). Two more limits follow:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="440-449" />
+<p>Line 440: the running sequences count against <code>max_num_seqs</code> (<code>max_num_prompts</code> is the same value, {{cite csrc/engine/scheduler.hpp:114}}). Lines 444-449: the sum of the full lengths in one prefill step must stay under <code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code>. If the variable is not set, the limit is <code>2**30</code> ({{cite deepinfer/environ.py:9}}, {{cite deepinfer/engine/llm_engine.py:317}}).</p>
+
+<h3>Step 4: the chunk size</h3>
+<p>The scheduler first compares the prompt with the rest of the token budget:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="460-475" highlight="470-472">
+<x-tr line="460">The first workload. It decides if the prompt is chunked.</x-tr>
+<x-tr line="461">The workload after all limits.</x-tr>
+<x-tr line="467-469">Cut the prompt (to the base length) only if this condition is true: with this prompt, the step goes over the base length. Note: count the CP padding when you compute the tokens that are left.</x-tr>
+</x-code>
+<p>So the chunk is simply "all the budget that is left", rounded down to a multiple of <code>cp_align</code>. <code>cp_align</code> is 1 without {{term context-parallelism}}, and <code>2 × cp_size</code> with it ({{cite csrc/engine/scheduler.hpp:90}}). Then two adjustments can make the chunk shorter or longer:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="477-511" highlight="483-486,488-493,504-506,509-511">
+<x-tr line="487">Adjust the cut position for multimodal input.</x-tr>
+<x-tr line="495">A request waits in the queue but cannot be scheduled; this must not happen (post_adjust).</x-tr>
+<x-tr line="508">All other limits are hard limits. Here, only check that seqlen_q meets the minimum. If not, do not schedule.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 477-486: a caller can give <em>chunk checkpoints</em>, positions where a chunk must end. The chunk ends at the next checkpoint if it would pass it. In this release, <code>add_request(chunk_checkpoints=...)</code> can set them ({{cite deepinfer/engine/llm_engine.py:615-616}}), and <code>examples/benchmark.py</code> sets one to stop a prefill at an exact length ({{cite examples/benchmark.py:364-370}}).</li>
+  <li>Lines 488-493: the chunk must not end inside an image. For the first sequence of the batch, <code>_adjust_chunk_size</code> first tries to make the chunk longer. If that breaks the budget, it makes the chunk shorter.</li>
+  <li>Lines 504-507: a cut prompt with chunked prefill off stops the loop. The request waits for a later step.</li>
+  <li>Lines 509-511: a chunk must have at least <code>max(lookahead_tokens, 1)</code> tokens.</li>
+</ol>
+
+<h3>Step 5: the side effects</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="513-546" highlight="515,518-520,522-526,533-537,543-545">
+<x-tr line="513">The scheduler decided to schedule this seq: all operations with side effects come below.</x-tr>
+</x-code>
+<ol>
+  <li>Line 515: the chunk length goes into the budget, rounded up to <code>cp_align</code>.</li>
+  <li>Lines 518-520: the first chunk takes the blocks and one {{term state-slot}} for the <em>whole</em> prompt, through <code>allocate_seq</code> ({{cite csrc/engine/block_manager.hpp:207-214}}). Later chunks need no new blocks.</li>
+  <li>Lines 522-526: only a full prompt, or the last chunk, makes the sequence <code>RUNNING</code> and gives it an {{term mtp}} info slot.</li>
+  <li>Lines 533-537: a chunk records the rest in <code>chunked_rest_len</code>.</li>
+  <li>Lines 543-545: in a NORMAL engine, a chunk ends the batch.</li>
+</ol>
+<p>After the step, <code>process_outputs</code> moves a sequence with a complete prompt into <code>running</code> and appends its first token. An unfinished chunk goes back to the <em>front</em> of <code>waiting</code> ({{cite csrc/engine/scheduler.hpp:951-953}}, {{cite csrc/engine/scheduler.hpp:1011-1020}}). So the next attempt continues the same prompt first.</p>
+
+<h3>Step 6: the decode batch</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="622-660" highlight="624-625,628-643,648-652">
+<x-tr line="622">LCFS (last come, first served).</x-tr>
+<x-tr line="645">decode: running still has queued seqs; N are scheduled and M are left; this must not happen.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 624-625: sort <code>running</code> by output length, the longest output first.</li>
+  <li>Lines 628-629: take sequences from the <em>end</em> of the list, so the shortest output comes first. The comment calls this LCFS: the newest sequences usually have the shortest outputs.</li>
+  <li>Lines 630-634: while no block is free and more than one sequence is left, preempt from the <em>front</em>: the longest output.</li>
+  <li>Lines 635-640: if a block is free, <code>_append_slot</code> gives the sequence one more block when it needs one ({{cite csrc/engine/scheduler.hpp:817-828}}). If not, the sequence itself is preempted.</li>
+  <li>Lines 648-652: the batch is sorted by total length. <code>MTPVarlen</code> sets the query tokens per sequence: 1 plus the number of draft tokens, so 6 with the defaults ({{cite csrc/engine/mtp_varlen.hpp:153-157}}).</li>
+</ol>
+<p>Before this loop, the decode branch does two clean-ups. It removes finished sequences from <code>running</code> ({{cite csrc/engine/scheduler.hpp:562}}). It also removes finished sequences from anywhere in <code>waiting</code> ({{cite csrc/engine/scheduler.hpp:569-577}}). Both go out with the step result.</p>
+
+<h3>Step 7: preemption</h3>
+<x-warning title="The comment says shortest; the code preempts the longest output">
+<p>The comment above <code>_schedule_decode</code> says, translated: <em>"when blocks are not enough, preempt the seq with the shortest output"</em> ({{cite csrc/engine/scheduler.hpp:556-557}}). The code sorts the longest output to the front and preempts from the front ({{cite csrc/engine/scheduler.hpp:624-634}}). This site describes the code.</p>
+</x-warning>
+<x-code file="csrc/engine/scheduler.hpp" lines="766-790" highlight="770-771,778-780,783-787">
+<x-tr line="768-769">COMPLETION with !stop_preempted_request was already blocked in the constructor. SO requests cannot be recomputed after preemption yet; they end at once.</x-tr>
+<x-tr line="783-784">Reset the rolling state of the seq (cache.num_tokens, in-flight counters, MTP state). The list is in Sequence::reset_for_recompute.</x-tr>
+</x-code>
+<p>There is no swap to CPU memory. A preempted sequence can stop with <code>FINISHED_PREEMPTED</code>. Or it keeps its tokens, loses its blocks, and waits at the front of the queue for a new prefill ({{term recompute}}). <code>EngineArgs</code> has <code>stop_preempted_request=True</code> ({{cite deepinfer/engine/arg_utils.py:40}}). The offline <code>LLM</code> sets it to <code>False</code> ({{cite deepinfer/entrypoints/llm.py:68}}).</p>
+
+<h3>Step 8: after the decision</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="671-686" highlight="676-681" />
+<p>A prefill step sets <code>decode_step</code> to 0. A decode step stores its batch as the new <code>running</code> list and adds 1 to <code>decode_step</code>. An empty decode step also counts. Then the loop in lines 692-729 makes one <code>SequenceMetadata</code> per sequence. It holds <code>seqlen_q</code> (query tokens) and <code>seqlen_k</code> (cached + in flight + query). The loop also reserves <code>max_seqlen_q = nextn + 1</code> in-flight tokens on the sequence ({{cite csrc/engine/scheduler.hpp:689}}, {{cite csrc/engine/scheduler.hpp:696-697}}, {{cite csrc/engine/scheduler.hpp:726}}).</p>
+<p>The result is a {{term scheduler-outputs | SchedulerOutputs}}: <code>scheduled_seqs</code>, <code>prompt_run</code>, <code>num_batched_tokens</code>, <code>finished_seqs</code>, <code>ignored_seqs</code>, <code>seqlens_q</code>, statistics, and the clone lists ({{cite csrc/engine/scheduler.hpp:45-77}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The whole algorithm in pseudocode">
+<p>This is <code>Scheduler::schedule</code> for a NORMAL engine, with the line of each statement. Variables keep their C++ names.</p>
+<pre><code class="language-python">def schedule(pool):                                         # 667
+    clone_states, zero_states, clone_blocks = [], [], []    # 282-284
+    ds = decode_step
+    is_any = ds != 0 and ds % prefill_any_attempt_interval == 0   # 308
+    is_all = ds % prefill_attempt_interval == 0                   # 309
+    if not (is_any or is_all):
+        out = schedule_decode()                             # 310-311
+    else:
+        want = cache_usage() &lt;= 0.9 and waiting and waiting[0].schedulable  # 273, 313
+        if is_any:  ok = allreduce_min(0 if want else 1) == 0   # 315-316 (ANY wins)
+        else:       ok = allreduce_min(1 if want else 0) == 1   # 317-318
+        if not ok:
+            out = schedule_decode()                         # 320-321
+        else:
+            out = schedule_prefill() if want else None      # 324-326
+            if allreduce_min(0 if out else 1) != 0:         # 332
+                out = schedule_decode()                     # 333-334
+            elif out is None:
+                out = empty_prompt_step()                   # 340
+    assert out.num_batched_tokens &lt;= max_num_batched_tokens  # 671-673
+    if out.prompt_run: decode_step = 0                      # 676-677
+    else:              running = out.scheduled_seqs; decode_step += 1   # 679-680
+    for seq, q in zip(out.scheduled_seqs, out.seqlens_q):   # 692-729
+        k = seq.cache.num_tokens + seq.total_inflight_tokens + q
+        assert position_end &lt;= runtime_max_model_len        # 700-705
+        metadata.append(pool.allocate(seq, out.prompt_run, q, k, golden))
+        seq.start_inflight_step(nextn + 1)                  # 726
+    return metadata, out
+
+def schedule_prefill():                                     # 351
+    scheduled, ignored, n_curr, tokens = [], [], len(running), 0
+    while waiting:
+        seq = waiting[0]
+        if seq.status in (ABORTED, VE_FAILED, SO_FAILED): ignore(seq); continue  # 363-368
+        if not seq.schedulable: break                       # 369-371
+        if not seq.block_table:                             # 374
+            if seq.len &gt; prompt_limit: ignore(seq, IGNORED); continue          # 377-385
+            st = can_allocate(blocks_for(seq)) and a state slot                  # 386
+            if st == LATER: break                           # 387-388
+            if st == NEVER: ignore(seq, IGNORED); continue  # 389-396
+        if n_curr + 1 &gt; max_num_seqs: break                 # 440-442
+        if sum_k_left &lt; seq.len: break                      # 444-446
+        work = seq.len - seq.cache.num_tokens
+        q = min(work, (budget - tokens) // cp_align * cp_align)                # 470-475
+        q = cut at the next chunk checkpoint                # 477-486
+        q = adjust so that no image is cut                  # 488-493
+        if q == 0: break                                    # 494-502
+        if q &lt; work and not chunked_prefill: break         # 504-507
+        if q &lt; max(lookahead_tokens, 1): break              # 509-511
+        tokens += round_up(q, cp_align)                     # 515
+        if not seq.block_table: allocate blocks + state slot   # 518-520
+        if q == work: n_curr += 1; seq.status = RUNNING; give MTP slot   # 522-526
+        scheduled.append(seq); waiting.popleft()            # 528, 541
+        if q &lt; work: break                                  # 543-545
+    return outputs(prompt_run=True) if scheduled or ignored else None     # 548-553
+
+def schedule_decode():                                      # 559
+    finished = [s for s in running if s.finished]; remove them    # 562
+    ignored = [s for s in waiting if s.finished]; remove them     # 569-577
+    move forked seqs from prompted to running               # 595-620 (unused here)
+    running.sort(key=output_len, reverse=True)              # 624-625
+    l, r, batch = 0, len(running), []
+    while l &lt; r and len(batch) &lt; max_num_seqs:             # 628
+        seq = running[r - 1]
+        while no free block and r - l &gt; 1:                  # 630
+            preempt(running[l]); l += 1                     # 631-633
+        if a block is free: append_slot(seq); batch.append(seq)   # 635-637
+        else: preempt(seq)                                  # 638-639
+        r -= 1
+    batch.sort(key=total_len, reverse=True)                 # 648-649
+    seqlens_q = mtp_varlen.schedule(batch)                  # 652
+    return outputs(prompt_run=False, batch, finished, ignored)</code></pre>
+<p>Two details are easy to miss. First, a sequence that finished in step <em>N</em> still counts in <code>running</code> during a prefill step, because only the decode branch removes it. So it still takes one of the <code>max_num_seqs</code> slots. Second, its blocks go back to the free list in <code>pre_sampler_sync</code> of the decode step that removed it ({{cite deepinfer/engine/llm_engine.py:844-846}}). That step's own block checks still see the blocks as used.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example with real sizes">
+<p>The settings come from the offline example: <code>max_num_batched_tokens=32768</code>, <code>max_model_len=32768</code>, <code>max_num_seqs=4</code> ({{cite examples/offline_inference.py:52-54}}), and chunked prefill on ({{cite examples/_config.py:120}}). The block size is 128 tokens ({{cite deepinfer/model_executor/model_metadata_utils.py:133-135}}). Assume 1000 KV blocks, one DP rank, and five schedulable requests in <code>waiting</code>: A (41 prompt tokens), B (20000), C (15000), D (300), E (50).</p>
+<p><strong>Step 1.</strong> <code>decode_step = 0</code>, an ALL point. Usage is 1/1000 (block 0 counts as used), so the rank wants a prefill.</p>
+<ol>
+  <li>A: <code>ceil(41/128) = 1</code> block. 41 tokens fit. Budget used: 41.</li>
+  <li>B: <code>ceil(20000/128) = 157</code> blocks. 20000 tokens fit in the 32727 that are left. Budget used: 20041.</li>
+  <li>C: <code>ceil(15000/128) = 118</code> blocks, all taken now. Only 12727 tokens are left, so C sends a chunk of 12727. <code>chunked_rest_len = 2273</code>. The chunk ends the batch.</li>
+</ol>
+<p>Result: <code>seqlens_q = [41, 20000, 12727]</code>, <code>num_batched_tokens = 32768</code>. After the step, A and B are in <code>running</code> with one output token each. C is at the front of <code>waiting</code>: <code>[C, D, E]</code>. 276 blocks are in use.</p>
+<p><strong>Step 2.</strong> <code>decode_step</code> is 0 again, an ALL point. C sends its last 2273 tokens and becomes <code>RUNNING</code>. D needs 3 blocks and sends 300 tokens. E: <code>running.size() = 2</code>, plus C and D, makes 4, so <code>4 + 1 &gt; 4</code> stops the loop. Budget used: 2573.</p>
+<p><strong>Step 3.</strong> Again an ALL point. E is schedulable, so the rank wants a prefill. <code>_schedule_prefill</code> returns nothing, because 4 sequences hold slots. The second vote turns the step into a decode step. A, B, C and D each send 1 token plus 5 placeholder drafts: <code>seqlens_q = [6, 6, 6, 6]</code>, 24 tokens. <code>decode_step</code> becomes 1.</p>
+<p><strong>Later.</strong> Steps 4 to 72 (<code>decode_step</code> 1 to 69) are decode steps with no vote. Suppose A finishes in step 20. Its slot is free after the next decode step, but E still waits for the next attempt point: <code>decode_step = 70</code> (ALL), in step 73. If the cache is then above 90 %, the next try is at 100 (ANY).</p>
+<p><strong>Blocks in decode.</strong> A sequence needs <code>ceil((len + total_inflight_tokens + drafts) / 128)</code> blocks ({{cite csrc/engine/sequence.hpp:291-293}}). For B after 300 output tokens with ZOS: <code>len = 20300</code>, 6 tokens of the previous step are still in flight, and 5 drafts. <code>ceil(20311/128) = 159</code> blocks.</p>
+</x-deepdive>
+
+<x-deepdive title="Chunk size: cp_align, checkpoints and image boundaries">
+<p><strong>The base cut.</strong> <code>q = min(work, (budget - used) / cp_align * cp_align)</code> ({{cite csrc/engine/scheduler.hpp:470-472}}). With context parallelism of size 4, <code>cp_align = 8</code>. Example: 1000 tokens of budget are left and the prompt has 5000 tokens left: <code>q = 1000 / 8 * 8 = 1000</code>. With 1005 left: <code>q = 1000</code>. The budget then grows by <code>ceil(q / 8) * 8</code> ({{cite csrc/engine/scheduler.hpp:515}}).</p>
+<p><strong>Image tokens.</strong> In the token list, an image is one <code>MM_TOKEN_IMAGE</code> followed by N <code>MM_TOKEN_IMAGE_PAD</code> tokens. Both ids are above the vocabulary: <code>vocab_size + 2</code> and <code>vocab_size + 1</code> ({{cite csrc/engine/sequence.hpp:21-28}}, {{cite csrc/engine/scheduler.hpp:91-92}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="232-260" highlight="241-246,248-254">
+<x-tr line="232-234">Adjust the chunk size so that multimodal input is not cut in the middle of an image. In token_ids an image is MM_TOKEN_IMAGE + MM_TOKEN_IMAGE_PAD*N (the IMAGE_START/NEW_LINE/END structure is only in mm_token_type). Protect each image unit. A cut between two images (at an MM_TOKEN_IMAGE) is allowed.</x-tr>
+<x-tr line="243">Extend forward: skip all IMAGE_PAD (stop at the next MM_TOKEN_IMAGE or at a non-image token).</x-tr>
+<x-tr line="248">Shrink backward: skip all IMAGE_PAD and the MM_TOKEN_IMAGE (the whole image unit moves to the next chunk).</x-tr>
+<x-tr line="259">Not inside an image: no change.</x-tr>
+</x-code>
+<p><strong>Worked example.</strong> A prompt has 100 text tokens (positions 0-99), an image at position 100 with 256 pad tokens (101-356), then text. The cache holds 0 tokens, and the budget allows <code>q = 200</code>, so the cut is at <code>k_len = 200</code>.</p>
+<ol>
+  <li><code>token_ids[200]</code> is a pad token, and a backward search finds <code>MM_TOKEN_IMAGE</code> at 100. So the cut is inside an image ({{cite csrc/engine/scheduler.hpp:217-230}}).</li>
+  <li>The sequence is the first of the batch, so the scheduler tries to grow: <code>k_len</code> moves to 357, so <code>q = 357</code>. That is more than the budget (line 489), so it tries again with <code>make_larger = false</code>.</li>
+  <li>Shrink: <code>k_len</code> moves back over the pads to 101, then over the image token to 100. <code>q = 100</code>. The image goes into the next chunk as one unit.</li>
+</ol>
+<p>A cut exactly at an <code>MM_TOKEN_IMAGE</code> is allowed (lines 214-216 say so). So two images next to each other can go into different chunks.</p>
+<p><strong>Chunk checkpoints.</strong> <code>chunk_checkpoints</code> is a deque of positions. Checkpoints at or before the cached length are dropped. If the chunk would reach or pass the next checkpoint, it ends exactly there, and that checkpoint is removed ({{cite csrc/engine/scheduler.hpp:477-486}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Blocks, state slots and MTP info slots">
+<p>The scheduler owns three kinds of slots. Each kind is limited, and each kind has a reserved slot 0.</p>
+<table>
+  <thead><tr><th>Slot</th><th>Pool</th><th>Taken</th><th>Given back</th></tr></thead>
+  <tbody>
+    <tr><td>KV block</td><td><code>block_manager</code>, <code>num_gpu_blocks</code> entries, block 0 never used ({{cite csrc/engine/block_manager.hpp:27-35}})</td><td>whole prompt at the first chunk; one more in decode when needed ({{cite csrc/engine/scheduler.hpp:518-520}}, {{cite csrc/engine/scheduler.hpp:817-820}})</td><td><code>free_seq_nolock</code>: finish, preemption ({{cite csrc/engine/scheduler.hpp:738-745}})</td></tr>
+    <tr><td>State slot</td><td><code>state_manager</code>, one per sequence, only if the model has state ({{cite deepinfer/engine/llm_engine.py:266}})</td><td>with the first chunk</td><td>same as blocks</td></tr>
+    <tr><td>MTP info slot</td><td><code>free_mtp_info_slots</code>, slots 1 … <code>max_num_seqs</code> ({{cite csrc/engine/scheduler.hpp:123-128}})</td><td>when the sequence becomes RUNNING, if <code>nextn &gt; 0</code> ({{cite csrc/engine/scheduler.hpp:792-800}})</td><td>at finish or preemption ({{cite csrc/engine/scheduler.hpp:802-810}})</td></tr>
+  </tbody>
+</table>
+<p><strong>LATER and NEVER.</strong> <code>can_allocate_nolock(n)</code> returns <code>NEVER</code> if <code>n &gt;= num_blocks</code>, <code>OK</code> if <code>n</code> blocks are free, else <code>LATER</code> ({{cite csrc/engine/block_manager.hpp:128-136}}). <code>_can_allocate_with_state</code> also turns <code>OK</code> into <code>LATER</code> when no state slot is free ({{cite csrc/engine/scheduler.hpp:195-201}}).</p>
+<p><strong>The watermark in numbers.</strong> <code>get_gpu_cache_usage()</code> is <code>(num_blocks - free) / num_blocks</code> ({{cite csrc/engine/scheduler.hpp:830-835}}). Block 0 is never free, so it counts as used. With 1000 blocks, a prefill is possible only with 100 or more free blocks: <code>(1000 - 100) / 1000 = 0.9</code>. With 99 free blocks, usage is 0.901 and no prefill starts.</p>
+<p><strong>Shrinking block tables.</strong> <code>_append_slot</code> can also free blocks. If the block table is longer than <code>get_num_blocks()</code>, it frees the extra blocks (lines 821-825). This happens when the reserve for drafts and in-flight tokens gets smaller.</p>
+<p><strong>The decode check is "one free block".</strong> The loop asks <code>can_allocate_single_nolock()</code> before each sequence, also for a sequence that needs no new block ({{cite csrc/engine/scheduler.hpp:630}}, {{cite csrc/engine/scheduler.hpp:635}}). So with 0 free blocks, the scheduler preempts even if the current sequence still has room in its last block.</p>
+</x-deepdive>
+
+<x-deepdive title="Draft tokens per step: MTP and DSpark">
+<p>A decode step sends the last sampled token plus the draft tokens of {{link concepts/speculative-decoding | speculative decoding}}. <code>MTPVarlen::schedule</code> sets <code>seqlen_q</code> per sequence:</p>
+<ul>
+  <li><strong>No performance curve</strong> (the default): <code>seqlen_q = 1 + len(draft_tokens)</code> ({{cite csrc/engine/mtp_varlen.hpp:153-157}}). After a prefill, the draft list holds 5 placeholder ids, so the first decode step already sends 6 tokens ({{cite deepinfer/engine/llm_engine.py:706-711}}).</li>
+  <li><strong>With a curve</strong> (DSpark): the curve exists only if CUDA graphs are on and <code>DEEPINFER_ENABLE_MTP_VARLEN</code> is set ({{cite deepinfer/worker/base.py:274-281}}). The scheduler sorts all drafts of the batch by their estimated accept rate. Then it picks the total <code>best_bsz</code> with the most expected tokens per millisecond ({{cite csrc/engine/mtp_varlen.hpp:228-258}}). Each sequence gets 1 plus its share of the best drafts (lines 263-266). The page {{link concepts/dspark}} explains the estimates.</li>
+</ul>
+<p><strong>Budget.</strong> <code>SchedulerConfig</code> makes sure that a full decode batch fits: <code>max_num_batched_tokens &gt;= max_num_seqs × (1 + nextn)</code> ({{cite deepinfer/config.py:224-227}}). With 256 sequences and 5 drafts that is 1536 tokens.</p>
+<p><strong>Reserved positions.</strong> Each scheduled sequence reserves <code>nextn + 1</code> in-flight tokens until its result is processed ({{cite csrc/engine/scheduler.hpp:726}}, {{cite csrc/engine/sequence.hpp:244-256}}). With ZOS, the scheduler plans step <em>N+1</em> before step <em>N</em> is processed, so up to two reserves exist at the same time. This is why <code>runtime_max_model_len</code> adds <code>nextn + (nextn + 1)</code> plus <code>nextn</code> positions to <code>max_model_len</code> ({{cite deepinfer/config.py:11-16}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The data-parallel votes in detail">
+<x-code file="csrc/engine/scheduler.hpp" lines="169-182">
+<x-tr line="169">Run one all-reduce inside dp and return the result (also with dp_size == 1; the caller can skip it).</x-tr>
+</x-code>
+<p>The tensor is one <code>int32</code> value. With ZOS, the group is the CPU Gloo group, so the tensor is on the CPU ({{cite csrc/engine/scheduler.hpp:109}}, {{cite deepinfer/engine/llm_engine.py:313}}). Without ZOS, the tensor is on the device.</p>
+<table>
+  <thead><tr><th>Point</th><th>Rank sends</th><th>MIN result means</th></tr></thead>
+  <tbody>
+    <tr><td>ANY (vote 1)</td><td><code>0</code> if it wants, else <code>1</code></td><td><code>0</code>: at least one rank wants</td></tr>
+    <tr><td>ALL (vote 1)</td><td><code>1</code> if it wants, else <code>0</code></td><td><code>1</code>: every rank wants</td></tr>
+    <tr><td>vote 2</td><td><code>0</code> if it has a batch, else <code>1</code></td><td><code>0</code>: at least one rank has a batch</td></tr>
+  </tbody>
+</table>
+<p><strong>Example with 4 ranks</strong> at <code>decode_step = 70</code> (ALL): ranks 0-2 want, rank 3 has an empty queue. MIN of <code>[1, 1, 1, 0]</code> is 0, so no prefill. At <code>decode_step = 100</code> (ANY): MIN of <code>[0, 0, 0, 1]</code> is 0, so all ranks prefill, and rank 3 runs an empty prefill step. The comments give the reason for the two kinds ({{cite csrc/engine/scheduler.hpp:1184-1193}}). ALL points prevent steps in which one rank works and the others run empty prompt steps. ANY points make sure that the prefill of an isolated rank waits at most about 100 decode steps.</p>
+<p><strong>Why the decode branch cleans <code>waiting</code>.</strong> The comment at lines 564-568 says, translated: <em>"Finished seqs in waiting (aborted, or failed in the image step) can only be removed by the scheduler. _schedule_prefill used to clean them up. Now prefill runs only when want is true on this rank. A rank whose waiting queue holds only such seqs never wants a prefill, so they stay forever. Then has_unfinished stays true and keeps the whole group in empty steps. This rank also blocks every ALL vote. So the decode branch cleans them up too, and scans the whole queue."</em></p>
+</x-deepdive>
+
+<x-deepdive title="Settings and environment variables">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>max_num_seqs</code></td><td>256 ({{cite deepinfer/engine/arg_utils.py:36}}); the offline example uses 4</td><td>{{cite csrc/engine/scheduler.hpp:97}}</td><td>Slots for running sequences; also MTP info slots.</td></tr>
+    <tr><td><code>max_num_batched_tokens</code></td><td><code>max(max_model_len, 4096, max_num_seqs × (1 + nextn))</code> ({{cite deepinfer/config.py:219-228}})</td><td>{{cite csrc/engine/scheduler.hpp:96}}</td><td>Token budget per step.</td></tr>
+    <tr><td><code>chunked_prefill</code></td><td><code>False</code> ({{cite deepinfer/engine/arg_utils.py:42}}); the examples set <code>True</code></td><td>{{cite csrc/engine/scheduler.hpp:99}}</td><td>Allows chunks; changes <code>prompt_limit</code>.</td></tr>
+    <tr><td><code>stop_preempted_request</code></td><td><code>True</code> in <code>EngineArgs</code>, <code>False</code> in <code>LLM</code></td><td>{{cite csrc/engine/scheduler.hpp:98}}</td><td>Stop or recompute a preempted sequence.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code></td><td>70 ({{cite deepinfer/environ.py:174}})</td><td>default argument of <code>SchedulerConfig</code> ({{cite deepinfer/config.py:193}})</td><td>ALL points. Must be 1 or more ({{cite csrc/engine/scheduler.hpp:105-106}}).</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code></td><td>100 ({{cite deepinfer/environ.py:177}})</td><td>{{cite deepinfer/config.py:194}}</td><td>ANY points. Must be 1 or more.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code></td><td>unset = <code>2**30</code></td><td>{{cite deepinfer/engine/llm_engine.py:317}}</td><td>Sum of full lengths in one prefill step. Must be at least <code>prompt_limit</code> ({{cite csrc/engine/scheduler.hpp:120-121}}).</td></tr>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5</td><td>C++ <code>getenv</code> ({{cite csrc/engine/utils.hpp:36-40}}, {{cite csrc/engine/scheduler.hpp:118}})</td><td>Drafts per decode step; in-flight reserve.</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td><code>1</code> for a NORMAL engine ({{cite deepinfer/engine/arg_utils.py:51-55}})</td><td>{{cite deepinfer/engine/llm_engine.py:313}}</td><td>CPU (Gloo) group for the votes.</td></tr>
+    <tr><td><code>DEEPINFER_ENABLE_MTP_VARLEN</code></td><td>off ({{cite deepinfer/environ.py:131}})</td><td>{{cite deepinfer/worker/base.py:280}}</td><td>Makes the decode performance curve for DSpark.</td></tr>
+  </tbody>
+</table>
+<x-note title="The intervals are read at import time">
+<p><code>SchedulerConfig</code> takes the two intervals as default arguments, and Python computes default arguments once, when <code>deepinfer/config.py</code> is imported ({{cite deepinfer/config.py:193-194}}). Set the variables before the first <code>import deepinfer</code>.</p>
+</x-note>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="One blocked request stops the queue">
+<p>The prefill loop stops at the first sequence that cannot start: not schedulable, not enough blocks (<code>LATER</code>), no slot, or no budget ({{cite csrc/engine/scheduler.hpp:369-371}}, {{cite csrc/engine/scheduler.hpp:387-388}}, {{cite csrc/engine/scheduler.hpp:440-442}}). A small request behind a large one waits too.</p>
+</x-warning>
+<ul>
+  <li><strong>Long waits for new requests.</strong> A request waits for the next attempt point after it becomes schedulable. With one rank, up to 69 more decode steps can run before its prefill. With several DP ranks, an ALL vote fails if one rank has no work, so up to 99 decode steps can run first. In this release, a request first waits for the image worker too ({{link tours/life-of-a-request}}, stop 5).</li>
+  <li><strong>Prompt too long.</strong> A prompt above <code>prompt_limit</code>, or one that needs <code>num_blocks</code> or more blocks, ends as <code>FINISHED_IGNORED</code> with a warning in the log ({{cite csrc/engine/scheduler.hpp:377-396}}).</li>
+  <li><strong>Budget below <code>max_model_len</code>.</strong> Without chunked prefill, <code>SchedulerConfig</code> raises <code>ValueError</code> ({{cite deepinfer/config.py:209-212}}).</li>
+  <li><strong>Requests stop with <code>insufficient_system_resource</code>.</strong> With the <code>EngineArgs</code> default, a preempted request ends. Requests with a structured-output status other than 0 always end when preempted ({{cite csrc/engine/scheduler.hpp:770-780}}).</li>
+  <li><strong>An image larger than the budget.</strong> Suppose that the next chunk of the first sequence starts with an image unit that is longer than the budget. Then the shrink gives 0 tokens, and the check at lines 495-500 stops the process. This site derived this case from the code and did not run it.</li>
+  <li><strong>Position limit.</strong> <code>schedule()</code> checks every position against <code>runtime_max_model_len</code> and raises if a sequence goes past it ({{cite csrc/engine/scheduler.hpp:700-705}}).</li>
+  <li><strong>Wrong engine combination.</strong> A COMPLETION engine with <code>stop_preempted_request=False</code> fails at start-up ({{cite csrc/engine/scheduler.hpp:101-104}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The scheduler sets the latency and the throughput of the engine. The attempt interval trades the time to the first token of new requests against the decode speed of the running ones. The watermark and the preemption policy decide how much work is lost when the KV cache is full.</p>
+
+<x-quiz>
+  <x-q level="easy">Can one engine step contain both prefill tokens and decode tokens?
+    <x-a><p>No. <code>_schedule</code> returns either the result of <code>_schedule_prefill</code> or of <code>_schedule_decode</code>, and <code>prompt_run</code> marks which one ({{cite csrc/engine/scheduler.hpp:305-341}}). While a prefill step runs, the running sequences wait.</p></x-a>
+  </x-q>
+  <x-q level="easy">A decode step has no free KV block. Which running sequence does the scheduler preempt first?
+    <x-a><p>The one with the most output tokens. The list is sorted with the longest output first, and the loop preempts from the front ({{cite csrc/engine/scheduler.hpp:624-634}}). The comment at line 557 says "shortest", but the code does the opposite.</p></x-a>
+  </x-q>
+  <x-q level="medium">The token budget is 32768 and 20041 tokens are already in the batch. The next request has a 15000-token prompt and chunked prefill is on. How many tokens does it send, and does the scheduler look at the request behind it?
+    <x-a><p>It sends a chunk of <code>32768 − 20041 = 12727</code> tokens ({{cite csrc/engine/scheduler.hpp:470-472}}). The scheduler does not look further: in a NORMAL engine a chunk ends the batch ({{cite csrc/engine/scheduler.hpp:543-545}}). After the step, the request goes back to the front of <code>waiting</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">With the default intervals and one DP rank, the last prefill step was 30 steps ago, and all steps since then were decode steps. A new request arrives now. When is the earliest step in which it can start its prefill?
+    <x-a><p>The next schedule sees <code>decode_step = 30</code>. After 40 more decode steps (<code>decode_step</code> 30 to 69), the step with <code>decode_step = 70</code> is an ALL point. The prefill starts there if the request is schedulable by then, the cache usage is 0.9 or less, and a slot is free ({{cite csrc/engine/scheduler.hpp:308-313}}, {{cite csrc/engine/scheduler.hpp:440-442}}). If one of these tests fails, the next points are 100 (ANY) and 140 (ALL). In this release, the request also waits for the image worker before it becomes schedulable.</p></x-a>
+  </x-q>
+  <x-q level="hard">The cache has 1000 blocks and 99 are free. A short request waits, and the step is an ALL point. Does a prefill start? What changes if one running sequence finishes in this step?
+    <x-a><p>No. Usage is <code>(1000 − 99) / 1000 = 0.901</code>, above the 0.9 watermark, so the rank does not want a prefill ({{cite csrc/engine/scheduler.hpp:313}}, {{cite csrc/engine/scheduler.hpp:830-835}}). A sequence that finishes in this step gives its blocks back only later. The next decode step removes it from <code>running</code>, and <code>pre_sampler_sync</code> of that step frees the blocks ({{cite csrc/engine/scheduler.hpp:562}}, {{cite deepinfer/engine/llm_engine.py:844-846}}). Then the request still waits for the next attempt point. See the deep dives "Blocks, state slots and MTP info slots" and "The whole algorithm in pseudocode".</p></x-a>
+  </x-q>
+</x-quiz>

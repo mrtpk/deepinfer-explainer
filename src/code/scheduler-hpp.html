@@ -1,0 +1,420 @@
+---
+title: csrc/engine/scheduler.hpp: the C++ Scheduler
+nav_title: scheduler.hpp
+level: Advanced
+prerequisites: concepts/scheduler, concepts/request-lifecycle
+related: code/sequence-hpp, code/block-manager-hpp, code/llm-engine, code/outputs-hpp, code/zos-cpp, code/engine-pyi, concepts/scheduler, concepts/dp-step-votes, concepts/speculative-decoding, concepts/zero-overhead-scheduling
+summary: scheduler.hpp holds the C++ Scheduler: the waiting and running queues, the choice between prefill and decode, block allocation, preemption, and the bookkeeping after each step. It also defines SchedulerOutputs and three free functions.
+---
+<h2>Purpose</h2>
+<p><code>scheduler.hpp</code> decides, for every engine step, which sequences run and with how many tokens, and then records the tokens that the step produced.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>csrc/engine/scheduler.hpp</code>, 1,329 lines of C++ in one header. Many comments are in Chinese.</td></tr>
+    <tr><th>Main class</th><td><code>struct Scheduler</code> ({{cite csrc/engine/scheduler.hpp:79}}). Also <code>SchedulerOutputs</code> ({{cite csrc/engine/scheduler.hpp:45}}), <code>enum class EngineType</code> ({{cite csrc/engine/scheduler.hpp:39-43}}), and the free functions <code>process_MTPInfo</code>, <code>clone_and_zero_states_and_blocks</code> and <code>get_finished_seqs_info</code> ({{cite csrc/engine/scheduler.hpp:1196}}, {{cite csrc/engine/scheduler.hpp:1264}}, {{cite csrc/engine/scheduler.hpp:1315}}).</td></tr>
+    <tr><th>Runs in</th><td>The engine process of one data-parallel rank, on the main thread. Python calls it through the {{term pybind11}} module <code>deepinfer._C.engine</code> ({{cite csrc/engine/pybind_scheduler.cpp:79-125}}). Only <code>clone_and_zero_states_and_blocks</code> copies data between device buffers. Without ZOS, the votes also use a one-value tensor on the device ({{cite csrc/engine/scheduler.hpp:172-173}}).</td></tr>
+    <tr><th>Called by</th><td><code>LLMEngine</code> (every step), <code>MultimodalProcessor.fetch</code>, <code>StatsLogger</code>, and <code>examples/benchmark.py</code>.</td></tr>
+    <tr><th>Calls</th><td><code>BlockManager</code> (two instances), <code>Sequence</code> and <code>SequenceMetadata</code>, <code>MTPVarlen</code>, <code>FlopsEstimator</code>, and <code>c10d::ProcessGroup::allreduce</code> for the votes.</td></tr>
+    <tr><th>Not in this file</th><td>The Python bindings (<code>pybind_scheduler.cpp</code>), the <code>RequestOutput</code> objects (<code>outputs.hpp</code>), the tensor inputs of the model (<code>input_metadata/</code>), and the ZOS corrections (<code>zos.cpp</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<p>The scheduler is a passive object. It has no thread and no loop of its own. <code>LLMEngine</code> makes it once and calls its methods from <code>step()</code> and from the post-process callback. The page {{link concepts/scheduler}} explains the policy with diagrams; this page walks through the code.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Construction.</strong> <code>LLMEngine._create_scheduler</code> passes 14 arguments ({{cite deepinfer/engine/llm_engine.py:307-327}}). Then the engine sets <code>decode_perf_curve</code> and gives the scheduler to the image processor ({{cite deepinfer/engine/llm_engine.py:267-270}}).</li>
+  <li><strong>Admission.</strong> <code>_enqueue</code> calls <code>add_sequence</code> ({{cite deepinfer/engine/llm_engine.py:623}}). <code>abort_request</code> calls <code>abort_sequence</code> ({{cite deepinfer/engine/llm_engine.py:651}}).</li>
+  <li><strong>Every step.</strong> <code>step()</code> calls <code>schedule(pool)</code> ({{cite deepinfer/engine/llm_engine.py:885-887}}). The Worker runs <code>clone_and_zero_states_and_blocks</code> when the scheduler asks for copies ({{cite deepinfer/worker/base.py:160-168}}).</li>
+  <li><strong>After a step.</strong> <code>_process_model_outputs</code> calls <code>process_MTPInfo</code>, <code>process_outputs</code> and <code>get_finished_seqs_info</code> ({{cite deepinfer/engine/llm_engine.py:717-738}}). <code>post_process</code> calls <code>update_mtp_runtime</code> ({{cite deepinfer/engine/llm_engine.py:995-1002}}). <code>finalize_seq</code> calls <code>free_seq</code> ({{cite deepinfer/engine/llm_engine.py:804-806}}).</li>
+  <li><strong>Loop tests.</strong> <code>has_unfinished_seqs</code> and <code>get_num_unfinished_seqs</code> ({{cite deepinfer/engine/llm_engine.py:660}}, {{cite deepinfer/engine/llm_engine.py:673}}).</li>
+  <li><strong>Images.</strong> <code>MultimodalProcessor.fetch</code> calls <code>set_schedulable(id)</code> ({{cite deepinfer/ve/multimodal_processor.py:303}}).</li>
+  <li><strong>Statistics.</strong> <code>StatsLogger</code> reads the free blocks, the queue sizes and the preempted and aborted counts ({{cite deepinfer/engine/stats_logger.py:411-423}}).</li>
+  <li><strong>Benchmark.</strong> <code>examples/benchmark.py</code> calls <code>try_allocate_seq</code>, <code>fork_seq</code>, and sets <code>decode_step = 0</code> to force an attempt point ({{cite examples/benchmark.py:314-317}}, {{cite examples/benchmark.py:337-350}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>Blocks and state slots.</strong> <code>BlockManager</code> and <code>BlockManagerMutexAcquire</code> ({{cite csrc/engine/block_manager.hpp:119-243}}). The scheduler holds two managers: one for KV blocks and one (optional) for state slots.</li>
+  <li><strong>Sequences.</strong> The fields of <code>Sequence</code> and the constructor of <code>SequenceMetadata</code> ({{cite csrc/engine/sequence.hpp:275-321}}, {{cite csrc/engine/sequence.hpp:374-389}}).</li>
+  <li><strong>Draft lengths.</strong> <code>MTPVarlen::schedule</code> sets <code>seqlen_q</code> in decode ({{cite csrc/engine/mtp_varlen.hpp:150-267}}).</li>
+  <li><strong>Statistics.</strong> <code>FlopsEstimator::calc_flops</code>, only with <code>log_stats</code> ({{cite csrc/engine/scheduler.hpp:712-719}}).</li>
+  <li><strong>Votes.</strong> <code>dp_group-&gt;allreduce</code> in <code>_dp_allreduce</code> ({{cite csrc/engine/scheduler.hpp:170-182}}).</li>
+  <li><strong>Device copies.</strong> <code>deepinfer::cuda::utils::cuda_copy_async</code> in <code>clone_and_zero_states_and_blocks</code> ({{cite csrc/engine/scheduler.hpp:1283}}, {{cite csrc/engine/scheduler.hpp:1297}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>EngineType</code></td><td>{{cite csrc/engine/scheduler.hpp:39}}</td><td>NORMAL (prefill and decode), PROMPT (prefill only), COMPLETION (decode only).</td></tr>
+    <tr><td><code>SchedulerOutputs</code></td><td>{{cite csrc/engine/scheduler.hpp:45}}</td><td>The result of one schedule: sequences, step type, token counts, finished and ignored lists, statistics, clone lists.</td></tr>
+    <tr><td><code>Scheduler::Scheduler</code></td><td>{{cite csrc/engine/scheduler.hpp:82}}</td><td>Reads the config, checks it, fills the MTP slot list.</td></tr>
+    <tr><td><code>add_sequence</code></td><td>{{cite csrc/engine/scheduler.hpp:135}}</td><td>Sets the arrival time, reserves memory, appends to <code>waiting</code>.</td></tr>
+    <tr><td><code>abort_sequence</code></td><td>{{cite csrc/engine/scheduler.hpp:144}}</td><td>Marks matching sequences in <code>running</code> and <code>waiting</code> as aborted.</td></tr>
+    <tr><td><code>_dp_allreduce</code></td><td>{{cite csrc/engine/scheduler.hpp:170}}</td><td>One all-reduce of one number over the DP group.</td></tr>
+    <tr><td><code>_block_table_capacity</code>, <code>_can_allocate_with_state</code>, <code>_clone_state</code></td><td>{{cite csrc/engine/scheduler.hpp:190-212}}</td><td>Small block helpers.</td></tr>
+    <tr><td><code>_is_inside_image_pad_region</code>, <code>_adjust_chunk_size</code></td><td>{{cite csrc/engine/scheduler.hpp:217-260}}</td><td>Keep a chunk from ending inside an image.</td></tr>
+    <tr><td><code>_has_prefill_waiting</code></td><td>{{cite csrc/engine/scheduler.hpp:273}}</td><td>Is the front of <code>waiting</code> schedulable?</td></tr>
+    <tr><td><code>_schedule</code></td><td>{{cite csrc/engine/scheduler.hpp:275}}</td><td>Chooses prefill or decode; runs the two votes.</td></tr>
+    <tr><td><code>_schedule_prefill</code></td><td>{{cite csrc/engine/scheduler.hpp:351}}</td><td>Fills a prefill batch from <code>waiting</code>.</td></tr>
+    <tr><td><code>_schedule_decode</code></td><td>{{cite csrc/engine/scheduler.hpp:559}}</td><td>Fills a decode batch from <code>running</code>; preempts.</td></tr>
+    <tr><td><code>update_mtp_runtime</code></td><td>{{cite csrc/engine/scheduler.hpp:663}}</td><td>Feeds measured step times to <code>MTPVarlen</code>.</td></tr>
+    <tr><td><code>schedule</code></td><td>{{cite csrc/engine/scheduler.hpp:667}}</td><td>Public entry: runs <code>_schedule</code>, updates <code>decode_step</code>, makes the metadata list.</td></tr>
+    <tr><td><code>free_seq_nolock</code>, <code>free_seq</code>, <code>free_finished_seqs</code></td><td>{{cite csrc/engine/scheduler.hpp:738-763}}</td><td>Give back blocks, state slot and MTP slot.</td></tr>
+    <tr><td><code>_preempt</code></td><td>{{cite csrc/engine/scheduler.hpp:766}}</td><td>Stop a sequence, or send it back for a recompute.</td></tr>
+    <tr><td><code>allocate_mtp_info_slot</code>, <code>release_mtp_info_slot</code></td><td>{{cite csrc/engine/scheduler.hpp:792-810}}</td><td>Manage the draft-info slots 1 … <code>max_num_seqs</code>.</td></tr>
+    <tr><td><code>_append_slot</code></td><td>{{cite csrc/engine/scheduler.hpp:817}}</td><td>Grow or shrink a block table to <code>get_num_blocks()</code>.</td></tr>
+    <tr><td><code>get_gpu_cache_usage</code> and the <code>get_*</code> counters</td><td>{{cite csrc/engine/scheduler.hpp:830-870}}</td><td>Read-only numbers for the watermark and the statistics.</td></tr>
+    <tr><td><code>process_outputs</code></td><td>{{cite csrc/engine/scheduler.hpp:872}}</td><td>Appends the step's tokens, moves sequences between queues, checks stops.</td></tr>
+    <tr><td><code>_check_stop</code></td><td>{{cite csrc/engine/scheduler.hpp:1035}}</td><td>EOS, <code>max_model_len</code>, <code>max_tokens</code>.</td></tr>
+    <tr><td><code>set_schedulable</code></td><td>{{cite csrc/engine/scheduler.hpp:1054}}</td><td>Marks a waiting request as ready.</td></tr>
+    <tr><td><code>fork_seq</code></td><td>{{cite csrc/engine/scheduler.hpp:1061}}</td><td>Makes a new sequence that shares the cached prefix of another one.</td></tr>
+    <tr><td><code>process_MTPInfo</code></td><td>{{cite csrc/engine/scheduler.hpp:1196}}</td><td>Stores the new drafts and their confidence values in each sequence.</td></tr>
+    <tr><td><code>clone_and_zero_states_and_blocks</code></td><td>{{cite csrc/engine/scheduler.hpp:1264}}</td><td>Device copies for forked sequences; returns ids to unpin.</td></tr>
+    <tr><td><code>get_finished_seqs_info</code></td><td>{{cite csrc/engine/scheduler.hpp:1315}}</td><td>Counts and lengths of the finished sequences, for the engine's counters.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The constructor</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="94-133" highlight="101-104,109,112,118,120-121,126-128">
+<x-tr line="101">A COMPLETION engine has no prefill path, so it cannot recompute preempted requests. Block this configuration at start-up.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 94-100: copy seven values from the Python <code>SchedulerConfig</code>.</li>
+  <li>Lines 101-104: a COMPLETION engine must stop preempted requests.</li>
+  <li>Lines 105-108: both attempt intervals must be 1 or more.</li>
+  <li>Line 109: a Gloo group means "do the votes on the CPU".</li>
+  <li>Line 112: <code>prompt_limit</code>: <code>max_model_len</code> with chunked prefill, else <code>min(max_model_len, max_num_batched_tokens)</code>.</li>
+  <li>Line 116: the budget must hold at least one block.</li>
+  <li>Line 118: <code>nextn</code> comes from the environment variable <code>DEEPINFER_USE_NEXTN_DECODE</code>, read with <code>getenv</code> (default 5, {{cite csrc/engine/utils.hpp:36-40}}).</li>
+  <li>Lines 120-121: the prefill sum limit must be at least <code>prompt_limit</code>.</li>
+  <li>Lines 126-128: MTP slots <code>max_num_seqs … 1</code> go into a stack, so slot 1 comes out first. Slot 0 is padding.</li>
+  <li>Lines 130-132: reserve the clone vectors for the worst case.</li>
+</ol>
+
+<h3><code>add_sequence</code> and <code>abort_sequence</code></h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="135-163" highlight="136,138-139,149,152">
+<x-tr line="146">A seq whose multimodal processing failed stays in waiting with schedule.schedulable = false, so scan both queues.</x-tr>
+</x-code>
+<ol>
+  <li>Line 136: the arrival time is set here, in milliseconds since the epoch ({{cite csrc/engine/block_manager.hpp:20-25}}). This value goes into the time-to-first-token statistic (line 1009).</li>
+  <li>Lines 138-139: reserve token ids for <code>max_tokens</code> outputs and block-table entries for <code>ceil((len + max_tokens) / block_size) + 1</code> blocks.</li>
+  <li>Lines 147-157: only an unfinished sequence with the same id is marked. The function returns the list of the aborted sequences.</li>
+  <li>Lines 158-161: <code>prompted</code> is not scanned. That queue only holds forked sequences.</li>
+</ol>
+
+<h3><code>_schedule</code>: the step type</h3>
+<p>The concept page shows the voting code line by line ({{link concepts/scheduler}}, step 2). The structure is:</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="275-295" highlight="276-277,286,288-295" />
+<ol>
+  <li>Line 276: release the Python GIL. Other Python threads, such as the grammar builders, can run during scheduling.</li>
+  <li>Line 277: lock the block manager and the state manager. <code>Lockable::lock_</code> refuses to run while the GIL is held, and gives up after 20 seconds ({{cite csrc/utils/lockable.hpp:16-28}}).</li>
+  <li>Lines 282-284: clear the clone vectors of the previous step. The previous <code>SchedulerOutputs</code> borrowed them.</li>
+  <li>Lines 288-294: PROMPT and COMPLETION engines skip the vote.</li>
+</ol>
+
+<h3><code>_schedule_prefill</code>: the loop, part 1</h3>
+<p>The doc comment says, translated: <em>"Prefill (prompt) scheduling: pick runnable prompts from the waiting queue. For a NORMAL engine, return nullptr if this round scheduled no prompt (scheduled and ignored both empty); _schedule then decides whether to switch to decode. Other engine types always return SchedulerOutputs."</em> ({{cite csrc/engine/scheduler.hpp:347-349}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="355-397" highlight="355,358,363-367,369-371,372,377-385,386-396">
+<x-tr line="362">A seq that was already dead before it entered the queue does not run a prefill. It goes into ignored_seqs and returns with its finish_reason.</x-tr>
+</x-code>
+<ol>
+  <li>Line 355: <code>num_curr_seqs</code> starts at the size of <code>running</code>, so finished but not yet removed sequences also count.</li>
+  <li>Line 372: the work of this sequence is its full length minus the cached tokens. For a recompute, that includes its earlier outputs.</li>
+  <li>Line 374: an empty block table means "first chunk". The local name <code>prefix_caching_hit</code> is set to true here. It only switches off the lookahead check at line 454.</li>
+  <li>Lines 386-396: <code>get_num_blocks()</code> of a new sequence is <code>ceil(len / block_size)</code>, because it has no drafts and no in-flight tokens yet.</li>
+</ol>
+
+<h3><code>_schedule_prefill</code>: forked prompts</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="398-437" highlight="413-415,425-430,431-437">
+<x-tr line="407">Release the parent's blocks and state that the fork pinned.</x-tr>
+<x-tr line="427">There is a tail: it needs a copy.</x-tr>
+</x-code>
+<ol>
+  <li>Line 398: a forked sequence has a <code>branch_id</code> that starts with <code>_</code> and a block table that it shares with its parent.</li>
+  <li>Lines 413-415: it keeps the full blocks of the shared prefix, and needs new blocks for the rest.</li>
+  <li>Lines 425-430: it gets its own state slot (a copy) and a copy of the half-full last block.</li>
+  <li>Lines 431-437: the other parent blocks are only unpinned (pair <code>(block, 0)</code>), then the table gets the new blocks.</li>
+</ol>
+<p>The pairs go to <code>clone_states</code> and <code>clone_blocks</code>. <code>LLMEngine.step()</code> sends them to the Worker in the same step ({{cite deepinfer/engine/llm_engine.py:889-905}}).</p>
+
+<h3><code>_schedule_prefill</code>: the loop, part 2</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="440-475" highlight="440-442,444-449,454,464,470-472" />
+<ol>
+  <li>Lines 440-442: the slot limit.</li>
+  <li>Lines 444-449: the sum limit counts the <em>full</em> length of each sequence, not the chunk.</li>
+  <li>Lines 451-458: a sequence that is neither new nor forked (a later chunk) must have <code>num_tokens == 0</code> or at least <code>lookahead_tokens</code> cached tokens. The comment says that the block size is assumed to be larger than <code>nextn</code>.</li>
+  <li>Line 464: the work must be at least <code>lookahead_tokens</code>.</li>
+  <li>Lines 470-475: the chunk cut (see the concept page).</li>
+</ol>
+<p>Lines 477-511 adjust the chunk for checkpoints and images, and lines 513-546 commit the side effects. The concept page explains both parts. <code>_make_outputs</code> (lines 263-268) wraps the result and adds references to the clone vectors.</p>
+
+<h3><code>_adjust_chunk_size</code></h3>
+<p>The doc comment of the first helper says, translated: <em>"Check whether position k_len is inside an image of the form MM_TOKEN_IMAGE + MM_TOKEN_IMAGE_PAD*N. True only if token_ids[k_len] == IMAGE_PAD and an MM_TOKEN_IMAGE comes before it. If token_ids[k_len] == MM_TOKEN_IMAGE, the cut is exactly at the start of an image: allowed, return false."</em> ({{cite csrc/engine/scheduler.hpp:214-216}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="217-256" highlight="218-220,221-228,241-256">
+<x-tr line="243">Extend forward: skip all IMAGE_PAD (stop at the next MM_TOKEN_IMAGE or at a non-image token).</x-tr>
+<x-tr line="248">Shrink backward: skip all IMAGE_PAD and the MM_TOKEN_IMAGE (the whole image unit moves to the next chunk).</x-tr>
+</x-code>
+<ol>
+  <li>Line 218: a cut position that is not a pad token is never inside an image.</li>
+  <li>Lines 221-228: walk back over pad tokens. Reaching the image token means "inside". Any other token means "not inside".</li>
+  <li>Lines 237-239: a cut at or after the end of the sequence needs no change.</li>
+  <li>Lines 244-246: grow until the first non-pad token.</li>
+  <li>Lines 249-254: shrink over the pads and the image token, but not below the cached length.</li>
+</ol>
+
+<h3><code>_schedule_decode</code>: clean-up and forked admission</h3>
+<p>The doc comment says, translated: <em>"Decode (completion) scheduling: first move the seqs from the prompted queue into running, then pick the seqs of this round in LCFS order; when blocks are not enough, preempt the seq with the shortest output."</em> ({{cite csrc/engine/scheduler.hpp:556-557}}). The last part is wrong (see the warning below).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="559-597" highlight="562,569-577,583-593">
+<x-tr line="564-568">Finished seqs in waiting (aborted, or failed in the image step) can only be removed by the scheduler. Only _schedule_prefill removed them before. Now prefill runs only when want is true on this rank, so such seqs could stay forever, keep has_unfinished true and block every ALL vote. So clean them up here, and scan the whole queue, because an abort can hit the middle of it.</x-tr>
+<x-tr line="581-582">Move the seqs at the head of the prompted queue into running (finished ones into finished). A forked seq must first clone its state and its last (maybe half-written) block.</x-tr>
+<x-tr line="597">Aborted before it entered the completion engine.</x-tr>
+</x-code>
+<ol>
+  <li>Line 562: finished sequences leave <code>running</code>. Their MTP slots go back now, if <code>process_outputs</code> did not give them back already (line 993). Their blocks go back later, in <code>finalize_seq</code>.</li>
+  <li>Lines 569-577: finished sequences anywhere in <code>waiting</code> go to <code>ignored_seqs</code>.</li>
+  <li>Lines 595-620: forked sequences in <code>prompted</code> join <code>running</code>, as long as there is room and a free block and state slot. The comment above line 556 is wrong about the preemption order (see below).</li>
+</ol>
+
+<h3><code>_schedule_decode</code>: the decode loop</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="622-660" highlight="624-625,629-634,635-640,645,648-652">
+<x-tr line="645">decode: running still has queued seqs; N are scheduled and M are left; this must not happen.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 624-625: <code>std::sort</code> with "more output first". <code>std::sort</code> is not stable, so the order of equal lengths is not fixed.</li>
+  <li>Line 629: take <code>running[r - 1]</code>, the fewest outputs among the sequences left.</li>
+  <li>Lines 630-634: while the free list is empty and two or more sequences are left, preempt <code>running[l]</code>, the most outputs.</li>
+  <li>Lines 635-640: with a free block, call <code>_append_slot</code>; without one (only the current sequence is left), preempt it.</li>
+  <li>Line 645: every sequence is either scheduled or preempted. A sequence that does not fit because of <code>max_seqs</code> would fail this check.</li>
+  <li>Line 646: <code>running</code> is cleared. <code>schedule()</code> sets it to the batch (line 679).</li>
+  <li>Lines 648-652: sort the batch by length, then <code>MTPVarlen</code> gives <code>seqlens_q</code>.</li>
+</ol>
+<x-warning title="The comment and the code disagree">
+<p>The comment says that the scheduler preempts the sequence with the <em>shortest</em> output (lines 556-557). The code preempts from the front of a list sorted with the <em>longest</em> output first. This site describes the code.</p>
+</x-warning>
+
+<h3><code>schedule</code>: the public entry</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="689-726" highlight="689,694-697,700-705,706-707,726">
+<x-tr line="698-699">Open upper bound of the positions in this step. Prefill ends at seqlen_k. In decode, seqlen_q on the GPU is padded to at most max_seqlen_q (same as max_k in zos.cpp), and the DFlash draft goes nextn further. Buffers indexed by position, such as the RoPE cache, have only runtime_max_model_len rows.</x-tr>
+</x-code>
+<ol>
+  <li>Line 689: <code>max_seqlen_q = nextn + 1</code>.</li>
+  <li>Line 694: count one more schedule for the MTP bookkeeping.</li>
+  <li>Line 695: the "golden" tokens: an optional list of reference tokens from <code>SamplingParams.golden_token_ids</code> ({{cite deepinfer/engine/llm_engine.py:562}}, {{cite csrc/engine/sequence.hpp:155-165}}). The YOCO equivalence example sets them ({{cite examples/yoco/yoco_equiv.py:682}}).</li>
+  <li>Line 697: <code>seqlen_k = cached + in flight + seqlen_q</code>.</li>
+  <li>Lines 700-705: the highest position must stay below <code>runtime_max_model_len</code>, or the call fails.</li>
+  <li>Lines 706-707: one <code>SequenceMetadata</code> from the pool. It holds references into the <code>Sequence</code>, not copies.</li>
+  <li>Line 726: reserve <code>nextn + 1</code> in-flight tokens on the sequence.</li>
+</ol>
+
+<h3><code>_preempt</code>, <code>_append_slot</code> and the free functions</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="738-763" highlight="739-744,755-761" />
+<p><code>free_seq_nolock</code> gives back the MTP slot, the state slot and all blocks. <code>BlockManager::free_blocks_nolock</code> frees the table in reverse order, and a block whose reference count reaches 0 goes to the tail of the free list ({{cite csrc/engine/block_manager.hpp:95-103}}, {{cite csrc/engine/block_manager.hpp:147-149}}). <code>free_finished_seqs</code> gives back only the MTP slot. <code>_preempt</code> calls <code>free_seq_nolock</code> in both of its paths ({{cite csrc/engine/scheduler.hpp:779}}, {{cite csrc/engine/scheduler.hpp:787}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="817-828" />
+<p>Line 820 adds at most one block per call; the check at line 826 fails if one block is not enough. Lines 821-825 free extra blocks when the reserve shrinks.</p>
+
+<h3><code>process_outputs</code>: after the step</h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="872-899">
+<x-tr line="873-875">[total_q] flat: each request has seqlens_q[i] positions. The first seqlens_q[i]-1 are draft tokens (-1 = not accepted); the last one is the main token position (not used). With MTP = 0, or in prefill, an empty 1-D tensor (numel() == 0).</x-tr>
+<x-tr line="876">Tokens that have not been forwarded yet, but are already accepted.</x-tr>
+<x-tr line="879">The returned numpy arrays borrow this storage (empty capsule). The caller must use them before the next process_outputs.</x-tr>
+<x-tr line="881">Counts the tokens pushed before the finish.</x-tr>
+</x-code>
+<p>For each scheduled sequence, in order:</p>
+<ol>
+  <li><code>finish_inflight_step()</code> (line 903).</li>
+  <li>Finished already (an abort while in flight): skip, give back the MTP slot; in a prompt step, put it into <code>running</code> so that the next decode removes it (lines 906-915).</li>
+  <li>Preempted while in flight (decode step, status <code>WAITING</code>): skip all bookkeeping (lines 920-925).</li>
+  <li><code>advance_optimistically(seqlen_q)</code> and the structured-output status (lines 927-929).</li>
+  <li>Prompt complete or decode: read the accepted drafts, append them and the sampled token with <code>_check_stop</code> after each one, then <code>commit_processed_tokens</code> in decode (lines 940-1000).</li>
+  <li>Prompt not complete: back to the front of <code>waiting</code> (lines 1011-1020).</li>
+</ol>
+<p>It returns two arrays: the time to the first token for sequences with exactly 1 output, and the number of tokens pushed per sequence (lines 1030-1032). Both borrow static buffers.</p>
+
+<h3><code>fork_seq</code></h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="1061-1066" />
+<p>A fork copies the tokens of a sequence that already has a cached prefix, shares its blocks and its state slot (with <code>pin</code>), and puts the new sequence either at the front of <code>waiting</code> (prompt not complete) or into <code>prompted</code> ({{cite csrc/engine/scheduler.hpp:1108-1120}}). No file in the <code>deepinfer</code> package calls it. <code>examples/benchmark.py</code> uses it to copy one cached prompt to a batch ({{cite examples/benchmark.py:331-352}}).</p>
+
+<h3><code>process_MTPInfo</code></h3>
+<p>A comment at the top of the loop says, translated: <em>"ZOS async: a seq that _preempt preempted for recompute while this step was in flight already had all its MTP counters reset; drop this step's bookkeeping too (same test as in process_outputs). Else process_cnt would run ahead of schedule_cnt, and the pairing check in MTPVarlen::schedule would fail."</em> ({{cite csrc/engine/scheduler.hpp:1214-1216}}).</p>
+<x-code file="csrc/engine/scheduler.hpp" lines="1217-1256" highlight="1217-1219,1220,1227-1229,1235-1238,1246-1251,1253-1256">
+<x-tr line="1230-1231">Only the chunked prefill case must be excluded here. Note: seqlen_q can now be smaller than 1 + nextn, so the old test does not hold. If seqlen_q &lt; 1 + nextn: decode always has nextn &gt; 0, and prefill always has nextn = 0.</x-tr>
+<x-tr line="1233">A chunked prefill makes no real nextn information.</x-tr>
+<x-tr line="1244-1245">build output reads the confidence values from before this update (moved into prev_confidence_raw above), so process_MTPInfo must be called before build output.</x-tr>
+<x-tr line="1248">The confidence rate from the model is per token and independent; multiply them before use.</x-tr>
+</x-code>
+<ol>
+  <li>Line 1220: <code>process_cnt</code> counts processed steps; <code>schedule()</code> counts scheduled steps (line 694). <code>MTPVarlen</code> uses the difference to know which round an accept rate belongs to ({{cite csrc/engine/mtp_varlen.hpp:195-201}}).</li>
+  <li>Lines 1235-1238: the new drafts replace the old ones.</li>
+  <li>Lines 1246-1251: <code>accept_rates[j]</code> is the product of the first <code>j + 1</code> confidence values. Example: confidences <code>[0.9, 0.8, 0.5]</code> give accept rates <code>[0.9, 0.72, 0.36]</code>.</li>
+  <li>Lines 1253-1256: in a decode step, mark that the new draft info is in the MTP pool and not yet read.</li>
+</ol>
+
+<h3><code>clone_and_zero_states_and_blocks</code></h3>
+<x-code file="csrc/engine/scheduler.hpp" lines="1273-1312" highlight="1283,1296-1299,1307" />
+<p>Line 1267 says, translated: <em>"The returned numpy arrays borrow this storage (empty capsule). The caller must use them before the next call."</em> The storage is the function-level <code>static</code> vectors of line 1268.</p>
+<p>Each pair <code>(src, dst)</code> copies one state row or one block row on the current stream; <code>dst = 0</code> skips the copy. Every <code>src</code> is returned for unpinning. The engine unpins them after a CUDA event, in the <code>pre_sampler_sync</code> of the same step ({{cite deepinfer/engine/llm_engine.py:109-116}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data that crosses the Python boundary: types and lifetimes">
+<table>
+  <thead><tr><th>Object</th><th>C++ type</th><th>Python view</th><th>Valid until</th></tr></thead>
+  <tbody>
+    <tr><td>return of <code>schedule</code></td><td><code>py::tuple(py::list, unique_ptr&lt;SchedulerOutputs&gt;)</code></td><td><code>(list[SequenceMetadata], SchedulerOutputs)</code></td><td>metadata: until given back to the pool; outputs: Python owns it</td></tr>
+    <tr><td><code>scheduled_seqs</code>, <code>finished_seqs</code></td><td><code>std::vector&lt;std::shared_ptr&lt;Sequence&gt;&gt;</code></td><td>lists of <code>Sequence</code> (read-only properties)</td><td>the <code>SchedulerOutputs</code> object</td></tr>
+    <tr><td><code>ignored_seqs</code>, <code>seqlens_q</code></td><td>vectors</td><td>not bound ({{cite csrc/engine/pybind_scheduler.cpp:20-63}})</td><td>used inside C++ only</td></tr>
+    <tr><td><code>clone_states</code>, <code>clone_blocks</code></td><td><code>const std::vector&lt;int&gt;&amp;</code> into the scheduler</td><td><code>int32 [n, 2]</code>, zero-copy</td><td>the next <code>schedule()</code> ({{cite csrc/engine/pybind_scheduler.cpp:31-50}})</td></tr>
+    <tr><td><code>zero_states</code></td><td>same</td><td><code>int32 [n]</code></td><td>the next <code>schedule()</code>; no code fills it in this release</td></tr>
+    <tr><td><code>process_outputs</code> results</td><td>static <code>std::vector&lt;double&gt;</code>, <code>std::vector&lt;int&gt;</code></td><td><code>float64 [n]</code>, <code>int32 [n]</code></td><td>the next <code>process_outputs</code></td></tr>
+    <tr><td><code>accepted_token_ids</code> (input)</td><td><code>torch::Tensor</code> int32</td><td>flat <code>[total_q]</code> or empty</td><td>read during the call</td></tr>
+    <tr><td><code>output_token_ids</code> (input)</td><td><code>torch::Tensor</code> int32, CPU</td><td><code>[n]</code></td><td>read during the call</td></tr>
+  </tbody>
+</table>
+<p><strong>A worked example of the flat layout.</strong> A decode step has two sequences with <code>seqlens_q = [6, 6]</code>, so <code>total_q = 12</code>. The sampler returns <code>accepted_token_ids = [a, b, -1, -1, -1, *, c, -1, -1, -1, -1, *]</code> and <code>output_token_ids = [x, y]</code>. The <code>*</code> slots are the main token positions and are not read.</p>
+<ol>
+  <li>Sequence 0: drafts <code>a, b</code> accepted, then <code>x</code>. <code>token_cnt = 3</code>. With <code>num_tokens = 100</code> before the step: <code>advance_optimistically(6)</code> gives 106, <code>commit_processed_tokens(3)</code> gives 103.</li>
+  <li>Sequence 1: draft <code>c</code> accepted, then <code>y</code>. <code>token_cnt = 2</code>.</li>
+  <li><code>flat_offset</code> moves by 6 after each sequence (line 1022). <code>pushed_tokens_before_finish = [3, 2]</code>.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Threads, locks and static buffers">
+<ul>
+  <li><strong>GIL.</strong> <code>_schedule</code> releases the GIL for its whole run (line 276). It must, because <code>Lockable::lock_</code> fails if the caller holds the GIL. Translated: <em>"Holding the GIL when you call this function is forbidden, to avoid deadlock!"</em> ({{cite csrc/utils/lockable.hpp:16}}). <code>fork_seq</code> and <code>free_seq</code> release it too ({{cite csrc/engine/scheduler.hpp:1109}}, {{cite csrc/engine/pybind_scheduler.cpp:100-102}}).</li>
+  <li><strong>Lock order.</strong> <code>BlockManagerMutexAcquire</code> locks the state manager first, then the block manager, and unlocks in the opposite order ({{cite csrc/engine/block_manager.hpp:189-204}}).</li>
+  <li><strong>Lock timeout.</strong> A lock that is not free after 20 seconds fails with <code>"failed to lock mutex"</code> ({{cite csrc/utils/lockable.hpp:22-27}}).</li>
+  <li><strong>One caller thread.</strong> The queues have no lock of their own. The engine calls the scheduler from its main thread only.</li>
+  <li><strong>Static buffers.</strong> <code>process_outputs</code> (lines 880-881, 896-897) and <code>clone_and_zero_states_and_blocks</code> (line 1268) keep function-level <code>static</code> vectors. They are shared by all <code>Scheduler</code> objects in the process, and the results of one call are overwritten by the next.</li>
+  <li><strong>Object pool.</strong> <code>SequenceMetadataPool::allocate</code> reuses a released object with placement <code>new</code>, or makes a new one ({{cite csrc/utils/object_pool.hpp:21-32}}). <code>release</code> destroys and keeps only objects that came from the pool ({{cite csrc/utils/object_pool.hpp:34-42}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Member variables">
+<table>
+  <thead><tr><th>Member</th><th>Type</th><th>Set from</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td><code>waiting</code></td><td><code>std::deque&lt;SequencePtr&gt;</code></td><td><code>add_sequence</code>, chunks, recompute</td><td>prefill queue; bound read-only</td></tr>
+    <tr><td><code>prompted</code></td><td><code>std::deque&lt;tuple&lt;SequencePtr, bool&gt;&gt;</code></td><td><code>fork_seq</code></td><td>forked sequences with a complete prompt</td></tr>
+    <tr><td><code>running</code></td><td><code>std::vector&lt;SequencePtr&gt;</code></td><td>prefill results, <code>schedule()</code></td><td>decode set; bound read-write</td></tr>
+    <tr><td><code>clone_states</code>, <code>clone_blocks</code>, <code>zero_states</code></td><td><code>std::vector&lt;int&gt;</code></td><td>forks</td><td>borrowed by <code>SchedulerOutputs</code></td></tr>
+    <tr><td><code>free_mtp_info_slots</code></td><td><code>std::vector&lt;int&gt;</code></td><td>constructor</td><td>stack of slots 1 … <code>max_num_seqs</code></td></tr>
+    <tr><td><code>decode_step</code></td><td><code>uint32_t</code></td><td><code>schedule()</code></td><td>attempt points; bound read-write</td></tr>
+    <tr><td><code>max_model_len</code>, <code>runtime_max_model_len</code>, <code>max_num_batched_tokens</code>, <code>max_num_seqs</code>, <code>max_num_prompts</code>, <code>prompt_limit</code></td><td><code>int</code></td><td>config</td><td>limits</td></tr>
+    <tr><td><code>eos_token_id</code></td><td><code>int</code></td><td>tokenizer</td><td><code>_check_stop</code></td></tr>
+    <tr><td><code>stop_preempted_request</code>, <code>chunked_prefill</code></td><td><code>bool</code></td><td>config</td><td>policies</td></tr>
+    <tr><td><code>dp_group</code>, <code>use_cpu_dp_group</code></td><td>process group, <code>bool</code></td><td>engine</td><td>votes</td></tr>
+    <tr><td><code>nextn</code></td><td><code>int</code></td><td><code>getenv</code></td><td>drafts, MTP slots, <code>max_seqlen_q</code></td></tr>
+    <tr><td><code>num_preempted</code>, <code>num_aborted</code></td><td><code>int64_t</code></td><td>counters</td><td>statistics</td></tr>
+    <tr><td><code>block_size</code>, <code>block_manager</code>, <code>state_manager</code></td><td><code>int</code>, <code>shared_ptr&lt;BlockManager&gt;</code></td><td>engine</td><td>allocation</td></tr>
+    <tr><td><code>prefill_max_sum_seqlen_k</code>, <code>lookahead_tokens</code></td><td><code>int</code></td><td>engine</td><td>prefill limits</td></tr>
+    <tr><td><code>engram_lookup_table</code></td><td><code>std::vector&lt;int&gt;</code></td><td>engine</td><td><code>map_engram</code> for compressed ids</td></tr>
+    <tr><td><code>cp_align</code></td><td><code>int</code></td><td><code>cp_size</code></td><td>1, or <code>2 × cp_size</code></td></tr>
+    <tr><td><code>MM_TOKEN_IMAGE</code>, <code>MM_TOKEN_IMAGE_PAD</code></td><td><code>const int</code></td><td><code>vocab_size</code> + 2, + 1</td><td>image boundaries</td></tr>
+    <tr><td><code>_mtp_varlen</code></td><td><code>MTPVarlen</code></td><td>-</td><td>draft lengths</td></tr>
+    <tr><td><code>prefill_attempt_interval</code>, <code>prefill_any_attempt_interval</code></td><td><code>int</code></td><td>config</td><td>attempt points</td></tr>
+    <tr><td><code>truncate_len</code>, <code>dp_size</code>, <code>dp_rank</code>, <code>schedule_counter</code>, <code>last_step_num_batched_tokens</code>, <code>last_step_cached_tokens</code>, <code>tokens_chunked_prefill_remaining</code></td><td>ints</td><td>constructor or <code>schedule()</code></td><td>written, but not read in this file and not bound to Python</td></tr>
+  </tbody>
+</table>
+<p>The members are listed at {{cite csrc/engine/scheduler.hpp:1124-1193}}. <code>num_cached_tokens_gpu</code> in <code>SchedulerOutputs</code> is always 0: every <code>_make_outputs</code> call passes 0 (lines 340, 549, 658-659).</p>
+</x-deepdive>
+
+<x-deepdive title="Interaction with ZOS and speculative decoding">
+<p>With ZOS, <code>schedule()</code> for step <em>N+1</em> runs before <code>process_outputs</code> for step <em>N</em>. Four parts of this file handle that order:</p>
+<ol>
+  <li><strong>In-flight tokens.</strong> <code>start_inflight_step(nextn + 1)</code> at schedule time and <code>finish_inflight_step()</code> at process time ({{cite csrc/engine/scheduler.hpp:726}}, {{cite csrc/engine/scheduler.hpp:903}}). Example: after step N is scheduled, <code>total_inflight_tokens = 6</code>. After step N+1 is scheduled, it is 12. When step N is processed, <code>total == last</code> is false, so it becomes <code>last = 6</code> ({{cite csrc/engine/sequence.hpp:249-256}}).</li>
+  <li><strong>Optimistic counters.</strong> <code>process_outputs</code> first adds the whole <code>seqlen_q</code> to <code>num_tokens</code>, then sets it to the old value plus the accepted tokens ({{cite csrc/engine/scheduler.hpp:927}}, {{cite csrc/engine/scheduler.hpp:999}}).</li>
+  <li><strong>Preempted in flight.</strong> Skipped in <code>process_outputs</code> and in <code>process_MTPInfo</code> (lines 920-925, 1217-1219).</li>
+  <li><strong>Device corrections.</strong> The CPU <code>seqlen_q</code> and <code>seqlen_k</code> are estimates. The Worker corrects them on the device, and <code>update_metadata_for_sampling_zos</code> writes the final values back into the metadata and into <code>scheduler_outputs.seqlens_q</code> ({{cite csrc/engine/zos.cpp:279-305}}).</li>
+</ol>
+<p><strong>The MTP counters.</strong> <code>MTPVarlen::schedule</code> checks that <code>process_cnt &lt;= schedule_cnt &lt;= process_cnt + 1</code> for every sequence ({{cite csrc/engine/mtp_varlen.hpp:195-196}}). The scheduler increments <code>schedule_cnt</code> in <code>schedule()</code> and <code>process_MTPInfo</code> increments <code>process_cnt</code>, so at most one step can be in flight per sequence.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one prefill and one decode, with all counters">
+<p>One sequence, prompt 300 tokens, budget 32768, block size 128, <code>nextn = 5</code>, ZOS on, one DP rank, 100 KV blocks, a state manager.</p>
+<ol>
+  <li><strong>Prefill.</strong> <code>decode_step = 0</code> → ALL point. Usage <code>1/100 ≤ 0.9</code>. <code>_can_allocate_with_state(3)</code> → OK. <code>seqlen_q = 300</code>, <code>num_batched_tokens = 300</code>. <code>allocate_seq</code>: blocks <code>[1, 2, 3]</code> (head of a fresh free list), state slot 1. Status RUNNING, MTP slot 1. <code>schedule()</code>: <code>decode_step = 0</code>, <code>seqlen_k = 0 + 0 + 300 = 300</code>, <code>schedule_cnt = 1</code>, in-flight 6.</li>
+  <li><strong>Process.</strong> In-flight back to 0. <code>num_tokens = 300 = len</code> → into <code>running</code>. <code>process_MTPInfo</code>: 5 placeholder drafts, <code>process_cnt = 1</code>. One token appended: <code>len = 301</code>. Output length 1, so the time to the first token is recorded.</li>
+  <li><strong>Decode.</strong> <code>decode_step = 0</code> → ALL point, but <code>waiting</code> is empty → <code>want = false</code> → vote fails → decode. Sort, serve; <code>_append_slot</code>: <code>ceil((301 + 0 + 5) / 128) = 3</code> blocks, no change. <code>seqlens_q = [6]</code>, 6 tokens. <code>decode_step = 1</code>. <code>seqlen_k = 300 + 0 + 6 = 306</code>; position end <code>306 − 6 + 6 + 5 = 311</code> must be ≤ <code>runtime_max_model_len</code>.</li>
+</ol>
+<p>The block ids in step 1 assume a fresh free list: <code>Blocks</code> starts with <code>_head = 1</code> and links 1, 2, 3, … ({{cite csrc/engine/block_manager.hpp:28-35}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: checks, warnings and their messages">
+<table>
+  <thead><tr><th>Where</th><th>Kind</th><th>When</th><th>Message (translated if Chinese)</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:102-104}}</td><td>TORCH_CHECK at start-up</td><td>COMPLETION engine and recompute</td><td>"COMPLETION engine cannot recompute preempted requests ..."</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:106}}, {{cite csrc/engine/scheduler.hpp:108}}</td><td>TORCH_CHECK</td><td>an interval below 1</td><td>(check text)</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:116}}</td><td>TORCH_CHECK</td><td>budget below one block</td><td>(check text)</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:120-121}}</td><td>TORCH_CHECK</td><td>sum limit below <code>prompt_limit</code></td><td>"prefill_max_sum_seqlen_k=... too small"</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:378-380}}</td><td>LOG_WARN, then IGNORED</td><td>prompt above <code>prompt_limit</code></td><td>"Input prompt (... tokens ...) is too long"</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:390-392}}</td><td>LOG_WARN, then IGNORED</td><td>NEVER fits</td><td>"... exceeds the capacity of block_manager"</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:445}}</td><td>LOG_WARN, stop loop</td><td>sum limit reached</td><td>"prefill_sum_seqlen_k will exceed limit"</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:495-500}}</td><td>TORCH_CHECK</td><td>chunk of 0 tokens for the first sequence</td><td>"A request waits in the queue but cannot be scheduled; this must not happen"</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:645}}</td><td>TORCH_CHECK</td><td>decode left a sequence unhandled</td><td>"decode: running still has queued seqs ..."</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:671-673}}</td><td>TORCH_CHECK</td><td>batch above the budget</td><td>"The number of scheduled tokens exceeds max_num_batched_tokens; this must not happen"</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:682-684}}</td><td>TORCH_CHECK</td><td>MTP slots and <code>running</code> disagree</td><td>"The number of used MTP info slots must match ..."</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:701-705}}</td><td>TORCH_CHECK</td><td>position past <code>runtime_max_model_len</code></td><td>"position_end=... exceeds runtime_max_model_len=..."</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:773-776}}, {{cite csrc/engine/scheduler.hpp:782}}</td><td>LOG_WARN</td><td>every preemption</td><td>"Request ... is preempted and stops." / "... will be recomputed."</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:796}}</td><td>TORCH_CHECK</td><td>no free MTP slot</td><td>"No free MTP info slot for request ..."</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:1026-1028}}</td><td>TORCH_CHECK</td><td>outputs and batch size differ</td><td>"There must be no request with seqlen_q = 0, and no seq._is_split = True"</td></tr>
+    <tr><td>{{cite csrc/engine/scheduler.hpp:1063-1064}}</td><td>TORCH_CHECK</td><td>fork with no cached prefix, or with prompt log-probabilities</td><td>"Cannot fork a sequence without a computed prefix"</td></tr>
+  </tbody>
+</table>
+<p>A failed <code>TORCH_CHECK</code> raises a C++ exception that pybind11 turns into a Python <code>RuntimeError</code>. In <code>step()</code> nothing catches it, so the engine stops.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and config values that reach this file">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Read at</th><th>Effect here</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td>5</td><td><code>getenv</code> in the constructor ({{cite csrc/engine/scheduler.hpp:118}}, {{cite csrc/engine/utils.hpp:36-40}})</td><td><code>nextn</code>: drafts, <code>max_seqlen_q</code>, MTP slots. A value below 0 becomes 0.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_ATTEMPT_INTERVAL</code></td><td>70</td><td>Python default argument ({{cite deepinfer/config.py:193}})</td><td>ALL points.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL</code></td><td>100</td><td>{{cite deepinfer/config.py:194}}</td><td>ANY points.</td></tr>
+    <tr><td><code>DEEPINFER_PREFILL_MAX_SUM_SEQLEN_K</code></td><td>unset → <code>2**30</code></td><td>{{cite deepinfer/engine/llm_engine.py:317}}</td><td>Prefill sum limit.</td></tr>
+    <tr><td><code>DEEPINFER_ZERO_OVERHEAD_SCHEDULING</code></td><td>on for NORMAL</td><td>{{cite deepinfer/engine/llm_engine.py:313}}</td><td>Gloo group → CPU tensors in the votes.</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code></td><td>0</td><td>{{cite deepinfer/engine/llm_engine.py:260}}</td><td>Stored as <code>truncate_len</code> (only in <code>compact</code> mode, else 0); not read in this file. The <code>FlopsEstimator</code> gets the value through its own argument ({{cite deepinfer/engine/llm_engine.py:318-322}}).</td></tr>
+    <tr><td><code>lookahead_tokens</code></td><td>0 (<code>EngineArgs</code>); the offline example uses 1</td><td>{{cite deepinfer/engine/llm_engine.py:316}}</td><td>Minimum chunk length (lines 509-511).</td></tr>
+    <tr><td><code>log_stats</code></td><td><code>not disable_log_stats</code>: off in <code>LLM</code>, on in the examples ({{cite deepinfer/engine/llm_engine.py:466}}, {{cite examples/_config.py:122}})</td><td>{{cite deepinfer/engine/llm_engine.py:326}}</td><td>FLOP estimates in <code>schedule()</code>.</td></tr>
+  </tbody>
+</table>
+<x-note title="The C++ and Python defaults must agree">
+<p>The C++ code reads <code>DEEPINFER_USE_NEXTN_DECODE</code> itself, with its own default of 5. The comment says, in English: <em>"Keep the unset default consistent with deepinfer/environ.py and script entry points"</em> ({{cite csrc/engine/utils.hpp:38}}). <code>environ.py</code> also has 5 ({{cite deepinfer/environ.py:129}}).</p>
+</x-note>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/scheduler}}: the policy, with diagrams and a simulator.</li>
+  <li>{{link concepts/request-lifecycle}}: the statuses that this file sets.</li>
+  <li>{{link concepts/paged-kv-cache}}: the block manager that this file calls.</li>
+  <li>{{link concepts/dp-step-votes}}: why the votes exist.</li>
+  <li>{{link concepts/speculative-decoding}} and {{link concepts/dspark}}: the drafts and <code>MTPVarlen</code>.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why the counters are optimistic.</li>
+  <li>{{link code/sequence-hpp}}: the fields that this file reads and writes.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method does <code>LLMEngine.step()</code> call on the scheduler, and what does it return?
+    <x-a><p><code>schedule(sequence_metadata_pool)</code>. It returns a tuple: a list of <code>SequenceMetadata</code> objects from the pool, and a <code>SchedulerOutputs</code> object ({{cite csrc/engine/scheduler.hpp:667}}, {{cite csrc/engine/scheduler.hpp:735}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>_schedule</code> release the GIL before it locks the block managers?
+    <x-a><p><code>Lockable::lock_</code> fails if the caller holds the GIL, to avoid a deadlock ({{cite csrc/utils/lockable.hpp:16}}). Releasing the GIL also lets other Python threads, such as the grammar builders, run during scheduling ({{cite csrc/engine/scheduler.hpp:276}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In <code>process_outputs</code>, a decode sequence has <code>num_tokens = 100</code> and <code>seqlen_q = 6</code>, and the sampler accepts 2 drafts. What is <code>num_tokens</code> after the call, and why not 106?
+    <x-a><p>103. <code>advance_optimistically(6)</code> first sets it to 106, then <code>commit_processed_tokens(3)</code> sets it to <code>100 + 3</code> ({{cite csrc/engine/scheduler.hpp:927}}, {{cite csrc/engine/scheduler.hpp:999}}). Rejected drafts take no KV cache.</p></x-a>
+  </x-q>
+  <x-q level="hard">The confidence head gives <code>[0.9, 0.8, 0.5, 0.5, 0.2]</code> for one sequence. What does <code>process_MTPInfo</code> store in <code>accept_rates</code>, and which earlier values does <code>build_request_outputs</code> see?
+    <x-a><p>The running products: <code>[0.9, 0.72, 0.36, 0.18, 0.036]</code> ({{cite csrc/engine/scheduler.hpp:1246-1251}}). The raw values go to <code>confidence_raw</code>, and the old raw values move to <code>prev_confidence_raw</code> first (line 1241). <code>build_request_outputs</code> reads <code>prev_confidence_raw</code>, so <code>process_MTPInfo</code> must run before it ({{cite csrc/engine/scheduler.hpp:1244-1245}}, {{cite csrc/engine/outputs.hpp:291-293}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Which members of <code>Scheduler</code> are written but never read, and what does that tell you about <code>DEEPINFER_YOCO_PREFILL_KEEP_TOKENS</code>?
+    <x-a><p><code>truncate_len</code>, <code>dp_size</code>, <code>dp_rank</code>, <code>schedule_counter</code>, <code>last_step_num_batched_tokens</code>, <code>last_step_cached_tokens</code> and <code>tokens_chunked_prefill_remaining</code> (see the deep dive "Member variables"). The engine passes the YOCO keep length as <code>truncate_len</code> ({{cite deepinfer/engine/llm_engine.py:315}}), but the scheduler does not use it in this release. Only the FLOP estimate that the scheduler calls gets the value, through a separate argument ({{cite deepinfer/engine/llm_engine.py:318-322}}).</p></x-a>
+  </x-q>
+</x-quiz>

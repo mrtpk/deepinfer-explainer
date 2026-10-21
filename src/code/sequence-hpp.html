@@ -1,0 +1,283 @@
+---
+title: csrc/engine/sequence.hpp: Sequence and SequenceMetadata
+nav_title: sequence.hpp
+level: Advanced
+prerequisites: concepts/request-lifecycle
+related: code/scheduler-hpp, code/sequence, code/block-manager-hpp, code/outputs-hpp, code/zos-cpp, code/engine-pyi, concepts/request-lifecycle, concepts/scheduler, concepts/speculative-decoding
+summary: sequence.hpp defines the C++ Sequence (one record per request, owned by the scheduler) and SequenceMetadata (a per-step view of one scheduled sequence that the worker reads). It also defines the status enum, the finish reasons and the image token offsets.
+---
+<h2>Purpose</h2>
+<p><code>sequence.hpp</code> defines the record that the engine keeps for each request, and the small view of it that each step sends to the model and the sampler.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>csrc/engine/sequence.hpp</code>, 419 lines of C++ in one header. Most comments are in Chinese.</td></tr>
+    <tr><th>Main classes</th><td><code>struct Sequence</code> ({{cite csrc/engine/sequence.hpp:275}}) and <code>struct SequenceMetadata</code> ({{cite csrc/engine/sequence.hpp:325}}). Also the enums <code>MMTokenOffset</code> and <code>SequenceStatus</code>, and eleven helper structs (from <code>SequenceData</code> to <code>SequenceInit</code>).</td></tr>
+    <tr><th>Runs in</th><td>CPU memory of the engine process. A <code>Sequence</code> lives in a <code>std::shared_ptr</code>; the scheduler queues and Python share it. No device code.</td></tr>
+    <tr><th>Used by</th><td><code>scheduler.hpp</code>, <code>block_manager.hpp</code>, <code>mtp_varlen.hpp</code>, <code>outputs.hpp</code>, <code>prepare_sample.hpp</code>, <code>process_output.hpp</code>, <code>input_metadata/prepare_tensor_input.hpp</code>, <code>zos.cpp</code>, and the bindings in <code>pybind_sequence.cpp</code>.</td></tr>
+    <tr><th>Calls</th><td>Only Python attribute reads: the constructor copies values out of the <code>SamplingParams</code> object ({{cite csrc/engine/sequence.hpp:103-115}}, {{cite csrc/engine/sequence.hpp:185-190}}).</td></tr>
+    <tr><th>Not in this file</th><td>The queue logic (<code>scheduler.hpp</code>), the block allocator (<code>block_manager.hpp</code>), and the Python names of the fields (<code>pybind_sequence.cpp</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<h3>Who uses it</h3>
+<ul>
+  <li><strong>Python makes a Sequence</strong> through the binding constructor, which builds a <code>SequenceInit</code> ({{cite csrc/engine/pybind_sequence.cpp:93-102}}). <code>LLMEngine.add_request</code> calls it ({{cite deepinfer/engine/llm_engine.py:594-598}}). <code>Scheduler::fork_seq</code> makes one in C++ ({{cite csrc/engine/scheduler.hpp:1074-1101}}).</li>
+  <li><strong>The scheduler</strong> reads and writes almost every field (the page {{link code/scheduler-hpp}}).</li>
+  <li><strong>The block manager</strong> fills <code>cache.block_table</code> and <code>cache.state_id</code> ({{cite csrc/engine/block_manager.hpp:207-214}}).</li>
+  <li><strong>The schedule step</strong> makes one <code>SequenceMetadata</code> per scheduled sequence from the object pool ({{cite csrc/engine/scheduler.hpp:706-707}}).</li>
+  <li><strong>The sampler preparation and the ZOS code</strong> read <code>SequenceMetadata</code> fields and call <code>is_last_prompt_chunk</code> and <code>refresh_for_sampling</code> ({{cite csrc/engine/prepare_sample.cpp:20-22}}, {{cite csrc/engine/zos.cpp:293-303}}).</li>
+  <li><strong>The output builder</strong> reads the status, the lengths and the MTP values ({{cite csrc/engine/outputs.hpp:194-294}}).</li>
+  <li><strong>Python</strong> imports the classes from <code>deepinfer._C.engine</code> through <code>deepinfer/sequence.py</code> ({{cite deepinfer/sequence.py:14-20}}).</li>
+</ul>
+<h3>What it calls</h3>
+<p>Nothing outside the file, except <code>py::object::attr</code> for the sampling values and <code>deepinfer::EnableObjectPool</code>, the base class that marks pool objects ({{cite csrc/utils/object_pool.hpp:12-15}}).</p>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><code>MMTokenOffset</code></td><td>{{cite csrc/engine/sequence.hpp:21}}</td><td>Image token ids as offsets above <code>vocab_size</code>.</td></tr>
+    <tr><td><code>SequenceStatus</code>, <code>is_finished</code>, <code>get_finished_reason</code></td><td>{{cite csrc/engine/sequence.hpp:30-64}}</td><td>Status values, the finished test, and the reason strings.</td></tr>
+    <tr><td><code>SequenceData</code></td><td>{{cite csrc/engine/sequence.hpp:66}}</td><td>Token ids plus the prompt length.</td></tr>
+    <tr><td><code>SamplingScalars</code></td><td>{{cite csrc/engine/sequence.hpp:92}}</td><td>Sampler values copied once from <code>SamplingParams</code>.</td></tr>
+    <tr><td><code>MtpState</code></td><td>{{cite csrc/engine/sequence.hpp:118}}</td><td>Draft tokens, accept rates, the MTP pool slot, counters.</td></tr>
+    <tr><td><code>SequenceRequest</code>, <code>SequenceInput</code></td><td>{{cite csrc/engine/sequence.hpp:168-179}}</td><td>Ids and arrival time; tokens and multimodal data.</td></tr>
+    <tr><td><code>StoppingCriteria</code>, <code>GenerationState</code></td><td>{{cite csrc/engine/sequence.hpp:181-198}}</td><td><code>max_tokens</code>, <code>ignore_eos</code>; the Python params and prompt log-probabilities.</td></tr>
+    <tr><td><code>KvCacheState</code></td><td>{{cite csrc/engine/sequence.hpp:200}}</td><td>Cached token count, block table, state slot.</td></tr>
+    <tr><td><code>StructuredOutputState</code></td><td>{{cite csrc/engine/sequence.hpp:230}}</td><td>Grammar status and matcher.</td></tr>
+    <tr><td><code>SequenceScheduleState</code></td><td>{{cite csrc/engine/sequence.hpp:235}}</td><td>Status, schedulable flag, chunk state, in-flight counters.</td></tr>
+    <tr><td><code>SequenceInit</code></td><td>{{cite csrc/engine/sequence.hpp:265}}</td><td>Named constructor arguments.</td></tr>
+    <tr><td><code>Sequence</code></td><td>{{cite csrc/engine/sequence.hpp:275}}</td><td>The record: seven groups plus helpers.</td></tr>
+    <tr><td><code>PLACEHOLDER_REQUEST_ID</code></td><td>{{cite csrc/engine/sequence.hpp:323}}</td><td><code>"placeholder"</code>, the id of dummy sequences.</td></tr>
+    <tr><td><code>SequenceMetadata</code></td><td>{{cite csrc/engine/sequence.hpp:325}}</td><td>Per-step view: <code>seqlen_q</code>, <code>seqlen_k</code>, references to tokens and blocks.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>Image tokens, statuses and reasons</h3>
+<x-code file="csrc/engine/sequence.hpp" lines="18-43" highlight="22-27,30-43">
+<x-tr line="18-20">Offset of the special image tokens above vocab_size. The real token_id = vocab_size + offset. Python: deepinfer.multimodal_tokens.ImageTokenOffset.</x-tr>
+<x-tr line="24">&lt;image&gt;, the real image token</x-tr>
+<x-tr line="27">Number of special image tokens (IMAGE_START to IMAGE_END, 5 in total)</x-tr>
+</x-code>
+<ol>
+  <li>Lines 21-28: five ids above the vocabulary. Only <code>IMAGE</code> (+2) and <code>IMAGE_PAD</code> (+1) appear in token lists ({{cite csrc/engine/scheduler.hpp:233-234}}); the scheduler uses them to protect image units in chunks ({{cite csrc/engine/scheduler.hpp:91-92}}).</li>
+  <li>Lines 30-41: ten status values. <code>SWAPPED</code> exists, but no code sets it.</li>
+  <li>Line 43: "finished" is an order test, so every value after <code>FINISHED_STOPPED</code> counts.</li>
+</ol>
+<x-code file="csrc/engine/sequence.hpp" lines="45-64">
+<x-tr line="56">If the KV cache is about to overflow, we stop the task that uses the most KV cache by force.</x-tr>
+</x-code>
+<p>The comment at line 56 describes the intent. The scheduler picks the victim by output length only ({{cite csrc/engine/scheduler.hpp:624-625}}).</p>
+
+<h3><code>SequenceData</code>: the token list</h3>
+<x-code file="csrc/engine/sequence.hpp" lines="66-89" highlight="70-78,83" />
+<ol>
+  <li>Lines 70-78: the Python path copies a C-contiguous <code>int32</code> NumPy array with one <code>memcpy</code>. No value check happens here. <code>add_request</code> checks the ids before ({{cite deepinfer/engine/llm_engine.py:581-589}}).</li>
+  <li>Line 83: the output length is computed, not stored: <code>len − prompt_len</code>. After a recompute, the prompt length does not change, so the old outputs still count as outputs.</li>
+  <li>Line 85: <code>get_last_token_id</code> reads <code>back()</code>. On an empty list this is undefined behaviour; <code>add_request</code> refuses empty prompts ({{cite deepinfer/engine/llm_engine.py:553-554}}).</li>
+</ol>
+
+<h3><code>SamplingScalars</code> and <code>StoppingCriteria</code></h3>
+<x-code file="csrc/engine/sequence.hpp" lines="91-116">
+<x-tr line="91">Sampler inputs that are copied into SequenceMetadata in every step.</x-tr>
+</x-code>
+<p>The constructor of <code>Sequence</code> calls <code>capture</code> once ({{cite csrc/engine/sequence.hpp:280-281}}). So a later change to the Python <code>SamplingParams</code> object does not reach the C++ copy. A missing attribute raises a Python error (<code>AttributeError</code>) when the sequence is made. <code>StoppingCriteria</code> copies only <code>max_tokens</code> and <code>ignore_eos</code> ({{cite csrc/engine/sequence.hpp:181-191}}).</p>
+
+<h3><code>MtpState</code>: draft tokens</h3>
+<x-code file="csrc/engine/sequence.hpp" lines="118-153" highlight="127-131,134-142,149-153">
+<x-tr line="119">Reference token list, read by output length.</x-tr>
+<x-tr line="120">The last token output in the previous round, which is the golden token of this round.</x-tr>
+<x-tr line="121">Tokens verified in the previous round (the SO matcher needs them to update its automaton).</x-tr>
+<x-tr line="122">Draft tokens made in the previous round.</x-tr>
+<x-tr line="123">Estimated accept rates of the previous round's drafts (after the running product). If empty, the scheduler pads 1.0 when drafts exist, else 0.0.</x-tr>
+<x-tr line="124">accept_rates of the round before; process_MTPInfo shifts it from accept_rates every round.</x-tr>
+<x-tr line="125">Estimated accept rates of the previous round's drafts (before the product). If empty, SequenceMetadata shows an empty tensor.</x-tr>
+<x-tr line="126">confidence_raw of the round before; only metrics read it (see outputs.hpp).</x-tr>
+<x-tr line="127">Request slot in the global MTP info pool; 0 = padding / not allocated.</x-tr>
+<x-tr line="128">Is there draft info that the sampler has not read yet?</x-tr>
+<x-tr line="129">Number of rounds that finished process_MTPInfo (aborted ones also count, like schedule_cnt).</x-tr>
+<x-tr line="130-131">Number of rounds scheduled (prompt and decode). The difference to process_cnt tells which round accept_rates belongs to; see MTPVarlen::schedule.</x-tr>
+<x-tr line="133">Keep accepted_tokens (the SO matcher still needs them after a recompute) and prev_confidence_raw (only for metrics).</x-tr>
+</x-code>
+<ol>
+  <li>Lines 127-128: <code>info_slot</code> is the row of this sequence in the device-side MTP pool. The scheduler gives slots 1 … <code>max_num_seqs</code> ({{cite csrc/engine/scheduler.hpp:792-800}}).</li>
+  <li>Lines 134-142: a recompute clears the draft state and both counters.</li>
+  <li>Lines 149-153: <code>take_draft_info_slot</code> returns the slot only once per new draft info, then clears the flag. A second read in the same round gets slot 0 (padding).</li>
+</ol>
+<x-code file="csrc/engine/sequence.hpp" lines="155-165" />
+<p><code>next_golden_tokens</code> returns <code>2 × nextn + 1</code> reference tokens, from position <code>output_len</code> on, padded with <code>-1</code>. Example: 10 golden tokens, output length 7, <code>nextn = 5</code>: positions 7 … 17, so <code>[g7, g8, g9, -1, -1, -1, -1, -1, -1, -1, -1]</code>. With no golden tokens, or output length 10 or more, it returns nothing.</p>
+
+<h3><code>KvCacheState</code>: the cache counters</h3>
+<x-code file="csrc/engine/sequence.hpp" lines="200-228" highlight="203,206-207,211-221">
+<x-tr line="210">When a hit count comes from outside, set the base for the increment at the same time.</x-tr>
+</x-code>
+<ol>
+  <li>Line 203: <code>num_tokens</code> is the number of tokens whose KV entries are written (Python: <code>num_cached_tokens</code>).</li>
+  <li>Line 206: <code>block_table</code> lists physical block ids. A real sequence never gets block 0 ({{cite csrc/engine/block_manager.hpp:27-35}}); only the placeholder step uses it.</li>
+  <li>Line 207: <code>state_id = -1</code> means "no state slot".</li>
+  <li>Lines 216-219: <code>advance_optimistically(n)</code> remembers the old value and adds <code>n</code>.</li>
+  <li>Line 221: <code>commit_processed_tokens(n)</code> sets the value to the old one plus <code>n</code>. Together, the two calls first assume that all query tokens are kept, then correct the value.</li>
+</ol>
+<p><code>hit_tokens</code> only goes from a parent to a fork ({{cite csrc/engine/scheduler.hpp:1086}}), and <code>swa_valid_start</code> is only reset to 0 in this file. No code in this release sets a value other than 0 for it, but the flop estimate and the tensor preparation read it.</p>
+
+<h3><code>SequenceScheduleState</code>: status and in-flight tokens</h3>
+<x-code file="csrc/engine/sequence.hpp" lines="230-262" highlight="231,237,239-242,244-256">
+<x-tr line="231">0: not started; 1: just started (at the boundary); 2: started; -1: aborted.</x-tr>
+</x-code>
+<ol>
+  <li>Line 237: <code>schedulable</code> defaults to false here, but the binding sets it from the multimodal data ({{cite csrc/engine/pybind_sequence.cpp:35}}).</li>
+  <li>Line 238: <code>branch_id</code> is <code>"default"</code>. A fork waits with a <code>_</code> prefix until its prefill is set up ({{cite csrc/engine/scheduler.hpp:398}}, {{cite csrc/engine/scheduler.hpp:423}}).</li>
+  <li>Lines 244-247: <code>schedule()</code> adds <code>nextn + 1</code> in-flight tokens for each scheduled step.</li>
+  <li>Lines 249-256: <code>process_outputs</code> removes one step. If only one step was in flight, both counters go to 0. If two were in flight (ZOS), the total becomes the size of the last one.</li>
+</ol>
+
+<h3><code>Sequence</code>: the record</h3>
+<x-code file="csrc/engine/sequence.hpp" lines="275-311" highlight="280-282,291-293,307-311" />
+<ol>
+  <li>Lines 280-281: copy the sampling and stop values once.</li>
+  <li>Line 282: the first "last output token" is the last prompt token.</li>
+  <li>Lines 286-289: reserve room for <code>max_tokens</code> more ids in both token lists.</li>
+  <li>Lines 291-293: the number of blocks: <code>ceil((len + total_inflight_tokens + drafts) / block_size)</code>. This is the core of all block decisions.</li>
+  <li>Lines 307-311: a recompute resets the cache, schedule and MTP parts. The tokens stay.</li>
+</ol>
+
+<h3><code>SequenceMetadata</code>: the per-step view</h3>
+<x-code file="csrc/engine/sequence.hpp" lines="325-372" highlight="340,342,346-349,356-361,363-366,371">
+<x-tr line="331-332">A dummy that Python makes (empty placeholder run / profile / CUDA graph padding) has no host Sequence. Its borrowed members point to this self-owned storage instead; on the pool path this is always nullptr.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 342 and 349: <code>request_id</code> and <code>block_table</code> are C++ <em>references</em> into the <code>Sequence</code>. A block added to the sequence later is visible through the metadata.</li>
+  <li>Lines 346-348: pointers to the token lists; <code>prompt_tokens</code> is set only for prefill.</li>
+  <li>Line 354: <code>sampling</code> is a copy, so the sampler reads plain numbers.</li>
+  <li>Lines 357-358: <code>seqlen_q</code> (query tokens of this step) and <code>seqlen_k</code> (tokens after this step, including in-flight ones).</li>
+  <li>Lines 363-365: the last output token and the two MTP pool slots (read and write).</li>
+  <li>Line 371: <code>prompt_logprobs</code> is a reference, so prompt log-probabilities of several chunks add up in the <code>Sequence</code> ({{cite csrc/engine/process_output.hpp:23-27}}).</li>
+</ol>
+<x-code file="csrc/engine/sequence.hpp" lines="374-389" highlight="382,386-388">
+<x-tr line="387">A prefill chunk that is not the last one makes no token in this step; the sampler uses -1 to skip the SO update.</x-tr>
+</x-code>
+<p>Line 382 calls <code>take_draft_info_slot()</code>, so building the metadata also clears <code>has_draft_info</code>. Lines 392-404 are a second constructor for Python dummies: the borrowed members point into <code>owned</code>, and the object never goes back to a pool. <code>is_placeholder</code> is true when the id is <code>"placeholder"</code> ({{cite csrc/engine/sequence.hpp:398}}).</p>
+<x-code file="csrc/engine/sequence.hpp" lines="406-418" />
+<ol>
+  <li>Line 406: the last prompt chunk is the one that reaches the full length.</li>
+  <li>Lines 408-418: with ZOS, the metadata was made before the previous step was processed. <code>refresh_for_sampling</code> copies the newest values just before sampling ({{cite csrc/engine/zos.cpp:300-302}}). It keeps the old write slot if the sequence already gave back its slot.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Every field of Sequence">
+<table>
+  <thead><tr><th>Group.field</th><th>Type</th><th>Default</th><th>Written by</th><th>Python name</th></tr></thead>
+  <tbody>
+    <tr><td><code>request.seq_id</code></td><td><code>int64_t</code></td><td>0</td><td><code>add_request</code> counter</td><td><code>seq_id</code></td></tr>
+    <tr><td><code>request.request_id</code>, <code>user_id</code></td><td><code>std::string</code></td><td>""</td><td>caller</td><td>same</td></tr>
+    <tr><td><code>request.arrival_time</code></td><td><code>double</code> (ms)</td><td>0</td><td><code>add_sequence</code> ({{cite csrc/engine/scheduler.hpp:136}})</td><td><code>arrival_time</code></td></tr>
+    <tr><td><code>input.tokens</code></td><td><code>SequenceData</code></td><td>-</td><td>constructor; <code>append_token_id</code></td><td><code>data</code></td></tr>
+    <tr><td><code>input.compressed_tokens</code></td><td><code>SequenceData</code></td><td>-</td><td>constructor (Engram ids); <code>append_compressed_token_id</code></td><td><code>compressed_data</code></td></tr>
+    <tr><td><code>input.multi_modal_data</code></td><td><code>py::object</code></td><td><code>None</code></td><td>caller; image worker results</td><td><code>multi_modal_data</code></td></tr>
+    <tr><td><code>generation.params</code></td><td><code>py::object</code></td><td><code>None</code></td><td>constructor</td><td><code>sampling_params</code> (read-only)</td></tr>
+    <tr><td><code>generation.sampling</code></td><td><code>SamplingScalars</code></td><td>-</td><td>constructor</td><td>-</td></tr>
+    <tr><td><code>generation.stopping</code></td><td><code>StoppingCriteria</code></td><td>-</td><td>constructor</td><td>-</td></tr>
+    <tr><td><code>generation.prompt_logprobs</code></td><td><code>optional&lt;vector&lt;double&gt;&gt;</code></td><td>empty</td><td>through metadata references</td><td>-</td></tr>
+    <tr><td><code>cache.block_size</code></td><td><code>int</code></td><td>0</td><td>constructor (128)</td><td><code>block_size</code></td></tr>
+    <tr><td><code>cache.num_tokens</code>, <code>previous_num_tokens</code></td><td><code>int</code></td><td>0</td><td><code>process_outputs</code></td><td><code>num_cached_tokens</code>, <code>old_cached_tokens</code></td></tr>
+    <tr><td><code>cache.hit_tokens</code></td><td><code>int</code></td><td>0</td><td><code>fork_seq</code></td><td><code>cached_hit_tokens</code></td></tr>
+    <tr><td><code>cache.swa_valid_start</code></td><td><code>int</code></td><td>0</td><td>recompute (to 0)</td><td><code>swa_valid_start</code></td></tr>
+    <tr><td><code>cache.block_table</code></td><td><code>vector&lt;int&gt;</code></td><td>empty</td><td>block manager, <code>_append_slot</code></td><td>-</td></tr>
+    <tr><td><code>cache.state_id</code></td><td><code>int</code></td><td>-1</td><td><code>allocate_seq</code>, fork</td><td><code>state_id</code></td></tr>
+    <tr><td><code>cache.last_copy_state_token_idx</code></td><td><code>int</code></td><td>0</td><td><code>do_copy_state</code> (unused in this release)</td><td>same</td></tr>
+    <tr><td><code>mtp.*</code></td><td>see <code>MtpState</code></td><td>-</td><td>scheduler, <code>process_MTPInfo</code></td><td><code>last_output_token</code>, <code>last_accepted_token</code>, <code>last_next_n_token</code></td></tr>
+    <tr><td><code>structured_output.status</code>, <code>matcher</code></td><td><code>int</code>, <code>py::object</code></td><td>0, <code>None</code></td><td>engine, <code>process_outputs</code></td><td><code>so_status</code>, <code>so_matcher</code></td></tr>
+    <tr><td><code>schedule.status</code></td><td><code>SequenceStatus</code></td><td>WAITING</td><td>scheduler, engine</td><td><code>status</code></td></tr>
+    <tr><td><code>schedule.schedulable</code></td><td><code>bool</code></td><td>false</td><td>binding, <code>set_schedulable</code></td><td><code>schedulable</code></td></tr>
+    <tr><td><code>schedule.branch_id</code></td><td><code>std::string</code></td><td><code>"default"</code></td><td><code>fork_seq</code></td><td><code>branch_id</code></td></tr>
+    <tr><td><code>schedule.chunked_rest_len</code></td><td><code>int</code></td><td>0</td><td>prefill</td><td><code>chunked_rest_len</code> (read-only)</td></tr>
+    <tr><td><code>schedule.chunk_checkpoints</code></td><td><code>deque&lt;int&gt;</code></td><td>empty</td><td>caller; prefill pops</td><td><code>chunk_checkpoints</code></td></tr>
+    <tr><td><code>schedule.total_inflight_tokens</code>, <code>last_inflight_tokens</code></td><td><code>int</code></td><td>0</td><td><code>schedule()</code>, <code>process_outputs</code></td><td>-</td></tr>
+  </tbody>
+</table>
+<p>The Python names come from {{cite csrc/engine/pybind_sequence.cpp:109-137}}. Most bindings are read-write, through a helper that returns a reference to the field ({{cite csrc/engine/pybind_sequence.cpp:13-18}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Ownership and lifetime">
+<ul>
+  <li><strong>Sequence.</strong> Held by <code>std::shared_ptr</code> (<code>SequencePtr</code>, {{cite csrc/engine/scheduler.hpp:34}}). The scheduler queues, <code>SchedulerOutputs</code> lists and Python handles share it. It dies when the last holder lets go.</li>
+  <li><strong>SequenceMetadata from the pool.</strong> It holds references into its <code>Sequence</code> (<code>request_id</code>, <code>block_table</code>, <code>mtp</code>, <code>prompt_logprobs</code>) and raw pointers to the token lists. It must not outlive the <code>Sequence</code>. The engine keeps the step's <code>SchedulerOutputs</code> (and so the <code>shared_ptr</code>s) alive in the step state while the metadata is in use, and gives the metadata back one step later ({{cite deepinfer/engine/llm_engine.py:1013}}).</li>
+  <li><strong>SequenceMetadata from Python.</strong> The second constructor owns its strings and vectors in <code>owned</code>, and the binding keeps <code>seq_data</code> and <code>compressed_seq_data</code> alive with <code>keep_alive</code> ({{cite csrc/engine/pybind_sequence.cpp:149-153}}).</li>
+  <li><strong>Pool reuse.</strong> The pool destroys a released object and builds the next one in the same memory with placement <code>new</code> ({{cite csrc/utils/object_pool.hpp:26-31}}, {{cite csrc/utils/object_pool.hpp:34-41}}). So a Python reference to an old metadata object sees the new contents after reuse.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: counters through two ZOS decode steps">
+<p>A running sequence has <code>len = 501</code> (500 cached + the last sampled token), <code>num_tokens = 500</code>, 5 drafts, block size 128, and no step in flight. <code>nextn = 5</code>.</p>
+<table>
+  <thead><tr><th>Event</th><th><code>total_inflight</code></th><th><code>last_inflight</code></th><th><code>num_tokens</code></th><th><code>len</code></th><th><code>get_num_blocks()</code></th></tr></thead>
+  <tbody>
+    <tr><td>start</td><td>0</td><td>0</td><td>500</td><td>501</td><td><code>ceil(506/128) = 4</code></td></tr>
+    <tr><td>step N scheduled</td><td>6</td><td>6</td><td>500</td><td>501</td><td>4 (checked before the reserve)</td></tr>
+    <tr><td>step N+1 scheduled</td><td>12</td><td>6</td><td>500</td><td>501</td><td><code>ceil((501 + 6 + 5)/128) = 4</code></td></tr>
+    <tr><td>step N processed, 2 drafts accepted</td><td>6</td><td>6</td><td><code>500 → 506 → 503</code></td><td>504</td><td><code>ceil((504 + 6 + 5)/128) = 5</code></td></tr>
+    <tr><td>step N+2 scheduled</td><td>12</td><td>6</td><td>503</td><td>504</td><td>5: <code>_append_slot</code> takes a fifth block before the reserve grows</td></tr>
+  </tbody>
+</table>
+<p>Lines: in-flight ({{cite csrc/engine/sequence.hpp:244-256}}), counters ({{cite csrc/engine/sequence.hpp:216-221}}), blocks ({{cite csrc/engine/sequence.hpp:291-293}}). The table assumes that the CPU schedules step N+2 after it processed step N, as in the Worker order: forward N+1, post-process N, then the next <code>step()</code> ({{cite deepinfer/worker/worker.py:113-189}}).</p>
+</x-deepdive>
+
+<x-deepdive title="SequenceMetadata fields that Python can read">
+<table>
+  <thead><tr><th>Python name</th><th>C++ source</th><th>Access</th></tr></thead>
+  <tbody>
+    <tr><td><code>request_id</code>, <code>seq_id</code>, <code>is_placeholder</code>, <code>is_prompt</code></td><td>fields</td><td>read-only</td></tr>
+    <tr><td><code>sampling_params</code>, <code>multi_modal_data</code>, <code>so_matcher</code></td><td><code>py::object</code> fields</td><td>read-only</td></tr>
+    <tr><td><code>seqlen_q</code>, <code>seqlen_k</code>, <code>last_output_token</code></td><td><code>int</code> fields</td><td>read-only</td></tr>
+    <tr><td><code>is_last_prompt_chunk</code>, <code>full_len</code></td><td>computed</td><td>read-only</td></tr>
+    <tr><td><code>last_accepted_token</code>, <code>last_next_n_token</code></td><td><code>mtp.accepted_tokens</code>, <code>mtp.draft_tokens</code></td><td>read-only (copies)</td></tr>
+    <tr><td><code>so_status</code></td><td><code>int</code></td><td>read-write (the engine sets it at the last prefill chunk, {{cite deepinfer/engine/llm_engine.py:913-927}})</td></tr>
+  </tbody>
+</table>
+<p>Source: {{cite csrc/engine/pybind_sequence.cpp:139-168}}. The block table, the token pointers and the MTP slots are not bound. C++ code (the input preparation and <code>prepare_sample.cpp</code>) reads them directly.</p>
+</x-deepdive>
+
+<x-deepdive title="Edge cases and error paths">
+<table>
+  <thead><tr><th>Case</th><th>What happens</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Token ids outside the vocabulary</td><td>No check here; <code>add_request</code> drops the request before</td><td>{{cite csrc/engine/sequence.hpp:70-78}}, {{cite deepinfer/engine/llm_engine.py:581-589}}</td></tr>
+    <tr><td>Non-contiguous or non-int32 array</td><td>The binding refuses it (<code>noconvert</code>)</td><td>{{cite csrc/engine/pybind_sequence.cpp:103}}</td></tr>
+    <tr><td><code>SamplingParams</code> without an attribute</td><td>pybind11 error in the constructor</td><td>{{cite csrc/engine/sequence.hpp:103-115}}</td></tr>
+    <tr><td>Empty token list</td><td><code>last_output_token = -1</code>; <code>get_last_token_id</code> would read past the end</td><td>{{cite csrc/engine/sequence.hpp:282}}, {{cite csrc/engine/sequence.hpp:85}}</td></tr>
+    <tr><td>Second <code>take_draft_info_slot</code> in a round</td><td>returns 0 (padding slot)</td><td>{{cite csrc/engine/sequence.hpp:149-153}}</td></tr>
+    <tr><td>Golden list shorter than needed</td><td>padded with <code>-1</code></td><td>{{cite csrc/engine/sequence.hpp:161-163}}</td></tr>
+  </tbody>
+</table>
+<p>The file has no <code>TORCH_CHECK</code>. All checks of these objects are in the files that use them.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/request-lifecycle}}: the statuses and the fields over the life of a request.</li>
+  <li>{{link concepts/scheduler}}: how <code>get_num_blocks</code> and the in-flight counters drive block allocation.</li>
+  <li>{{link concepts/speculative-decoding}}: the draft tokens in <code>MtpState</code>.</li>
+  <li>{{link concepts/zero-overhead-scheduling}}: why the counters are optimistic and why <code>refresh_for_sampling</code> exists.</li>
+  <li>{{link code/sequence}}: the Python module that re-exports these classes.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which status values count as finished?
+    <x-a><p>Every value from <code>FINISHED_STOPPED</code> on: <code>is_finished</code> is the test <code>status &gt;= FINISHED_STOPPED</code> ({{cite csrc/engine/sequence.hpp:43}}). That is seven values.</p></x-a>
+  </x-q>
+  <x-q level="medium">A sequence has 260 tokens, 6 tokens in flight and 5 drafts. The block size is 128. How many blocks does it need?
+    <x-a><p><code>ceil((260 + 6 + 5) / 128) = ceil(271/128) = 3</code> ({{cite csrc/engine/sequence.hpp:291-293}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The scheduler adds a block to a sequence after its <code>SequenceMetadata</code> was made. Does the metadata see the new block?
+    <x-a><p>Yes. <code>block_table</code> in <code>SequenceMetadata</code> is a reference to <code>seq-&gt;cache.block_table</code>, not a copy ({{cite csrc/engine/sequence.hpp:349}}, {{cite csrc/engine/sequence.hpp:379}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With ZOS, two steps of a sequence are in flight: <code>total_inflight_tokens = 12</code>, <code>last_inflight_tokens = 6</code>. The older step is processed with 1 accepted draft, and <code>num_tokens</code> was 500. What are the three counters after <code>process_outputs</code>?
+    <x-a><p><code>finish_inflight_step</code> sees <code>12 != 6</code>, so <code>total_inflight_tokens = 6</code> and <code>last_inflight_tokens</code> stays 6 ({{cite csrc/engine/sequence.hpp:249-256}}). <code>advance_optimistically(6)</code> gives 506, then <code>commit_processed_tokens(2)</code> gives <code>num_tokens = 502</code> ({{cite csrc/engine/sequence.hpp:216-221}}). See the deep dive "Worked example".</p></x-a>
+  </x-q>
+</x-quiz>
