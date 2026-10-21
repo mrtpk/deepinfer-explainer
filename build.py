@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import html
 import json
 import os
@@ -380,7 +381,7 @@ def load_pages() -> dict[str, Page]:
 def run_diagrams(force: bool) -> dict[str, Path]:
     DIAGRAM_OUT.mkdir(parents=True, exist_ok=True)
     lib = DIAGRAMS / "svglib.py"
-    lib_mtime = lib.stat().st_mtime if lib.exists() else 0
+    lib_bytes = lib.read_bytes() if lib.exists() else b""
     found: dict[str, Path] = {}
     ran = 0
     for script in sorted(DIAGRAMS.glob("*.py")):
@@ -388,7 +389,10 @@ def run_diagrams(force: bool) -> dict[str, Path]:
             continue
         name = script.stem
         out = DIAGRAM_OUT / f"{name}.svg"
-        stale = force or not out.exists() or out.stat().st_mtime < max(script.stat().st_mtime, lib_mtime)
+        # Content hash of script + svglib, not mtime: mtimes on /mnt/c are not reliable.
+        stamp = DIAGRAM_OUT / f"{name}.hash"
+        digest = hashlib.sha256(script.read_bytes() + b"\0" + lib_bytes).hexdigest()
+        stale = force or not out.exists() or not stamp.exists() or stamp.read_text() != digest
         if stale:
             ran += 1
             proc = subprocess.run([sys.executable, str(script), str(out)], capture_output=True, text=True, cwd=str(DIAGRAMS),
@@ -396,12 +400,13 @@ def run_diagrams(force: bool) -> dict[str, Path]:
             if proc.returncode != 0:
                 R.error(rel(script), "diagram script failed:\n" + (proc.stderr.strip() or proc.stdout.strip()))
                 continue
+            stamp.write_text(digest)
             for line in proc.stderr.strip().splitlines():
                 R.warn(rel(script), line)
         if out.exists():
             head = out.read_text(encoding="utf-8")[:300]
-            if 'width="1500"' not in head:
-                R.warn(rel(out), "canvas width is not 1500 (instructions-svg.md section 5)")
+            if 'width="1100"' not in head:
+                R.warn(rel(out), "canvas width is not 1100 (STYLE.md section 10, readability rule)")
             found[name] = out
     print(f"diagrams: {len(found)} found, {ran} rebuilt")
     return found
