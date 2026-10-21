@@ -1,0 +1,243 @@
+---
+title: Tour: Inside one decoder layer
+nav_title: Inside one decoder layer
+level: Advanced
+prerequisites: concepts/model-map, concepts/mhc-residual, concepts/mla-attention, concepts/moe-routing
+related: code/decoder-layer, code/v4-hc, code/v4-attn, code/v4-mlp, concepts/mhc-residual, concepts/sparse-attention-indexer, concepts/mega-moe, concepts/speculative-decoding, tours/spec-decode-round
+summary: Follow 192 tokens of one decode step through one decoder layer, in 10 stops: inputs, hooks, mHC post and pre, the DFlash copy, attention, mHC again, the gate, the experts, and the way out. Shapes at every stop.
+---
+<x-sentence>We follow the 192 tokens of one decode step through one decoder layer, from the call in the model loop to the return value.</x-sentence>
+
+<h2>The idea</h2>
+<p>The page {{link concepts/model-map}} showed the whole model. This tour stays inside <em>one</em> {{term decoder-layer}} and reads every call in code order. We name the file and the function at each stop, and we give the tensor shapes.</p>
+<p>The example step:</p>
+<ul>
+  <li>A {{term decode}} step with 32 sequences. Each sequence sends 1 token plus 5 drafts, so the step has <code>T = 192</code> tokens.</li>
+  <li>We look at layer 7. It is a sparse compressed layer (it has an indexer), a DFlash target layer, and not an Engram layer.</li>
+  <li>Example model sizes: hidden size <code>H = 4096</code>, <code>hc_mult = 4</code>. These values are not in the repo; they come from <code>config.json</code>.</li>
+  <li>The device is a GPU, and the expert-parallel group fits in one NVLink domain. So the layer uses <code>mega_mhc</code> and {{term mega-moe}}.</li>
+</ul>
+<x-simplified><p>The layer number, the layer kind and the sizes are an example. Other layers and other configs take other branches; each stop says which.</p></x-simplified>
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The layer gets its inputs</td><td><code>DeepseekModel.forward</code>, <code>DeepseekDecoderLayer.forward</code></td></tr>
+    <tr><td>2</td><td>Hooks and the YOCO boundary</td><td><code>DeepseekDecoderLayer.forward</code></td></tr>
+    <tr><td>3</td><td>mHC post of the previous MoE</td><td><code>HCLayerMixin._hc_fused_post_pre</code></td></tr>
+    <tr><td>4</td><td>mHC pre and the attention norm</td><td><code>HCLayerMixin._hc_pre</code> / <code>_mega_mhc</code></td></tr>
+    <tr><td>5</td><td>The DFlash copy and the YOCO shared hidden</td><td><code>_store_dflash_input</code></td></tr>
+    <tr><td>6</td><td>Attention: MLA, SWA and compressed keys, indexer</td><td><code>V4Attention.forward</code></td></tr>
+    <tr><td>7</td><td>mHC post of attention, and pre for the MoE</td><td><code>ffn_norm_forward</code></td></tr>
+    <tr><td>8</td><td>The gate picks the experts</td><td><code>DeepseekMoE.gate_forward</code></td></tr>
+    <tr><td>9</td><td>The experts: dispatch, compute, shared expert, combine</td><td><code>DeepseekMoE.forward</code> / <code>mega_moe_forward</code></td></tr>
+    <tr><td>10</td><td>Out: the layer returns</td><td><code>DeepseekDecoderLayer.forward</code>, <code>DeepseekModel.forward</code></td></tr>
+  </tbody>
+</table>
+
+<h2>The picture</h2>
+<x-diagram name="b6a_layer_tour" alt="Two panels of numbered step cards. Panel 1, into the layer and through attention: 1 the layer gets hidden [192, 4096] and the lazy residual with trunk [1, 192, 4, 4096]; 2 optional Engram hook and YOCO boundary; 3 mHC post of the previous MoE gives the trunk [192, 4, 4096]; 4 mHC pre and attention norm give fp8 and bf16 [192, 4096] and new lazy data; 5 DFlash target layers store the mean of the 4 streams, the first YOCO consumer keeps the shared hidden; 6 attention returns bf16 [192, 4096]. Panel 2, the MoE half: 7 mHC post of attention and pre for the MoE; 8 the gate gives topk_idx and topk_weights [192, k]; 9 the experts give bf16 [192, 4096]; 10 the layer returns the MoE output and the lazy residual; the post runs in the next layer." caption="Figure: the ten stops of this tour, with the example shapes. Panel 1 is stops 1-6, panel 2 is stops 7-10. Click to zoom." />
+<p>Read the cards from top to bottom. The teal cards are {{term mhc}} work: they run twice per layer, once before each {{term sub-layer}}. Look at stop 10: the MoE output leaves the layer as one stream. The {{term mhc-trunk | trunk}} gets it only at stop 3 of the next layer.</p>
+
+<x-stop n="1" title="The layer gets its inputs">
+<p>We are in the loop of <code>DeepseekModel.forward</code>. It calls layer <code>i</code> with its own view of the KV cache:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="209-218" />
+<p>The layer receives two things from layer 6. <code>hidden_states</code> is the MoE output of layer 6, which is not yet in the trunk. <code>residual</code> is an {{term hc-lazy-post-data}} object: the trunk before the MoE of layer 6, plus the mixes for its post. Then <code>DeepseekDecoderLayer.forward</code> takes the tensor out of its <code>Movable</code> wrapper:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="97-109" highlight="107" />
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">hidden_states            bf16 [192, 4096]         # MoE output of layer 6
+residual.residual        bf16 [1, 192, 4, 4096]   # trunk before that MoE
+residual.post_layer_mix  fp32 [1, 192, 4, 1]
+residual.comb_res_mix    fp32 [1, 192, 4, 4]
+residual.pre_layer_mix   fp32 [1, 192, 4, 1]      # only with hc_shifted, else None
+kv_cache                 KVCache views of layer 7: swa_cache, ca_cache, ica_cache, ...</code></pre>
+<x-deepdive title="Stop 1 in detail: layer 0 is different">
+<p>Before the loop, <code>residual = None</code> ({{cite deepinfer/model_executor/models/deepseek.py:164}}). So layer 0 gets the embedding output <code>[T, H]</code> and no lazy data. At stop 3 it takes a different branch: it makes the trunk with <code>expand_to_mhc</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:203-208}}). In a prefill, the VL class gives the embedding output ({{cite deepinfer/model_executor/models/deepseek_vl.py:232-233}}).</p>
+<p>One <code>CrossLayerRuntime</code> object goes to all layers ({{cite deepinfer/model_executor/models/deepseek.py:166}}). It carries the shared hidden, the pre-RoPE KV and the top-k list from source layers to later layers. See {{link concepts/cross-layer-kv-sharing}}.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="2" title="Hooks and the YOCO boundary">
+<p>Still in <code>DeepseekDecoderLayer.forward</code>. Two optional blocks run before any math:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="111-118">
+<x-tr line="113">Engram is the trunk intervention hook after the hc post (see HCLayerMixin.attn_norm_forward).</x-tr>
+</x-code>
+<p>An Engram layer makes a closure here. Stop 3 calls it on the trunk. Layer 7 is not an Engram layer, so <code>hc_post_intervention = None</code>. The page {{link concepts/engram}} explains Engram.</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="134-142" />
+<p>This block runs only in the first YOCO consumer layer of a prefill with <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code> (default <code>off</code>, {{cite deepinfer/environ.py:188}}). It keeps only the query rows of the last tokens of each prompt ({{cite deepinfer/environ.py:191-192}}). Our step is a decode step, so nothing happens. See {{link concepts/yoco-swa-replay}}.</p>
+<p><strong>What the data looks like now:</strong> nothing changed. Lines 120-133 also open two timers; they record only in one sample layer per group of equal layers ({{cite deepinfer/model_executor/models/v4_modules/utils.py:139-143}}).</p>
+</x-stop>
+
+<x-stop n="3" title="mHC post of the previous MoE">
+<p>Line 143 calls <code>attn_norm_forward</code>. With mHC on, it goes to <code>_hc_fused_post_pre</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:125-131}}). Its first job is the post mix of layer 6's MoE: write <code>hidden_states</code> into the trunk.</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="195-224" highlight="195-202,220-224" />
+<p>On our GPU, with <code>hc_mult = 4</code> and <code>H = 4096</code> (a multiple of 1024), <code>use_mega_mhc</code> is true ({{cite deepinfer/model_executor/models/v4_modules/hc.py:99-101}}). There is no Engram hook, the input is 2-D, and the lazy data has its post mix. So line 202 runs: one <code>deep_gemm.mega_mhc</code> call does this stop <em>and</em> stop 4. Without the fused path, lines 220-224 do the same in steps: <code>hc_post</code>, then <code>_hc_pre</code>.</p>
+<x-simplified><p>The post kernel is not in the repo. The page {{link concepts/mhc-residual}} gives a simplified model. In it, each of the 4 new streams is a weighted sum of the 4 old streams plus a weighted copy of the MoE output. The post term of the engine's FLOP counter fits this model: <code>4 × 5 × 4096 = 81,920</code> per token, times a fixed cost factor ({{cite csrc/engine/flops_estimator.hpp:111}}).</p></x-simplified>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">trunk (new_residual)     bf16 [192, 4, 4096]     # 6 MiB; layer 6 is now complete
+old lazy data            cleared (all fields None)</code></pre>
+<x-deepdive title="Stop 3 in detail: the other cases">
+<p><code>_hc_fused_post_pre</code> has five cases. The page {{link code/v4-hc}} reads them all. In short:</p>
+<ul>
+  <li>Layer 0: no lazy data, so <code>expand_to_mhc</code> makes the trunk; with <code>hc_shifted</code>, a one-hot pre mix reads only stream 0 ({{cite deepinfer/model_executor/models/v4_modules/hc.py:203-208}}).</li>
+  <li>At its attention boundary, an Engram layer cannot use the fused call, because "no hook can be inserted inside the kernel" ({{cite deepinfer/model_executor/models/v4_modules/hc.py:184-186}}). It runs <code>hc_post</code>, then the hook, then <code>_hc_pre</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:222-227}}). Its FFN boundary has no hook, so it can use <code>mega_mhc</code>.</li>
+  <li>On Ascend, <code>use_mega_mhc</code> is false (line 100), so every layer takes the step-by-step path.</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="4" title="mHC pre and the attention norm">
+<p>Now the trunk must become one attention input. In the fused path, <code>mega_mhc</code> does it in the same call. The outputs show what it computes:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="252-268" highlight="252-256,264-268" />
+<p>The call computes 24 mix values per token from the trunk (4 pre, 4 post, 16 residual-mix values). It applies a pre mix to make one <code>[192, 4096]</code> input. With <code>hc_shifted</code> (the HF default), this is the pre mix of the previous sub-layer (<code>prev_pre_mix</code>, line 249). Then it applies the attention RMSNorm and casts the result to FP8. Lines 264-268 prepare the MXFP8 scale layout, because the attention norm has FP8 output ({{cite deepinfer/model_executor/models/decoder_layer.py:43}}).</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="300-310" />
+<p>The new lazy data keeps the trunk and the mixes for the post at stop 7.</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">hidden_states        (fp8 e4m3 [192, 4096], int32 scales [192, 32])   # 32 = 4096 / 128
+hidden_states_bf16   bf16 [192, 4096]
+residual             HCLazyPostData(
+                       residual       bf16 [1, 192, 4, 4096],   # trunk after stop 3
+                       post_layer_mix fp32 [1, 192, 4, 1],
+                       comb_res_mix   fp32 [1, 192, 4, 4],
+                       pre_layer_mix  fp32 [1, 192, 4, 1] or None)</code></pre>
+<x-deepdive title="Stop 4 in detail: the step-by-step path">
+<p>Without <code>mega_mhc</code>, <code>_hc_pre</code> runs ({{cite deepinfer/model_executor/models/v4_modules/hc.py:317-364}}):</p>
+<ol>
+  <li>Not shifted: <code>mhc_pre_big_fuse</code>. A TF32 GEMM multiplies the flat trunk <code>[192, 16384]</code> by <code>fn</code> (24 rows). One fused kernel then does the RMS, the split, Sinkhorn and the pre apply ({{cite deepinfer/model_executor/models/v4_modules/mhc_modeling.py:115-136}}).</li>
+  <li>Shifted (the HF default, {{cite deepinfer/hugging_face/config.py:295}}): apply the pre mix of the previous sub-layer to the trunk. Then three operators compute the new mixes: <code>mhc_pre_norm_fn</code> (GEMM and RMS), <code>mhc_pre_split_mixes</code> and <code>sinkhorn_normalize</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:343-358}}).</li>
+  <li>Both: the attention RMSNorm gives FP8 and BF16 ({{cite deepinfer/model_executor/models/v4_modules/hc.py:359-363}}).</li>
+</ol>
+<p>The int32 scale tensor packs four UE8M0 scales, one per 32 values. So 4096 values need <code>4096 / 32 / 4 = 32</code> int32 values per row ({{cite deepinfer/model_executor/models/v4_modules/hc.py:268}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="5" title="The DFlash copy and the YOCO shared hidden">
+<p>Back in <code>DeepseekDecoderLayer.forward</code>, right after the attention norm:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="144-152">
+<x-tr line="147-148">First consumer layer: the attn-norm bf16 hidden is the shared hidden. Write it in place into the cross-layer runtime, for this layer and the later consumer layers.</x-tr>
+<x-tr line="149-150">Under YOCO compaction this is the compact version; the full version goes through consumer_full_hidden.</x-tr>
+<x-tr line="151">TODO(YOCO): remove this clone (at the moment it prevents an in-place clear inside attention).</x-tr>
+</x-code>
+<p>Layer 7 is a DFlash target, so lines 144-145 run. <code>residual.residual</code> is the trunk from stop 3 (after the Engram hook, when there is one). <code>_store_dflash_input</code> writes the mean of its 4 streams into this layer's column block of <code>dflash_input</code>:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="92-95" />
+<p>After the last layer, <code>DFlash.update_main_cache</code> reads <code>dflash_input</code> ({{cite deepinfer/model_executor/models/deepseek.py:220-223}}). The tour {{link tours/spec-decode-round}} (stop 3) follows it from there.</p>
+<p>Lines 146-152 run only in the first YOCO consumer layer. Layer 7 is not that layer in our example.</p>
+<p><strong>What the data looks like now</strong> (with two target layers, layer 7 has index 1):</p>
+<pre><code class="language-python">dflash_input   bf16 [192, 8192]            # [T, H × 2 targets]
+dflash_input[:, 4096:8192] = trunk.mean(over the 4 streams)   # this layer's block</code></pre>
+<x-simplified><p>The target list and the index of layer 7 are an example. They come from <code>dspark_target_layer_ids</code> in <code>config.json</code> ({{cite deepinfer/model_executor/models/deepseek.py:72-73}}).</p></x-simplified>
+</x-stop>
+
+<x-stop n="6" title="Attention: MLA, SWA and compressed keys, indexer">
+<p>The layer wraps the two inputs in <code>Movable</code> and calls <code>V4Attention</code>:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="153-161" />
+<p>Inside <code>V4Attention.forward</code>, the decode path of a sparse compressed layer runs these steps ({{link code/v4-attn}} reads them in detail):</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="760-810" highlight="765,768,787-790,792-797,799,802-809" />
+<ol>
+  <li>Line 765: expand the compact index fields of the metadata into the index lists of the kernels.</li>
+  <li>Line 768: one GEMM gives the input of the KV compressor and the weights of the indexer.</li>
+  <li>Lines 787-790: project the query (low rank) and the {{term sliding-window-attention | sliding-window}} key vector.</li>
+  <li>Lines 792-797: in decode, one fused kernel normalizes the SWA vector, applies RoPE, casts it to FP8 and stores it into <code>swa_cache</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:421-448}}).</li>
+  <li>Line 799: the query up-projection gives <code>q_b [192, heads, 512]</code>.</li>
+  <li>Lines 802-809: store the compressed KV entries, and let the {{term sparse-indexer | indexer}} pick the top-k compressed entries for each token ({{cite deepinfer/model_executor/models/v4_modules/attn.py:544-567}}).</li>
+</ol>
+<x-code file="deepinfer/model_executor/models/v4_modules/attn.py" lines="870-880" />
+<p>The decode kernel reads the SWA window and the selected compressed entries. Then <code>_wv_and_o_proj</code> maps the result back to the hidden size.</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">q_b             bf16 [192, heads, 512]  # 512 = head size, inferred (not a config value in the repo)
+kv_swa_index    int32 [192, window]           # from the metadata
+kv_ca_index     int32 [192, index_topk]       # indexer output
+attention out   bf16 [192, 4096]              # = hidden_states
+residual        unchanged since stop 4</code></pre>
+<x-deepdive title="Stop 6 in detail: other layer kinds">
+<ul>
+  <li>A ratio-0 layer (SWA only) has no compressed KV: <code>_compute_kv_ca_index</code> returns <code>None</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:534-535}}).</li>
+  <li>A sparse layer without its own indexer reuses <code>cross_layer_runtime.topk_indices</code> of its source layer ({{cite deepinfer/model_executor/models/v4_modules/attn.py:568-570}}).</li>
+  <li>A YOCO KV-source consumer projects its compressed KV from the shared hidden of stop 5 ({{cite deepinfer/model_executor/models/v4_modules/attn.py:775-780}}).</li>
+  <li>A prefill builds one buffer <code>[SWA cache | current SWA | compressed]</code> and calls the prefill kernel ({{cite deepinfer/model_executor/models/v4_modules/attn.py:812-869}}).</li>
+</ul>
+<p>The concepts are on {{link concepts/mla-attention}}, {{link concepts/sparse-attention-indexer}}, {{link concepts/sliding-window-attention}} and {{link concepts/kv-compression}}.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="7" title="mHC post of attention, and pre for the MoE">
+<p>Line 162 of <code>DeepseekDecoderLayer.forward</code>:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="162" />
+<p>This is stop 3 and stop 4 again, with the MoE weights (<code>hc_ffn</code>, <code>hc_ffn_fn</code>, <code>hc_ffn_scale</code>) and the FFN norm ({{cite deepinfer/model_executor/models/v4_modules/hc.py:111-117}}). The post writes the attention output into the trunk. The pre makes the MoE input. One difference: <code>ffn_norm_forward</code> asks the MoE for cast arguments.</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="141-153" highlight="146" />
+<p>Our layer uses mega-MoE with FP8 activations. So <code>fused_norm_cast_kwargs</code> returns the MoE's symmetric buffer as <code>out</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:274-290}}). <code>mega_mhc</code> writes the FP8 MoE input and its scales straight into that buffer ({{cite deepinfer/model_executor/models/v4_modules/hc.py:259-263}}). No copy is needed at stop 9.</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">trunk           bf16 [192, 4, 4096]      # now includes the attention output
+hidden_states   (sym_buffer.x[:192] fp8 [192, 4096], sym_buffer.x_sf[:192])
+hidden_states_bf16  bf16 [192, 4096]
+residual        new HCLazyPostData for the MoE sub-layer</code></pre>
+</x-stop>
+
+<x-stop n="8" title="The gate picks the experts">
+<p>The MoE timer opens (lines 164-168), and the layer calls <code>self.mlp</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:169-173}}). <code>DeepseekMoE.forward</code> sends mega layers to <code>mega_moe_forward</code>, which starts with the gate:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="534-546" highlight="537-541,542-544" />
+<p>The gate reads the BF16 copy. It writes the top-k physical expert slots and their weights straight into the buffer of the mega call. Lines 543-544 check that stop 7 really wrote the FP8 input into the same buffer.</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">sym_buffer.topk_idx[:192]      [192, k]   # physical expert slots
+sym_buffer.topk_weights[:192]  [192, k]   # routing weights</code></pre>
+<x-deepdive title="Stop 8 in detail: what the gate does">
+<p><code>gate_forward</code> passes the expert-score bias, the image-token bias, the padding mask and the EPLB map from logical to physical experts to the gate kernel ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:381-401}}). The scoring function must be <code>sqrtsoftplus</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:169-170}}). The page {{link concepts/moe-routing}} reads it line by line.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="9" title="The experts: dispatch, compute, shared expert, combine">
+<p>In our example, one DeepGEMM call does all the expert work:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="547-563" />
+<p>This call does the dispatch, both expert GEMMs with SwiGLU, and the combine. In a mega layer, <code>fuse_shared</code> equals <code>has_shared</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:256}}), so the call also does the shared expert when the layer has one. The page {{link concepts/mega-moe}} describes the call. This site does not describe the inside of DeepGEMM.</p>
+<p>Without mega-MoE, <code>forward</code> runs the same parts one by one:</p>
+<x-code file="deepinfer/model_executor/models/v4_modules/mlp.py" lines="574-610" highlight="574,578-585,593-598,601-603,604-610" />
+<ol>
+  <li>Line 574: the gate.</li>
+  <li>Lines 578-585: DeepEP dispatch sends the FP8 rows to the expert ranks.</li>
+  <li>Lines 593-598: two grouped GEMMs with SwiGLU between them, on the received rows.</li>
+  <li>Lines 601-603: capture an event, then launch the shared expert on the local tokens, with some SMs kept free for communication. The code launches combine after the shared expert, but combine waits on the event from before the shared expert. Whether the two overlap on the device is decided inside DeepEP.</li>
+  <li>Lines 604-610: combine sums the expert outputs back, with the shared output as <code>bias</code> ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:505}}).</li>
+</ol>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">hidden_states   bf16 [192, 4096]      # MoE output (routed + shared)
+residual        HCLazyPostData from stop 7 (trunk includes attention, not the MoE)</code></pre>
+</x-stop>
+
+<x-stop n="10" title="Out: the layer returns">
+<p>The last line of <code>DeepseekDecoderLayer.forward</code>:</p>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="175" />
+<p>The layer returns the MoE output and the lazy data. It does <em>not</em> write the MoE output into the trunk. Layer 8 does that at its stop 3, in the same call as its attention pre mix ({{cite deepinfer/model_executor/models/v4_modules/hc.py:62-64}}). The code does not say why it waits.</p>
+<p>After the last layer, <code>DeepseekModel.forward</code> does the last post and the fold:</p>
+<x-code file="deepinfer/model_executor/models/deepseek.py" lines="225-239" highlight="227,230,238,239" />
+<p><strong>What the data looks like now</strong> (after the last layer):</p>
+<pre><code class="language-python">after line 227   bf16 [192, 4, 4096]    # full trunk
+after line 230   bf16 [192, 4096]       # shifted: last pre mix (or HCHead, line 238)
+after line 239   bf16 [192, 4096]       # output_norm; the sampler applies the lm head later</code></pre>
+</x-stop>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A wrong block type.</strong> A block that is not <code>MoeDecoderBlockHC</code> fails the assert at {{cite deepinfer/model_executor/models/decoder_layer.py:57}}.</li>
+  <li><strong>DFlash targets with the wrong config.</strong> <code>dspark_target_attn_input=False</code> or mHC off raises an <code>AssertionError</code> at build time ({{cite deepinfer/model_executor/models/decoder_layer.py:65-67}}). A DFlash module without target layers fails in every forward ({{cite deepinfer/model_executor/models/deepseek.py:173}}).</li>
+  <li><strong>Engram and YOCO compaction in one layer.</strong> Assert "yoco 层不能是 engram 层" (translated: "a YOCO layer cannot be an Engram layer") ({{cite deepinfer/model_executor/models/decoder_layer.py:136}}).</li>
+  <li><strong>The FP8 buffer contract of mega-MoE.</strong> If the FFN norm did not write into the MoE buffer, the asserts at {{cite deepinfer/model_executor/models/v4_modules/mlp.py:543-544}} fail.</li>
+  <li><strong>An MoE error.</strong> The DeepEP path logs the rank and the <code>topk_idx</code> shape, then raises the error again ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:612-614}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> All model work of a step happens in these ten stops, N times. A slow layer shows up in the attention or MoE timers. A wrong output can come from any stop, so the shapes above help you to put a check in the right place. A check that synchronizes with the CPU fails inside the forward, because <code>ModelRunner</code> forbids it ({{cite deepinfer/worker/model_runner.py:320-329}}).</p>
+
+<x-quiz>
+  <x-q level="easy">What two values does a decoder layer return, and what are their shapes in the example?
+    <x-a><p>The MoE output, bf16 <code>[192, 4096]</code>, and an <code>HCLazyPostData</code> with the trunk <code>[1, 192, 4, 4096]</code> and the mixes ({{cite deepinfer/model_executor/models/decoder_layer.py:175}}, {{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:21-25}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">At which stop does a DFlash target layer copy its features, and what does it copy?
+    <x-a><p>Stop 5, after the attention norm and before attention. It copies the mean of the <code>hc_mult</code> streams of the trunk ({{cite deepinfer/model_executor/models/decoder_layer.py:144-145}}, {{cite deepinfer/model_executor/layers/tilelang_ops/dflash.py:134-143}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In our example, how many kernel calls do stops 3 and 4 take, and why would an Engram layer take more?
+    <x-a><p>One <code>deep_gemm.mega_mhc</code> call ({{cite deepinfer/model_executor/models/v4_modules/hc.py:195-202}}). An Engram layer must change the trunk between the post and the pre, and "no hook can be inserted inside the kernel" ({{cite deepinfer/model_executor/models/v4_modules/hc.py:184-186}}). So it runs <code>hc_post</code>, the hook, and <code>_hc_pre</code> as separate calls.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the MoE not copy its FP8 input into its own buffer at stop 9?
+    <x-a><p>At stop 7, <code>ffn_norm_forward</code> passed the MoE's buffer as the output of the norm ({{cite deepinfer/model_executor/models/v4_modules/hc.py:146}}, {{cite deepinfer/model_executor/models/v4_modules/mlp.py:274-290}}). <code>mega_moe_forward</code> only checks the pointers ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:542-544}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The step has 192 tokens, <code>H = 4096</code>, <code>hc_mult = 4</code>. How many bytes of trunk does one layer write, and why does the post of the MoE wait for the next layer?
+    <x-a><p>Two posts per layer (stops 3 and 7), each writes <code>192 × 4 × 4096 × 2</code> bytes = 6 MiB, so 12 MiB. The code does not state the reason for the wait. It joins the previous post with the next pre ({{cite deepinfer/model_executor/models/v4_modules/hc.py:62-64}}), and on a GPU one <code>mega_mhc</code> call then does the post, the pre and the norm ({{cite deepinfer/model_executor/models/v4_modules/hc.py:236-238}}). A post at the end of the layer would need its own kernel call. See stop 3 and stop 10.</p></x-a>
+  </x-q>
+</x-quiz>

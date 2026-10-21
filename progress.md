@@ -23,7 +23,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 | B4b Worker + ZOS | done | done (26 defects fixed) | yes |
 | B5a Attention I | done | done (43 defects fixed) | yes |
 | B5b Attention II | done | done (24 defects fixed) | yes |
-| B6a Layer + mHC | done | running | — |
+| B6a Layer + mHC | done | done (30 defects fixed) | yes |
 | B6b Engram + VL | done | done (36 defects fixed) | yes |
 | B7 MoE + EP | done | done (40 defects fixed) | yes |
 | B8 Scale | running | — | — |

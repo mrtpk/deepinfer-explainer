@@ -1,0 +1,222 @@
+---
+title: models/decoder_layer.py: one decoder layer
+nav_title: decoder_layer.py
+level: Advanced
+prerequisites: concepts/model-map, concepts/mhc-residual
+related: tours/decoder-layer, code/v4-hc, code/deepseek, code/v4-attn, code/v4-mlp, code/dflash, concepts/mhc-residual, concepts/yoco-swa-replay, concepts/engram
+summary: decoder_layer.py holds DeepseekDecoderLayer (one main-model layer: mHC, attention, mHC, MoE, plus the Engram, YOCO and DFlash hooks) and DFlashDecoderLayer (one draft-model layer).
+---
+<h2>Purpose</h2>
+<p><code>decoder_layer.py</code> joins the parts of one {{term decoder-layer}}: it calls the {{term mhc}} code, the attention, and the MoE in the right order, and it adds three optional hooks.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>deepinfer/model_executor/models/decoder_layer.py</code>, 239 lines of Python. No "Derived from vLLM" header. Some comments are in Chinese.</td></tr>
+    <tr><th>Main classes</th><td><code>DeepseekDecoderLayer</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:48}}) and <code>DFlashDecoderLayer</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:178}}). Both inherit from <code>HCLayerMixin</code>.</td></tr>
+    <tr><th>Runs in</th><td>Every worker process. The forward launches device kernels on the current stream; in decode it runs inside the CUDA graph of the model.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekModel</code> (build and forward loop), <code>DFlash</code> (draft layers).</td></tr>
+    <tr><th>Calls</th><td><code>HCLayerMixin</code> (mHC), <code>V4Attention</code> / <code>DFlashAttention</code>, <code>DeepseekMoE</code>, <code>Engram</code>, YOCO helpers, <code>dflash_input_store</code>, the timers.</td></tr>
+    <tr><th>Not in this file</th><td>The mHC math (<code>v4_modules/hc.py</code>), attention (<code>attn.py</code>), MoE (<code>mlp.py</code>), the weights (<code>hc_blocks.py</code>), the loop over layers (<code>deepseek.py</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6a_decoder_forward" alt="Panel 1: what __init__ builds from one MoeDecoderBlockHC: the mHC parameters through HCLayerMixin, the sub-layers V4Attention and DeepseekMoE with two norms, and the flags dflash_input_index, yoco_captures_shared_hidden, Engram and the timer group. Panel 2: a grid of forward steps against five layer kinds (plain, Engram, DFlash target, first YOCO consumer, DFlash draft). attn_norm_forward, self_attn, ffn_norm_forward and mlp run in all kinds; the Engram hook only in Engram layers; the DFlash store only in DFlash targets; the shared hidden only in the first YOCO consumer; YOCO compaction only there and only in a compact-mode prefill." caption="Figure: what a layer holds (panel 1), and which parts of <code>forward</code> run for which kind of layer (panel 2). Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Build.</strong> <code>DeepseekModel.__init__</code> makes one <code>DeepseekDecoderLayer</code> per main block, with <code>layer_idx</code> 0 … N−1 and an optional DFlash index ({{cite deepinfer/model_executor/models/deepseek.py:92-103}}). <code>DFlash</code> makes the <code>DFlashDecoderLayer</code> objects ({{cite deepinfer/model_executor/models/mtp/dflash.py:128-132}}).</li>
+  <li><strong>Forward.</strong> The loop of <code>DeepseekModel.forward</code> calls each layer and keeps the returned <code>residual</code> for the next layer ({{cite deepinfer/model_executor/models/deepseek.py:209-218}}).</li>
+  <li><strong>Drafts.</strong> <code>DFlash.forward_drafts</code> calls <code>forward_drafts</code> on each draft layer ({{cite deepinfer/model_executor/models/mtp/dflash.py:249-256}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>mHC.</strong> <code>attn_norm_forward</code> and <code>ffn_norm_forward</code> from <code>HCLayerMixin</code> ({{link code/v4-hc}}).</li>
+  <li><strong>Attention.</strong> <code>V4Attention</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:85}}) or <code>DFlashAttention</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:190-195}}). See {{link code/v4-attn}}.</li>
+  <li><strong>MoE.</strong> <code>DeepseekMoE</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:40}}). See {{link code/v4-mlp}}.</li>
+  <li><strong>Hooks.</strong> <code>Engram</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:83}}), <code>compact_yoco_boundary</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:137-139}}), <code>dflash_input_store</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:95}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_build_mlp_and_layernorms</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:38}}</td><td>Makes the MoE and the two norms (FP8 output when <code>fp8_attn</code> / <code>fp8_mlp</code>).</td></tr>
+    <tr><td><code>DeepseekDecoderLayer.__init__</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:49}}</td><td>Wraps one <code>MoeDecoderBlockHC</code>; sets the hooks.</td></tr>
+    <tr><td><code>_store_dflash_input</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:92}}</td><td>Writes the mean of the trunk streams into this layer's column block of <code>dflash_input</code>.</td></tr>
+    <tr><td><code>DeepseekDecoderLayer.forward</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:97}}</td><td>mHC + attention, then mHC + MoE. Returns the MoE output and the lazy residual.</td></tr>
+    <tr><td><code>DFlashDecoderLayer.__init__</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:179}}</td><td>Draft layer. In <code>prefill_only</code> mode it has no MoE and no norms.</td></tr>
+    <tr><td><code>update_main_cache</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:208}}</td><td>Passes the main-model keys to <code>DFlashAttention</code>.</td></tr>
+    <tr><td><code>forward_drafts</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:224}}</td><td>The four calls of a layer, for draft tokens. No hooks.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>_build_mlp_and_layernorms</code></h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="38-45" />
+<p>Every block of this release is a <code>MoeDecoderBlockHC</code>, so every layer has a <code>DeepseekMoE</code>. For the main model, the type check in <code>__init__</code> (line 57) fails first, with an <code>AssertionError</code>, so line 42 cannot run there. Only a <code>DFlashDecoderLayer</code> can reach the <code>NotImplementedError</code>. The two norms come from the block's <code>norm1</code> and <code>norm2</code>. The loader sets <code>fp8_attn</code> and <code>fp8_mlp</code> for the released format ({{cite deepinfer/hugging_face/config.py:304-305}}), so both norms give FP8 output.</p>
+
+<h3><code>DeepseekDecoderLayer.__init__</code></h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="57-90" highlight="57-58,64-67,70-73,76,80-83,85,87,90">
+<x-tr line="67">(assert message) DFlash attention-input feature extraction supports only models with HC enabled.</x-tr>
+<x-tr line="69">The MLP timer scales with the number of layers that actually run; with MTP off, or in a DFlash prefill, only the MLPs of the main model run.</x-tr>
+<x-tr line="75">The shared hidden is captured and passed on only when a consumer exists (yoco_shared_hidden_required decides).</x-tr>
+<x-tr line="89">Group the layers with the same structure; get_enable_timer_layer uses the groups to select the timer sample layers.</x-tr>
+</x-code>
+<ol>
+  <li>Lines 57-58: the block must be a <code>MoeDecoderBlockHC</code>. <code>HCLayerMixin.__init__</code> copies the mHC weights.</li>
+  <li>Lines 64-67: a DFlash target layer needs mHC, and the DFlash config must take the attention input (<code>dspark_target_attn_input</code>, default <code>True</code>, {{cite deepinfer/hugging_face/config.py:183}}).</li>
+  <li>Lines 70-73: timer scales. <code>DEEPINFER_USE_NEXTN_DECODE</code> (default 5) adds the draft layers to the MLP count.</li>
+  <li>Line 76: every YOCO consumer layer gets the capture flag, but only when some consumer layer reads the shared hidden. At run time only the first of them captures it, because line 146 also checks that no shared hidden exists yet.</li>
+  <li>Lines 80-83: an Engram layer gets an <code>Engram</code> module. The comment on line 82 says "HACK: currently only support hc_enabled".</li>
+  <li>Lines 85 and 87: the attention, the MoE and the two norms.</li>
+  <li>Line 90: register the layer in a timer group. The key is the module structure plus the attention config ({{cite deepinfer/model_executor/models/v4_modules/utils.py:123-127}}).</li>
+</ol>
+
+<h3><code>forward</code>, part 1: setup</h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="97-133" highlight="107-109,111-118,120-121">
+<x-tr line="113">Engram is the trunk intervention hook after the hc post (see HCLayerMixin.attn_norm_forward).</x-tr>
+</x-code>
+<ol>
+  <li>Line 107: the loop wraps the hidden states in <code>Movable</code> ({{cite deepinfer/model_executor/models/deepseek.py:209}}). <code>move()</code> takes the tensor and leaves the wrapper empty, so the caller no longer holds a reference ({{cite deepinfer/model_executor/utils.py:66-81}}).</li>
+  <li>Lines 108-109: a layer called alone gets an empty <code>CrossLayerRuntime</code>.</li>
+  <li>Lines 111-118: an Engram layer makes a closure. <code>attn_norm_forward</code> calls it on the trunk <code>[T, hc_mult, H]</code> after the post mix ({{cite deepinfer/model_executor/models/v4_modules/hc.py:225-226}}).</li>
+  <li>Lines 120-133: the attention timer records in one sample layer per group: the second-last layer in prefill, the second layer in decode ({{cite deepinfer/model_executor/models/v4_modules/utils.py:139-143}}). The scale is the size of the group.</li>
+</ol>
+
+<h3><code>forward</code>, part 2: the YOCO boundary and the attention input</h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="134-152" highlight="134,137-141,143,144-145,146,152">
+<x-tr line="136">(assert message) A YOCO layer cannot be an Engram layer.</x-tr>
+<x-tr line="147-148">First consumer layer: the attn-norm bf16 hidden is the shared hidden. Write it in place into the cross-layer runtime, for this layer and the later consumer layers (held across layers).</x-tr>
+<x-tr line="149-150">Under YOCO compaction this is the compact version (the boundary code above has swapped in the compact copy); the full version goes through consumer_full_hidden.</x-tr>
+<x-tr line="151">TODO(YOCO): remove this clone (at the moment it prevents an in-place clear inside attention).</x-tr>
+</x-code>
+<ol>
+  <li>Line 134: this block runs once per forward: in the first consumer layer of a prefill with <code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code>. The model sets <code>consumer_full_metadata</code> there ({{cite deepinfer/model_executor/models/deepseek.py:192-198}}).</li>
+  <li>Lines 137-141: make compact copies of the hidden states and the lazy data. Then run <code>attn_norm_forward</code> on the full rows and keep only its BF16 output as <code>consumer_full_hidden</code>.</li>
+  <li>Line 143: the mHC post of the previous MoE, the attention pre mix and the attention norm. See {{link code/v4-hc}}.</li>
+  <li>Lines 144-145: a DFlash target layer copies its trunk. <code>residual.residual</code> is the trunk after the post (and after the Engram hook), <code>[1, T, hc_mult, H]</code>.</li>
+  <li>Lines 146-152: the first YOCO consumer keeps a clone of the BF16 attention input as the shared hidden.</li>
+</ol>
+
+<h3><code>_store_dflash_input</code></h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="92-95" />
+<p><code>n_embed</code> is the last dimension of the trunk, <code>H</code>. The layer with DFlash index <code>j</code> writes into columns <code>j·H … (j+1)·H − 1</code> of <code>dflash_input [T, H × number of targets]</code>. <code>dflash_input_store</code> computes the mean over the <code>hc_mult</code> streams and copies the result into that slice ({{cite deepinfer/model_executor/layers/tilelang_ops/dflash.py:134-143}}). The slice is a strided view, so the row stride must be a multiple of 4 ({{cite deepinfer/model_executor/layers/tilelang_ops/dflash.py:150}}).</p>
+
+<h3><code>forward</code>, part 3: attention, then the MoE</h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="153-175" highlight="153,154,155-161,162,164,169-173,175" />
+<ol>
+  <li>Line 153: wrap both inputs in <code>Movable</code>. <code>V4Attention.forward</code> moves them out at once ({{cite deepinfer/model_executor/models/v4_modules/attn.py:760}}), so attention can free them early.</li>
+  <li>Line 154: only <code>V4Attention</code> gets the cross-layer runtime. In this class <code>self_attn</code> is always a <code>V4Attention</code> (line 85), so the condition is always true here.</li>
+  <li>Lines 155-161: attention returns BF16 <code>[T, H]</code> ({{cite deepinfer/model_executor/models/v4_modules/attn.py:880}}).</li>
+  <li>Line 162: the mHC post of attention, the MoE pre mix and the FFN norm. With mega-MoE and FP8, the norm writes into the MoE buffer.</li>
+  <li>Lines 164-168: the MLP timer records only in layer 1.</li>
+  <li>Lines 169-173: the MoE. <code>DeepseekMoE.forward</code> picks mega-MoE or the DeepEP path ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:571-572}}).</li>
+  <li>Line 175: return the MoE output and the lazy residual. The MoE output is not in the trunk yet: the next layer, or the end of the model, does that post mix.</li>
+</ol>
+
+<h3><code>DFlashDecoderLayer</code></h3>
+<x-code file="deepinfer/model_executor/models/decoder_layer.py" lines="186-206" highlight="190-195,197-200,203">
+<x-tr line="198">In prefill_only mode the MLP and the layer norms are not loaded; only the attention parameters for main_k are needed.</x-tr>
+<x-tr line="199">The DFlash MoE can have a different structure from the main model.</x-tr>
+<x-tr line="202">attn_norm_forward / ffn_norm_forward (HCLayerMixin) depend on hc_enabled.</x-tr>
+<x-tr line="205">Group the layers with the same structure; get_enable_timer_layer uses the groups to select the timer sample layers.</x-tr>
+</x-code>
+<p><code>forward_drafts</code> runs the same four calls as the main layer, with no hooks ({{cite deepinfer/model_executor/models/decoder_layer.py:231-239}}). The page {{link code/dflash}} explains the draft model.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<p>Example sizes are not in the repo: <code>T = 192</code> (decode, 32 sequences × 6), <code>H = 4096</code>, <code>m = hc_mult = 4</code>.</p>
+<table>
+  <thead><tr><th>Object</th><th>Type and shape</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><code>hidden_states</code> (in)</td><td><code>Movable</code> of bf16 <code>[T, H]</code>: the embedding (layer 0) or the MoE output of the previous layer</td><td><code>[192, 4096]</code></td></tr>
+    <tr><td><code>residual</code> (in)</td><td><code>None</code> (layer 0) or <code>HCLazyPostData</code>; trunk <code>[1, T, m, H]</code></td><td><code>[1, 192, 4, 4096]</code></td></tr>
+    <tr><td><code>kv_cache</code></td><td><code>KVCache</code> views of this layer</td><td>-</td></tr>
+    <tr><td><code>dflash_input</code></td><td>bf16 <code>[T, H × n_targets]</code> or <code>None</code></td><td>3 targets: <code>[192, 12288]</code></td></tr>
+    <tr><td>attention input</td><td>(fp8 <code>[T, H]</code>, scales) and bf16 <code>[T, H]</code></td><td><code>[192, 4096]</code></td></tr>
+    <tr><td>attention output</td><td>bf16 <code>[T, H]</code></td><td><code>[192, 4096]</code></td></tr>
+    <tr><td>MoE input</td><td>(fp8, scales) and bf16 <code>[T, H]</code></td><td><code>[192, 4096]</code></td></tr>
+    <tr><td>return</td><td>(bf16 <code>[T, H]</code>, <code>HCLazyPostData</code>)</td><td><code>[192, 4096]</code></td></tr>
+  </tbody>
+</table>
+<x-simplified><p>"3 targets" is an example. The target list <code>dspark_target_layer_ids</code> comes from <code>config.json</code> ({{cite deepinfer/hugging_face/config.py:182}}).</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one token through the DFlash store">
+<p>Take <code>H = 3</code>, <code>m = 2</code>, two target layers 5 and 9, so <code>dflash_input</code> is <code>[T, 6]</code>. Layer 9 has index <code>j = 1</code> ({{cite deepinfer/model_executor/models/deepseek.py:72-73}}).</p>
+<ol>
+  <li>After the post of the previous MoE, the trunk of one token in layer 9 is <code>[[1, 2, 3], [3, 0, −1]]</code>.</li>
+  <li><code>_store_dflash_input</code> selects columns <code>1·3 … 2·3 − 1</code>, that is columns 3, 4, 5.</li>
+  <li>The mean of the two streams is <code>[2, 1, 1]</code>. It goes into columns 3 to 5 of this token's row.</li>
+  <li>After the loop, <code>DFlash.update_main_cache</code> reads the whole <code>dflash_input</code> ({{cite deepinfer/model_executor/models/deepseek.py:220-223}}).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="The kinds of layer">
+<p>All main layers have the same class and the same four calls. They differ in these ways:</p>
+<table>
+  <thead><tr><th>Difference</th><th>Decided by</th><th>Effect in this file</th></tr></thead>
+  <tbody>
+    <tr><td>Attention kind: compress ratio from <code>config.json</code> (0 means a window-only layer, {{cite deepinfer/hugging_face/config.py:152}}); sparse or dense</td><td>the layer config ({{link concepts/model-map}})</td><td>none; <code>V4Attention</code> handles it</td></tr>
+    <tr><td>KV source or consumer (cross-layer sharing)</td><td><code>shared_topology</code> (line 85)</td><td>passed to <code>V4Attention</code></td></tr>
+    <tr><td>YOCO consumer, first consumer</td><td><code>n_prefill_layer</code> ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:19-21}})</td><td>shared hidden, compaction boundary</td></tr>
+    <tr><td>Engram layer</td><td><code>engram_layer_ids</code> (line 81)</td><td>trunk hook after the post mix</td></tr>
+    <tr><td>DFlash target layer</td><td><code>dspark_target_layer_ids</code></td><td>trunk mean into <code>dflash_input</code></td></tr>
+    <tr><td>Timer group</td><td><code>layer_group_key</code> (line 90)</td><td>which layer records the timers</td></tr>
+  </tbody>
+</table>
+<p>Every layer is an MoE layer. The page {{link concepts/model-map}} lists the layer kinds and their caches.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Main block is not <code>MoeDecoderBlockHC</code></td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:57}}</td></tr>
+    <tr><td>Draft block is not <code>MoeDecoderBlockHC</code> (not prefill-only)</td><td><code>NotImplementedError</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:41-42}}</td></tr>
+    <tr><td>DFlash target with <code>dspark_target_attn_input=False</code>, or without mHC</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:66-67}}</td></tr>
+    <tr><td>Engram layer without mHC, or without its hook at run time</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:82}}, {{cite deepinfer/model_executor/models/decoder_layer.py:112}}</td></tr>
+    <tr><td>YOCO compaction without YOCO metadata, or in an Engram layer</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:135-136}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and settings">
+<table>
+  <thead><tr><th>Variable or field</th><th>Default</th><th>Read at</th><th>Effect here</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEEPINFER_USE_NEXTN_DECODE</code></td><td><code>5</code> ({{cite deepinfer/environ.py:129}})</td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:71}}</td><td>adds the draft MoE layers to the decode MLP timer scale</td></tr>
+    <tr><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE</code></td><td><code>off</code> ({{cite deepinfer/environ.py:188}})</td><td>in <code>deepseek.py</code> (lines 126, 192)</td><td>only <code>compact</code> makes line 134 true</td></tr>
+    <tr><td><code>fp8_attn</code>, <code>fp8_mlp</code></td><td>loader sets them ({{cite deepinfer/hugging_face/config.py:304-305}})</td><td>{{cite deepinfer/model_executor/models/decoder_layer.py:43-44}}</td><td>FP8 output of the two norms</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link tours/decoder-layer}}: one decode step through this file, stop by stop.</li>
+  <li>{{link concepts/mhc-residual}} and {{link code/v4-hc}}: the mHC calls.</li>
+  <li>{{link concepts/mla-attention}} and {{link code/v4-attn}}: the attention call.</li>
+  <li>{{link concepts/moe-routing}}, {{link concepts/mega-moe}} and {{link code/v4-mlp}}: the MoE call.</li>
+  <li>{{link concepts/yoco-swa-replay}}, {{link concepts/engram}}, {{link concepts/speculative-decoding}}: the hooks.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which four calls run in every <code>DeepseekDecoderLayer.forward</code>?
+    <x-a><p><code>attn_norm_forward</code>, <code>self_attn</code>, <code>ffn_norm_forward</code>, <code>mlp</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:143}}, {{cite deepinfer/model_executor/models/decoder_layer.py:155-162}}, {{cite deepinfer/model_executor/models/decoder_layer.py:169-173}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Is the MoE output of layer i in the trunk when <code>forward</code> returns?
+    <x-a><p>No. The layer returns the MoE output and the lazy data ({{cite deepinfer/model_executor/models/decoder_layer.py:175}}). The post mix runs at the start of layer i + 1, in <code>mega_mhc</code> or in <code>hc_post</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:195-202}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:220-222}}), or after the last layer ({{cite deepinfer/model_executor/models/deepseek.py:226-227}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What exactly does a DFlash target layer store, and when in the layer?
+    <x-a><p>The mean over the <code>hc_mult</code> streams of the trunk at the attention input: after the post of the previous MoE and after the Engram hook, before attention ({{cite deepinfer/model_executor/models/decoder_layer.py:143-145}}, {{cite deepinfer/model_executor/layers/tilelang_ops/dflash.py:134-143}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With two DFlash target layers, <code>H = 4096</code> and a decode step of 192 tokens, what is the shape of <code>dflash_input</code>, and which columns does the second target write?
+    <x-a><p><code>[192, 8192]</code> ({{cite deepinfer/model_executor/models/deepseek.py:74}}, {{cite deepinfer/model_executor/models/deepseek.py:174}}). The second target has index 1, so it writes columns 4096 to 8191 ({{cite deepinfer/model_executor/models/decoder_layer.py:95}}). See the deep dive "Worked example: one token through the DFlash store".</p></x-a>
+  </x-q>
+</x-quiz>

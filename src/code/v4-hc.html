@@ -1,0 +1,243 @@
+---
+title: v4_modules/hc.py: the mHC runtime
+nav_title: v4_modules/hc.py
+level: Advanced
+prerequisites: concepts/mhc-residual
+related: concepts/mhc-residual, code/decoder-layer, tours/decoder-layer, code/deepseek, code/dflash, concepts/model-map
+summary: hc.py runs mHC around every sub-layer (HCLayerMixin) and folds the streams at the end (HCHead). mhc_ops.py and mhc_modeling.py wrap the kernels. hc_lazy.py holds the data that goes from one sub-layer to the next.
+---
+<h2>Purpose</h2>
+<p>These four files compute the {{term mhc}} mixes: they turn the <code>[T, hc_mult, H]</code> {{term mhc-trunk | trunk}} into one input for each {{term sub-layer}}, and write the sub-layer output back into the trunk.</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>deepinfer/model_executor/models/v4_modules/hc.py</code> (397 lines), <code>mhc_ops.py</code> (148 lines), <code>mhc_modeling.py</code> (142 lines), <code>hc_lazy.py</code> (35 lines). Written for DeepInfer; no "Derived from vLLM" header. The weights are in <code>hc_blocks.py</code> (109 lines, a parameter container).</td></tr>
+    <tr><th>Main classes</th><td><code>HCLayerMixin</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:57}}), <code>HCHead</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:367}}), <code>HCLazyPostData</code> ({{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:15}}).</td></tr>
+    <tr><th>Runs in</th><td>Every worker process. All work is device kernels on the current stream. In decode it runs inside the CUDA graph of the model.</td></tr>
+    <tr><th>Called by</th><td><code>DeepseekDecoderLayer</code> and <code>DFlashDecoderLayer</code> (subclasses), <code>DeepseekModel.forward</code> and <code>DFlash.forward_drafts</code> (final post and fold), <code>yoco.py</code> (copies the lazy data).</td></tr>
+    <tr><th>Calls</th><td><code>tile_kernels.mhc.*</code> kernels, <code>deep_gemm.tf32_hc_prenorm_gemm</code>, <code>deep_gemm.mega_mhc</code>, the sub-layer's <code>RMSNorm</code>, <code>per_token_cast</code>.</td></tr>
+    <tr><th>Not in these files</th><td>The kernel code (pip packages and vendor libraries), the weight containers (<code>hc_blocks.py</code>, <code>heads.py</code>), the Engram hook body (<code>engram.py</code>), the layer body (<code>decoder_layer.py</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6a_hc_calls" alt="Panel 1: the five cases of _hc_fused_post_pre: A fused mega_mhc on GPU with hc_mult 4; B first layer with expand_to_mhc and a one-hot pre mix when shifted; C a full trunk as input (nextn); D post already done, which no code path reaches; E the normal case, hc_post then pre; cases B to E then apply the Engram hook and call _hc_pre. Panel 2: _hc_pre without shifting calls mhc_pre_big_fuse (prenorm GEMM, then one fused epilogue); with shifting it calls apply mix, pre_norm_fn, split mixes and Sinkhorn; both end with the layer norm and a new HCLazyPostData." caption="Figure: the paths inside <code>HCLayerMixin</code>. Panel 1 is <code>_hc_fused_post_pre</code>; panel 2 is <code>_hc_pre</code>. Click to zoom." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The decoder layers.</strong> <code>DeepseekDecoderLayer</code> and <code>DFlashDecoderLayer</code> inherit from <code>HCLayerMixin</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:48}}, {{cite deepinfer/model_executor/models/decoder_layer.py:178}}). Their forward calls <code>attn_norm_forward</code> and <code>ffn_norm_forward</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:143}}, {{cite deepinfer/model_executor/models/decoder_layer.py:162}}).</li>
+  <li><strong>The end of the model.</strong> <code>DeepseekModel.forward</code> calls the static <code>HCLayerMixin.hc_post</code>, then <code>mhc_pre_apply_mix</code> or <code>HCHead</code> ({{cite deepinfer/model_executor/models/deepseek.py:225-238}}). The DFlash draft model does the same ({{cite deepinfer/model_executor/models/mtp/dflash.py:258-264}}).</li>
+  <li><strong>YOCO.</strong> <code>gather_hc_lazy</code> makes a compact copy of the lazy data at the compaction boundary ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:79-90}}). This is why <code>hc_lazy.py</code> has no imports from the forward path ({{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:1-5}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><strong>tile_kernels</strong> (a pip package): expand, post, apply mix, head mix, split mixes, Sinkhorn, the norm epilogues and the big fused pre ({{cite deepinfer/model_executor/models/v4_modules/mhc_ops.py:7-14}}, {{cite deepinfer/model_executor/models/v4_modules/mhc_modeling.py:11}}).</li>
+  <li><strong>DeepGEMM</strong> (a vendor library): <code>tf32_hc_prenorm_gemm</code> ({{cite deepinfer/model_executor/models/v4_modules/mhc_ops.py:6}}) and <code>mega_mhc</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:270}}).</li>
+  <li><strong>The sub-layer norm.</strong> <code>hc_modules.layer_norm</code> is the <code>RMSNorm</code> of attention or of the MoE ({{cite deepinfer/model_executor/models/v4_modules/hc.py:359-363}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>HCSubmodules</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:36}}</td><td>Named tuple: <code>fn</code>, <code>scale</code>, <code>base</code> and the layer norm of one sub-layer.</td></tr>
+    <tr><td><code>_make_identity_pre_mix</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:45}}</td><td>One-hot pre mix for the first shifted sub-layer.</td></tr>
+    <tr><td><code>HCLayerMixin.__init__</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:71}}</td><td>Copies the mHC weights and settings; decides <code>use_mega_mhc</code>.</td></tr>
+    <tr><td><code>attn_norm_forward</code>, <code>ffn_norm_forward</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:119}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:141}}</td><td>Entry points of the layer. mHC path, or a plain add + RMSNorm.</td></tr>
+    <tr><td><code>hc_post</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:164}}</td><td>Writes a sub-layer output into the trunk.</td></tr>
+    <tr><td><code>_hc_fused_post_pre</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:174}}</td><td>Previous post + this pre + norm. Picks one of five cases.</td></tr>
+    <tr><td><code>_mega_mhc</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:229}}</td><td>The same work in one <code>deep_gemm.mega_mhc</code> call.</td></tr>
+    <tr><td><code>_hc_pre</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:317}}</td><td>Computes the mixes and the normed sub-layer input.</td></tr>
+    <tr><td><code>HCHead</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:367}}</td><td>Folds the trunk into <code>[T, H]</code> when <code>hc_shifted</code> is off.</td></tr>
+    <tr><td><code>HCLazyPostData</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:15}}</td><td>Trunk + post mix + residual mix + pre mix, with <code>clear_post</code> and <code>clear</code>.</td></tr>
+    <tr><td><code>mhc_pre_big_fuse</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mhc_modeling.py:72}}</td><td>Non-shifted pre: GEMM, then one fused epilogue.</td></tr>
+    <tr><td><code>mhc_head</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mhc_modeling.py:22}}</td><td>The fold of <code>HCHead</code>.</td></tr>
+    <tr><td><code>mhc_pre_norm_fn</code>, <code>mhc_pre_split_mixes</code>, <code>sinkhorn_normalize</code>, <code>mhc_pre_apply_mix</code>, <code>mhc_post</code>, <code>expand_to_mhc</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mhc_ops.py:25-148}}</td><td>One wrapper per kernel: allocate the output, reshape, call.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>HCLayerMixin.__init__</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="71-101" highlight="73-74,83-88,91-92,94,99-101" />
+<ol>
+  <li>Lines 73-74: a block without <code>hc_mult</code> is not an mHC model; the method returns early. In this release every block is a <code>MoeDecoderBlockHC</code> ({{cite deepinfer/model_executor/models/v4_modules/builder.py:63}}), which has <code>hc_mult</code> ({{cite deepinfer/model_executor/models/v4_modules/hc_blocks.py:86}}).</li>
+  <li>Lines 83-88: <code>reconstruct_param</code> takes over the six float32 tensors of the container. The comment on line 90 says "Transfer ownership of HF's effective FP32 fn matrices bit-for-bit".</li>
+  <li>Lines 91-92: the norm epsilon of the mix computation must be the same for attention and MoE.</li>
+  <li>Line 94: <code>hc_shifted</code> comes from the block (see {{link concepts/mhc-residual}}, deep dive "Shifted mHC").</li>
+  <li>Lines 99-101: the fused path needs a GPU, <code>hc_mult == 4</code>, and an <code>fn</code> width (<code>4 × H</code>) that is a multiple of <code>4 × 1024</code>. So <code>H</code> must be a multiple of 1024.</li>
+</ol>
+
+<h3><code>attn_norm_forward</code> and <code>ffn_norm_forward</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="119-161" highlight="125-131,133-139,146-153" />
+<ol>
+  <li>Lines 125-131: with mHC on, the attention entry calls <code>_hc_fused_post_pre</code> with the attention weights and the optional Engram hook.</li>
+  <li>Lines 133-139: without mHC, it is a plain pre-norm residual: the first layer keeps the input as the residual; later layers do "add + RMSNorm" in one call.</li>
+  <li>Line 146: the FFN entry asks the MoE for cast arguments. A mega-MoE layer with FP8 activations returns its symmetric buffer, so the norm writes its FP8 output straight into that buffer ({{cite deepinfer/model_executor/models/v4_modules/mlp.py:274-301}}). Other layers return <code>{}</code>.</li>
+  <li>Lines 147-153: the FFN entry has no Engram hook.</li>
+</ol>
+<p>All three return values are the same in both paths: the normed input (FP8 with scales, or BF16), a BF16 copy, and the new residual object.</p>
+
+<h3><code>_hc_fused_post_pre</code>: five cases</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="191-227" highlight="195-202,203-208,209-212,213-219,220-224,225-227" />
+<ol>
+  <li>Lines 195-202 (case A): the fused path. It needs no Engram hook, a 2-D output of the previous sub-layer, and lazy data that still has its post mix.</li>
+  <li>Lines 203-208 (case B): the first layer. <code>expand_to_mhc</code> makes the trunk from the embedding output; with <code>hc_shifted</code> a one-hot pre mix is added.</li>
+  <li>Lines 209-212 (case C): the input is already a full trunk. The comment calls it "the nextn input". Shifted mHC does not allow it.</li>
+  <li>Lines 213-219 (case D): the comment says a DFlash target layer "has already run post ahead of time and saved the full trunk". No code in this commit reaches this case: <code>clear_post</code> is never called, and every layer returns a 2-D output. See the deep dive "Lifetime of the lazy data".</li>
+  <li>Lines 220-224 (case E): the normal case. Post first, then keep the pre mix of the previous sub-layer (only set when shifted), then release the old lazy data.</li>
+  <li>Lines 225-227: the Engram hook changes the trunk after the post and before the pre. Then <code>_hc_pre</code>.</li>
+</ol>
+
+<h3><code>_hc_pre</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="317-364" highlight="324,326,329-339,343-358,359-364" />
+<ol>
+  <li>Line 324: the pre mix of the previous sub-layer must exist exactly when <code>hc_shifted</code> is on.</li>
+  <li>Line 326: the kernels need a batch dim, so the trunk becomes <code>[1, T, m, H]</code>.</li>
+  <li>Lines 329-339: not shifted. One call to <code>mhc_pre_big_fuse</code> returns post <code>[1, T, m, 1]</code>, residual mix <code>[1, T, m, m]</code> and the input <code>[1, T, H]</code>. No pre mix is kept (<code>pre_layer_mix = None</code>).</li>
+  <li>Lines 343-358: shifted. Apply the old pre mix; compute the new mixes; split them; normalize the residual mix with Sinkhorn. The comment on line 347 says the HF <code>fn</code> "includes the norm weight", so the norm weight argument is <code>None</code>.</li>
+  <li>Lines 359-363: the sub-layer's RMSNorm, with the cast arguments from <code>ffn_norm_forward</code>.</li>
+  <li>Line 364: the new <code>HCLazyPostData</code> keeps the trunk <em>before</em> the sub-layer, plus the mixes. The next boundary uses it for the post.</li>
+</ol>
+
+<h3><code>_mega_mhc</code>: one call for post + pre + norm</h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/hc.py" lines="243-268" highlight="246-250,252-256,259-263,264-268" />
+<ol>
+  <li>Lines 246-250: unpack the lazy data (drop the batch dim) and release it.</li>
+  <li>Lines 252-256: new outputs: trunk bf16 <code>[T, m, H]</code>, pre mix (only when shifted) and post mix fp32 <code>[T, m, 1]</code>, residual mix fp32 <code>[T, m, m]</code>, input bf16 <code>[T, H]</code>.</li>
+  <li>Lines 259-263: mega-MoE: the FP8 output and its scales go into the MoE buffer. The shared-expert scales get their own layout.</li>
+  <li>Lines 264-268: other FP8 consumers get a TMA column-major scale tensor. Line 267 pads the column length to a multiple of 4 int32 values (16 bytes).</li>
+</ol>
+<p>Lines 270-298 pass all inputs, all weights (<code>fn</code>, <code>mix_scales</code>, <code>mix_bases</code>), all eps values, the Sinkhorn rounds and the RMSNorm weight to <code>deep_gemm.mega_mhc</code>. Lines 300-315 wrap the outputs as <code>_hc_pre</code> does.</p>
+
+<h3><code>HCHead</code> and <code>mhc_head</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mhc_modeling.py" lines="55-69" highlight="56,58-59,61,63,67,69" />
+<ol>
+  <li>Lines 56-59: the head <code>fn</code> has only <code>m</code> rows. It is padded with zero rows to <code>m × (2 + m)</code> "to reuse the pre_norm_fn kernel" (docstring, line 39).</li>
+  <li>Line 61: the same GEMM + RMS epilogue as a sub-layer.</li>
+  <li>Line 63: only the first <code>m</code> values are used.</li>
+  <li>Line 67: <code>mhc_head_compute_mix</code> turns them into the fold weights, with <code>scale [1]</code> and <code>base [m]</code>.</li>
+  <li>Line 69: the weighted sum of the streams: <code>[T, H]</code>.</li>
+</ol>
+<p><code>HCHead.forward</code> only adds and removes the batch dim around this call ({{cite deepinfer/model_executor/models/v4_modules/hc.py:386-397}}). <code>HCHead</code> refuses a shifted checkpoint ({{cite deepinfer/model_executor/models/v4_modules/hc.py:372-373}}).</p>
+
+<h3><code>mhc_pre_big_fuse</code></h3>
+<x-code file="deepinfer/model_executor/models/v4_modules/mhc_modeling.py" lines="89-142" highlight="90-93,95-98,101-104,111-113,115,121-136" />
+<ol>
+  <li>Lines 90-104: the checks: BF16 trunk; FP32 <code>fn [2m + m², m × H]</code>, <code>scale [3]</code>, <code>base [2m + m²]</code>.</li>
+  <li>Lines 111-113: the outputs: post and residual mix in FP32, the layer input in BF16.</li>
+  <li>Line 115: the prenorm GEMM with <code>S</code> split-K parts (16 on CUDA, 1 on Ascend).</li>
+  <li>Lines 121-136: one kernel does the rest: add the parts, RMS, split, Sinkhorn, apply the pre mix.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<p><code>T</code> = tokens, <code>H</code> = hidden size, <code>m</code> = <code>hc_mult</code>, <code>S</code> = split-K parts.</p>
+<table>
+  <thead><tr><th>Object</th><th>Type and shape</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>prev_layer_out</code></td><td>bf16 <code>[T, H]</code> (a sub-layer output or the embedding)</td><td>hc.py:176</td></tr>
+    <tr><td>trunk (<code>next_residual</code>)</td><td>bf16 <code>[T, m, H]</code>; <code>[1, T, m, H]</code> inside <code>_hc_pre</code></td><td>hc.py:206, 222, 326</td></tr>
+    <tr><td><code>hc_attn_fn</code>, <code>hc_ffn_fn</code></td><td>fp32 <code>[2m + m², m × H]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_blocks.py:38-40}}</td></tr>
+    <tr><td><code>hc_attn</code>, <code>hc_ffn</code> (base)</td><td>fp32 <code>[2m + m²]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_blocks.py:34-35}}</td></tr>
+    <tr><td><code>hc_attn_scale</code>, <code>hc_ffn_scale</code></td><td>fp32 <code>[3]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_blocks.py:39-41}}</td></tr>
+    <tr><td>GEMM partials</td><td>fp32 <code>[S, T, 1, 2m + m²]</code> and <code>[S, T, 1]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mhc_ops.py:108-109}}</td></tr>
+    <tr><td>raw mixes</td><td>fp32 <code>[T, 2m + m²]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mhc_ops.py:137}}</td></tr>
+    <tr><td><code>pre_layer_mix</code>, <code>post_layer_mix</code></td><td>fp32 <code>[1, T, m, 1]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:22}}, {{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:24-25}}</td></tr>
+    <tr><td><code>comb_res_mix</code></td><td>fp32 <code>[1, T, m, m]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:23}}</td></tr>
+    <tr><td>sub-layer input</td><td>bf16 <code>[T, H]</code> → (fp8 <code>[T, H]</code>, scales) and bf16 <code>[T, H]</code></td><td>hc.py:359-364</td></tr>
+    <tr><td><code>HCHead</code> weights</td><td><code>hc_head_layer_fn</code> fp32 <code>[m, m × H]</code>, <code>scale [1]</code>, <code>base [m]</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc_blocks.py:56-63}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Lifetime of the lazy data">
+<ol>
+  <li><code>_hc_pre</code> (or <code>_mega_mhc</code>) makes a new <code>HCLazyPostData</code> for each sub-layer. The decoder layer keeps it in the variable <code>residual</code> ({{cite deepinfer/model_executor/models/decoder_layer.py:143}}).</li>
+  <li>The next boundary reads it and calls <code>clear()</code>, which sets all four fields to <code>None</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:219}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:224}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:250}}). The comment says "To reduce memory footprint". After the call, the old object no longer holds the old trunk or the old mixes.</li>
+  <li>After the last layer, <code>hc_post</code> reads it and does not clear it. With <code>hc_shifted</code>, the fold then reads its <code>pre_layer_mix</code> ({{cite deepinfer/model_executor/models/deepseek.py:227-230}}).</li>
+</ol>
+<p><code>clear_post()</code> keeps the pre mix and clears the rest ({{cite deepinfer/model_executor/models/v4_modules/hc_lazy.py:27-31}}). A search of the repo finds no call to it outside <code>clear()</code>. So case D of <code>_hc_fused_post_pre</code> (residual <code>None</code>, layer output 3-D) has no producer in this commit. The YOCO compaction asserts that "engram-cleared lazy data must not reach the compaction boundary" ({{cite deepinfer/model_executor/models/v4_modules/yoco.py:108}}), so the design expects such objects in some form.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the work at one boundary">
+<p>Example sizes (not in the repo): <code>T = 192</code>, <code>H = 4096</code>, <code>m = 4</code>. The FLOP counter of the engine gives the terms ({{cite csrc/engine/flops_estimator.hpp:107-111}}):</p>
+<table>
+  <thead><tr><th>Part</th><th>Per token</th><th>For 192 tokens</th></tr></thead>
+  <tbody>
+    <tr><td>prenorm GEMM <code>[1, m·H] × [m·H, m(m+2)]</code></td><td>16384 × 24 = 393,216 multiply-adds</td><td>75.5 M</td></tr>
+    <tr><td>pre apply (<code>m · H</code>)</td><td>16,384</td><td>3.1 M</td></tr>
+    <tr><td>post (<code>m · (m+1) · H</code>)</td><td>81,920</td><td>15.7 M</td></tr>
+  </tbody>
+</table>
+<p>Each layer has two boundaries. Memory: the input trunk is <code>192 × 4 × 4096 × 2</code> bytes = 6 MiB, and the post writes a new trunk of the same size. The mixes are small: <code>192 × 24 × 4</code> bytes = 18 KiB. So the boundary reads and writes mostly the trunk. The code joins the post and the next pre ({{cite deepinfer/model_executor/models/v4_modules/hc.py:62-64}}), but it does not say why. In the separate-kernel path, <code>hc_post</code> writes the new trunk and the kernels of <code>_hc_pre</code> read it again. <code>mega_mhc</code> gets the old trunk and returns the new trunk and the input in one call (lines 270-298). How the kernel reads memory is inside DeepGEMM, which is not in the repo.</p>
+<x-simplified><p>The counter is an accounting model. It counts FP32 work with the TF32 weight: "Accounting reference, not actual kernel precision" ({{cite csrc/engine/flops_estimator.hpp:19}}).</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="The FP8 output layouts of _mega_mhc">
+<table>
+  <thead><tr><th>Consumer</th><th>Condition</th><th>Returned input</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td>mega-MoE with FP8</td><td><code>cast_kwargs</code> not empty</td><td>(fp8 in the MoE buffer, routed scales); shared-expert scales also written</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:259-263}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:306-307}}</td></tr>
+    <tr><td>FP8 GEMM (MXFP8, 32 values per scale)</td><td><code>use_fp8</code> and granularity 32</td><td>(fp8 <code>[T, H]</code>, int32 scales <code>[T, H/128]</code> in TMA column-major order)</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:264-268}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:309-310}}</td></tr>
+    <tr><td>FP8 with 128 per scale</td><td><code>use_fp8</code>, other granularity</td><td>BF16 out, then <code>per_token_cast</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:311-314}}</td></tr>
+    <tr><td>BF16 consumer</td><td>no FP8</td><td>(bf16, bf16)</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:315}}</td></tr>
+  </tbody>
+</table>
+<p>The int32 scale tensor has <code>H / 128</code> columns: each int32 packs four UE8M0 scales of 32 values. <code>get_fp8_casting_granularity()</code> always returns 32 in this commit ({{cite deepinfer/model_executor/layers/linear.py:13-14}}). So the third row does not run in this release.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>hc_mult</code> below 1</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:76}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:376}}</td></tr>
+    <tr><td>Different norm eps for attention and MoE mixes</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:92}}</td></tr>
+    <tr><td>Different <code>fn</code> widths for attention and MoE</td><td><code>AssertionError</code> "attn/ffn must use the same fn hidden"</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:96}}</td></tr>
+    <tr><td>Full-trunk input with <code>hc_shifted</code></td><td><code>AssertionError</code> "hc_shifted does not support nextn, please use DFlash"</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:211}}</td></tr>
+    <tr><td>Pre mix present without <code>hc_shifted</code>, or missing with it</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:324}}</td></tr>
+    <tr><td><code>HCHead</code> for a shifted checkpoint</td><td><code>AssertionError</code> "hc_shifted does not build an HCHead"</td><td>{{cite deepinfer/model_executor/models/v4_modules/hc.py:373}}</td></tr>
+    <tr><td>Wrong dtype or shape in the big fused pre</td><td><code>AssertionError</code></td><td>{{cite deepinfer/model_executor/models/v4_modules/mhc_modeling.py:90-104}}</td></tr>
+    <tr><td>HC <code>fn</code> not FP32 in the checkpoint</td><td><code>ValueError</code> at load</td><td>{{cite deepinfer/hugging_face/loading.py:112-116}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Platforms and settings">
+<ul>
+  <li><strong>Split-K.</strong> <code>default_n_splits()</code> returns 1 on Ascend and 16 on CUDA ({{cite deepinfer/model_executor/models/v4_modules/mhc_ops.py:16-22}}).</li>
+  <li><strong>Fused path.</strong> <code>mega_mhc</code> runs only when <code>PLATFORM.is_gpu</code> ({{cite deepinfer/model_executor/models/v4_modules/hc.py:100}}).</li>
+  <li><strong>Environment variables.</strong> These four files read none.</li>
+  <li><strong>Config fields.</strong> <code>hc_mult</code>, <code>hc_shifted</code>, <code>hc_eps</code>, <code>hc_sinkhorn_iters</code> and <code>hc_post_mult_value</code> come through the block ({{cite deepinfer/model_executor/models/v4_modules/hc_blocks.py:84-93}}). Their defaults are on {{link concepts/mhc-residual}}, deep dive "Config fields and defaults".</li>
+</ul>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/mhc-residual}}: what mHC is, with a worked example.</li>
+  <li>{{link code/decoder-layer}}: the layer that calls these methods.</li>
+  <li>{{link tours/decoder-layer}}: one decode step through a layer, with shapes.</li>
+  <li>{{link concepts/mega-moe}}: why the FFN norm writes into the MoE buffer.</li>
+  <li>{{link concepts/engram}}: the hook between post and pre.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method writes the output of the MoE sub-layer of layer 3 into the trunk?
+    <x-a><p><code>_hc_fused_post_pre</code> of layer 4 (case E calls <code>hc_post</code>, or case A calls <code>mega_mhc</code>) ({{cite deepinfer/model_executor/models/v4_modules/hc.py:195-202}}, {{cite deepinfer/model_executor/models/v4_modules/hc.py:220-224}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A GPU model has <code>hc_mult = 4</code> and <code>H = 3072</code>. Does it use <code>mega_mhc</code>?
+    <x-a><p>Yes: <code>fn</code> has <code>4 × 3072 = 12288</code> columns, and 12288 % (4 × 1024) = 0 ({{cite deepinfer/model_executor/models/v4_modules/hc.py:99-101}}). The first layer still uses the separate kernels (case B), and an Engram layer uses them at its attention boundary.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the shifted path pass <code>None</code> as the norm weight to <code>mhc_pre_norm_fn</code>?
+    <x-a><p>The HF <code>fn</code> already includes the norm weight ({{cite deepinfer/model_executor/models/v4_modules/hc.py:347}}). The loader even rejects a checkpoint with separate HC norm tensors ({{cite deepinfer/hugging_face/loading.py:39-41}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">How many bytes does one boundary read for the trunk with T = 192, H = 4096, m = 4, and why does the code join the post with the next pre?
+    <x-a><p>6 MiB (<code>192 × 4 × 4096 × 2</code>). The code does not state the reason. The comment says only that the previous post and the next pre run back to back ({{cite deepinfer/model_executor/models/v4_modules/hc.py:62-64}}). On a GPU this lets one <code>mega_mhc</code> call do the post, the pre and the norm ({{cite deepinfer/model_executor/models/v4_modules/hc.py:236-238}}), so the new trunk does not go to a separate pre kernel. See the deep dive "Worked example: the work at one boundary".</p></x-a>
+  </x-q>
+  <x-q level="hard">In this commit, which FP8 branch of <code>_mega_mhc</code> never runs, and why?
+    <x-a><p>The branch for a 128 granularity (lines 311-314). <code>get_fp8_casting_granularity()</code> always returns 32 ({{cite deepinfer/model_executor/layers/linear.py:13-14}}), so an FP8 norm always takes the MXFP8 branch ({{cite deepinfer/model_executor/models/v4_modules/hc.py:264-268}}).</p></x-a>
+  </x-q>
+</x-quiz>
