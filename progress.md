@@ -38,7 +38,7 @@ Current phase: **Full build — wave 1** (plan section 13)
 
 Subagents were cut off. Their files on disk are partial and NOT committed.
 Resume order after the reset:
-1. Resume (continue, not restart): writers B3b, B4a, B4b, B5b, B6a, B6b; fact checks B3a, B7, B9.
+1. B3b writer FINISHED (needs fact check; also: facts.md fork_seq + _preempt frees state and MTP slots; learn/kv-cache slot mapping is on device with ZOS; possible block leak for aborted chunked prompts). Resume (continue, not restart): writers B4a, B4b, B5b, B6a, B6b; fact checks B3a, B7, B9.
 2. Then: fact checks for B3b, B4a, B4b, B5b, B6a, B6b; writers B8, B10a, B10b, B11; final pass F (TODOs below).
 Committed so far: Phase 1, D, B1, B2, B5a.
 
