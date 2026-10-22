@@ -7,8 +7,9 @@ The site is for a reader who knows Python but knows little about machine learnin
 Each page starts with a simple explanation. Then a "Deep dive" gives the full detail for study:
 tensor shapes, memory layouts, algorithms, edge cases and environment variables.
 
-> **Status:** work in progress. Pages that are not written yet show as "soon" in the menu.
-> See [`progress.md`](progress.md) for the current state.
+> **Status:** complete except for two pages. The site has 106 pages, and each page was fact-checked against the code.
+> Two pages about the TileLang kernels (`concepts/tilelang-kernels`, `code/tilelang-ops`) are not written yet.
+> They show as "soon" in the menu. See [`progress.md`](progress.md) for the details.
 
 ## Code version
 

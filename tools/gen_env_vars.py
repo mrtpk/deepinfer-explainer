@@ -81,8 +81,11 @@ VARS: dict[str, dict] = {
     "DEEPINFER_GLOO_TIMEOUT": dict(
         type="seconds (float), converted to <code>timedelta</code>",
         default="<code>14400</code> (4 hours)",
-        does="Time-out of the default Gloo process group that each worker makes at start-up.",
-        cites=["deepinfer/worker/base.py:334-340"],
+        does="Time-out of the default Gloo process group that each worker makes at start-up. Only the default group "
+             "uses it: the split groups (also the Gloo DP group of the step votes) get no time-out argument, so the "
+             "PyTorch default applies.",
+        cites=["deepinfer/worker/base.py:334-340",
+               "deepinfer/model_executor/parallel_utils/parallel_state.py:34"],
         page=None),
     "DEEPINFER_REARRANGE_P2P_GROUPS": dict(
         does="Number of buckets for the point-to-point sends and receives that move expert weights in EPLB. "
@@ -121,7 +124,8 @@ VARS: dict[str, dict] = {
         page=("concepts/eplb", "EPLB")),
     "DEEPINFER_FORCE_IMBALANCE_RATIO": dict(
         does="Profiling setting. With an EP size above 1, a value above 0 replaces MoE routing with random "
-             "choices that send more tokens to the first EP rank. The value must then be 1.0 or more (assertion).",
+             "choices that send more tokens to the first EP rank. The value must then be 1.0 or more (assertion). "
+             "The memory profile run sets it to 1.8 and then to 0.0, so a value from the environment never takes effect.",
         cites=["deepinfer/model_executor/models/v4_modules/mlp.py:367-371",
                "deepinfer/worker/model_runner.py:509-512"],
         page=("concepts/moe-routing", "MoE routing")),

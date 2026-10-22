@@ -70,7 +70,7 @@ bytes for one sequence    = bytes per token per layer × n_layers × n_tokens</c
 </ol>
 <p>So device memory, not compute, often limits how many sequences can run at the same time. This is why engines save cache memory in many ways.</p>
 <x-note title="DeepInfer stores much less per token">
-<p>DeepInfer's model has one KV head ({{cite deepinfer/worker/cache_engine.py:624}}). It stores one entry of 512 numbers for each token, or for each 2 tokens, per layer. One entry takes 528 bytes in 8-bit format or 288 bytes in 4-bit format ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-128}}). See the deep dive and {{link concepts/kv-compression}}.</p>
+<p>DeepInfer's model has one KV head ({{cite deepinfer/worker/cache_engine.py:624}}). It stores one entry of 512 numbers for each token, or for each 2 tokens, per layer. One entry takes 528 bytes in 8-bit format or 288 bytes in 4-bit format ({{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-128}}). The Hugging Face loader uses the 4-bit format by default ({{cite deepinfer/hugging_face/config.py:302-303}}). See the deep dive and {{link concepts/kv-compression}}.</p>
 </x-note>
 
 <h3>Blocks and block tables</h3>
@@ -140,7 +140,8 @@ slot          = block_table[logical block] × block_size + offset</code></pre>
   <li><code>ca_cache</code>: the main compressed cache. It is paged: one row per block.</li>
   <li><code>ica_cache</code>: the keys of the indexer, for sparse layers. It is paged in the same blocks.</li>
   <li><code>swa_cache</code>: the {{term sliding-window-attention}} cache. It is <em>not</em> paged. Each sequence has a fixed ring of recent tokens in its {{term state-slot}}.</li>
-  <li><code>ca_state</code> and <code>ica_state</code>: per-sequence float32 state for compression with ratio 2. It is also in the state slot.</li>
+  <li><code>ca_state</code>: per-sequence float32 state for compression with ratio 2. It is also in the state slot.</li>
+  <li><code>ica_state</code>: float32 state for an indexer without <code>use_kproj</code> ({{cite deepinfer/worker/cache_engine.py:123-127}}). The Hugging Face loader always sets <code>use_kproj=True</code> ({{cite deepinfer/hugging_face/config.py:122}}). So in practice <code>ica_state</code> is <code>None</code>.</li>
 </ul>
 <p>So DeepInfer has two pools: paged KV blocks, and one state slot per running sequence. It makes one <code>BlockManager</code> for each pool ({{cite deepinfer/engine/llm_engine.py:265-266}}).</p>
 
@@ -165,24 +166,24 @@ slot          = block_table[logical block] × block_size + offset</code></pre>
     <tr><td><code>V41_FP4_FORMAT</code> (main, if <code>use_fp4_sparse_kv</code>)</td><td>512 × FP4 e2m1 = 256 B</td><td>32 × E4M3, one per 16 numbers = 32 B</td><td><strong>288</strong></td><td>{{cite deepinfer/model_executor/layers/tilelang_ops/cache_common.py:119-128}}</td></tr>
   </tbody>
 </table>
-<p>The choice between the two main formats comes from the model config ({{cite deepinfer/model_executor/model_metadata_utils.py:37-39}}). The SWA cache always uses 528 bytes ({{cite deepinfer/worker/cache_engine.py:261-263}}).</p>
+<p>The choice between the two main formats comes from the model config ({{cite deepinfer/model_executor/model_metadata_utils.py:37-39}}). If <code>config.json</code> does not set <code>use_fp4_sparse_kv</code>, the Hugging Face loader selects FP4 (288 bytes) ({{cite deepinfer/hugging_face/config.py:302-303}}). The SWA cache always uses 528 bytes ({{cite deepinfer/worker/cache_engine.py:261-263}}).</p>
 <p><strong>Compression ratio.</strong> A layer with <code>kv_compress_ratio</code> <em>n</em> stores one entry for every <em>n</em> tokens. Only <em>n</em> = 1 and 2 are allowed; C4 and C128 were removed ({{cite deepinfer/model_executor/model_metadata_utils.py:51-53}}). So one block has <code>128 // n</code> entries per layer ({{cite deepinfer/worker/cache_engine.py:452-453}}):</p>
 <table>
-  <thead><tr><th>Layer kind</th><th>Entries per block</th><th>Bytes per block (MXFP8)</th><th>Bytes per token</th></tr></thead>
+  <thead><tr><th>Layer kind</th><th>Entries per block</th><th>Bytes per block (FP4, default)</th><th>Bytes per block (MXFP8)</th><th>Bytes per token (FP4 / MXFP8)</th></tr></thead>
   <tbody>
-    <tr><td>C1 (ratio 1)</td><td>128</td><td>128 × 528 = 67,584</td><td>528</td></tr>
-    <tr><td>C2 (ratio 2)</td><td>64</td><td>64 × 528 = 33,792</td><td>264</td></tr>
-    <tr><td>SWA-only (ratio 0)</td><td>0</td><td>0 (cache is in the state slot)</td><td>0 in blocks</td></tr>
+    <tr><td>C1 (ratio 1)</td><td>128</td><td>128 × 288 = 36,864</td><td>128 × 528 = 67,584</td><td>288 / 528</td></tr>
+    <tr><td>C2 (ratio 2)</td><td>64</td><td>64 × 288 = 18,432</td><td>64 × 528 = 33,792</td><td>144 / 264</td></tr>
+    <tr><td>SWA-only (ratio 0)</td><td>0</td><td>0 (cache is in the state slot)</td><td>0 (cache is in the state slot)</td><td>0 in blocks</td></tr>
   </tbody>
 </table>
-<p>Compare 528 bytes per token and layer with 16,384 bytes in the generic example: about 31 times less.</p>
+<p>Compare this with 16,384 bytes per token and layer in the generic example. FP4 uses about 57 times less, and MXFP8 about 31 times less.</p>
 <p><strong>Indexer keys.</strong> A sparse layer (<code>index_topk &gt; 0</code>) also stores FP4 indexer keys: <code>index_head_dim / 2 + index_head_dim / 32</code> bytes per entry, with the same <code>128 // n</code> entries per block ({{cite deepinfer/worker/cache_engine.py:73-80}}, {{cite deepinfer/worker/cache_engine.py:428-439}}). A layer can reuse the indexer keys or the main cache of an earlier layer. Then it adds no bytes ({{cite deepinfer/worker/cache_engine.py:429-431}}, {{cite deepinfer/worker/cache_engine.py:448-449}}); see {{link concepts/cross-layer-kv-sharing}}.</p>
 <p><strong>Sliding-window ring.</strong> Per sequence and SWA layer: <code>(window + backtracking) × 528</code> bytes, a fixed size, padded to 32 bytes ({{cite deepinfer/worker/cache_engine.py:88-93}}, {{cite deepinfer/worker/cache_engine.py:274-275}}). The backtracking value is at least <code>DEEPINFER_USE_NEXTN_DECODE + 1</code> = 6 ({{cite deepinfer/environ.py:129-132}}). If <code>DEEPINFER_PREFILL_STORE_EXTRA_STATE</code> is on (default off), the ring in the state slot is longer by <code>DEEPINFER_PREFILL_STORE_EXTRA_SIZE</code> tokens, default 128 ({{cite deepinfer/worker/cache_engine.py:101-110}}). The deployment notes give 134 = 128 (window) + 6 (backtracking) ({{cite doc/inference_deployment_qa.md:191}}), and the stored total: 20 layers × 134 tokens × 528 B = 1,415,040 B per sequence ({{cite doc/inference_deployment_qa.md:169}}).</p>
-<x-diagram name="kv_deepinfer_layout" alt="Panel 1: one row of gpu_blocks holds a byte range for each layer: C1 layers 128 entries of 528 bytes, C2 layers 64 entries plus optional FP4 indexer keys, SWA-only layers nothing; the row is padded to a multiple of lcm(128, 528) = 4,224 bytes. Panel 2: one row of gpu_states holds the stored SWA rings (134 tokens of 528 bytes per layer), the dropped YOCO consumer SWA rings, and fp32 compression state; there are int(max_num_seqs × 1.2) + 1 slots." caption="DeepInfer's two cache buffers. Blue, violet: paged per block. Green, amber: one fixed slot per sequence." />
+<x-diagram name="kv_deepinfer_layout" alt="Panel 1: one row of gpu_blocks holds a byte range for each layer: C1 layers 128 entries of 288 bytes (default FP4; 528 bytes with MXFP8), C2 layers 64 entries plus optional FP4 indexer keys, SWA-only layers nothing; the row is padded to a multiple of lcm(128, 288) = 1,152 bytes. Panel 2: one row of gpu_states holds the stored SWA rings (134 tokens of 528 bytes per layer), the dropped YOCO consumer SWA rings, and fp32 compression state (ca_state; ica_state is None in practice); there are int(max_num_seqs × 1.2) + 1 slots." caption="DeepInfer's two cache buffers. Blue, violet: paged per block. Green, amber: one fixed slot per sequence." />
 </x-deepdive>
 
 <x-deepdive title="From token position to byte: the slot mapping">
-<p>Before each step, C++ code computes for each new token where the kernels must write its cache entry. For compressed layers:</p>
+<p>Before each step, the engine computes for each new token where the kernels must write its cache entry. For a prefill step, and for a decode step without ZOS, C++ code does this. ZOS is on by default in the NORMAL engine ({{cite deepinfer/engine/arg_utils.py:51-55}}). With ZOS, a decode step uses a different function: the kernel <code>prepare_v4_decode_metadata</code> computes the decode slot mapping on the device ({{cite deepinfer/model_executor/model_metadata_utils.py:143-144}}, {{cite deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py:336-367}}). The C++ rules below show the arithmetic. For compressed layers:</p>
 <x-code file="csrc/engine/input_metadata/prepare_tensor_input_v4.cpp" lines="41-61" highlight="42,58,60" />
 <ol>
   <li>Line 42: <code>compressed_block_size = block_size / n</code>, the entries per block (128 or 64).</li>
@@ -245,7 +246,7 @@ slot          = block_table[logical block] × block_size + offset</code></pre>
 <x-tr line="783-784">Reset the state of the sequence that changes in each step (cache.num_tokens, in-flight counts, MTP state); the list is in Sequence::reset_for_recompute.</x-tr>
 </x-code>
 <ul>
-  <li><strong>Stop</strong> (<code>stop_preempted_request</code> is true, or a structured output is active): status <code>FINISHED_PREEMPTED</code>, finish reason <code>"insufficient_system_resource"</code> ({{cite csrc/engine/sequence.hpp:55-56}}).</li>
+  <li><strong>Stop</strong> (<code>stop_preempted_request</code> is true, or the structured-output status is not 0): status <code>FINISHED_PREEMPTED</code>, finish reason <code>"insufficient_system_resource"</code> ({{cite csrc/engine/sequence.hpp:55-56}}).</li>
   <li><strong>Recompute</strong>: the sequence keeps its tokens (prompt and output so far), goes to the <em>front</em> of the waiting queue, and frees all blocks. The next prefill computes the cache for all its tokens again.</li>
   <li>DeepInfer has no swap to CPU memory here. The status <code>SWAPPED</code> exists in the enum ({{cite csrc/engine/sequence.hpp:33}}), but <code>_preempt</code> never sets it.</li>
 </ul>
@@ -292,7 +293,7 @@ slot          = block_table[logical block] × block_size + offset</code></pre>
   <li><strong>No memory for the cache.</strong> If the profile leaves no budget, start-up stops with <code>"No available memory for the cache blocks"</code> ({{cite deepinfer/engine/llm_engine.py:441-444}}). Increase <code>gpu_memory_utilization</code> or decrease <code>max_num_seqs</code>.</li>
   <li><strong>Cache too small for the context length.</strong> Start-up stops if <code>runtime_max_model_len</code> is more than 80 % of all block tokens ({{cite deepinfer/engine/llm_engine.py:445-451}}).</li>
   <li><strong>A prompt that can never fit.</strong> If a prompt needs <code>num_gpu_blocks</code> blocks or more, the scheduler logs <em>"exceeds the capacity of block_manager"</em> and ends the request as ignored ({{cite csrc/engine/scheduler.hpp:386-396}}).</li>
-  <li><strong>Preempted requests.</strong> With <code>stop_preempted_request</code> on, a long request can end early with the reason <code>insufficient_system_resource</code>. With recompute, it gets a new prefill, so its latency goes up. Structured-output requests always stop ({{cite csrc/engine/scheduler.hpp:770-779}}).</li>
+  <li><strong>Preempted requests.</strong> With <code>stop_preempted_request</code> on, a long request can end early with the reason <code>insufficient_system_resource</code>. With recompute, it gets a new prefill, so its latency goes up. Structured-output requests with a status that is not 0 always stop ({{cite csrc/engine/scheduler.hpp:770-779}}).</li>
   <li><strong>Free blocks, but the request still waits.</strong> A new request also needs a free state slot, and a prefill starts only at 90 % cache usage or less ({{cite csrc/engine/scheduler.hpp:194-201}}, {{cite csrc/engine/scheduler.hpp:313}}).</li>
 </ul>
 <p><strong>Why it matters.</strong> The KV cache decides how many requests can run at the same time, and how long they can be. Most memory settings of an inference engine are really KV cache settings. When you read about compression, sliding windows or the scheduler, ask: how does this change the bytes per token, or the number of free blocks?</p>

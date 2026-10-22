@@ -4,6 +4,8 @@ Used by: src/learn/kv-cache.html (deep dive)
 Sources (commit 9bd9cf2):
   deepinfer/model_executor/model_metadata_utils.py:133-140    128 tokens per block, 128-byte alignment
   deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-128  V41 formats: 512 values, 528 B (MXFP8) / 288 B (FP4)
+  deepinfer/hugging_face/config.py:302-303    HF loader default use_fp4_sparse_kv=True -> main cache 288 B (SWA stays 528 B)
+  deepinfer/worker/cache_engine.py:123-127, 441-443   ica_state only without use_kproj; HF loader sets use_kproj=True (config.py:122)
   deepinfer/worker/cache_engine.py:205-218    KVCache fields and shapes
   deepinfer/worker/cache_engine.py:406-468    per-layer views: swa_cache, ica_cache, ca_cache
   deepinfer/worker/cache_engine.py:479-484    block total aligned to lcm(128, bytes_per_token)
@@ -94,15 +96,15 @@ cy, ch, cw = y0 + 172, 196, (CX1 - CX0 - 2 * cgap) / 3
 xs = [CX0, CX0 + cw + cgap, CX0 + 2 * (cw + cgap)]
 card(xs[0], cy, cw, ch, "Main cache, ratio 1 (C1)", [
     "ca_cache[layer]:",
-    "  uint8 [num_blocks, 128, 1, 528]",
+    "  uint8 [num_blocks, 128, 1, 288]",
     "1 entry per token, 512 values:",
-    "  512 B FP8 data + 16 B scales",
-    "= 128 × 528 = 67,584 B per block",
-    "(FP4 option: 288 B → 36,864 B)",
+    "  256 B FP4 data + 32 B scales",
+    "= 128 × 288 = 36,864 B per block",
+    "(FP8 option: 528 B → 67,584 B)",
 ], BLUE, "cache_engine.py:447-461")
 card(xs[1], cy, cw, ch, "Ratio 2 (C2) and the indexer", [
-    "ca_cache: [num_blocks, 64, 1, 528]",
-    "1 entry per 2 tokens → 33,792 B",
+    "ca_cache: [num_blocks, 64, 1, 288]",
+    "1 entry per 2 tokens → 18,432 B",
     "ica_cache (sparse layers only):",
     "  [num_blocks, 64, 1, d/2 + d/32]",
     "  FP4 keys, d = index_head_dim",
@@ -111,8 +113,8 @@ card(xs[1], cy, cw, ch, "Ratio 2 (C2) and the indexer", [
 card(xs[2], cy, cw, ch, "Row size and alignment", [
     "bytes_per_block = Σ layer ranges",
     "each range padded to 32 B",
-    "row padded to lcm(128, 528)",
-    "  = 4,224 B (MXFP8 main cache)",
+    "row padded to lcm(128, 288)",
+    "  = 1,152 B (FP4 main cache)",
     "Block 0 exists but is never used.",
     "Profile run sets num_gpu_blocks.",
 ], NEUTRAL, "cache_engine.py:479-484")
@@ -128,7 +130,7 @@ d.text(46, y1 + 86, "gpu_states[state_id]  =  [ stored region | dropped region ]
 bar(y1 + 98, [
     ("stored: SWA rings", "one ring per stored SWA layer", EMERALD, 4.6),
     ("dropped: consumer SWA", "YOCO layers", EMERALD, 2.0),
-    ("dropped: compression state", "fp32 ca_state | ica_state", AMBER, 2.4),
+    ("dropped: compression state", "fp32 ca_state", AMBER, 2.4),
     ("pad", "", NEUTRAL, 0.5),
 ])
 cy = y1 + 172
@@ -144,9 +146,9 @@ card(xs[1], cy, cw, ch, "Compression state (C2 layers)", [
     "ca_state: fp32 [num_slots, 7, 2, 512]",
     "7 = ratio 2 + backtracking 6 − 1",
     "= 7 × 2 × 512 × 4 = 28,672 B",
-    "ica_state: same form, index dim",
     "Doc: boundary accumulators of",
     "  the compression window.",
+    "ica_state: None (use_kproj=True)",
 ], AMBER, "cache_engine.py:441-465")
 card(xs[2], cy, cw, ch, "How many slots?", [
     "num_slots = int(max_num_seqs × 1.2) + 1",
@@ -171,6 +173,7 @@ d.legend(30, y, [
 y += 40
 FN = []
 for s in [
+    "Main cache sizes use the HF loader default, FP4 with 288 B per entry (hugging_face/config.py:302-303). If config.json sets use_fp4_sparse_kv to false, an entry is 528 B (MXFP8). The SWA ring always uses 528 B.",
     "Byte widths in the two bars are not to scale. Which layer is C1, C2, sparse or SWA-only comes from the model config (attn_module_list), which is not in the repo.",
     "Defaults: DEEPINFER_USE_NEXTN_DECODE=5 → backtracking = max(value, 5 + 1) = 6 (environ.py:129-132); DEEPINFER_NUM_STATE_SLOTS_RATIO=1.2 (environ.py:162).",
     "Window 128 and the 20 stored layers are from doc/inference_deployment_qa.md:163,169,191. With DEEPINFER_PREFILL_STORE_EXTRA_STATE the rings are 128 tokens longer (plus the YOCO keep tokens if truncation is on).",

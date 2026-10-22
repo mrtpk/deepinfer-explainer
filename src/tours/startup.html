@@ -266,7 +266,7 @@ torch.initial_seed()          # 0 + 3</code></pre>
 <x-code file="deepinfer/worker/base.py" lines="315-344" highlight="329,334-340,343" />
 <ol>
   <li>Line 329: the global rank is <code>engine_rank × cp_size + cp_rank</code>: 3 for our process.</li>
-  <li>Lines 334-340: the default {{term process-group}} uses the {{term gloo}} backend on the CPU. Its timeout is <code>DEEPINFER_GLOO_TIMEOUT</code>, default 14400 s ({{cite deepinfer/environ.py:110}}).</li>
+  <li>Lines 334-340: the default {{term process-group}} uses the {{term gloo}} backend on the CPU. Its timeout is <code>DEEPINFER_GLOO_TIMEOUT</code>, default 14400 s ({{cite deepinfer/environ.py:110}}). Only the default group uses this timeout. <code>dist.new_group</code> gets no timeout argument, so the split groups use the PyTorch default ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:34}}).</li>
   <li>Line 343: the named groups for DP, CP, EP and Engram, on the device backend.</li>
 </ol>
 <x-code file="deepinfer/model_executor/parallel_utils/parallel_state.py" lines="85-126" highlight="92-94,97-99,102-106,123-124,126" />
@@ -291,7 +291,7 @@ PG.rank    3</code></pre>
   </tbody>
 </table>
 <p>There is no tensor-parallel group and no pipeline-parallel group. With <code>cp_size &gt; 1</code>, the CP group also gets a shared-memory message queue with 10 slots of 1 MiB each. The driver sends method calls to the followers through it ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:122-124}}, {{cite deepinfer/worker/base.py:290-302}}).</p>
-<p><strong>Why this is a barrier.</strong> <code>init_process_group</code> waits until all <code>world_size</code> ranks connect. <code>dist.new_group</code> is a collective call, so every rank creates every group in the same order ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:26-37}}). If one DP process fails before this stop, the others wait until the Gloo timeout.</p>
+<p><strong>Why this is a barrier.</strong> <code>init_process_group</code> waits until all <code>world_size</code> ranks connect. <code>dist.new_group</code> is a collective call, so every rank creates every group in the same order ({{cite deepinfer/model_executor/parallel_utils/parallel_state.py:26-37}}). If one DP process fails before this stop, the others wait until the timeout of the default group.</p>
 </x-deepdive>
 </x-stop>
 
@@ -466,7 +466,7 @@ engine.generate_step            # 0</code></pre>
 </x-warning>
 <ul>
   <li><strong><code>KeyError: 'CUDA_VISIBLE_DEVICES'</code>.</strong> The engine and the Worker read this variable without a default ({{cite deepinfer/engine/llm_engine.py:188}}, {{cite deepinfer/worker/base.py:127}}). Set it, also on Ascend.</li>
-  <li><strong>The ranks hang in stop 8.</strong> One DP process failed or did not start, or two jobs use the same <code>MASTER_PORT</code> ({{cite deepinfer/utils.py:222-230}}). The others wait up to <code>DEEPINFER_GLOO_TIMEOUT</code> (4 hours by default).</li>
+  <li><strong>The ranks hang in stop 8.</strong> One DP process failed or did not start, or two jobs use the same <code>MASTER_PORT</code> ({{cite deepinfer/utils.py:222-230}}). The others wait up to the timeout of the default group, <code>DEEPINFER_GLOO_TIMEOUT</code> (4 hours by default).</li>
   <li><strong><code>ValueError: Unsupported HF ...</code></strong> The checkpoint is not a DeepSeek V4.1 checkpoint in the expected format ({{cite deepinfer/hugging_face/config.py:241-262}}).</li>
   <li><strong>"No available memory for the cache blocks"</strong> or <strong>"runtime max seq len ... is larger than ..."</strong>. The weights and the test batch leave too little memory. Raise <code>gpu_memory_utilization</code>, or lower <code>max_model_len</code>, <code>max_num_seqs</code> or <code>max_num_batched_tokens</code> ({{cite deepinfer/engine/llm_engine.py:441-451}}).</li>
   <li><strong>Out of memory or "illegal memory access" in stop 13.</strong> The graphs did not fit in the memory that is left. Lower <code>gpu_memory_utilization</code> ({{cite deepinfer/entrypoints/llm.py:50-51}}).</li>

@@ -1,7 +1,7 @@
 # DeepInfer Explainer — Progress
 
-Last update: 2026-10-21
-Current phase: **Paused for user approval** — all 16 batches committed and pushed; final pass F and README update wait for approval
+Last update: 2026-10-22
+Current phase: **Done** — final pass F complete and committed (not pushed). Open: the two deferred TileLang pages (the user will revisit them).
 
 ## Phase status
 
@@ -9,7 +9,7 @@ Current phase: **Paused for user approval** — all 16 batches committed and pus
 |---|---|---|
 | 0 Plan approval | done | Approved 2026-10-21 with answers (plan section 11) |
 | 1 Foundation | done | User reviewed and approved: "I like it. build for all. fact check it as well." |
-| Full build (plan §13) | running | Batches B1–B11, D, F. Writer → fact check → commit per batch. |
+| Full build (plan §13) | done | Batches B1–B11, D, F. Writer → fact check → commit per batch. |
 
 ## Full build — batch status
 
@@ -32,7 +32,7 @@ Current phase: **Paused for user approval** — all 16 batches committed and pus
 | B10b Kernels + loading | done (6 pages; 2 TileLang pages DEFERRED by user) | done (~35 defects fixed) | yes |
 | B11 Start-up + reference | done | done (40 defects fixed) | yes |
 | D Diagrams to 1100 | done | n/a | yes |
-| F Final pass | later | — | — |
+| F Final pass | done (consistency + site check) | done | yes |
 
 ## RESUMED after the usage limit (was stopped 2026-10-21 18:21 Dubai)
 
@@ -44,32 +44,34 @@ Committed so far: Phase 1, D, B1, B2, B5a.
 
 ## Done
 
+- 2026-10-22: Final consistency pass (subagent): all 8 non-CSS FINAL-PASS TODO lines fixed (kv-cache FP4 default/ica_state/ZOS slot mapping, env-vars imbalance ratio + shared-expert launch order via tools/gen_env_vars.py, fork_seq, Tour 1 stop 5 + simplification box, DFlash hook position on 5 pages + b9 diagram, Gloo time-out default group only, sampler_utils topk, number-formats converter link). Broad facts.md sweep fixed: SO preempt only when status != 0 (kv-cache, structured-outputs), block size 64 example (python-cpp-boundary), 528 B as main entry (learn/attention), top-p 'more than p' (learn/sampling), KEEP_TOKENS not read by scheduler (code/llm-engine), ZOS device slot mapping (Tour 1 stop 6). kv_deepinfer_layout diagram now shows FP4 default. Normal build: 106 pages, 0 errors, 8 expected TileLang warnings.
+
 - 2026-10-22: All 16 batches written, fact-checked and committed (B10b without the 2 deferred TileLang pages). Normal build: 106 pages, 321 glossary terms, 91 diagrams, 0 errors, 8 warnings (all links to the deferred TileLang pages). Pushed to origin. PAUSED for user approval of the final pass (consistency, site check) and README + final commit.
 
-- FINAL-PASS TODO: concepts/hardware-platforms names only sampler.py for the Ascend torch.topk fallback; sampler_utils.py also gets it.
+- DONE (final pass) — FINAL-PASS TODO: concepts/hardware-platforms names only sampler.py for the Ascend torch.topk fallback; sampler_utils.py also gets it.
 
-- FINAL-PASS TODO: other pages may say split groups / DP votes use the 14400 s Gloo time-out — only the default group does (facts.md B8). Pages that mention it: code/worker-base, learn/parallelism, tours/startup, reference/env-vars.
+- DONE (final pass) — FINAL-PASS TODO: other pages may say split groups / DP votes use the 14400 s Gloo time-out — only the default group does (facts.md B8). Pages that mention it: code/worker-base, learn/parallelism, tours/startup, reference/env-vars.
 
 - USER INSTRUCTION 2026-10-22 (usage at 77%): normal plan, but first let the 4 running subagents finish (B8/B10a/B11 fact checks, B10b writer), then build, commit and PUSH, then PAUSE for user approval. UPDATE: the user wants the B10b fact check BEFORE the build/commit/push. Then a NORMAL build (not strict; user decision 2026-10-22, because links to the deferred TileLang pages give expected warnings), commit, push, and pause. Final pass (consistency, site check) and README + final commit wait for user approval.
 
-- FINAL-PASS TODO: add a link from learn/number-formats to concepts/low-precision-formats#converter (the interactive format converter).
+- DONE (final pass) — FINAL-PASS TODO: add a link from learn/number-formats to concepts/low-precision-formats#converter (the interactive format converter).
 
 - USER DECISION 2026-10-21: B10b option 1. Write the 6 other B10b pages now. The two TileLang pages (concepts/tilelang-kernels, code/tilelang-ops) are DEFERRED: the user will revisit them later. They stay "soon" in the nav. Reason: a safety classifier stopped the first B10b writer on concepts/tilelang-kernels (probably a false positive); we do not retry it without the user. Saved for that work: diagrams/b10b_tilelang_path.py and the B10b facts in notes/facts.md.
 
-- FINAL-PASS TODO: check every page that describes the DFlash hook position (Tour 1 stop 8/11, model-map, decoder-layer, dflash pages): it runs after the attention mHC pre + norm, before attention, and stores the mean of the trunk streams.
+- DONE (final pass) — FINAL-PASS TODO: check every page that describes the DFlash hook position (Tour 1 stop 8/11, model-map, decoder-layer, dflash pages): it runs after the attention mHC pre + norm, before attention, and stores the mean of the trunk streams.
 
 - DECISION 2026-10-21: doc QA ~274 "post-process(N−1) while device runs N" and the code (post-process N in the call that launches N+1) are the same overlap with shifted numbering — not a contradiction. Pages use the code's numbering.
 
-- FINAL-PASS TODO: Tour 1 stop 5: item 6 sums full lengths (incl. outputs after recompute), not prompt lengths; the token limit when unset is 2**30; structured output stops on preempt only when status != 0. learn/kv-cache: with ZOS the decode slot mapping is computed on the device.
+- DONE (final pass) — FINAL-PASS TODO: Tour 1 stop 5: item 6 sums full lengths (incl. outputs after recompute), not prompt lengths; the token limit when unset is 2**30; structured output stops on preempt only when status != 0. learn/kv-cache: with ZOS the decode slot mapping is computed on the device.
 
-- FINAL-PASS TODO: code/llm-engine.html says no Python code calls fork_seq — examples/benchmark.py does (facts.md). Tour 1 simplification box: the fifth request starts at the next attempt point after a slot frees, not when another finishes.
-- FINAL-PASS TODO (CSS): wide tables inside deep dives scroll sideways; add a wrapping table style.
+- DONE (final pass) — FINAL-PASS TODO: code/llm-engine.html says no Python code calls fork_seq — examples/benchmark.py does (facts.md). Tour 1 simplification box: the fifth request starts at the next attempt point after a slot frees, not when another finishes.
+- DONE (final pass) — FINAL-PASS TODO (CSS): wide tables inside deep dives scroll sideways; add a wrapping table style. Fixed in assets/site.css (cells wrap at spaces, code breaks anywhere, tighter cells on phones).
 
 - IDEA for B10a/final: interactive number-format converter (value → BF16 / E4M3 / E2M1 bits) for learn/number-formats and concepts/low-precision-formats.
 
-- FINAL-PASS TODO: reference/env-vars.html: (a) DEEPINFER_FORCE_IMBALANCE_RATIO from the env never takes effect (model_runner.py ~509-512); (b) line ~494 says the shared expert runs "while combine runs" — the code shows only the launch order; overlap is decided inside DeepEP (see facts.md).
+- DONE (final pass) — FINAL-PASS TODO: reference/env-vars.html: (a) DEEPINFER_FORCE_IMBALANCE_RATIO from the env never takes effect (model_runner.py ~509-512); (b) line ~494 says the shared expert runs "while combine runs" — the code shows only the launch order; overlap is decided inside DeepEP (see facts.md).
 
-- FINAL-PASS TODO: learn/kv-cache.html (already fact-checked) may say ica_state is float32 state for ratio-2 layers and that the main KV entry is 528 B; per B5a, ica_state is None in practice and the loader default is FP4 (288 B). Check and fix in pass F.
+- DONE (final pass) — FINAL-PASS TODO: learn/kv-cache.html (already fact-checked) may say ica_state is float32 state for ratio-2 layers and that the main KV entry is 528 B; per B5a, ica_state is None in practice and the loader default is FP4 (288 B). Check and fix in pass F.
 - 2026-10-21: build.py --preview writes site/ even with errors (writers asked: one broken page blocked all previews).
 
 - 2026-10-21: User asked to change the commit email to contact@thomaspaul.dev; history rewritten (backup ref refs/backup/before-email-rewrite, not pushed). Repo-local user.email set.
@@ -131,3 +133,4 @@ Wave 1 writers running. Start fact checks as batches finish. Then wave 2. Then s
 | 2026-10-21 | Restyle: light article look (user feedback) | Done. Always light (dark only by toggle), Inter 18px/1.7, 720px column, figures up to 1100px, version line on every page + footer. Supervisor checked screenshots: good. |
 | 2026-10-21 | 1c Fact-check A: Tour 1, llm-engine module page, home | Running |
 | 2026-10-21 | 1c Fact-check B: KV cache, platforms, env vars, folder tree | Running |
+| 2026-10-22 | Final site check (layout, JS errors, links) | Done. 106 pages at 1280/390 px, all deep dives open: page overflow 0/1 before (glossary at 390), 0/0 after; JS console/page errors 0; internal links 19382, broken files 0, broken anchors 0, glossary term links 0 missing (TileLang pages show as "coming soon"). 8 visuals render and react to a click. CSS: table wrapping (deep dives), long prose names wrap, row-header borders, phone table spacing. Markup: identifiers in `<code>` in 3 tables (scheduler-hpp, determinism, request-lifecycle). Open: 5 many-column tables still scroll inside their own box at 390 px (dspark deep dive, sampling-params, cpp-engine-api x3). |

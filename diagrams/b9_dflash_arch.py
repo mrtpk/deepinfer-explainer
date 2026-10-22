@@ -2,7 +2,7 @@
 
 Used by: src/concepts/dspark.html ("The picture"), src/code/dflash.html ("Where it sits")
 Sources (commit 9bd9cf2):
-  deepinfer/model_executor/models/decoder_layer.py:92-95, 144-145  copy residual stream of target layers into dflash_input
+  deepinfer/model_executor/models/decoder_layer.py:92-95, 143-145  target layers store the mean of the mHC trunk streams (after attn mHC pre + norm, before attention)
   deepinfer/model_executor/models/deepseek.py:172-174, 219-223      dflash_input buffer; update_main_cache after the last layer
   deepinfer/model_executor/models/mtp/dflash.py:198-228             projection -> norm -> main_kv_proj -> SWA cache write
   deepinfer/model_executor/models/mtp/dflash.py:230-269             draft block [golden, noise x4], DFlash layers
@@ -32,13 +32,13 @@ d.header(
 y0 = 112
 P1 = 220
 d.panel(y0, P1, 1, "Where do the draft keys come from? From the target model's own layers",
-        "Some main layers copy their hidden states out. DFlash turns them into one key per DFlash layer and token.")
+        "Some main layers store the mean of their mHC trunk streams. DFlash turns these features into one key per DFlash layer and token.")
 by = y0 + 72
 bw, bh = 300, 112
 xs = [46, 400, 754]
 d.box(xs[0], by, bw, bh, "Target layers (main model)", [
-    "layers in dspark_target_layer_ids", "copy residual stream into", "one hidden-size slice per layer",
-    "decoder_layer.py:144-145"], col=BLUE)
+    "layers in dspark_target_layer_ids", "before attention: mean of the", "mHC trunk streams → one slice",
+    "decoder_layer.py:143-145"], col=BLUE)
 d.box(xs[1], by, bw, bh, "update_main_cache", [
     "projection → RMSNorm", "main_kv_proj → main_k", "[total_q, n_layers, head_dim]", "dflash.py:219-220"], col=VIOLET)
 d.box(xs[2], by, bw, bh, "DFlash SWA cache", [
